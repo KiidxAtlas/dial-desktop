@@ -69,10 +69,30 @@ async function place() {
   }
 }
 
-let frame = 0;
+/** Run `fn` on the next frame, or soon when the window is in the background (WebKit pauses
+ *  animation frames there, and the agent drives the panel while the user looks elsewhere). */
+function soon(fn: () => void): () => void {
+  let done = false;
+  const once = () => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(id);
+    clearTimeout(timer);
+    fn();
+  };
+  const id = requestAnimationFrame(once);
+  const timer = setTimeout(once, 80);
+  return () => {
+    done = true;
+    cancelAnimationFrame(id);
+    clearTimeout(timer);
+  };
+}
+
+let cancelPlace: (() => void) | null = null;
 function placeSoon() {
-  cancelAnimationFrame(frame);
-  frame = requestAnimationFrame(() => void place());
+  cancelPlace?.();
+  cancelPlace = soon(() => void place());
 }
 
 function submit() {
@@ -113,7 +133,7 @@ async function share(event: MouseEvent) {
       icon: "sparkle",
       run: () =>
         addToPrompt(
-          `Open ${page.url} with your browser tool and check that it works: look for visual problems, broken interactions and console errors, then report what you find.`,
+          `Open ${page.url} in the Browser panel (browser_open) and check that it works: look for visual problems, broken interactions and console errors, then report what you find.`,
         ),
     },
     { label: "Add page address", icon: "globe", run: () => addToPrompt(`Page: ${name}`) },
@@ -174,7 +194,7 @@ watch(
     address.value = url;
     await nextTick();
     // The panel may still be sliding in; wait until it has a size.
-    requestAnimationFrame(() => void open(url));
+    soon(() => void open(url));
   },
   { immediate: true },
 );
@@ -204,7 +224,7 @@ onBeforeUnmount(() => {
   observer?.disconnect();
   window.removeEventListener("resize", placeSoon);
   window.removeEventListener("keydown", onKey);
-  cancelAnimationFrame(frame);
+  cancelPlace?.();
   unlisten?.();
   if (created.value) void browserApi.hide().catch(() => {});
 });
@@ -255,6 +275,10 @@ onBeforeUnmount(() => {
         <Icon name="external" :size="15" />
       </button>
     </form>
+    <div v-if="workspace.agentActivity" class="agent" role="status">
+      <Icon name="sparkle" :size="12" />
+      <span class="truncate">Dial: {{ workspace.agentActivity }}</span>
+    </div>
     <div v-if="state.title && !blank" class="page-title truncate" :title="state.title">{{ state.title }}</div>
 
     <div ref="stage" class="stage">
@@ -349,6 +373,18 @@ onBeforeUnmount(() => {
   font-size: var(--text-xs);
   color: var(--text-faint);
   padding: 0 4px 6px;
+}
+.agent {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 4px 6px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+  font-size: var(--text-xs);
 }
 .stage {
   position: relative;

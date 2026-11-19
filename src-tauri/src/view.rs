@@ -10,7 +10,7 @@ use crate::time;
 use dial_client::{Entry, ToolEntry};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod tests;
@@ -216,7 +216,10 @@ impl ToolView {
             .filter(|t| !t.is_empty())
             .unwrap_or(&tool.summary)
             .to_owned();
+        // An edit's hunks say what changed; its patch arguments and line-numbered receipt do not.
+        let diff = tool.result.as_ref().and_then(|r| change_preview(&r.text));
         let input = match card.and_then(|c| c.preview.as_deref()) {
+            _ if diff.is_some() => None,
             Some(preview) => Some(Block {
                 caption: "preview",
                 text: preview.to_owned(),
@@ -231,6 +234,10 @@ impl ToolView {
             None => None,
         };
         let output = match &tool.result {
+            _ if diff.is_some() => diff.map(|text| Block {
+                caption: "diff",
+                text,
+            }),
             Some(result) if !result.text.trim().is_empty() => Some(Block {
                 caption: "result",
                 text: result.text.clone(),
@@ -274,6 +281,31 @@ impl ToolView {
             facts,
         }
     }
+}
+
+/// The unified hunks the engine appends to an `edit` or `write` result after its
+/// `change preview (+A -R lines)` header, without the header or any notes that follow. A result
+/// covering several files keeps its full text, which names each file.
+fn change_preview(text: &str) -> Option<String> {
+    const HEADER: &str = "\nchange preview (";
+    let start = text.find(HEADER)? + 1;
+    if text[start..].contains(HEADER) {
+        return None;
+    }
+    let hunks: Vec<&str> = text[start..]
+        .lines()
+        .skip(1)
+        .take_while(|line| {
+            line.starts_with("@@")
+                || line.starts_with([' ', '+', '-'])
+                || (line.starts_with("[diff preview truncated")
+                    || line.starts_with("[final newline"))
+        })
+        .collect();
+    hunks
+        .first()
+        .is_some_and(|line| line.starts_with("@@"))
+        .then(|| hunks.join("\n"))
 }
 
 /// The tool that generates images; its written files are previewed in the conversation.
@@ -467,6 +499,7 @@ pub struct ModelOptionView {
     pub reasoning: bool,
     pub vision: bool,
     pub configured: bool,
+    pub local: bool,
 }
 
 impl From<&ModelOption> for ModelOptionView {
@@ -479,6 +512,7 @@ impl From<&ModelOption> for ModelOptionView {
             reasoning: m.reasoning,
             vision: m.vision,
             configured: m.configured,
+            local: m.local,
         }
     }
 }
@@ -528,9 +562,11 @@ impl Snapshot {
         let shown = workspace.unwrap_or(&no_workspace);
         let conversation = &model.conversation;
         let session_id = conversation.session_id().map(str::to_owned);
+        let mut seen = HashSet::new();
         let sessions = model
             .sessions
             .iter()
+            .filter(|s| seen.insert(s.id.as_str()))
             .map(|s| {
                 let mut meta = time::label(&s.updated, now);
                 if s.messages > 0 {
@@ -655,7 +691,9 @@ impl Snapshot {
         }
         let mut missing: Vec<(&String, &Activity)> = activity
             .iter()
-            .filter(|(id, a)| a.running && !self.sessions.iter().any(|s| &s.id == *id))
+            .filter(|(id, a)| {
+                (a.running || a.waiting) && !self.sessions.iter().any(|s| &s.id == *id)
+            })
             .collect();
         missing.sort_by(|a, b| a.0.cmp(b.0));
         for (id, a) in missing.into_iter().rev() {
@@ -664,10 +702,15 @@ impl Snapshot {
                 SessionView {
                     id: id.clone(),
                     title: a.title.clone(),
-                    meta: "Running".into(),
+                    meta: if a.waiting {
+                        "Waiting for you"
+                    } else {
+                        "Running"
+                    }
+                    .into(),
                     pinned: false,
                     selected: self.session_id.as_deref() == Some(id.as_str()),
-                    running: true,
+                    running: a.running,
                     waiting: a.waiting,
                 },
             );

@@ -7,6 +7,8 @@ import { focusComposer, ui } from "./ui";
 import { appearance, zoomBy, type Theme } from "./appearance";
 import { showPanel, workspace } from "./workspace";
 import { checkApp, checkEngine } from "./updates";
+import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "./taskRecipes";
+import { markTurnAborted } from "./queue";
 import {
   canCompact,
   canRetry,
@@ -100,8 +102,21 @@ export function commands(snap: OpenSnapshot): Command[] {
     { id: "compact", group: "Session", label: "Compact conversation", icon: "compress", keywords: "context summarize free tokens", run: () => engine.compact() },
     canCompact(snap),
   );
-  add({ id: "stop", group: "Session", label: "Stop the turn", icon: "stop", hint: "Esc", run: () => engine.abort() }, snap.turnRunning);
+  add({ id: "stop", group: "Session", label: "Stop the turn", icon: "stop", hint: "Esc", run: () => { markTurnAborted(snap); return engine.abort(); } }, snap.turnRunning);
   add({ id: "find", group: "Session", label: "Find in conversation", icon: "search", hint: "⌘F", run: openConversationFind }, snap.entries.length > 0);
+
+  if (canUseTaskRecipes(snap)) {
+    for (const recipe of taskRecipes) {
+      add({
+        id: `recipe-${recipe.id}`,
+        group: "Task recipes",
+        label: recipe.title,
+        icon: "pencil",
+        keywords: recipe.detail,
+        run: () => insertTaskRecipe(recipe.prompt),
+      });
+    }
+  }
 
   add({
     id: "model",
@@ -221,6 +236,8 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     keys: [
       ["Enter", "Send (while Dial works: add a note)"],
       ["⇧Enter", "New line"],
+      ["⌘/Ctrl+Enter", "Queue a follow-up during a turn"],
+      ["@", "Find and insert a project file path"],
       ["⌘F", "Find in conversation"],
       ["↑", "Previous prompt (in an empty box)"],
       ["Esc", "Stop the turn"],

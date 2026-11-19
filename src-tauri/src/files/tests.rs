@@ -158,3 +158,86 @@ fn diffs_show_tracked_and_untracked_changes() {
     fs::write(root.0.join("a.txt"), "one\n").unwrap();
     assert_eq!(diff(&root.0, "a.txt").unwrap().diff, "");
 }
+
+#[test]
+fn search_ranks_matches_and_skips_ignored_dirs_without_git() {
+    let root = Scratch::new("search-nogit");
+    for dir in ["src/components", "node_modules/pkg", "target/debug"] {
+        fs::create_dir_all(root.0.join(dir)).unwrap();
+    }
+    fs::write(root.0.join("src/components/Composer.vue"), "").unwrap();
+    fs::write(root.0.join("src/commands.ts"), "").unwrap();
+    fs::write(root.0.join("README.md"), "").unwrap();
+    fs::write(root.0.join("node_modules/pkg/composer.js"), "").unwrap();
+    fs::write(root.0.join("target/debug/composer"), "").unwrap();
+    // Prevent discovery of an ancestor repo when the harness puts TMPDIR inside a checkout.
+    fs::write(root.0.join(".git"), "gitdir: missing\n").unwrap();
+
+    let results = search(&root.0, "comp", 10).unwrap();
+    assert_eq!(results, ["src/components/Composer.vue"]);
+
+    let fuzzy = search(&root.0, "cmpsr", 10).unwrap();
+    assert_eq!(fuzzy, ["src/components/Composer.vue"]);
+
+    let all = search(&root.0, "", 2).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0], "README.md");
+}
+
+#[test]
+fn search_respects_gitignore_and_skips_deleted_files() {
+    let root = Scratch::new("search-git");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{:?}", status);
+    };
+    git(&["init", "-q"]);
+    fs::write(root.0.join(".gitignore"), "ignored.log\nbuild-out/\n").unwrap();
+    fs::create_dir_all(root.0.join("build-out")).unwrap();
+    fs::write(root.0.join("ignored.log"), "").unwrap();
+    fs::write(root.0.join("build-out/secret.ts"), "").unwrap();
+    fs::write(root.0.join("kept.ts"), "").unwrap();
+    fs::write(root.0.join("deleted.ts"), "").unwrap();
+    git(&["add", "kept.ts", "deleted.ts", ".gitignore"]);
+    git(&["commit", "-qm", "init"]);
+    fs::remove_file(root.0.join("deleted.ts")).unwrap();
+    fs::write(root.0.join("untracked.ts"), "").unwrap();
+
+    let ts = search(&root.0, ".ts", 10).unwrap();
+    assert_eq!(ts, ["kept.ts", "untracked.ts"]);
+    assert!(search(&root.0, "ignored", 10).unwrap().is_empty());
+    fs::create_dir(root.0.join("only-ignored")).unwrap();
+    fs::write(root.0.join("only-ignored/ignored.log"), "private").unwrap();
+    assert!(
+        search(&root.0.join("only-ignored"), "", 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn search_omits_symlinks_leaving_the_workspace() {
+    let root = Scratch::new("search-symlink");
+    fs::write(root.0.join(".git"), "gitdir: missing\n").unwrap();
+    let outside = Scratch::new("search-symlink-outside");
+    fs::write(outside.0.join("secret.txt"), "x").unwrap();
+    fs::write(root.0.join("inside.txt"), "ok").unwrap();
+    std::os::unix::fs::symlink(outside.0.join("secret.txt"), root.0.join("escape.txt")).unwrap();
+
+    let results = search(&root.0, ".txt", 10).unwrap();
+    assert_eq!(results, ["inside.txt"]);
+}

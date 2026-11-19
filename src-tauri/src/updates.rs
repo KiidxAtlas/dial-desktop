@@ -169,7 +169,10 @@ pub fn install_engine() -> Result<String, String> {
     let (program, args) = install_command(cfg!(windows));
     let mut command = Command::new(program);
     command.args(&args);
-    finished(run_bounded(&mut command, INSTALL_TIMEOUT)?, "the Dial installer")
+    finished(
+        run_bounded(&mut command, INSTALL_TIMEOUT)?,
+        "the Dial installer",
+    )
 }
 
 fn finished(output: RunOutput, what: &str) -> Result<String, String> {
@@ -238,8 +241,18 @@ pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<RunOutput
             String::from_utf8_lossy(&text).into_owned()
         })
     };
-    let stdout = read(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
-    let stderr = read(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {

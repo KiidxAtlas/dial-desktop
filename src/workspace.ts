@@ -4,7 +4,7 @@
 import { reactive, watch } from "vue";
 import type { Entry, OpenSnapshot } from "./types";
 import { focusComposer, ui, type InspectorTab } from "./ui";
-import { showToast, snapshot } from "./bridge";
+import { browserApi, showToast, snapshot } from "./bridge";
 import { draftFor } from "./drafts";
 
 const KEY = "dial.workspace";
@@ -42,6 +42,8 @@ export const workspace = reactive({
   previews: [] as string[],
   /** An address the browser panel should open when it next shows. */
   pendingUrl: null as string | null,
+  /** What the agent is doing in the browser right now (its MCP tools), or null. */
+  agentActivity: null as string | null,
 });
 
 watch(
@@ -100,6 +102,20 @@ export function openInBrowser(url: string) {
   showPanel("browser");
 }
 
+/** Follow the agent's browser tools: show the panel and open the pages they ask for. */
+export async function followAgentBrowser(): Promise<() => void> {
+  try {
+    return await browserApi.onAgent((event) => {
+      if (event.kind === "open") openInBrowser(event.url);
+      else if (event.kind === "show") showPanel("browser");
+      else workspace.agentActivity = event.busy ? (event.text ?? "Using the browser") : null;
+    });
+  } catch {
+    // Outside Tauri there is no browser.
+    return () => {};
+  }
+}
+
 /** Add `text` to the end of the open session's draft as its own paragraph, and focus the composer. */
 export function addToPrompt(text: string) {
   const snap = snapshot.value;
@@ -112,7 +128,10 @@ export function addToPrompt(text: string) {
 
 /** `path` as a Markdown code span the agent reads as a file reference. */
 export function mention(path: string): string {
-  return `\`${path.replace(/`/g, "")}\``;
+  const ticks = path.match(/`+/g);
+  if (!ticks) return `\`${path}\``;
+  const fence = "`".repeat(1 + Math.max(...ticks.map(run => run.length)));
+  return `${fence} ${path} ${fence}`;
 }
 
 // Dev servers announce themselves in tool output ("Local: http://localhost:5173/").

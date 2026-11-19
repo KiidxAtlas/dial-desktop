@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { OpenSnapshot, Session, Workspace } from "../types";
+import type { OpenSnapshot, Session, TranscriptHit, TranscriptResults, Workspace } from "../types";
 import { engine, folders } from "../bridge";
 import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
@@ -12,15 +12,54 @@ import Logo from "./Logo.vue";
 const props = defineProps<{ snap: OpenSnapshot }>();
 
 const live = computed(() => props.snap.connection.state === "live");
+const searchMessages = ref(false);
+const results = ref<TranscriptResults | null>(null);
+const searching = ref(false);
+const searchError = ref("");
+let searchVersion = 0;
+
+watch([() => props.snap.workspace.root, () => ui.sessionFilter, searchMessages], () => {
+  searchVersion++;
+  results.value = null;
+  searching.value = false;
+  searchError.value = "";
+});
+
+async function searchTranscripts() {
+  const query = ui.sessionFilter.trim();
+  if (!searchMessages.value || !query || !live.value) return;
+  const version = ++searchVersion;
+  searching.value = true;
+  searchError.value = "";
+  try {
+    const found = await engine.searchTranscripts(props.snap.workspace.root, query);
+    if (version === searchVersion) results.value = found;
+  } catch (error) {
+    if (version === searchVersion) searchError.value = String(error);
+  } finally {
+    if (version === searchVersion) searching.value = false;
+  }
+}
+
+async function openHit(hit: TranscriptHit) {
+  const jump = { ...hit, root: props.snap.workspace.root };
+  ui.settingsOpen = false;
+  ui.transcriptJump = jump;
+  const pending = ui.transcriptJump;
+  if (hit.session_id !== props.snap.sessionId && !(await engine.resume(hit.session_id, jump.root))) {
+    if (ui.transcriptJump === pending) ui.transcriptJump = null;
+  }
+}
 const matching = computed(() => {
   const filter = ui.sessionFilter.trim().toLowerCase();
   return props.snap.sessions.filter((s) => !filter || s.title.toLowerCase().includes(filter));
 });
-/** Pinned sessions first, in the order the list shows them (Shift-click ranges follow it). */
+/** Each session belongs to one group (Shift-click ranges follow the displayed order). */
 const groups = computed(() =>
   [
-    { name: "Pinned", sessions: matching.value.filter((s) => s.pinned) },
-    { name: "Recents", sessions: matching.value.filter((s) => !s.pinned) },
+    { name: "Active", sessions: matching.value.filter((s) => s.running || s.waiting) },
+    { name: "Pinned", sessions: matching.value.filter((s) => s.pinned && !s.running && !s.waiting) },
+    { name: "Recents", sessions: matching.value.filter((s) => !s.pinned && !s.running && !s.waiting) },
   ].filter((g) => g.sessions.length),
 );
 const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
@@ -87,6 +126,7 @@ function click(event: MouseEvent, id: string, selected: boolean) {
 }
 
 function open(id: string, selected: boolean) {
+  ui.transcriptJump = null;
   ui.settingsOpen = false;
   if (!selected) engine.resume(id);
 }
@@ -181,13 +221,29 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         <span class="plus"><Icon name="plus" :size="13" /></span>
         New session
       </button>
-      <label class="item search">
+      <form class="item search" @submit.prevent="searchTranscripts">
         <Icon name="search" :size="15" />
-        <input v-model="ui.sessionFilter" placeholder="Search" spellcheck="false" />
-      </label>
+        <input v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search titles'" :aria-label="searchMessages ? 'Search messages' : 'Search titles'" spellcheck="false" />
+      </form>
+      <button class="item" :aria-pressed="searchMessages" @click="searchMessages = !searchMessages">
+        {{ searchMessages ? 'Search titles instead' : 'Search project messages' }}
+      </button>
     </nav>
 
-    <nav class="list">
+    <nav v-if="searchMessages" class="list" aria-label="Transcript search results">
+      <button class="item" :disabled="!live || searching || !ui.sessionFilter.trim()" @click="searchTranscripts">Search messages</button>
+      <p v-if="searching" class="empty" role="status">Searching messages…</p>
+      <p v-else-if="searchError" class="empty" role="alert">{{ searchError }}</p>
+      <p v-else-if="results && !results.hits.length" class="empty">No matching messages.</p>
+      <template v-else-if="results">
+        <button v-for="(hit, index) in results.hits" :key="`${hit.session_id}:${hit.entry_id}:${index}`" class="hit" @click="openHit(hit)">
+          <strong class="truncate">{{ hit.title || 'Untitled session' }}</strong>
+          <span>{{ hit.snippet }}</span>
+        </button>
+        <p v-if="results.has_more" class="empty">Showing the first 40 matches. Refine your search for more specific results.</p>
+      </template>
+    </nav>
+    <nav v-else class="list">
       <p v-if="!sessions.length" class="empty">
         {{ snap.sessions.length ? "No sessions match." : "Your sessions appear here." }}
       </p>
@@ -680,4 +736,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   opacity: 0;
   transform: translateY(4px);
 }
+.hit { display: grid; gap: 4px; width: 100%; padding: 8px; text-align: left; border-radius: var(--radius-sm); }
+.hit:hover { background: var(--hover); }
+.hit span { color: var(--text-faint); overflow-wrap: anywhere; }
 </style>

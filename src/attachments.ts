@@ -9,7 +9,6 @@ const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
 const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/i;
 /** Matches `MAX_IMAGE_BYTES` in the desktop backend. */
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-let next = 0;
 
 function hasRoom(draft: Draft): boolean {
   if (draft.attachments.length < MAX_IMAGES) return true;
@@ -28,7 +27,7 @@ export async function addPaths(draft: Draft, paths: string[]) {
       const image = await files.readImage(path);
       if (draft.attachments.some((a) => a.path === image.path)) continue;
       if (!hasRoom(draft)) return;
-      draft.attachments.push({ key: `a${++next}`, name: image.name, url: image.url, path: image.path, data: null });
+      draft.attachments.push({ key: crypto.randomUUID(), name: image.name, url: image.url, path: image.path, data: null });
     } catch (error) {
       showToast(String(error));
     }
@@ -59,6 +58,6 @@ export async function addBlobs(draft: Draft, blobs: File[]) {
       continue;
     }
     if (!hasRoom(draft)) return;
-    draft.attachments.push({ key: `a${++next}`, name: blob.name || "Pasted image", url, path: null, data });
+    draft.attachments.push({ key: crypto.randomUUID(), name: blob.name || "Pasted image", url, path: null, data });
   }
 }

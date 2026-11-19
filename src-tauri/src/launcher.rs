@@ -104,7 +104,7 @@ pub fn import_shell_env() {
 /// our terminal makes itself that terminal's foreground job. That suspends whatever was in the
 /// foreground (`zsh: suspended (tty output)`) and, if the probe is then killed, leaves the terminal
 /// owned by a dead process group. A new session detaches it from the terminal entirely.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
+pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -219,18 +219,7 @@ impl Recents {
 
     /// The per-user default location.
     pub fn default_file(home: Option<&Path>) -> Option<PathBuf> {
-        let home = home?;
-        Some(if cfg!(target_os = "macos") {
-            home.join("Library/Application Support/dev.dial.desktop/recent-workspaces.json")
-        } else if cfg!(windows) {
-            std::env::var_os("APPDATA")
-                .map_or_else(|| home.join("AppData/Roaming"), PathBuf::from)
-                .join("dev.dial.desktop/recent-workspaces.json")
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map_or_else(|| home.join(".config"), PathBuf::from)
-                .join("dial-desktop/recent-workspaces.json")
-        })
+        app_dir(home).map(|dir| dir.join("recent-workspaces.json"))
     }
 
     /// Move `path` to the front and save. Saving is best effort: a read-only disk only loses
@@ -253,4 +242,20 @@ impl Recents {
             }
         }
     }
+}
+
+/// The app's per-user folder (recent folders, the browser's endpoint for the agent).
+pub fn app_dir(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/dev.dial.desktop")
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map_or_else(|| home.join("AppData/Roaming"), PathBuf::from)
+            .join("dev.dial.desktop")
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map_or_else(|| home.join(".config"), PathBuf::from)
+            .join("dial-desktop")
+    })
 }

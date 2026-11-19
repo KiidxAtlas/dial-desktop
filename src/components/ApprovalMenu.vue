@@ -18,6 +18,7 @@ const root = ref<HTMLElement | null>(null);
 const open = ref(false);
 const current = computed(() => MODES.find((m) => m.mode === props.snap.approval) ?? null);
 const usable = computed(() => props.snap.connection.state === "live" || props.snap.connection.state === "preview");
+defineExpose({ show: () => { if (usable.value && current.value) open.value = true; } });
 
 function pick(mode: ApprovalMode) {
   if (mode !== props.snap.approval) engine.setApproval(mode);

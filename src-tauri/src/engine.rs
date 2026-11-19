@@ -6,9 +6,10 @@
 
 use dial_client::{Client, Decision, Launch, Message, Ready, RequestId};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -329,9 +330,22 @@ pub enum Update {
     Message(Message),
 }
 
+type ReplySender = Sender<Result<Value, String>>;
+pub type RpcReply = Receiver<Result<Value, String>>;
+
+struct Work {
+    call: Call,
+    reply: Option<ReplySender>,
+}
+
+enum Call {
+    Command(Command),
+    Rpc(&'static str, Value),
+}
+
 /// Handle to the worker thread.
 pub struct Engine {
-    commands: Sender<Command>,
+    commands: Sender<Work>,
     updates: Receiver<Update>,
     stop: Arc<AtomicBool>,
     done: Receiver<()>,
@@ -341,6 +355,10 @@ pub struct Engine {
 impl Engine {
     /// Start the engine described by `launch` on a worker thread.
     pub fn spawn(launch: Launch, waker: Waker) -> Self {
+        Self::spawn_after(launch, waker, None)
+    }
+
+    pub fn spawn_after(launch: Launch, waker: Waker, previous: Option<Weak<AtomicBool>>) -> Self {
         let (commands, command_rx) = mpsc::channel();
         let (update_tx, updates) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
@@ -349,6 +367,20 @@ impl Engine {
         let worker = thread::Builder::new()
             .name("dial-engine".into())
             .spawn(move || {
+                if let Some(previous) = previous {
+                    let deadline = std::time::Instant::now() + SHUTDOWN + Duration::from_secs(2);
+                    while previous.strong_count() > 0 {
+                        if worker_stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            let _ = update_tx.send(Update::ConnectFailed("The previous engine is still shutting down. Try reconnecting again.".into()));
+                            waker();
+                            return;
+                        }
+                        thread::sleep(POLL);
+                    }
+                }
                 run(&launch, &command_rx, &update_tx, &worker_stop, &waker);
                 let _ = done_tx.send(());
                 waker();
@@ -363,6 +395,11 @@ impl Engine {
         }
     }
 
+    /// The worker keeps this alive until its client is gone, even if shutdown timed out.
+    pub fn lifetime(&self) -> Weak<AtomicBool> {
+        Arc::downgrade(&self.stop)
+    }
+
     /// Queue a command. Dropped silently once the worker has ended; the model already shows that.
     pub fn send(&self, command: Command) {
         let _ = self.enqueue(command);
@@ -370,8 +407,32 @@ impl Engine {
 
     /// Report when the worker is no longer available to accept a user draft.
     pub fn enqueue(&self, command: Command) -> Result<(), String> {
+        self.queue(Work {
+            call: Call::Command(command),
+            reply: None,
+        })
+    }
+
+    pub fn submit(&self, command: Command) -> Result<RpcReply, String> {
+        self.with_reply(Call::Command(command))
+    }
+
+    pub fn rpc(&self, method: &'static str, params: Value) -> Result<RpcReply, String> {
+        self.with_reply(Call::Rpc(method, params))
+    }
+
+    fn with_reply(&self, call: Call) -> Result<RpcReply, String> {
+        let (tx, rx) = mpsc::channel();
+        self.queue(Work {
+            call,
+            reply: Some(tx),
+        })?;
+        Ok(rx)
+    }
+
+    fn queue(&self, work: Work) -> Result<(), String> {
         self.commands
-            .send(command)
+            .send(work)
             .map_err(|_| "Dial has stopped".into())
     }
 
@@ -406,7 +467,7 @@ impl Drop for Engine {
 
 fn run(
     launch: &Launch,
-    commands: &Receiver<Command>,
+    commands: &Receiver<Work>,
     updates: &Sender<Update>,
     stop: &AtomicBool,
     waker: &Waker,
@@ -424,6 +485,7 @@ fn run(
         }
     };
     emit(Update::Connected(Box::new(client.ready().clone())));
+    let mut replies = HashMap::new();
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = client.shutdown(SHUTDOWN);
@@ -431,14 +493,34 @@ fn run(
         }
         loop {
             match commands.try_recv() {
-                Ok(command) => {
-                    let (_, method, params) = command.request();
+                Ok(Work { call, reply }) => {
+                    let (command, method, params) = match call {
+                        Call::Command(command) => {
+                            let (_, method, params) = command.request();
+                            (Some(command), method, params)
+                        }
+                        Call::Rpc(method, params) => (None, method, params),
+                    };
                     match client.request(method, params) {
-                        Ok(id) => emit(Update::Requested { command, id }),
-                        Err(error) => emit(Update::RequestFailed {
-                            command,
-                            error: error.to_string(),
-                        }),
+                        Ok(id) => {
+                            if let Some(reply) = reply {
+                                replies.insert(id, (method, reply));
+                            }
+                            if let Some(command) = command {
+                                emit(Update::Requested { command, id });
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(error.to_string()));
+                            }
+                            if let Some(command) = command {
+                                emit(Update::RequestFailed {
+                                    command,
+                                    error: error.to_string(),
+                                });
+                            }
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -450,6 +532,26 @@ fn run(
         }
         if let Some(message) = client.poll(POLL) {
             let ended = matches!(message, Message::Disconnected { .. });
+            if let Message::Response { id, result, .. } = &message
+                && let Some((_, reply)) = replies.remove(id)
+            {
+                let _ = reply.send(result.clone().map_err(|error| error.message));
+            }
+            // A turn reply normally arrives at the end. Confirm an accepted send sooner once
+            // this exact request produces observable work, so the composer can take notes.
+            if let Message::Event(event) = &message
+                && matches!(
+                    event.kind.as_str(),
+                    "text" | "reasoning" | "tool_call" | "approval" | "question"
+                )
+                && let Some(id) = event.request_id()
+                && replies
+                    .get(&id)
+                    .is_some_and(|(method, _)| *method == "send")
+                && let Some((_, reply)) = replies.remove(&id)
+            {
+                let _ = reply.send(Ok(Value::Null));
+            }
             emit(Update::Message(message));
             if ended {
                 return;

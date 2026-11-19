@@ -7,6 +7,7 @@
 //! web pages. [`inspect`] reads the page's address, title, selected text, visible text and the
 //! errors it logged, so the user can hand them to the agent.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
@@ -94,6 +95,8 @@ pub struct PageInfo {
 #[derive(Default)]
 pub struct Browser {
     state: Mutex<BrowserState>,
+    /// Pages finished loading so far; the agent's tools wait for it to move.
+    loads: AtomicU64,
 }
 
 impl Browser {
@@ -105,6 +108,19 @@ impl Browser {
             state.clone()
         };
         let _ = app.emit("browser", state);
+    }
+
+    /// The page on show.
+    pub fn current(&self) -> BrowserState {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many page loads have finished.
+    pub fn loads(&self) -> u64 {
+        self.loads.load(Ordering::SeqCst)
     }
 }
 
@@ -163,17 +179,19 @@ pub fn allowed(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
 }
 
-/// Read [`INSPECT_SCRIPT`]'s result: a JSON string, maybe wrapped once more as a JSON string.
-pub fn parse_page(raw: &str) -> Result<PageInfo, String> {
-    let value: Value =
-        serde_json::from_str(raw).map_err(|e| format!("Unreadable page info: {e}"))?;
-    let value = match value {
-        Value::String(inner) => {
-            serde_json::from_str(&inner).map_err(|e| format!("Unreadable page info: {e}"))?
-        }
+/// A script's JSON answer: platforms hand results back as JSON, and a string result (what our
+/// scripts return) may arrive wrapped once more as a JSON string.
+pub fn unwrap_json(raw: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|e| format!("Unreadable answer: {e}"))?;
+    Ok(match value {
+        Value::String(inner) => serde_json::from_str(&inner).unwrap_or(Value::String(inner)),
         other => other,
-    };
-    serde_json::from_value(value).map_err(|e| format!("Unreadable page info: {e}"))
+    })
+}
+
+/// Read [`INSPECT_SCRIPT`]'s result.
+pub fn parse_page(raw: &str) -> Result<PageInfo, String> {
+    serde_json::from_value(unwrap_json(raw)?).map_err(|e| format!("Unreadable page info: {e}"))
 }
 
 fn webview<R: Runtime>(app: &AppHandle<R>) -> Result<Webview<R>, String> {
@@ -195,7 +213,11 @@ fn create<R: Runtime>(app: &AppHandle<R>, url: Url, bounds: Bounds) -> Result<We
         .on_page_load(move |_, payload| {
             let url = payload.url().to_string();
             let loading = matches!(payload.event(), PageLoadEvent::Started);
-            loads.state::<Browser>().update(&loads, |state| {
+            let browser = loads.state::<Browser>();
+            if !loading {
+                browser.loads.fetch_add(1, Ordering::SeqCst);
+            }
+            browser.update(&loads, |state| {
                 if state.url != url {
                     state.title.clear();
                 }
@@ -311,27 +333,38 @@ pub async fn browser_go(app: AppHandle, action: String) -> Result<(), String> {
 /// The page's address, title, selection, text and logged errors.
 #[tauri::command]
 pub async fn browser_inspect(app: AppHandle) -> Result<PageInfo, String> {
-    let view = webview(&app)?;
+    tauri::async_runtime::spawn_blocking(move || inspect(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// [`browser_inspect`], blocking.
+pub fn inspect<R: Runtime>(app: &AppHandle<R>) -> Result<PageInfo, String> {
+    parse_page(&eval_raw(app, INSPECT_SCRIPT, INSPECT_TIMEOUT)?)
+}
+
+/// Run `script` in the page and return its answer as the platform hands it back. Blocks; never
+/// call it on the main thread, which delivers the answer.
+pub fn eval_raw<R: Runtime>(
+    app: &AppHandle<R>,
+    script: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let view = webview(app)?;
     let (tx, rx) = mpsc::channel();
-    view.eval_with_callback(INSPECT_SCRIPT, move |raw| {
+    view.eval_with_callback(script, move |raw| {
         let _ = tx.send(raw);
     })
     .map_err(|e| e.to_string())?;
-    let raw = tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(INSPECT_TIMEOUT))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|_| "The page did not answer; is it still loading?".to_owned())?;
-    parse_page(&raw)
+    rx.recv_timeout(timeout).map_err(|_| {
+        "The page did not answer: it may be busy or still loading, or the script failed".to_owned()
+    })
 }
 
 /// The page on show (the panel asks when it mounts).
 #[tauri::command]
 pub fn browser_state(browser: State<'_, Browser>) -> BrowserState {
-    browser
-        .state
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+    browser.current()
 }
 
 #[cfg(test)]

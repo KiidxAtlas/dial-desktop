@@ -2,12 +2,22 @@
 import { computed } from "vue";
 import type { ToolEntry } from "../types";
 import { toggle, ui } from "../ui";
+import { addToPrompt, showPanel } from "../workspace";
 import Icon from "./Icon.vue";
 import CodeBlock from "./CodeBlock.vue";
 import GeneratedImage from "./GeneratedImage.vue";
 
 const props = defineProps<{ tool: ToolEntry }>();
 const open = computed(() => ui.expanded.has(props.tool.key));
+function openDiff(path: string) {
+  ui.diffPath = path;
+  showPanel("changes");
+}
+function askAboutFailure() {
+  const t = props.tool;
+  const detail = t.output?.text || t.progress || t.facts.join("\n");
+  addToPrompt(`Help diagnose the failed ${t.label} call (${t.target}).${detail ? `\n\nReported output:\n${detail.slice(-4000)}` : ""}`);
+}
 
 /** The one-line result under the call, as a terminal agent prints it. */
 const result = computed(() => {
@@ -44,9 +54,16 @@ const result = computed(() => {
         :lang="tool.input.caption === 'arguments' ? 'json' : ''"
         :max-height="200"
       />
-      <CodeBlock v-if="tool.output" :caption="tool.output.caption" :text="tool.output.text" :max-height="280" />
-      <div v-if="tool.changedPaths.length > 1" class="paths">
-        <div v-for="path in tool.changedPaths" :key="path" class="mono truncate">{{ path }}</div>
+      <CodeBlock
+        v-if="tool.output"
+        :caption="tool.output.caption"
+        :text="tool.output.text"
+        :lang="tool.output.caption === 'diff' ? 'diff' : ''"
+        :max-height="280"
+      />
+      <button v-if="tool.state === 'failed'" class="btn btn-secondary" @click="askAboutFailure">Ask about failure</button>
+      <div v-if="tool.changedPaths.length" class="paths">
+        <button v-for="path in tool.changedPaths" :key="path" class="mono truncate" :title="`Show diff: ${path}`" @click="openDiff(path)">{{ path }}</button>
       </div>
       <div v-if="tool.facts.length && tool.state !== 'failed'" class="facts">{{ tool.facts.join(" · ") }}</div>
     </div>

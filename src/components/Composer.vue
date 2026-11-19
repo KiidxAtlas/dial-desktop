@@ -2,11 +2,14 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
-import { engine, files, folders, showToast } from "../bridge";
+import { engine, files, folders, showToast, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
 import { ui } from "../ui";
 import { draftFor } from "../drafts";
-import { canCompact, canUndo, lastPrompt } from "../sessionActions";
+import { canCompact, canRetry, canUndo, lastPrompt } from "../sessionActions";
+import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
+import { editQueued, enqueuePrompt, markTurnAborted, queueFor, removeQueued, sendQueuedNext } from "../queue";
+import { mention } from "../workspace";
 import Icon from "./Icon.vue";
 import ModelPicker from "./ModelPicker.vue";
 import ApprovalMenu from "./ApprovalMenu.vue";
@@ -16,6 +19,41 @@ import ContextMeter from "./ContextMeter.vue";
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
 const draft = computed(() => draftFor(props.snap));
+const approvalMenu = ref<InstanceType<typeof ApprovalMenu> | null>(null);
+const queue = computed(() => queueFor(props.snap));
+const selected = ref(0);
+const caret = ref(-1);
+const paths = ref<string[]>([]);
+function trackCaret() {
+  const el = input.value;
+  caret.value = el && el.selectionStart === el.selectionEnd ? el.selectionStart : -1;
+}
+const token = computed(() => {
+  const text = draft.value.text;
+  if (caret.value < 0 || (text[caret.value] && !/\s/.test(text[caret.value]))) return null;
+  return /(?:^|\s)@([^\s@`]*)$/.exec(text.slice(0, caret.value))?.[1] ?? null;
+});
+watch([token, draft], ([query], _, cleanup) => {
+  paths.value = [];
+  selected.value = 0;
+  if (query === null) return;
+  let current = true;
+  const timer = setTimeout(async () => {
+    try {
+      const found = await workspaceFiles.search(query, 8);
+      if (current) paths.value = found;
+    } catch (e) { if (current) showToast(`File search failed: ${e}`); }
+  }, 150);
+  cleanup(() => { current = false; clearTimeout(timer); });
+}, { flush: "sync" });
+function pickPath(path: string) {
+  if (token.value === null || !paths.value.includes(path)) return;
+  const start = caret.value - token.value.length - 1;
+  const insert = mention(path) + " ";
+  draft.value.text = draft.value.text.slice(0, start) + insert + draft.value.text.slice(caret.value);
+  caret.value = -1;
+  nextTick(() => { input.value?.focus(); input.value?.setSelectionRange(start + insert.length, start + insert.length); });
+}
 
 /** Slash commands handled in the app, as in a terminal agent. */
 const COMMANDS: { name: string; detail: string; run: () => void }[] = [
@@ -25,6 +63,11 @@ const COMMANDS: { name: string; detail: string; run: () => void }[] = [
   { name: "/compact", detail: "Summarize the conversation to free context", run: () => engine.compact() },
   { name: "/undo", detail: "Undo the last turn and restore its files", run: () => void engine.undoTurn() },
   { name: "/open", detail: "Open another project folder", run: () => folders.choose() },
+  { name: "/think", detail: "Open model and reasoning options", run: () => (ui.modelPickerOpen = true) },
+  { name: "/mode", detail: "Choose an approval mode", run: () => approvalMenu.value?.show() },
+  { name: "/retry", detail: "Retry the failed turn", run: () => engine.retryTurn() },
+  { name: "/fork", detail: "Duplicate this session", run: () => props.snap.sessionId && engine.forkSession(props.snap.sessionId) },
+  ...taskRecipes.map(r => ({ name: `/${r.id}`, detail: r.title, run: () => { draft.value.text = r.prompt; } })),
 ];
 
 const approval = computed(() => props.snap.approvals[0] ?? null);
@@ -35,6 +78,10 @@ const slash = computed(() => {
 });
 /** Slash commands that make sense right now. */
 function available(name: string) {
+  if (name === "/retry") return canRetry(props.snap);
+  if (name === "/fork") return !!props.snap.sessionId && props.snap.connection.state === "live" && !props.snap.turnRunning;
+  if (name === "/mode") return !!props.snap.approval && ["live", "preview"].includes(props.snap.connection.state);
+  if (taskRecipes.some(r => `/${r.id}` === name)) return canUseTaskRecipes(props.snap);
   if (name === "/compact") return canCompact(props.snap);
   if (name === "/undo") return props.snap.connection.state === "live" && canUndo(props.snap);
   if (name === "/new" || name === "/clear") return props.snap.connection.state === "live";
@@ -43,11 +90,18 @@ function available(name: string) {
 /** `false` only when the model is known not to take images; unknown models may try. */
 const imagesAllowed = computed(() => props.snap.model?.acceptsImages !== false);
 const hasContent = computed(() => !!draft.value.text.trim() || draft.value.attachments.length > 0);
+const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && hasContent.value && (!draft.value.attachments.length || imagesAllowed.value));
+function queueDraft() {
+  if (!canQueue.value || !enqueuePrompt(props.snap, draft.value.text, draft.value.attachments)) return;
+  draft.value.text = "";
+  draft.value.attachments = [];
+  focus();
+}
 /** While a turn runs, typed text goes to it as guidance (images cannot). */
 const steering = computed(
   () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
 );
-const canSend = computed(() => !draft.value.sending && (slash.value.length === 1 || steering.value || (
+const canSend = computed(() => !draft.value.sending && (slash.value.length > 0 || steering.value || (
   props.snap.canSend && hasContent.value && (imagesAllowed.value || !draft.value.attachments.length)
 )));
 /** Files are being dragged over the window. */
@@ -88,7 +142,7 @@ function focus() {
 function runCommand(command: (typeof COMMANDS)[number]) {
   draft.value.text = "";
   command.run();
-  if (command.name !== "/model") focus();
+  if (!["/model", "/think", "/mode"].includes(command.name)) focus();
 }
 
 async function send() {
@@ -96,7 +150,7 @@ async function send() {
   if (!canSend.value) return;
   const original = target.text;
   const text = original.trim();
-  if (slash.value.length === 1) return runCommand(slash.value[0]);
+  if (slash.value.length) return runCommand(slash.value[selected.value] ?? slash.value[0]);
   const images = [...target.attachments];
   target.sending = true;
   try {
@@ -154,12 +208,28 @@ onUnmounted(() => {
 });
 
 function onKey(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  const count = paths.value.length || slash.value.length;
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && props.snap.turnRunning) {
+    event.preventDefault(); queueDraft(); return;
+  }
+  if (count && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault(); selected.value = (selected.value + (event.key === "ArrowDown" ? 1 : -1) + count) % count;
+    nextTick(() => input.value?.parentElement?.querySelector('.slash-row.active')?.scrollIntoView({ block: 'nearest' }));
+    return;
+  }
+  if (paths.value.length && !event.shiftKey && (event.key === "Tab" || event.key === "Enter")) {
+    event.preventDefault(); pickPath(paths.value[selected.value] ?? paths.value[0]); return;
+  }
+  if (token.value !== null && event.key === "Escape") {
+    event.stopPropagation(); event.preventDefault(); caret.value = -1; return;
+  }
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     send();
   } else if (event.key === "Tab" && !event.shiftKey && slash.value.length) {
     event.preventDefault();
-    draft.value.text = slash.value[0].name;
+    draft.value.text = (slash.value[selected.value] ?? slash.value[0]).name;
   } else if (event.key === "ArrowUp" && !draft.value.text && !draft.value.attachments.length && !event.isComposing) {
     // Like a shell: an empty box recalls the last prompt.
     const previous = lastPrompt(props.snap);
@@ -175,7 +245,7 @@ function decide(decision: Decision) {
   if (approval.value) engine.approve(approval.value.approvalId, decision);
 }
 
-watch(() => draft.value.text, () => nextTick(resize));
+watch(() => draft.value.text, () => { selected.value = 0; nextTick(resize); });
 watch(() => ui.focusComposer, focus);
 onMounted(focus);
 </script>
@@ -207,16 +277,28 @@ onMounted(focus);
       <Transition name="pop">
         <QuestionCard v-if="snap.question" :key="snap.question.id" :question="snap.question" />
       </Transition>
+      <section v-if="queue.items.length" class="queue card" aria-label="Follow-up queue">
+        <strong>{{ queue.paused ? 'Queue paused' : 'Queued follow-ups' }}</strong>
+        <div v-for="item in queue.items" :key="item.id" class="queue-row">
+          <span class="truncate">{{ item.text || 'Image prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} image(s)` : '' }}</span>
+          <button class="icon-btn" title="Edit queued prompt" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
+          <button class="icon-btn" title="Remove queued prompt" @click="removeQueued(snap, item.id)"><Icon name="cross" :size="14" /></button>
+        </div>
+        <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.sending || !snap.canSend" @click="sendQueuedNext(snap)">Send next</button>
+      </section>
       <div class="composer" :class="{ dropping }" @click="input?.focus()">
         <div v-if="dropping" class="drop-hint"><Icon name="image" :size="16" /> Drop images to attach</div>
         <Transition name="pop">
           <div v-if="slash.length" class="slash" @click.stop>
-            <button v-for="c in slash" :key="c.name" class="slash-row" @click="runCommand(c)">
+            <button v-for="(c, i) in slash" :key="c.name" class="slash-row" :class="{active: i === selected}" @click="runCommand(c)">
               <span class="mono">{{ c.name }}</span>
               <span class="slash-detail">{{ c.detail }}</span>
             </button>
           </div>
         </Transition>
+        <div v-if="paths.length" class="slash" aria-label="Matching files" @mousedown.prevent @click.stop>
+          <button v-for="(path, i) in paths" :key="path" class="slash-row mono" :class="{active: i === selected}" @click="pickPath(path)">{{ path }}</button>
+        </div>
         <div v-if="draft.attachments.length" class="thumbs" @click.stop>
           <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
             <img :src="a.url" :alt="a.name" />
@@ -234,6 +316,7 @@ onMounted(focus);
           :placeholder="snap.turnRunning ? 'Add a note for Dial while it works…' : 'How can I help you today?'"
           :readonly="draft.sending"
           @keydown="onKey"
+          @input="trackCaret" @click="trackCaret" @select="trackCaret" @keyup.left="trackCaret" @keyup.right="trackCaret"
           @paste="onPaste"
         />
         <div class="bar" @click.stop>
@@ -247,7 +330,7 @@ onMounted(focus);
             <Icon name="image" :size="15" />
           </button>
           <ModelPicker :snap="snap" />
-          <ApprovalMenu :snap="snap" />
+          <ApprovalMenu ref="approvalMenu" :snap="snap" />
           <span class="grow" />
           <ContextMeter
             v-if="snap.context"
@@ -255,7 +338,8 @@ onMounted(focus);
             :can-compact="canCompact(snap)"
             @compact="engine.compact()"
           />
-          <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="engine.abort()">
+          <button v-if="snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" title="Queue for the next turn (⌘/Ctrl+Enter)" @click="queueDraft">Queue</button>
+          <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="markTurnAborted(snap); engine.abort()">
             <Icon name="stop" :size="14" />
           </button>
           <button
@@ -437,6 +521,9 @@ onMounted(focus);
   background: var(--raised);
   box-shadow: var(--shadow-pop);
 }
+.slash, .queue { max-height: 30vh; overflow-y: auto; }
+.queue-row { display: flex; align-items: center; gap: 6px; }
+.queue-row span { flex: 1; }
 .slash-row {
   display: flex;
   align-items: baseline;
@@ -446,7 +533,7 @@ onMounted(focus);
   border-radius: var(--radius-sm);
   text-align: left;
 }
-.slash-row:first-child,
+.slash-row.active,
 .slash-row:hover {
   background: var(--hover);
 }

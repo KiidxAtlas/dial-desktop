@@ -154,6 +154,29 @@ export interface ModelOption {
   vision: boolean;
   /** The main model, a favorite, a profile or a role in the user's Dial config. */
   configured: boolean;
+  local: boolean;
+}
+
+export interface TranscriptHit {
+  session_id: string;
+  entry_id: string;
+  role: string;
+  snippet: string;
+  preview: string;
+  title: string;
+}
+
+export interface TranscriptResults {
+  hits: TranscriptHit[];
+  has_more: boolean;
+}
+
+export interface LocalModelRemoval {
+  label: string;
+  folder: string;
+  bytes: number;
+  source: string;
+  deleted: boolean;
 }
 
 /** An image attached to the draft: a file sent by path, or pasted bytes sent inline. */

@@ -55,6 +55,9 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
 }
 
 impl Terminals {
+    pub fn has_shells(&self) -> bool {
+        !self.shells.is_empty()
+    }
     /// Start `command` in a terminal of `cols`×`rows`; its output goes to `sink` from a reader
     /// thread until it ends. Returns the shell's id.
     pub fn open(

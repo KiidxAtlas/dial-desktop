@@ -6,9 +6,12 @@
 //! session. Clicking a running session goes back to the engine that owns it; resuming it
 //! elsewhere would fork it. A background engine closes once its turn is over.
 
-use crate::engine::Engine;
+use crate::engine::{Command, Engine, Update};
 use crate::model::Model;
+use dial_client::{Message, RequestId};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 
 #[cfg(test)]
 mod tests;
@@ -20,6 +23,11 @@ pub struct Tab {
     pub engine: Option<Engine>,
     /// The user was told this background tab is waiting for them.
     alerted: bool,
+    opening: Option<(String, Option<RequestId>)>,
+    restore_target: Option<String>,
+    turn_queued: bool,
+    // Stand-in lifetime for tabs without a worker (preview and routing tests).
+    lifetime: Arc<AtomicBool>,
 }
 
 impl Tab {
@@ -28,6 +36,10 @@ impl Tab {
             model,
             engine,
             alerted: false,
+            opening: None,
+            restore_target: None,
+            turn_queued: false,
+            lifetime: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -35,8 +47,114 @@ impl Tab {
         self.model.conversation.session_id()
     }
 
+    pub fn reconnect_target(&self) -> Option<&str> {
+        self.restore_target.as_deref().or_else(|| self.session())
+    }
+
+    pub fn restore_on_connect(&mut self, id: String) -> Result<(), String> {
+        self.enqueue(Command::Resume(id.clone()))?;
+        self.restore_target = Some(id);
+        Ok(())
+    }
+
+    pub fn protects_work(&self) -> bool {
+        self.busy() || self.waiting() || self.transitioning()
+    }
+
+    pub fn enqueue(&mut self, command: Command) -> Result<(), String> {
+        let opening = match &command {
+            Command::Resume(id) => Some(id.clone()),
+            _ => None,
+        };
+        let starts_turn = matches!(command, Command::Send { .. } | Command::Retry);
+        self.engine
+            .as_ref()
+            .ok_or("Dial is not connected")?
+            .enqueue(command)?;
+        if let Some(id) = opening {
+            self.opening = Some((id, None));
+        }
+        self.restore_target = None;
+        self.turn_queued |= starts_turn;
+        Ok(())
+    }
+
+    pub fn submit_prompt(&mut self, command: Command) -> Result<crate::engine::RpcReply, String> {
+        let reply = self
+            .engine
+            .as_ref()
+            .ok_or("Dial is not connected")?
+            .submit(command)?;
+        self.turn_queued = true;
+        Ok(reply)
+    }
+
+    pub fn apply(&mut self, update: Update) -> Vec<Command> {
+        match &update {
+            Update::Requested {
+                command: Command::Resume(target),
+                id,
+            } => {
+                if let Some((_, request)) =
+                    self.opening.as_mut().filter(|(wanted, _)| wanted == target)
+                {
+                    *request = Some(*id);
+                }
+            }
+            Update::Message(Message::Response { id, result, .. })
+                if self
+                    .opening
+                    .as_ref()
+                    .is_some_and(|(_, request)| *request == Some(*id)) =>
+            {
+                self.opening = None;
+                if result.is_ok() {
+                    self.restore_target = None;
+                }
+            }
+            Update::RequestFailed {
+                command: Command::Resume(target),
+                ..
+            } if self
+                .opening
+                .as_ref()
+                .is_some_and(|(wanted, _)| wanted == target) =>
+            {
+                self.opening = None;
+            }
+            Update::Requested {
+                command: Command::Send { .. } | Command::Retry,
+                ..
+            }
+            | Update::RequestFailed {
+                command: Command::Send { .. } | Command::Retry,
+                ..
+            } => {
+                self.turn_queued = false;
+            }
+            Update::ConnectFailed(_) | Update::Message(Message::Disconnected { .. }) => {
+                self.opening = None;
+                self.turn_queued = false;
+            }
+            _ => {}
+        }
+        self.model.apply(update)
+    }
+
+    fn owns(&self, id: &str) -> bool {
+        self.session() == Some(id)
+            || self
+                .opening
+                .as_ref()
+                .is_some_and(|(wanted, _)| wanted == id)
+    }
+
+    pub fn transitioning(&self) -> bool {
+        self.opening.is_some() || self.turn_queued
+    }
+
     fn busy(&self) -> bool {
-        self.model.conversation.turn_running()
+        self.turn_queued || self.model.conversation.turn_running()
     }
 
     fn waiting(&self) -> bool {
@@ -54,6 +172,8 @@ pub enum Route {
     Switch(usize),
     /// The tab on screen is busy: open it in a new engine.
     Spawn,
+    /// The old worker has not finished releasing the journal yet.
+    Closing,
 }
 
 /// What a session is doing in some tab, for the sidebar.
@@ -69,6 +189,7 @@ pub struct Activity {
 pub struct Tabs {
     tabs: Vec<Tab>,
     active: usize,
+    closing: HashMap<String, Weak<AtomicBool>>,
 }
 
 impl Tabs {
@@ -76,6 +197,7 @@ impl Tabs {
         Self {
             tabs: vec![tab],
             active: 0,
+            closing: HashMap::new(),
         }
     }
 
@@ -85,6 +207,30 @@ impl Tabs {
 
     pub fn active_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    pub fn protects_work(&self) -> bool {
+        self.tabs.iter().any(Tab::protects_work)
+    }
+
+    pub fn check_model_removal(&self, model: &str) -> Result<(), String> {
+        if self.protects_work() {
+            return Err("Wait for running sessions before removing a model.".into());
+        }
+        if self.tabs.iter().any(|tab| {
+            tab.model
+                .current_model
+                .as_ref()
+                .is_some_and(|current| current.model_id == model)
+                || tab
+                    .model
+                    .models
+                    .iter()
+                    .any(|row| row.model_id == model && row.configured)
+        }) {
+            return Err("Switch away from this model and remove it from Dial’s configuration before deleting it.".into());
+        }
+        Ok(())
     }
 
     pub fn active_index(&self) -> usize {
@@ -107,16 +253,22 @@ impl Tabs {
 
     /// Where opening session `id` goes.
     pub fn route_resume(&self, id: &str) -> Route {
-        match self.tabs.iter().position(|t| t.session() == Some(id)) {
+        match self.tabs.iter().position(|t| t.owns(id)) {
             Some(index) => Route::Switch(index),
-            None if self.active().busy() => Route::Spawn,
-            None => Route::Here,
+            None if self
+                .closing
+                .get(id)
+                .is_some_and(|owner| owner.strong_count() > 0) =>
+            {
+                Route::Closing
+            }
+            None => self.route_new(),
         }
     }
 
     /// Where starting a fresh session goes.
     pub fn route_new(&self) -> Route {
-        if self.active().busy() {
+        if self.active().busy() || self.active().opening.is_some() {
             Route::Spawn
         } else {
             Route::Here
@@ -128,9 +280,7 @@ impl Tabs {
         self.tabs
             .iter()
             .enumerate()
-            .find(|(index, tab)| {
-                *index != self.active && tab.session().is_some_and(|s| ids.iter().any(|i| i == s))
-            })
+            .find(|(index, tab)| *index != self.active && ids.iter().any(|id| tab.owns(id)))
             .map(|(_, tab)| {
                 format!(
                     "“{}” is still running; open it and stop it before deleting",
@@ -160,11 +310,24 @@ impl Tabs {
 
     /// Close background tabs with nothing left to do and return them for shutdown.
     pub fn close_idle(&mut self) -> Vec<Tab> {
+        self.closing.retain(|_, owner| owner.strong_count() > 0);
         let mut closed = Vec::new();
         let mut index = 0;
         while index < self.tabs.len() {
-            if index != self.active && !self.tabs[index].busy() {
-                closed.push(self.tabs.remove(index));
+            if index != self.active
+                && !self.tabs[index].busy()
+                && !self.tabs[index].transitioning()
+                && !self.tabs[index].waiting()
+            {
+                let tab = self.tabs.remove(index);
+                if let Some(id) = tab.session() {
+                    let lifetime = tab
+                        .engine
+                        .as_ref()
+                        .map_or_else(|| Arc::downgrade(&tab.lifetime), Engine::lifetime);
+                    self.closing.insert(id.to_owned(), lifetime);
+                }
+                closed.push(tab);
                 if index < self.active {
                     self.active -= 1;
                 }

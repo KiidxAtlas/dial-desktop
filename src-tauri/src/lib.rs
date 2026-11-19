@@ -5,9 +5,11 @@
 //! engine per running session, [`view`] turns that state into the JSON snapshot the web UI
 //! renders, and [`app`] wires them into Tauri.
 
+pub mod agent_browser;
 pub mod app;
 pub mod attachments;
 pub mod browser;
+pub mod browser_mcp;
 pub mod cli;
 pub mod engine;
 pub mod files;

@@ -8,6 +8,7 @@ export const ui = reactive({
   /** Bumped to move keyboard focus to the composer. */
   focusComposer: 0,
   sessionFilter: "",
+  transcriptJump: null as (import("./types").TranscriptHit & { root: string }) | null,
   inspectorOpen: false,
   inspectorTab: "plan" as InspectorTab,
   /** The changed file whose diff the Changes panel shows, or `null` for the list. */

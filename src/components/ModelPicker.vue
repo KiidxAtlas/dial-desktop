@@ -2,7 +2,7 @@
 // The model switcher in the composer, like `/model` in a terminal agent: search, pick, and set
 // how hard the model thinks. The choice applies to this session.
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import type { ModelOption, OpenSnapshot } from "../types";
+import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
 import { engine, models } from "../bridge";
 import { focusComposer, ui } from "../ui";
 import Icon from "./Icon.vue";
@@ -13,6 +13,43 @@ const root = ref<HTMLElement | null>(null);
 const search = ref<HTMLInputElement | null>(null);
 const query = ref("");
 const active = ref(0);
+const downloadedOnly = ref(false);
+const details = ref<{ row: ModelOption; plan?: LocalModelRemoval; error?: string } | null>(null);
+const managing = ref(false);
+
+async function inspectModel(row: ModelOption) {
+  const root = props.snap.workspace.root;
+  details.value = { row };
+  const request = details.value;
+  try {
+    const plan = await engine.localModelDetails(root, row.modelId);
+    if (details.value === request) details.value = { row, plan };
+  } catch (error) {
+    if (details.value === request) details.value = { row, error: String(error) };
+  }
+}
+
+async function removeModel() {
+  const selected = details.value;
+  if (!selected?.plan || managing.value || cannotRemove(selected.row)) return;
+  managing.value = true;
+  try {
+    if (await engine.removeLocalModel(props.snap.workspace.root, selected.row.modelId, selected.plan) && details.value === selected) details.value = null;
+  } catch (error) {
+    if (details.value === selected) details.value = { ...selected, error: String(error) };
+  } finally {
+    managing.value = false;
+  }
+}
+
+function cannotRemove(row: ModelOption) {
+  if (props.snap.connection.state !== "live") return "Connect to Dial to remove models.";
+  if (props.snap.turnRunning) return "Wait for the running turn to finish.";
+  if (isCurrent(row) || row.configured) return "Switch away from this model and remove it from Dial’s configuration before deleting it.";
+  return "";
+}
+
+watch([() => props.snap.workspace.root, () => props.snap.sessionId, downloadedOnly, () => ui.modelPickerOpen], () => { details.value = null; });
 
 const current = computed(() => props.snap.model);
 const usable = computed(() => props.snap.connection.state === "live" || props.snap.connection.state === "preview");
@@ -31,14 +68,17 @@ const groups = computed<Group[]>(() => {
     return words.every((w) => text.includes(w));
   };
   const rows = models.value.filter(match);
-  const mine = rows.filter((m) => m.configured || isCurrent(m));
+  const local = rows.filter((m) => m.local);
+  if (downloadedOnly.value) return local.length ? [{ title: "Downloaded models", rows: local }] : [];
+  const mine = rows.filter((m) => !m.local && (m.configured || isCurrent(m)));
   const byProvider = new Map<string, ModelOption[]>();
   for (const m of rows) {
-    if (mine.includes(m)) continue;
+    if (m.local || mine.includes(m)) continue;
     byProvider.set(m.provider, [...(byProvider.get(m.provider) ?? []), m]);
   }
   const out: Group[] = [];
   if (mine.length) out.push({ title: "Your models", rows: mine });
+  if (local.length) out.push({ title: "Downloaded models", rows: local });
   for (const [provider, list] of byProvider) out.push({ title: provider, rows: list });
   return out;
 });
@@ -110,7 +150,7 @@ watch(
   () => ui.modelPickerOpen,
   (isOpen) => {
     if (isOpen) {
-      if (!models.value.length) engine.refreshModels();
+      engine.refreshModels();
       const index = flat.value.findIndex(isCurrent);
       active.value = index < 0 ? 0 : index;
       nextTick(() => {
@@ -123,7 +163,7 @@ watch(
     }
   },
 );
-watch(query, () => (active.value = 0));
+watch([query, downloadedOnly], () => (active.value = 0));
 onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 </script>
 
@@ -150,28 +190,50 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
             <Icon name="refresh" :size="13" />
           </button>
         </label>
+        <div class="filters" role="group" aria-label="Model source">
+          <button :aria-pressed="!downloadedOnly" @click="downloadedOnly = false">All models</button>
+          <button :aria-pressed="downloadedOnly" @click="downloadedOnly = true">Downloaded</button>
+        </div>
 
         <div class="list">
-          <p v-if="!models.length" class="empty">Loading models…</p>
+          <p v-if="downloadedOnly && models.length && !models.some((m) => m.local)" class="empty">
+            No downloaded models found by Dial. After adding a local model, reload this list.
+          </p>
+          <p v-else-if="!models.length" class="empty">No models listed yet. Use reload to check again.</p>
           <p v-else-if="!flat.length" class="empty">No model matches “{{ query }}”.</p>
           <template v-for="group in groups" :key="group.title">
             <div class="group">{{ group.title }}</div>
-            <button
-              v-for="m in group.rows"
-              :key="`${m.provider}/${m.modelId}`"
-              class="row"
-              :class="{ active: flat[active] === m, current: isCurrent(m) }"
-              @mouseenter="active = flat.indexOf(m)"
-              @click="choose(m)"
-            >
-              <span class="name truncate">{{ m.label }}</span>
-              <span class="id truncate">{{ m.provider }}/{{ m.modelId }}</span>
-              <span class="tags">
-                <span v-if="m.reasoning" class="tag" title="Supports reasoning"><Icon name="brain" :size="11" /></span>
-                <span v-if="context(m)" class="tag">{{ context(m) }}</span>
-              </span>
-              <Icon v-if="isCurrent(m)" class="tick" name="check" :size="14" />
-            </button>
+            <div v-for="m in group.rows" :key="`${m.provider}/${m.modelId}`" class="model-line">
+              <button
+                class="row"
+                :class="{ active: flat[active] === m, current: isCurrent(m) }"
+                @mouseenter="active = flat.indexOf(m)"
+                @click="choose(m)"
+              >
+                <span class="name truncate">{{ m.label }}</span>
+                <span class="id truncate">{{ m.provider }}/{{ m.modelId }}</span>
+                <span class="tags">
+                  <span v-if="m.reasoning" class="tag" title="Supports reasoning"><Icon name="brain" :size="11" /></span>
+                  <span v-if="context(m)" class="tag">{{ context(m) }}</span>
+                </span>
+                <Icon v-if="isCurrent(m)" class="tick" name="check" :size="14" />
+              </button>
+              <button v-if="downloadedOnly && snap.connection.state === 'live'" class="refresh" :aria-label="`Details for ${m.label}`" title="Model details" @click="inspectModel(m)">···</button>
+            </div>
+          </template>
+        </div>
+        <div v-if="downloadedOnly" class="model-details">
+          <p v-if="!details">Add models outside Desktop, then reload this list.</p>
+          <template v-else>
+            <strong>{{ details.row.label }}</strong>
+            <p v-if="details.error" role="alert">{{ details.error }}</p>
+            <p v-else-if="!details.plan" role="status">Looking up model details…</p>
+            <template v-if="details.plan">
+              <p>{{ details.plan.source }} · {{ (details.plan.bytes / 1024 ** 3).toFixed(2) }} GiB</p>
+              <p class="mono" :title="details.plan.folder">{{ details.plan.folder }}</p>
+              <p v-if="cannotRemove(details.row)">{{ cannotRemove(details.row) }}</p>
+              <button v-else class="btn btn-danger" :disabled="managing" @click="removeModel">Remove from disk…</button>
+            </template>
           </template>
         </div>
 
@@ -271,6 +333,27 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   background: var(--hover);
   color: var(--text);
 }
+.filters {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.filters button {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.filters button:hover,
+.filters button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--hover);
+}
+.model-line { display: flex; align-items: center; gap: 4px; }
+.model-line .row { flex: 1; min-width: 0; }
+.model-details { border-top: 1px solid var(--border); padding: 8px 12px; font-size: var(--text-sm); overflow-wrap: anywhere; }
+.model-details p { margin: 4px 0; color: var(--text-faint); }
 .list {
   max-height: 340px;
   overflow-y: auto;

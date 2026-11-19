@@ -27,6 +27,49 @@ fn outcome(ok: Option<bool>, changed: &[&str]) -> dial_client::ToolOutcome {
 }
 
 #[test]
+fn an_edit_shows_its_hunks_instead_of_the_patch_and_receipt() {
+    let edit = |text: &str| {
+        let tool = ToolEntry {
+            call_id: "e1".into(),
+            name: "edit".into(),
+            arguments: r#"{"input":"[src/calc.py#E1A8]\nPUT 2.=2:\n+    return a + b"}"#.into(),
+            result: Some(dial_client::ToolOutcome {
+                text: text.into(),
+                ..outcome(Some(true), &["/home/ada/work/app/src/calc.py"])
+            }),
+            ..ToolEntry::default()
+        };
+        ToolView::new(0, &tool, &workspace())
+    };
+    let view = edit(
+        "[src/calc.py#BA1A]\nupdated (+1 -1 lines)\n1:def add(a, b):\n2:    return a + b\n\n\
+         change preview (+1 -1 lines)\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n\
+         +    return a + b\n[final newline added]\n\n[Edit churn: run a check]",
+    );
+    assert_eq!(view.input, None);
+    assert_eq!(
+        view.output,
+        Some(Block {
+            caption: "diff",
+            text: "@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n\
+                   [final newline added]"
+                .into(),
+        })
+    );
+
+    // Several files, or no hunks: the full result, which names each file, and the arguments.
+    for text in [
+        "[a.py#1]\n\nchange preview (+1 -0 lines)\n@@ -1 +1,2 @@\n+x\n[b.py#2]\n\
+         \nchange preview (+1 -0 lines)\n@@ -1 +1,2 @@\n+y",
+        "[a.py#1]\nno changes",
+    ] {
+        let view = edit(text);
+        assert_eq!(view.input.unwrap().caption, "arguments");
+        assert_eq!(view.output.unwrap().caption, "result");
+    }
+}
+
+#[test]
 fn generated_images_show_inline_from_changed_paths_else_the_output_argument() {
     let w = workspace();
     let args = r#"{"prompt":"a kite","output":"art/kite.png"}"#;
@@ -89,6 +132,15 @@ fn workspace_abbreviates_home_and_relativizes_paths() {
     assert_eq!(w.relative("/home/ada/work/app"), "/home/ada/work/app");
     assert_eq!(Workspace::new("/srv/x/", None).name, "x");
     assert_eq!(Workspace::new("/srv/x", None).display, "/srv/x");
+}
+
+#[test]
+fn sidebar_shows_each_session_once_even_if_history_repeats_it() {
+    let w = workspace();
+    let mut model = preview::model(Preview::Session, &w.root);
+    let count = model.sessions.len();
+    model.sessions.push(model.sessions[0].clone());
+    assert_eq!(Snapshot::new(&model, Some(&w), 0).sessions.len(), count);
 }
 
 #[test]
@@ -320,6 +372,7 @@ fn the_model_view_prefers_state_and_labels_from_the_list() {
         reasoning: true,
         vision: true,
         configured: true,
+        local: false,
     }];
     model.approval = Some("ask".into());
     let value = serde_json::to_value(Snapshot::new(&model, None, 0)).unwrap();

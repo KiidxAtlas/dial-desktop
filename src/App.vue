@@ -2,10 +2,11 @@
 import { computed, onBeforeUnmount, onMounted, watch } from "vue";
 import { engine, snapshot } from "./bridge";
 import { ui, type InspectorTab } from "./ui";
-import { showPanel, trackPreviews } from "./workspace";
+import { followAgentBrowser, showPanel, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
+import { markTurnAborted, syncQueue } from "./queue";
 import type { OpenSnapshot } from "./types";
 import Sidebar from "./components/Sidebar.vue";
 import TopBar from "./components/TopBar.vue";
@@ -34,7 +35,11 @@ const showBackdrop = computed(
 );
 
 // Dev servers Dial starts are offered in (or opened by) the browser panel.
-watch(opened, (s) => s && trackPreviews(s));
+watch(opened, (s) => {
+  if (!s) return;
+  trackPreviews(s);
+  syncQueue(s);
+});
 
 /** Show panel `tab`, or close the inspector when it already shows it. */
 function togglePanel(tab: InspectorTab) {
@@ -98,16 +103,22 @@ function onKey(event: KeyboardEvent) {
     ui.settingsOpen = false;
   } else if (event.key === "Escape" && !event.isComposing && s.turnRunning) {
     event.preventDefault();
+    markTurnAborted(s);
     engine.abort();
   }
 }
 
-onMounted(() => {
+let stopFollowing: (() => void) | null = null;
+onMounted(async () => {
   window.addEventListener("keydown", onKey);
   restoreImage();
   startUpdateChecks();
+  stopFollowing = await followAgentBrowser();
 });
-onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKey);
+  stopFollowing?.();
+});
 </script>
 
 <template>

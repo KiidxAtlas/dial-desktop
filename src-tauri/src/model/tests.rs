@@ -448,16 +448,19 @@ fn state_and_models_load_the_model_controls() {
         "list_models",
         json!({"models": [
             {"provider": "anthropic", "model_id": "claude-opus", "label": "Claude Opus", "sources": ["main"], "reasoning": true, "context_window": 1000000},
+            {"provider": "mlx", "model_id": "/models/test", "sources": ["local", "favorite"]},
             {"provider": "openai", "model_id": "gpt", "sources": ["catalog"]},
             {"provider": "", "model_id": "broken"}
         ]}),
     );
     assert!(model.models_changed);
-    assert_eq!(model.models.len(), 2);
+    assert_eq!(model.models.len(), 3);
     assert_eq!(model.models[0].label, "Claude Opus");
     assert!(model.models[0].configured);
-    assert_eq!(model.models[1].label, "gpt");
-    assert!(!model.models[1].configured);
+    assert!(!model.models[0].local);
+    assert!(model.models[1].local && model.models[1].configured);
+    assert_eq!(model.models[2].label, "gpt");
+    assert!(!model.models[2].configured && !model.models[2].local);
 }
 
 #[test]

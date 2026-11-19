@@ -41,7 +41,9 @@ fn engines_before_update_checks_are_offered_an_update() {
 #[test]
 fn a_missing_engine_and_a_broken_answer_are_told_apart() {
     assert!(matches!(
-        parse_check(Err("could not start \"dial\": No such file or directory".into())),
+        parse_check(Err(
+            "could not start \"dial\": No such file or directory".into()
+        )),
         EngineUpdateView::Missing { .. }
     ));
     assert!(matches!(
@@ -85,7 +87,10 @@ fn connect_failures_name_their_fix() {
 fn the_installer_is_the_signed_release_installer_for_each_platform() {
     let (program, args) = install_command(false);
     assert_eq!(program, "sh");
-    assert_eq!(args, ["-c", "curl -fsSL https://dial.rootatlas.dev/install | sh"]);
+    assert_eq!(
+        args,
+        ["-c", "curl -fsSL https://dial.rootatlas.dev/install | sh"]
+    );
     let (program, args) = install_command(true);
     assert_eq!(program, "powershell");
     assert_eq!(
@@ -121,9 +126,12 @@ fn bounded_runs_capture_both_streams_and_stop_at_the_deadline() {
     .unwrap_err();
     assert!(error.contains("did not finish"), "{error}");
     assert!(
-        run_bounded(&mut Command::new("/nonexistent/dial"), Duration::from_secs(1))
-            .unwrap_err()
-            .starts_with("could not start")
+        run_bounded(
+            &mut Command::new("/nonexistent/dial"),
+            Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .starts_with("could not start")
     );
 }
 

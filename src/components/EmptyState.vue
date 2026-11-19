@@ -1,43 +1,12 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { OpenSnapshot } from "../types";
-import { focusComposer } from "../ui";
-import { draftFor } from "../drafts";
+import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes";
 import Logo from "./Logo.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
-const SUGGESTIONS = [
-  {
-    title: "Map this codebase",
-    detail: "Explain the structure and main flows",
-    prompt:
-      "Explain how this project is structured: the main modules, how they fit together and where to start reading.",
-  },
-  {
-    title: "Fix a failing test",
-    detail: "Run the suite, find the cause, fix it",
-    prompt: "Run the test suite, find the first failing test, diagnose the cause and fix it.",
-  },
-  {
-    title: "Review my changes",
-    detail: "Check uncommitted work for problems",
-    prompt: "Review my uncommitted changes for bugs, missing tests and anything risky.",
-  },
-  {
-    title: "Add tests",
-    detail: "Cover the most important module",
-    prompt: "Find the most important untested behaviour in this project and add focused tests for it.",
-  },
-];
-
-const enabled = computed(() => props.snap.canSend || props.snap.connection.state === "preview");
-
-function pick(prompt: string) {
-  const draft = draftFor(props.snap);
-  if (!draft.text) draft.text = prompt;
-  focusComposer();
-}
+const enabled = computed(() => canUseTaskRecipes(props.snap));
 </script>
 
 <template>
@@ -48,12 +17,12 @@ function pick(prompt: string) {
     </div>
     <div class="chips">
       <button
-        v-for="s in SUGGESTIONS"
-        :key="s.title"
+        v-for="s in taskRecipes"
+        :key="s.id"
         class="chip"
         :disabled="!enabled"
         :title="s.detail"
-        @click="pick(s.prompt)"
+        @click="insertTaskRecipe(s.prompt)"
       >
         {{ s.title }}
       </button>

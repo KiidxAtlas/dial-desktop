@@ -9,6 +9,7 @@ import Markdown from "./Markdown.vue";
 import ToolRow from "./ToolRow.vue";
 import EmptyState from "./EmptyState.vue";
 import Icon from "./Icon.vue";
+import WorkingIndicator from "./WorkingIndicator.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -18,6 +19,24 @@ const pinned = ref(true);
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref("");
 const activeMatch = ref(-1);
+const transcriptMatch = ref(-1);
+const transcriptHit = computed(() => {
+  const hit = ui.transcriptJump;
+  return hit?.root === props.snap.workspace.root && hit.session_id === props.snap.sessionId ? hit : null;
+});
+
+watch([transcriptHit, () => props.snap.entries], ([hit, entries], old) => {
+  if (!hit || hit !== old?.[0]) transcriptMatch.value = -1;
+  if (!hit || transcriptMatch.value >= 0 || !hit.preview.trim()) return;
+  const needle = hit.preview.trim();
+  const matches = entries.flatMap((entry, index) =>
+    ((entry.kind === "user" || entry.kind === "assistant") && entry.kind === hit.role && entry.text.trim() === needle) ? [index] : [],
+  );
+  if (matches.length !== 1) return;
+  transcriptMatch.value = matches[0];
+  pinned.value = false;
+  nextTick(() => scroller.value?.querySelector(`[data-entry="${matches[0]}"]`)?.scrollIntoView({ block: "center" }));
+}, { flush: "post", immediate: true });
 const matches = computed(() => {
   const term = query.value.trim().toLowerCase();
   if (!conversationFindOpen.value || !term) return [];
@@ -76,33 +95,6 @@ const empty = computed(() => props.snap.entries.length === 0 && !props.snap.turn
 const streaming = computed(() => {
   const last = props.snap.entries.at(-1);
   return last?.kind === "assistant" && last.streaming && last.text.length > 0;
-});
-
-// The working line: a spinning glyph and the turn's elapsed time, like a terminal agent.
-const GLYPHS = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
-const frame = ref(0);
-const elapsed = ref(0);
-let started = 0;
-let timer: ReturnType<typeof setInterval> | null = null;
-watch(
-  () => props.snap.turnRunning,
-  (running) => {
-    if (timer) clearInterval(timer);
-    timer = null;
-    if (!running) return;
-    started = Date.now();
-    elapsed.value = 0;
-    timer = setInterval(() => {
-      frame.value = (frame.value + 1) % GLYPHS.length;
-      elapsed.value = Math.floor((Date.now() - started) / 1000);
-    }, 120);
-  },
-  { immediate: true },
-);
-onBeforeUnmount(() => timer && clearInterval(timer));
-const elapsedLabel = computed(() => {
-  const s = elapsed.value;
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 });
 
 function onScroll() {
@@ -182,8 +174,12 @@ function gap(index: number) {
   </div>
   <div v-if="!empty" ref="scroller" class="scroller" tabindex="-1" @scroll.passive="onScroll">
     <div class="column">
+      <p v-if="transcriptHit && transcriptMatch < 0" role="status">
+        <strong>Search result preview</strong> · {{ transcriptHit.snippet }}
+        <button class="btn btn-secondary" @click="ui.transcriptJump = null">Dismiss</button>
+      </p>
       <template v-for="(entry, index) in snap.entries" :key="entry.kind === 'tool' ? entry.key : index">
-        <div class="row" :class="[`k-${entry.kind}`, gap(index), { 'current-match': matches.length && index === activeMatch }]" :data-entry="index">
+        <div class="row" :class="[`k-${entry.kind}`, gap(index), { 'current-match': index === transcriptMatch || (matches.length && index === activeMatch) }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
             <div class="bubble">
               <div class="user-text">{{ entry.text }}</div>
@@ -251,11 +247,7 @@ function gap(index: number) {
         </div>
       </template>
 
-      <div v-if="snap.turnRunning && !streaming" class="working">
-        <span class="glyph">{{ GLYPHS[frame] }}</span>
-        <span class="shimmer">Working…</span>
-        <span class="hint">({{ elapsedLabel }} · esc to interrupt)</span>
-      </div>
+      <WorkingIndicator v-if="snap.turnRunning" v-show="!streaming" />
       <div v-if="!pinned && !matches.length" class="jump">
         <button title="Jump to the latest message" aria-label="Jump to the latest message" @click="jumpToEnd">
           <Icon name="arrowDown" :size="16" />
@@ -485,34 +477,5 @@ function gap(index: number) {
   gap: 6px;
   user-select: none;
   -webkit-user-select: none;
-}
-.working {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-top: 18px;
-  font-size: 14px;
-}
-.glyph {
-  width: 14px;
-  text-align: center;
-  color: var(--accent);
-}
-.shimmer {
-  color: var(--accent);
-  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-soft) 50%, var(--accent) 100%) 0 0 / 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: shimmer 2s linear infinite;
-}
-.hint {
-  font-size: 13px;
-  color: var(--text-faint);
-}
-@keyframes shimmer {
-  to {
-    background-position: -200% 0;
-  }
 }
 </style>

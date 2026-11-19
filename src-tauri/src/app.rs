@@ -95,21 +95,62 @@ impl Shared {
     }
 
     /// Run in `path` from now on: a fresh engine there (or the preview), remembered as recent.
-    fn open(&self, path: &Path) {
+    fn open(&self, path: &Path, confirmed_from: Option<&str>) -> Result<Option<String>, String> {
         let workspace = self.workspace(path);
+        let mut inner = self.lock();
+        let current = inner.workspace.as_ref().map(|w| w.root.as_str());
+        if current == Some(workspace.root.as_str()) {
+            return Ok(None);
+        }
+        let mut terminals = self.terminals();
+        if let Some(root) = current
+            && confirmed_from != Some(root)
+            && (inner.tabs.protects_work() || terminals.has_shells())
+        {
+            return Ok(Some(root.to_owned()));
+        }
         let tab = match &self.source {
             Source::Preview(kind) => Tab::new(preview::model(*kind, &workspace.root), None),
             Source::Engine { .. } => Tab::new(Model::starting(), self.spawn(path)),
         };
-        let mut inner = self.lock();
         inner.recents.touch(path);
         let old = std::mem::replace(&mut inner.tabs, Tabs::new(tab));
         inner.workspace = Some(workspace);
+        terminals.close_all();
+        drop(terminals);
         drop(inner);
         retire(old.into_tabs());
-        // Shells run in the folder that was open; the panel starts fresh ones here.
-        self.terminals().close_all();
         self.poke();
+        Ok(None)
+    }
+
+    fn reconnect(&self) -> Result<(), String> {
+        let mut inner = self.lock();
+        let root = inner
+            .workspace
+            .as_ref()
+            .ok_or("Open a folder first")?
+            .root
+            .clone();
+        let active = inner.tabs.active_mut();
+        if active.protects_work() {
+            return Err("Wait for the current session to finish before reconnecting".into());
+        }
+        let target = active.reconnect_target().map(str::to_owned);
+        let previous = active.engine.as_ref().map(Engine::lifetime);
+        let engine = self
+            .spawn_after(Path::new(&root), previous)
+            .ok_or(PREVIEW_NOTICE)?;
+        let mut tab = Tab::new(Model::starting(), Some(engine));
+        tab.model.sessions = active.model.sessions.clone();
+        if let Some(id) = target {
+            tab.restore_on_connect(id)?;
+        }
+        let old = std::mem::replace(active, tab);
+        drop(inner);
+        retire(vec![old]);
+        self.poke();
+        Ok(())
     }
 
     /// The engine binary in use; `None` in the design preview.
@@ -127,6 +168,14 @@ impl Shared {
 
     /// A new engine in `path`; `None` in the design preview.
     fn spawn(&self, path: &Path) -> Option<Engine> {
+        self.spawn_after(path, None)
+    }
+
+    fn spawn_after(
+        &self,
+        path: &Path,
+        previous: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    ) -> Option<Engine> {
         let Source::Engine { args, .. } = &self.source else {
             return None;
         };
@@ -145,7 +194,10 @@ impl Shared {
             .current_dir(path)
             .diagnostics(Diagnostics::Inherit)
             .interactive(true);
-        Some(Engine::spawn(launch, waker))
+        Some(match previous {
+            Some(previous) => Engine::spawn_after(launch, waker, Some(previous)),
+            None => Engine::spawn(launch, waker),
+        })
     }
 
     /// Show a new engine for the open workspace that runs `first`; the busy tab keeps going.
@@ -156,10 +208,11 @@ impl Shared {
             .map(|w| PathBuf::from(&w.root))
             .ok_or("Open a folder first")?;
         let engine = self.spawn(&root).ok_or(PREVIEW_NOTICE)?;
+        let mut tab = Tab::new(Model::starting(), Some(engine));
         if let Some(command) = first {
-            engine.send(command);
+            tab.enqueue(command)?;
         }
-        inner.tabs.open(Tab::new(Model::starting(), Some(engine)));
+        inner.tabs.open(tab);
         Ok(())
     }
 
@@ -220,7 +273,7 @@ fn publish(app: &AppHandle) {
         for tab in tabs.iter_mut() {
             let updates = tab.engine.as_ref().map(Engine::drain).unwrap_or_default();
             for update in updates {
-                let follow = tab.model.apply(update);
+                let follow = tab.apply(update);
                 dispatch(app, tab.engine.as_ref(), follow);
             }
             messages.extend(tab.model.toast.take());
@@ -348,26 +401,22 @@ fn recent_workspaces(shared: State<'_, Shared>) -> Vec<Workspace> {
 }
 
 #[tauri::command]
-fn open_workspace(shared: State<'_, Shared>, path: String) -> Result<(), String> {
+fn open_workspace(
+    shared: State<'_, Shared>,
+    path: String,
+    confirmed_from: Option<String>,
+) -> Result<Option<String>, String> {
     let path = PathBuf::from(&path);
     let path = path.canonicalize().unwrap_or(path);
     if !path.is_dir() {
         return Err(format!("{} is not a folder", path.display()));
     }
-    shared.open(&path);
-    Ok(())
+    shared.open(&path, confirmed_from.as_deref())
 }
 
 #[tauri::command]
 fn reconnect(shared: State<'_, Shared>) -> Result<(), String> {
-    let root = shared
-        .lock()
-        .workspace
-        .as_ref()
-        .map(|w| PathBuf::from(&w.root));
-    let root = root.ok_or("Open a folder first")?;
-    shared.open(&root);
-    Ok(())
+    shared.reconnect()
 }
 
 /// The engine binary, or why there is none (the design preview).
@@ -416,13 +465,9 @@ async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
         .installed
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Some(found);
-    let root = shared
-        .lock()
-        .workspace
-        .as_ref()
-        .map(|w| PathBuf::from(&w.root));
-    if let Some(root) = root {
-        shared.open(&root);
+    let has_workspace = shared.lock().workspace.is_some();
+    if has_workspace {
+        shared.reconnect()?;
     }
     Ok(log)
 }
@@ -446,8 +491,94 @@ fn check_session(
     Ok(())
 }
 
+async fn rpc_reply(
+    reply: engine::RpcReply,
+    timeout: Option<Duration>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || match timeout {
+        Some(timeout) => reply
+            .recv_timeout(timeout)
+            .map_err(|e| format!("No reply from Dial: {e}"))?,
+        None => reply
+            .recv()
+            .map_err(|_| "Dial disconnected before confirming the request".to_owned())?,
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn workspace_rpc(
+    shared: &Shared,
+    root: &str,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<engine::RpcReply, String> {
+    let inner = shared.lock();
+    if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(root) {
+        return Err("The project changed. Try again from the current project.".into());
+    }
+    let tab = inner.tabs.active();
+    tab.engine
+        .as_ref()
+        .ok_or("Dial is not connected")?
+        .rpc(method, params)
+}
+
 #[tauri::command]
-fn send_prompt(
+async fn search_transcripts(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    query: String,
+) -> Result<serde_json::Value, String> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 4096 {
+        return Err("Enter a search between 1 and 4096 bytes".into());
+    }
+    let reply = workspace_rpc(
+        &shared,
+        &workspace_root,
+        "search_sessions",
+        serde_json::json!({"query": query, "limit": 40}),
+    )?;
+    rpc_reply(reply, Some(Duration::from_secs(20))).await
+}
+
+#[tauri::command]
+async fn local_model_removal(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    model: String,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
+    let reply = {
+        let inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed. Reopen the model picker and try again.".into());
+        }
+        let tab = inner.tabs.active();
+        if !tab
+            .model
+            .models
+            .iter()
+            .any(|row| row.local && row.model_id == model)
+        {
+            return Err(
+                "Dial no longer lists this downloaded model. Reload the model list.".into(),
+            );
+        }
+        if !dry_run {
+            inner.tabs.check_model_removal(&model)?;
+        }
+        tab.engine.as_ref().ok_or("Dial is not connected")?.rpc(
+            "delete_local_model",
+            serde_json::json!({"model": model, "dry_run": dry_run}),
+        )?
+    };
+    rpc_reply(reply, Some(Duration::from_secs(60))).await
+}
+
+#[tauri::command]
+async fn send_prompt(
     shared: State<'_, Shared>,
     workspace_root: String,
     session_id: Option<String>,
@@ -460,20 +591,20 @@ fn send_prompt(
         return Err("The prompt is empty".into());
     }
     attachments::check(&images, &inline_images)?;
-    let inner = shared.lock();
-    check_session(&inner, &workspace_root, session_id.as_deref())?;
-    let tab = inner.tabs.active();
-    if !tab.model.can_send() {
-        return Err("Dial is not ready to accept a prompt".into());
-    }
-    tab.engine
-        .as_ref()
-        .ok_or("Dial is not connected")?
-        .enqueue(Command::Send {
+    let reply = {
+        let mut inner = shared.lock();
+        check_session(&inner, &workspace_root, session_id.as_deref())?;
+        let tab = inner.tabs.active_mut();
+        if tab.transitioning() || !tab.model.can_send() {
+            return Err("Dial is not ready to accept a prompt".into());
+        }
+        tab.submit_prompt(Command::Send {
             text: text.to_owned(),
             images,
             inline_images,
-        })
+        })?
+    };
+    rpc_reply(reply, None).await.map(|_| ())
 }
 
 /// Check an image chosen or dropped by the user and return its preview. Async, so reading a
@@ -514,7 +645,7 @@ fn new_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> 
     let mut inner = shared.lock();
     match inner.tabs.route_new() {
         Route::Spawn => shared.open_tab(&mut inner, None)?,
-        Route::Here | Route::Switch(_) => {
+        Route::Here | Route::Switch(_) | Route::Closing => {
             dispatch(
                 &app,
                 inner.tabs.active().engine.as_ref(),
@@ -529,16 +660,27 @@ fn new_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> 
 
 /// Show session `session_id`: the tab already running it, this tab when idle, or a new engine.
 #[tauri::command]
-fn resume(app: AppHandle, shared: State<'_, Shared>, session_id: String) -> Result<(), String> {
+fn resume(
+    shared: State<'_, Shared>,
+    session_id: String,
+    workspace_root: Option<String>,
+) -> Result<(), String> {
     let mut inner = shared.lock();
+    if let Some(root) = workspace_root.as_deref()
+        && inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(root)
+    {
+        return Err("That search result belongs to a different project".into());
+    }
     match inner.tabs.route_resume(&session_id) {
         Route::Switch(index) => inner.tabs.switch(index),
         Route::Spawn => shared.open_tab(&mut inner, Some(Command::Resume(session_id)))?,
-        Route::Here => dispatch(
-            &app,
-            inner.tabs.active().engine.as_ref(),
-            vec![Command::Resume(session_id)],
-        ),
+        Route::Here => inner
+            .tabs
+            .active_mut()
+            .enqueue(Command::Resume(session_id))?,
+        Route::Closing => {
+            return Err("That session just finished. Try opening it again in a moment.".into());
+        }
     }
     drop(inner);
     shared.poke();
@@ -578,6 +720,9 @@ fn rename_session(
     let index = match tabs.route_resume(&session_id) {
         Route::Switch(index) => index,
         Route::Here | Route::Spawn => tabs.active_index(),
+        Route::Closing => {
+            return Err("That session is still closing. Try again in a moment.".into());
+        }
     };
     let tab = tabs
         .iter_mut()
@@ -662,30 +807,37 @@ fn undo_turn(
 
 /// Add guidance to the turn running in the session on screen.
 #[tauri::command]
-fn steer(
+async fn steer(
     shared: State<'_, Shared>,
     workspace_root: String,
     session_id: Option<String>,
     text: String,
 ) -> Result<(), String> {
-    let inner = shared.lock();
-    check_session(&inner, &workspace_root, session_id.as_deref())?;
-    let tab = inner.tabs.active();
-    let command = tab.model.steer(&text)?;
-    tab.engine
-        .as_ref()
-        .ok_or("Dial is not connected")?
-        .enqueue(command)
+    let reply = {
+        let inner = shared.lock();
+        check_session(&inner, &workspace_root, session_id.as_deref())?;
+        let tab = inner.tabs.active();
+        let command = tab.model.steer(&text)?;
+        tab.engine
+            .as_ref()
+            .ok_or("Dial is not connected")?
+            .submit(command)?
+    };
+    rpc_reply(reply, Some(Duration::from_secs(15)))
+        .await
+        .map(|_| ())
 }
 
 /// Send the last unanswered prompt of the session on screen again.
 #[tauri::command]
-fn retry_turn(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
-    let inner = shared.lock();
-    let tab = inner.tabs.active();
+fn retry_turn(shared: State<'_, Shared>) -> Result<(), String> {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    if tab.transitioning() {
+        return Err("Wait for the session to finish opening or sending".into());
+    }
     let command = tab.model.retry()?;
-    dispatch(&app, tab.engine.as_ref(), vec![command]);
-    Ok(())
+    tab.enqueue(command)
 }
 
 /// Summarize the conversation on screen to free context.
@@ -772,6 +924,20 @@ async fn file_diff(shared: State<'_, Shared>, path: String) -> Result<DiffView, 
     files::diff(&shared.root()?, &path)
 }
 
+/// Fuzzy-search files inside the workspace for `@` mentions in the composer.
+#[tauri::command]
+async fn search_files(
+    shared: State<'_, Shared>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let root = shared.root()?;
+    let cap = limit.unwrap_or(20);
+    tauri::async_runtime::spawn_blocking(move || files::search(&root, &query, cap))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Start a shell in the workspace; its output follows as `terminal` events.
 #[tauri::command]
 fn terminal_open(
@@ -808,6 +974,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok();
+    let endpoint = crate::agent_browser::endpoint_file(home.as_deref().map(Path::new));
+    let endpoint_on_exit = endpoint.clone();
 
     let app = tauri::Builder::default()
         // Links in answers open in the system browser, never in the app window.
@@ -845,6 +1013,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             retry_turn,
             compact_session,
             refresh_sessions,
+            search_transcripts,
+            local_model_removal,
             refresh_models,
             set_model,
             set_thinking,
@@ -854,6 +1024,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             list_dir,
             read_file,
             file_diff,
+            search_files,
             terminal_open,
             terminal_write,
             terminal_resize,
@@ -881,8 +1052,15 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 installed: Mutex::new(None),
             });
             app.manage(Browser::default());
+            // The agent's tools for the Browser panel (`agent_browser`); without them the panel
+            // still works for the user.
+            if let Some(file) = &endpoint
+                && let Err(error) = crate::agent_browser::start(app.handle(), file)
+            {
+                eprintln!("dial-desktop: the agent's browser tools are off: {error}");
+            }
             if let Some(path) = workspace {
-                app.state::<Shared>().open(&path);
+                app.state::<Shared>().open(&path, None)?;
             }
             let handle = app.handle().clone();
             thread::Builder::new()
@@ -904,11 +1082,14 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         })
         .build(tauri::generate_context!())?;
 
-    app.run(|app, event| {
+    app.run(move |app, event| {
         if let RunEvent::Exit = event
             && let Some(shared) = app.try_state::<Shared>()
         {
             shared.terminals().close_all();
+            if let Some(file) = &endpoint_on_exit {
+                crate::agent_browser::remove_endpoint(file);
+            }
             // Shut every engine down gracefully (bounded, in parallel) before the process ends.
             let empty = Tabs::new(Tab::new(Model::default(), None));
             let tabs = std::mem::replace(&mut shared.lock().tabs, empty);

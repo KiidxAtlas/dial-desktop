@@ -128,7 +128,68 @@ fn a_session_cannot_be_resumed_while_its_previous_engine_shuts_down() {
     finish(&mut tabs.tabs[0].model);
     let closed = tabs.close_idle();
     assert_eq!(closed.len(), 1);
-    assert_ne!(tabs.route_resume("s1"), Route::Here, "the old engine can still own s1");
+    assert_eq!(tabs.route_resume("s1"), Route::Closing);
     drop(closed);
     assert_eq!(tabs.route_resume("s1"), Route::Here);
+}
+
+#[test]
+fn repeated_opens_use_the_same_engine_before_resume_completes() {
+    let mut tabs = Tabs::new(tab("s1", true));
+    let mut opening = Tab::new(Model::starting(), None);
+    opening.opening = Some(("s2".into(), None));
+    tabs.open(opening);
+    assert_eq!(tabs.route_resume("s2"), Route::Switch(1));
+    assert_eq!(tabs.route_resume("s1"), Route::Switch(0));
+    assert_eq!(tabs.route_resume("s3"), Route::Spawn);
+    tabs.switch(0);
+    assert!(tabs.close_idle().is_empty());
+
+    let id = request_id(2);
+    tabs.tabs[1].apply(Update::Requested {
+        command: Command::Resume("s2".into()),
+        id,
+    });
+    assert_eq!(tabs.route_resume("s2"), Route::Switch(1));
+    tabs.tabs[1].apply(Update::Message(Message::Response {
+        id,
+        method: "resume".into(),
+        result: Ok(json!({})),
+    }));
+    assert_eq!(tabs.route_resume("s2"), Route::Spawn);
+}
+
+#[test]
+fn switching_away_from_a_queued_send_preserves_its_engine() {
+    let mut tabs = Tabs::new(tab("s1", false));
+    tabs.active_mut().turn_queued = true;
+    assert_eq!(tabs.route_resume("s2"), Route::Spawn);
+    tabs.open(tab("s2", false));
+    assert!(tabs.close_idle().is_empty());
+    assert_eq!(tabs.route_resume("s1"), Route::Switch(0));
+}
+
+#[test]
+fn reconnect_keeps_its_target_after_a_failed_engine_start() {
+    let mut restoring = Tab::new(Model::starting(), None);
+    restoring.opening = Some(("original".into(), None));
+    restoring.restore_target = Some("original".into());
+    assert!(restoring.protects_work());
+    restoring.apply(Update::ConnectFailed("engine unavailable".into()));
+    assert!(!restoring.protects_work());
+    assert_eq!(restoring.reconnect_target(), Some("original"));
+}
+
+#[test]
+fn model_removal_is_refused_while_background_work_is_running() {
+    let mut tabs = Tabs::new(tab("working", true));
+    tabs.open(tab("foreground", false));
+    assert!(tabs.check_model_removal("unused").is_err());
+    finish(&mut tabs.tabs[0].model);
+    assert!(tabs.check_model_removal("unused").is_ok());
+    tabs.active_mut().model.current_model = Some(crate::model::CurrentModel {
+        model_id: "selected".into(),
+        ..Default::default()
+    });
+    assert!(tabs.check_model_removal("selected").is_err());
 }

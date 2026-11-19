@@ -302,6 +302,7 @@ fn models() -> Vec<ModelOption> {
         reasoning: true,
         vision: true,
         configured,
+        local: provider == "mlx",
     };
     vec![
         row(
@@ -319,6 +320,7 @@ fn models() -> Vec<ModelOption> {
             true,
         ),
         row("openai", "gpt-5", "GPT-5", 400_000, true),
+        row("mlx", "qwen-local", "Qwen (downloaded)", 32_000, false),
         row(
             "anthropic",
             "claude-haiku-4-5",

@@ -54,6 +54,12 @@ Shortcuts: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line
 <kbd>Esc</kbd> stops a running turn, <kbd>⌘/Ctrl</kbd>+<kbd>N</kbd> starts a session,
 <kbd>⌘/Ctrl</kbd>+<kbd>,</kbd> opens settings.
 
+Running sessions and sessions waiting for a reply appear under **Active** in the sidebar. Open
+one there to return to its running conversation. To browse local chat models that Dial already
+detects on disk, open the composer’s model picker and choose **Downloaded**. Model details show
+the source, folder and size. You can confirm removal of an unused model from a supported store;
+add models outside Desktop, then reload the list.
+
 ## Updates
 
 The app and the Dial engine update separately, and nothing installs until the user asks
@@ -91,7 +97,17 @@ One-time repository setup:
 | Variable / secret | `DIAL_WEB_REFRESH_URL` / `DIAL_WEB_REFRESH_TOKEN` | `https://dial.rootatlas.dev/release/refresh` and the site's `NUXT_RELEASE_REFRESH_TOKEN` (optional) |
 
 Keep the private key safe: losing it means installed apps can never verify another update.
-Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first run.
+
+Windows release signing uses Azure Artifact Signing (`rootatlas`, Public Trust profile
+`dial-desktop`), independently of the Tauri updater key. Create a GitHub environment named
+`windows-signing`, restrict deployments to release tags (`v*`), and configure reviewers.
+In Entra ID, add a GitHub federated credential on the release app registration for this repo's
+`windows-signing` environment; assign the app **Artifact Signing Certificate Profile Signer**
+on the profile. Set environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+`AZURE_SUBSCRIPTION_ID`, `AZURE_SIGNING_ENDPOINT` (the account's regional HTTPS endpoint),
+and `AZURE_SIGNING_PUBLISHER` (the exact certificate common name). No client secret or PFX
+is needed. The Tauri signing hook verifies the publisher and timestamp before packaging
+continues. Local builds without the release config do not contact Azure.
 
 ## What it does today
 
@@ -104,6 +120,11 @@ Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first r
   fresh one first. <kbd>⌘/Ctrl</kbd>-click picks several sessions and <kbd>Shift</kbd>-click a
   range; then delete them together from the bar above the list or with <kbd>Delete</kbd>
   (<kbd>Esc</kbd> clears the pick, <kbd>⌘/Ctrl</kbd>+<kbd>A</kbd> picks every listed session).
+  **Search project messages** searches saved transcripts across the project. Select a result to
+  open its conversation and jump to the message; if it is no longer in the displayed history or
+  can’t be identified uniquely, Desktop shows the saved snippet instead.
+  Switching projects asks before stopping running work or closing terminals. **Reconnect**
+  resumes the foreground conversation without restarting other session engines or terminals.
 - **Session actions**: right-click a session, use its `…` button, or click the title in the top
   bar to rename (also double-click or <kbd>F2</kbd>), pin to the top, duplicate (a forked copy),
   copy the conversation as Markdown, export it to a Markdown file in the project, undo the last
@@ -114,6 +135,9 @@ Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first r
   every keyboard shortcut. <kbd>⌘/Ctrl</kbd>+<kbd>B</kbd> hides the sidebar,
   <kbd>⌥⌘I</kbd> toggles the side panel, <kbd>⇧⌘B</kbd> the browser, <kbd>⇧⌘E</kbd> the files,
   <kbd>Ctrl</kbd>+<kbd>`</kbd> the terminal, <kbd>⌘+</kbd>/<kbd>⌘−</kbd>/<kbd>⌘0</kbd> zoom.
+  Search for a **Task recipe** by name (for example, **Review my changes** or **Fix a failing
+  test**) to add an editable prompt to the current draft. The same recipes are available on an
+  empty conversation. They preserve existing draft content and attachments and never send on their own.
 - **Appearance** (Settings → Appearance): light, dark or the system's theme, and the zoom level.
   Saved on this computer. A pane over background artwork keeps the dark palette so text stays
   readable on the art.
@@ -143,10 +167,17 @@ Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first r
   <kbd>Enter</kbd> and <kbd>Shift</kbd>+<kbd>Enter</kbd> cycle through them.
   A ring by the send button shows how full the model's context is; click it (or type `/compact`)
   to summarize the conversation and free context.
-- **Composer**: drafts and their images stay with their session while the app is open. If the app
-  can't queue a prompt, the draft stays in the composer. While Dial works, Enter or the send-note
-  button adds guidance to the running turn. <kbd>↑</kbd> in an empty box recalls the last prompt.
-  Slash commands: `/model`, `/new`, `/clear`, `/compact`, `/undo`, `/open`.
+- **Composer**: unsent text and images are saved locally per project and session, including across
+  restarts. If Dial rejects a submission or disconnects before confirming it, the draft remains
+  available and is never resent automatically. Check the transcript before retrying an unconfirmed
+  send. While Dial works, Enter or the send-note button adds guidance to the running turn.
+  <kbd>↑</kbd> in an empty box recalls the last prompt.
+  During a live turn, **Queue** (⌘/Ctrl+Enter) saves text and images for the next turn instead.
+  Queues stay in memory for this app run. Switching sessions, stopping a turn, or a failed turn
+  pauses automatic sending; **Send next** resumes from the open, idle session.
+  Type `@` and part of a filename to insert its project-relative path. Use ↑/↓ to select a match
+  and Tab or Enter to insert it. Slash commands include `/model`, `/think`, `/mode`, `/fork`,
+  `/retry`, `/new`, `/clear`, `/compact`, `/undo`, `/open`, and the task recipes (e.g. `/fix-test`).
 - **Approvals**: allow once, always, for the project, or deny, right above the composer.
 - **Questions**: when the agent asks (`ask`), its questions appear above the composer with their
   options (single or multiple choice, the suggested one preselected) and a free-text answer.
@@ -158,6 +189,8 @@ Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first r
   - **Plan**: the agent's todo list with progress. **Activity**: recent tool calls.
   - **Changes**: the files the agent changed; click one for its diff against `HEAD` (new files
     against nothing), with added and removed line counts, "open in Files", copy, and "ask Dial".
+    **Review files** adds the changed paths to your draft. Expanded tool rows also link to their
+    files' diffs, and failed calls can add the reported error to your draft.
   - **Files**: the project tree (folders first, `.git` hidden) with a filter and a viewer with
     syntax highlighting. Right-click to mention a file in the prompt, copy its path, or show it in
     the system file browser. Reads stay inside the project (symlinks that leave it are refused)
@@ -174,12 +207,17 @@ Windows bundles are not Authenticode-signed yet, so SmartScreen warns on first r
   - **Live previews**: when a tool call's output announces a local server (`http://localhost:5173`
     and the like), the browser opens it, or a toast offers it if you turned that off (Browser
     panel or palette). Previews from a session's history are listed but not opened.
+  - **The agent's browser**: Dial can drive the Browser panel itself through MCP tools
+    (`mcp__dial_desktop__browser_open`, `_snapshot`, `_click`, `_type`, `_read`, `_screenshot`
+    and more): open your dev server, click through it, read console errors and look at it. The
+    app registers the `mcp.dial_desktop` setting at start (this binary with `--browser-mcp`); set
+    its `enabled = false` to turn it off. See `docs/browser-agent.md`.
 - **Reliability**: lost events trigger one `recovery_snapshot` reload once the turn is idle. A
   dropped engine is shown as stopped, and tool calls it left running are marked as having
   unknown outcomes, never as succeeded.
 
-Not yet: images in question answers, multiple windows, the agent driving the in-app browser itself
-(see `docs/browser-agent.md`).
+Not yet: images in question answers, multiple windows, agent screenshots of the browser outside
+macOS.
 
 ## Layout
 
@@ -192,6 +230,8 @@ Not yet: images in question answers, multiple windows, the agent driving the in-
 | `src-tauri/src/settings.rs` | The settings page: the engine's settings reference joined with saved values into typed controls |
 | `src-tauri/src/app.rs` | Tauri setup: window, pump thread (`snapshot`, `models`, `settings` and `toast` events), UI commands |
 | `src-tauri/src/browser.rs` | The Browser panel's child web view: address normalizing, navigation guard, page inspection script, `browser` events |
+| `src-tauri/src/agent_browser.rs` | The agent's browser tools: page scripts, the token-guarded loopback port, the `mcp.dial_desktop` registration, screenshots |
+| `src-tauri/src/browser_mcp.rs` | `--browser-mcp`: the stdio MCP server the engine runs, forwarding calls to the app |
 | `src-tauri/src/files.rs` | Project files for the Files and Changes panels: listing, reading, `git diff`, all confined to the project |
 | `src-tauri/src/terminal.rs` | PTY shells for the Terminal panel (`terminal` events) |
 | `src-tauri/src/preview.rs` | Built-in session fed through the real `Conversation` reducer, for design work |

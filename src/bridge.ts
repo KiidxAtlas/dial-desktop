@@ -109,7 +109,19 @@ export const engine = {
   approve: (approvalId: string, decision: Decision) => call("approve", { approvalId, decision }),
   abort: () => call("abort"),
   newSession: () => call("new_session"),
-  resume: (sessionId: string) => call("resume", { sessionId }),
+  resume: (sessionId: string, workspaceRoot?: string) => call("resume", { sessionId, workspaceRoot }),
+  searchTranscripts: (workspaceRoot: string, query: string) =>
+    invoke<import("./types").TranscriptResults>("search_transcripts", { workspaceRoot, query }),
+  localModelDetails: (workspaceRoot: string, model: string) =>
+    invoke<import("./types").LocalModelRemoval>("local_model_removal", { workspaceRoot, model, dryRun: true }),
+  async removeLocalModel(workspaceRoot: string, model: string, preview: import("./types").LocalModelRemoval) {
+    const confirmed = await ask(`Remove ${preview.label} from disk?\n\n${preview.folder}\n\nThis removes the entire model folder and cannot be undone.`, { title: "Remove downloaded model?", kind: "warning" });
+    if (!confirmed) return false;
+    const result = await invoke<import("./types").LocalModelRemoval>("local_model_removal", { workspaceRoot, model, dryRun: false });
+    if (!result.deleted) throw new Error("Dial did not confirm removal");
+    await engine.refreshModels();
+    return true;
+  },
   /** Delete sessions after the user confirms; resolves to whether they were asked to go. */
   async deleteSessions(sessions: { id: string; title: string }[]): Promise<boolean> {
     if (!sessions.length) return false;
@@ -180,7 +192,19 @@ export const engine = {
 
 export const folders = {
   recent: () => invoke<Workspace[]>("recent_workspaces").catch(() => [] as Workspace[]),
-  open: (path: string) => call("open_workspace", { path }),
+  async open(path: string) {
+    try {
+      let from = await invoke<string | null>("open_workspace", { path });
+      while (from) {
+        if (!(await ask("Switching projects will stop active turns and close open terminals in the current project.", { title: "Switch projects?", kind: "warning" }))) return false;
+        from = await invoke<string | null>("open_workspace", { path, confirmedFrom: from });
+      }
+      return true;
+    } catch (error) {
+      showToast(String(error));
+      return false;
+    }
+  },
   /** Ask for a folder with the system dialog and open it. */
   async choose() {
     try {
@@ -250,6 +274,8 @@ export const workspaceFiles = {
   read: (path: string) => invoke<FileView>("read_file", { path }),
   /** Uncommitted changes of `path` (relative or absolute inside the project). */
   diff: (path: string) => invoke<DiffView>("file_diff", { path }),
+  /** Fuzzy-search workspace files for `@` mentions in the composer. */
+  search: (query: string, limit = 20) => invoke<string[]>("search_files", { query, limit }),
 };
 
 /** The integrated browser (a native webview laid over the Browser panel). Calls throw. */
@@ -265,7 +291,16 @@ export const browserApi = {
   inspect: () => invoke<PageInfo>("browser_inspect"),
   state: () => invoke<BrowserState>("browser_state"),
   onState: (handler: (state: BrowserState) => void) => listen<BrowserState>("browser", (e) => handler(e.payload)),
+  /** What the agent does with the browser (through its MCP tools). */
+  onAgent: (handler: (event: AgentBrowserEvent) => void) =>
+    listen<AgentBrowserEvent>("agent-browser", (e) => handler(e.payload)),
 };
+
+/** The agent's browser tools ask the panel to open a page or show itself, or report a step. */
+export type AgentBrowserEvent =
+  | { kind: "open"; url: string }
+  | { kind: "show" }
+  | { kind: "activity"; busy: boolean; text?: string };
 
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
 export const terminalApi = {

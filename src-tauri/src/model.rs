@@ -135,6 +135,8 @@ pub struct ModelOption {
     pub vision: bool,
     /// Configured by the user: the main model, a favorite, a profile or a role.
     pub configured: bool,
+    /// Discovered in a downloaded local model store.
+    pub local: bool,
 }
 
 impl ModelOption {
@@ -142,7 +144,8 @@ impl ModelOption {
     pub fn from_wire(value: &Value) -> Option<Self> {
         let provider = value["provider"].as_str().filter(|s| !s.is_empty())?;
         let model_id = value["model_id"].as_str().filter(|s| !s.is_empty())?;
-        let configured = strings(&value["sources"]).iter().any(|source| {
+        let sources = strings(&value["sources"]);
+        let configured = sources.iter().any(|source| {
             matches!(source.as_str(), "main" | "favorite")
                 || source.starts_with("profile:")
                 || source.starts_with("role:")
@@ -159,6 +162,7 @@ impl ModelOption {
             reasoning: value["reasoning"].as_bool().unwrap_or_default(),
             vision: value["vision"].as_bool().unwrap_or_default(),
             configured,
+            local: sources.iter().any(|source| source == "local"),
         })
     }
 }

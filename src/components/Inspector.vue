@@ -2,7 +2,7 @@
 import { computed, reactive, watch } from "vue";
 import type { OpenSnapshot, ToolEntry } from "../types";
 import { ui, type InspectorTab } from "../ui";
-import { inspectorWidth, setInspectorWidth } from "../workspace";
+import { addToPrompt, inspectorWidth, mention, setInspectorWidth } from "../workspace";
 import Icon from "./Icon.vue";
 import BrowserPane from "./workspace/BrowserPane.vue";
 import DiffPane from "./workspace/DiffPane.vue";
@@ -132,8 +132,8 @@ function startResize(event: PointerEvent) {
         </div>
         <template v-else>
           <div class="head">
-            <span class="section-label">{{ snap.changes.length }} files changed</span>
-            <span class="faint">Click for the diff</span>
+            <span class="section-label">{{ snap.changes.length }} {{ snap.changes.length === 1 ? "file" : "files" }} changed</span>
+            <button class="btn btn-secondary" @click="addToPrompt('Review the changes to these files for bugs and missing tests:\n' + snap.changes.map(c => mention(c.path)).join('\n'))">Review files</button>
           </div>
           <button
             v-for="change in snap.changes"

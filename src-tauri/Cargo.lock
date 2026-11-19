@@ -789,10 +789,15 @@ dependencies = [
 
 [[package]]
 name = "dial-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
+ "block2",
  "dial-client",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-web-kit",
  "portable-pty",
  "serde",
  "serde_json",
