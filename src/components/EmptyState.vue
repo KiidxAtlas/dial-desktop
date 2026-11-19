@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { OpenSnapshot } from "../types";
-import { focusComposer, ui } from "../ui";
+import { focusComposer } from "../ui";
+import { draftFor } from "../drafts";
 import Logo from "./Logo.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
@@ -33,7 +34,8 @@ const SUGGESTIONS = [
 const enabled = computed(() => props.snap.canSend || props.snap.connection.state === "preview");
 
 function pick(prompt: string) {
-  ui.draft = prompt;
+  const draft = draftFor(props.snap);
+  if (!draft.text) draft.text = prompt;
   focusComposer();
 }
 </script>

@@ -1,0 +1,132 @@
+# Builds, signs and publishes Dial Desktop for macOS, Windows and Linux when a `v*` tag is pushed.
+#
+# Every platform uploads into one draft release; the last job publishes it, so `latest.json` (what
+# installed apps poll for updates) and the website's download links only move to a release once
+# every bundle is attached. See "Releasing" in README.md for the one-time secrets and variables.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches every version field
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          npm_version=$(jq -r .version package.json)
+          tauri_version=$(jq -r .version src-tauri/tauri.conf.json)
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n1)
+          for version in "$npm_version" "$tauri_version" "$cargo_version"; do
+            if [ "$version" != "$tag" ]; then
+              echo "::error::package.json ($npm_version), tauri.conf.json ($tauri_version) and Cargo.toml ($cargo_version) must all equal the tag $GITHUB_REF_NAME"
+              exit 1
+            fi
+          done
+      - name: Update signing is configured
+        env:
+          PUBKEY: ${{ vars.DIAL_DESKTOP_UPDATER_PUBKEY }}
+          HAS_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_APPLE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        run: |
+          # Without both halves installed apps could not verify (or would never see) this release.
+          if [ -z "$PUBKEY" ] || [ "$HAS_PRIVATE_KEY" != "true" ]; then
+            echo "::error::Set the DIAL_DESKTOP_UPDATER_PUBKEY variable and the TAURI_SIGNING_PRIVATE_KEY secret (see README.md › Releasing)"
+            exit 1
+          fi
+          if [ "$HAS_APPLE" != "true" ]; then
+            echo "::warning::No Apple Developer ID certificate: the macOS app will be unsigned and Gatekeeper will block it on download"
+          fi
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Compiled into the app: the key its updater verifies downloads with.
+          DIAL_DESKTOP_UPDATER_PUBKEY: ${{ vars.DIAL_DESKTOP_UPDATER_PUBKEY }}
+          # Signs the update bundles and `latest.json` entries.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing and notarization (Developer ID Application certificate).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Dial Desktop ${{ github.ref_name }}
+          releaseBody: |
+            Download Dial Desktop for your platform below, or from https://dial.rootatlas.dev/download.
+            Installed apps update themselves. The app runs the Dial engine (`dial`); if none is installed it offers to install it, and it keeps the engine updated through `dial update`.
+            Terminal only? `curl -fsSL https://dial.rootatlas.dev/install | sh`
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+      - name: Refresh the website's release cache
+        if: vars.DIAL_WEB_REFRESH_URL != ''
+        env:
+          URL: ${{ vars.DIAL_WEB_REFRESH_URL }}
+          TOKEN: ${{ secrets.DIAL_WEB_REFRESH_TOKEN }}
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "$URL" || echo "::warning::website refresh failed; it refetches within an hour"

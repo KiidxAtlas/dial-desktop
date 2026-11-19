@@ -87,6 +87,77 @@ fn connecting_goes_live_and_asks_for_sessions() {
 }
 
 #[test]
+fn session_listing_follows_the_engine_offset() {
+    let mut model = Model::starting();
+    let (id, _) = requested(&mut model, Command::ListSessions, 1);
+    let follow = respond(
+        &mut model,
+        id,
+        "list_sessions",
+        json!({
+            "sessions": [{"session_id": "s1"}], "next_offset": 1,
+        }),
+    );
+    let page = follow
+        .into_iter()
+        .next()
+        .expect("the next page must be requested");
+    let (_, method, params) = page.request();
+    assert_eq!(method, "list_sessions");
+    assert_eq!(params["offset"], 1);
+    let (page_id, _) = requested(&mut model, page, 2);
+    assert!(
+        respond(
+            &mut model,
+            page_id,
+            "list_sessions",
+            json!({
+                "sessions": [{"session_id": "s1"}, {"session_id": "s2"}], "next_offset": null,
+            })
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        model
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        ["s1", "s2"]
+    );
+}
+
+#[test]
+fn stale_session_pages_cannot_replace_a_newer_refresh() {
+    let mut model = Model::starting();
+    let (first, _) = requested(&mut model, Command::ListSessions, 1);
+    let mut follow = respond(
+        &mut model,
+        first,
+        "list_sessions",
+        json!({
+            "sessions": [{"session_id": "old-first"}], "next_offset": 1,
+        }),
+    );
+    let (refresh, _) = requested(&mut model, Command::ListSessions, 2);
+    let (stale, _) = requested(&mut model, follow.remove(0), 3);
+    respond(
+        &mut model,
+        refresh,
+        "list_sessions",
+        json!({"sessions": [{"session_id": "fresh"}]}),
+    );
+    respond(
+        &mut model,
+        stale,
+        "list_sessions",
+        json!({"sessions": [{"session_id": "old-second"}]}),
+    );
+    assert_eq!(model.sessions.len(), 1);
+    assert_eq!(model.sessions[0].id, "fresh");
+}
+
+#[test]
 fn switching_sessions_waits_for_the_running_turn() {
     // The app opens a busy engine's other sessions in a second engine; should one still refuse,
     // the reason reads plainly.

@@ -41,3 +41,13 @@ fn attachments_are_checked_before_sending() {
     let many = vec!["x.png".to_owned(); MAX_IMAGES + 1];
     assert!(check(&many, &[]).unwrap_err().contains("at most"));
 }
+
+#[test]
+fn inline_images_have_the_same_size_limit_as_files() {
+    let too_large = STANDARD.encode(vec![0; MAX_IMAGE_BYTES as usize + 1]);
+    assert!(
+        check(&[], &[too_large])
+            .unwrap_err()
+            .contains("at most 20 MB")
+    );
+}

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core events, window dragging and zoom from the custom title area, opening web links in the browser, the folder and image pickers, the export save dialog, and confirmations.",
-  "windows": [
+  "description": "The main window's own interface (the `main` webview only, never the integrated browser's pages): core events, window dragging and zoom from the custom title area, opening web links in the browser, the folder and image pickers, the export save dialog, confirmations, and installing the app's own signed updates and relaunching after one.",
+  "webviews": [
     "main"
   ],
   "permissions": [
@@ -13,6 +13,8 @@
     "opener:default",
     "dialog:allow-open",
     "dialog:allow-ask",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

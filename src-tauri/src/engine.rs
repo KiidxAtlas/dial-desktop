@@ -45,6 +45,10 @@ pub enum Command {
     Abort,
     /// Refresh the sidebar's session list.
     ListSessions,
+    ListSessionsPage {
+        offset: u64,
+        after: RequestId,
+    },
     /// Start a fresh session.
     NewSession,
     /// Switch to a persisted session.
@@ -62,7 +66,10 @@ pub enum Command {
         scope: String,
     },
     /// Remove one setting from `scope`, so the default (or the other scope) applies again.
-    ResetSetting { key: String, scope: String },
+    ResetSetting {
+        key: String,
+        scope: String,
+    },
     /// Reload the saved settings into the running session.
     ApplySettings,
     /// Replace the view with an authoritative snapshot after lost events.
@@ -72,7 +79,10 @@ pub enum Command {
     /// Load the models `SetModel` accepts.
     ListModels,
     /// Switch this session's model.
-    SetModel { provider: String, model_id: String },
+    SetModel {
+        provider: String,
+        model_id: String,
+    },
     /// Set the reasoning level; `default` restores the model's default.
     SetThinking(String),
     /// Set the approval mode: `ask`, `write`, `auto` or `readonly`.
@@ -89,7 +99,10 @@ pub enum Command {
     /// Rename the active session.
     Rename(String),
     /// Pin or unpin a session of this project.
-    PinSession { session_id: String, pinned: bool },
+    PinSession {
+        session_id: String,
+        pinned: bool,
+    },
     /// Copy a session of this project into a new one and switch to the copy.
     ForkSession(String),
     /// Write the active session as Markdown to `path`, relative to the project root.
@@ -198,6 +211,11 @@ impl Command {
                 Purpose::Sessions,
                 "list_sessions",
                 json!({ "limit": SESSION_PAGE }),
+            ),
+            Self::ListSessionsPage { offset, .. } => (
+                Purpose::Sessions,
+                "list_sessions",
+                json!({ "limit": SESSION_PAGE, "offset": offset }),
             ),
             Self::NewSession => (Purpose::NewSession, "new_session", json!({})),
             Self::Resume(id) => (Purpose::Resume, "resume", json!({ "session_id": id })),
@@ -347,7 +365,14 @@ impl Engine {
 
     /// Queue a command. Dropped silently once the worker has ended; the model already shows that.
     pub fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+        let _ = self.enqueue(command);
+    }
+
+    /// Report when the worker is no longer available to accept a user draft.
+    pub fn enqueue(&self, command: Command) -> Result<(), String> {
+        self.commands
+            .send(command)
+            .map_err(|_| "Dial has stopped".into())
     }
 
     /// Updates queued since the last call.

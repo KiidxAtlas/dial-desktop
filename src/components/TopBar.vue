@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
 import { openMenu, ui } from "../ui";
 import { finishRename, openSession, sessionItems } from "../sessionActions";
+import { conversationFindOpen } from "../commands";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
@@ -65,6 +66,17 @@ function more(event: MouseEvent) {
     <h1 v-else class="truncate" data-tauri-drag-region>{{ snap.title }}</h1>
     <span v-if="snap.connection.state === 'preview'" class="pill" data-tauri-drag-region>Preview</span>
     <div class="spacer" data-tauri-drag-region />
+    <button
+      v-if="snap.entries.length"
+      class="icon-btn"
+      title="Find in conversation (⌘F)"
+      aria-label="Find in conversation"
+      :aria-expanded="conversationFindOpen"
+      :class="{ on: conversationFindOpen }"
+      @click="conversationFindOpen = !conversationFindOpen"
+    >
+      <Icon name="search" :size="16" />
+    </button>
     <button
       class="icon-btn"
       :class="{ on: ui.inspectorOpen }"

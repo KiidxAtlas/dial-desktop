@@ -10,14 +10,18 @@
 //! or reconnecting after the engine stopped, replaces them without restarting the app.
 
 use crate::attachments::{self, ImageFile};
+use crate::browser::{self, Browser};
 use crate::cli::Preview;
 use crate::engine::{self, APPROVAL_MODES, Command, Engine};
-use crate::launcher::Recents;
+use crate::files::{self, DiffView, DirEntryView, FileView};
+use crate::launcher::{self, Recents};
 use crate::model::{Answer, Model, Reply};
 use crate::preview;
 use crate::settings::{self, SettingsView};
 use crate::tabs::{Route, Tab, Tabs};
+use crate::terminal::{self, Terminals};
 use crate::time;
+use crate::updates;
 use crate::view::{ModelOptionView, Snapshot, Workspace};
 use dial_client::{Diagnostics, Launch};
 use std::ffi::OsString;
@@ -59,6 +63,11 @@ struct Shared {
     home: Option<String>,
     /// Wakes the pump; every engine gets a clone.
     wake: Mutex<Sender<()>>,
+    /// The Terminal panel's shells, all running in the open workspace.
+    terminals: Mutex<Terminals>,
+    /// The engine installed from the app after none was found; used instead of the launch
+    /// choice from then on.
+    installed: Mutex<Option<PathBuf>>,
 }
 
 impl Shared {
@@ -68,6 +77,21 @@ impl Shared {
 
     fn workspace(&self, path: &Path) -> Workspace {
         Workspace::new(&path.to_string_lossy(), self.home.as_deref())
+    }
+
+    /// The open workspace's folder.
+    fn root(&self) -> Result<PathBuf, String> {
+        self.lock()
+            .workspace
+            .as_ref()
+            .map(|w| PathBuf::from(&w.root))
+            .ok_or_else(|| "Open a folder first".to_owned())
+    }
+
+    fn terminals(&self) -> MutexGuard<'_, Terminals> {
+        self.terminals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Run in `path` from now on: a fresh engine there (or the preview), remembered as recent.
@@ -83,14 +107,30 @@ impl Shared {
         inner.workspace = Some(workspace);
         drop(inner);
         retire(old.into_tabs());
+        // Shells run in the folder that was open; the panel starts fresh ones here.
+        self.terminals().close_all();
         self.poke();
+    }
+
+    /// The engine binary in use; `None` in the design preview.
+    fn program(&self) -> Option<PathBuf> {
+        let Source::Engine { program, .. } = &self.source else {
+            return None;
+        };
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Some(installed.unwrap_or_else(|| program.clone()))
     }
 
     /// A new engine in `path`; `None` in the design preview.
     fn spawn(&self, path: &Path) -> Option<Engine> {
-        let Source::Engine { program, args } = &self.source else {
+        let Source::Engine { args, .. } = &self.source else {
             return None;
         };
+        let program = self.program()?;
         let wake = self
             .wake
             .lock()
@@ -100,7 +140,7 @@ impl Shared {
             let _ = wake.send(());
         });
         // A person answers this client, so the engine may ask questions.
-        let launch = Launch::new(program)
+        let launch = Launch::new(&program)
             .args(args.iter().cloned())
             .current_dir(path)
             .diagnostics(Diagnostics::Inherit)
@@ -330,10 +370,87 @@ fn reconnect(shared: State<'_, Shared>) -> Result<(), String> {
     Ok(())
 }
 
+/// The engine binary, or why there is none (the design preview).
+fn engine_program(shared: &Shared) -> Result<PathBuf, String> {
+    shared
+        .program()
+        .ok_or_else(|| "The design preview has no engine".to_owned())
+}
+
+/// Ask the engine whether a newer Dial release exists (`dial update --check --json`).
+#[tauri::command]
+async fn engine_update_check(
+    shared: State<'_, Shared>,
+) -> Result<updates::EngineUpdateView, String> {
+    let program = engine_program(&shared)?;
+    tauri::async_runtime::spawn_blocking(move || updates::check_engine(&program))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Update the engine the way it was installed (`dial update`). Running engines keep the old
+/// version until they are reconnected; the UI decides when.
+#[tauri::command]
+async fn engine_update(shared: State<'_, Shared>) -> Result<String, String> {
+    let program = engine_program(&shared)?;
+    tauri::async_runtime::spawn_blocking(move || updates::update_engine(&program))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Install the engine with Dial's signed release installer, then connect to it.
+#[tauri::command]
+async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
+    engine_program(&shared)?;
+    let log = tauri::async_runtime::spawn_blocking(updates::install_engine)
+        .await
+        .map_err(|error| error.to_string())??;
+    let home = shared.home.as_deref().map(Path::new);
+    let found = launcher::find_dial(None, std::env::var_os("PATH").as_deref(), home);
+    if !found.is_file() {
+        return Err(format!(
+            "The installer finished but no Dial engine was found in the usual folders.\n{log}"
+        ));
+    }
+    *shared
+        .installed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(found);
+    let root = shared
+        .lock()
+        .workspace
+        .as_ref()
+        .map(|w| PathBuf::from(&w.root));
+    if let Some(root) = root {
+        shared.open(&root);
+    }
+    Ok(log)
+}
+
+/// Whether this build checks for app updates: only release builds that embed the update key.
+#[tauri::command]
+fn app_updates_enabled() -> bool {
+    updates::UPDATER_PUBKEY.is_some_and(|key| !key.is_empty()) && !cfg!(debug_assertions)
+}
+
+fn check_session(
+    inner: &Inner,
+    workspace_root: &str,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root)
+        || inner.tabs.active().model.conversation.session_id() != session_id
+    {
+        return Err("The active session changed; try again from that session".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn send_prompt(
-    app: AppHandle,
     shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: Option<String>,
     text: String,
     images: Vec<String>,
     inline_images: Vec<String>,
@@ -343,16 +460,20 @@ fn send_prompt(
         return Err("The prompt is empty".into());
     }
     attachments::check(&images, &inline_images)?;
-    request(
-        &app,
-        &shared,
-        Command::Send {
+    let inner = shared.lock();
+    check_session(&inner, &workspace_root, session_id.as_deref())?;
+    let tab = inner.tabs.active();
+    if !tab.model.can_send() {
+        return Err("Dial is not ready to accept a prompt".into());
+    }
+    tab.engine
+        .as_ref()
+        .ok_or("Dial is not connected")?
+        .enqueue(Command::Send {
             text: text.to_owned(),
             images,
             inline_images,
-        },
-    );
-    Ok(())
+        })
 }
 
 /// Check an image chosen or dropped by the user and return its preview. Async, so reading a
@@ -524,22 +645,37 @@ fn export_session(app: AppHandle, shared: State<'_, Shared>, path: String) -> Re
 
 /// Undo the last turn of the session on screen, files included.
 #[tauri::command]
-fn undo_turn(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
+fn undo_turn(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
     let inner = shared.lock();
+    check_session(&inner, &workspace_root, session_id.as_deref())?;
     let tab = inner.tabs.active();
     let command = tab.model.undo()?;
-    dispatch(&app, tab.engine.as_ref(), vec![command]);
-    Ok(())
+    tab.engine
+        .as_ref()
+        .ok_or("Dial is not connected")?
+        .enqueue(command)
 }
 
 /// Add guidance to the turn running in the session on screen.
 #[tauri::command]
-fn steer(app: AppHandle, shared: State<'_, Shared>, text: String) -> Result<(), String> {
+fn steer(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: Option<String>,
+    text: String,
+) -> Result<(), String> {
     let inner = shared.lock();
+    check_session(&inner, &workspace_root, session_id.as_deref())?;
     let tab = inner.tabs.active();
     let command = tab.model.steer(&text)?;
-    dispatch(&app, tab.engine.as_ref(), vec![command]);
-    Ok(())
+    tab.engine
+        .as_ref()
+        .ok_or("Dial is not connected")?
+        .enqueue(command)
 }
 
 /// Send the last unanswered prompt of the session on screen again.
@@ -618,6 +754,55 @@ fn answer_question(
     Ok(())
 }
 
+/// The entries of folder `path` in the workspace (`""` for its root).
+#[tauri::command]
+async fn list_dir(shared: State<'_, Shared>, path: String) -> Result<Vec<DirEntryView>, String> {
+    files::list(&shared.root()?, &path)
+}
+
+/// File `path` in the workspace, for the viewer.
+#[tauri::command]
+async fn read_file(shared: State<'_, Shared>, path: String) -> Result<FileView, String> {
+    files::read(&shared.root()?, &path)
+}
+
+/// The uncommitted changes of file `path` in the workspace.
+#[tauri::command]
+async fn file_diff(shared: State<'_, Shared>, path: String) -> Result<DiffView, String> {
+    files::diff(&shared.root()?, &path)
+}
+
+/// Start a shell in the workspace; its output follows as `terminal` events.
+#[tauri::command]
+fn terminal_open(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    cols: u16,
+    rows: u16,
+) -> Result<u32, String> {
+    let root = shared.root()?;
+    shared
+        .terminals()
+        .open(terminal::login_shell(&root), cols, rows, move |event| {
+            let _ = app.emit("terminal", event);
+        })
+}
+
+#[tauri::command]
+fn terminal_write(shared: State<'_, Shared>, id: u32, data: String) -> Result<(), String> {
+    shared.terminals().write(id, &data)
+}
+
+#[tauri::command]
+fn terminal_resize(shared: State<'_, Shared>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    shared.terminals().resize(id, cols, rows)
+}
+
+#[tauri::command]
+fn terminal_close(shared: State<'_, Shared>, id: u32) {
+    shared.terminals().close(id);
+}
+
 /// Open the window and run until it closes. With no `workspace` the UI asks for a folder.
 pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> tauri::Result<()> {
     let home = std::env::var("HOME")
@@ -626,8 +811,14 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
 
     let app = tauri::Builder::default()
         // Links in answers open in the system browser, never in the app window.
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // The app's own signed updates; checked only when `app_updates_enabled`.
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updates::UPDATER_PUBKEY.unwrap_or_default())
+                .build(),
+        )
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             snapshot,
             models,
@@ -637,6 +828,10 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             recent_workspaces,
             open_workspace,
             reconnect,
+            engine_update_check,
+            engine_update,
+            engine_install,
+            app_updates_enabled,
             send_prompt,
             read_image,
             approve,
@@ -658,7 +853,21 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             set_thinking,
             set_approval,
             question_presented,
-            answer_question
+            answer_question,
+            list_dir,
+            read_file,
+            file_diff,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            browser::browser_show,
+            browser::browser_bounds,
+            browser::browser_hide,
+            browser::browser_navigate,
+            browser::browser_go,
+            browser::browser_inspect,
+            browser::browser_state
         ])
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
@@ -671,7 +880,10 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 source,
                 home,
                 wake: Mutex::new(wake_tx),
+                terminals: Mutex::new(Terminals::default()),
+                installed: Mutex::new(None),
             });
+            app.manage(Browser::default());
             if let Some(path) = workspace {
                 app.state::<Shared>().open(&path);
             }
@@ -699,6 +911,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         if let RunEvent::Exit = event
             && let Some(shared) = app.try_state::<Shared>()
         {
+            shared.terminals().close_all();
             // Shut every engine down gracefully (bounded, in parallel) before the process ends.
             let empty = Tabs::new(Tab::new(Model::default(), None));
             let tabs = std::mem::replace(&mut shared.lock().tabs, empty);

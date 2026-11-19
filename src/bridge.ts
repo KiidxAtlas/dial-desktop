@@ -1,19 +1,30 @@
 // The only place the UI talks to the Rust side.
 
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { ref, shallowRef } from "vue";
 import type {
   Answer,
   ApprovalMode,
   Attachment,
+  Bounds,
+  BrowserState,
   Decision,
+  DiffView,
+  EngineUpdateView,
+  DirEntry,
+  FileView,
   ModelOption,
+  PageInfo,
   SettingScope,
   SettingsPage,
   Snapshot,
+  TerminalEvent,
   Workspace,
 } from "./types";
 
@@ -81,15 +92,17 @@ export async function connect() {
 async function call(command: string, args?: Record<string, unknown>) {
   try {
     await invoke(command, args);
+    return true;
   } catch (error) {
     showToast(String(error));
+    return false;
   }
 }
 
 export const engine = {
-  send: (text: string, attachments: Attachment[] = []) =>
+  send: (text: string, attachments: Attachment[], scope: { workspaceRoot: string; sessionId: string | null }) =>
     call("send_prompt", {
-      text,
+      ...scope, text,
       images: attachments.flatMap((a) => (a.path ? [a.path] : [])),
       inlineImages: attachments.flatMap((a) => (a.data ? [a.data] : [])),
     }),
@@ -135,15 +148,18 @@ export const engine = {
   },
   /** Undo the last turn, files included, after the user confirms; resolves to whether it was sent. */
   async undoTurn(): Promise<boolean> {
+    const current = snapshot.value;
+    if (!current?.workspace) return false;
+    const { sessionId } = current;
+    const workspaceRoot = current.workspace.root;
     const confirmed = await ask(
       "Dial restores the files the last turn changed and removes that prompt and its answer from the conversation.",
       { title: "Undo the last turn?", kind: "warning", okLabel: "Undo", cancelLabel: "Cancel" },
     ).catch(() => false);
-    if (confirmed) await call("undo_turn");
-    return confirmed;
+    return confirmed && await call("undo_turn", { workspaceRoot, sessionId });
   },
   /** Add guidance to the running turn; Dial reads it at its next step. */
-  steer: (text: string) => call("steer", { text }),
+  steer: (text: string, scope: { workspaceRoot: string; sessionId: string | null }) => call("steer", { ...scope, text }),
   /** Send the last prompt again after its turn failed. */
   retryTurn: () => call("retry_turn"),
   /** Summarize the conversation so far to free context. */
@@ -225,4 +241,67 @@ export const settings = {
   },
   save: (key: string, value: unknown, scope: SettingScope) => call("save_setting", { key, value, scope }),
   reset: (key: string, scope: SettingScope) => call("reset_setting", { key, scope }),
+};
+
+/** The open project's files, for the Files and Changes panels. Calls throw a readable message. */
+export const workspaceFiles = {
+  /** Folder `path` relative to the project; `""` is its root. */
+  list: (path: string) => invoke<DirEntry[]>("list_dir", { path }),
+  read: (path: string) => invoke<FileView>("read_file", { path }),
+  /** Uncommitted changes of `path` (relative or absolute inside the project). */
+  diff: (path: string) => invoke<DiffView>("file_diff", { path }),
+};
+
+/** The integrated browser (a native webview laid over the Browser panel). Calls throw. */
+export const browserApi = {
+  /** Show it at `bounds`, creating it on first use; opens `url` when given. */
+  show: (bounds: Bounds, url?: string) => invoke<BrowserState>("browser_show", { bounds, url: url ?? null }),
+  bounds: (bounds: Bounds) => invoke<void>("browser_bounds", { bounds }),
+  hide: () => invoke<void>("browser_hide"),
+  /** Open an address or a search; resolves to the URL opened. */
+  navigate: (url: string) => invoke<string>("browser_navigate", { url }),
+  go: (action: "back" | "forward" | "reload" | "stop") => invoke<void>("browser_go", { action }),
+  /** The page's address, title, selection, text and logged errors. */
+  inspect: () => invoke<PageInfo>("browser_inspect"),
+  state: () => invoke<BrowserState>("browser_state"),
+  onState: (handler: (state: BrowserState) => void) => listen<BrowserState>("browser", (e) => handler(e.payload)),
+};
+
+/** Shells for the Terminal panel, running in the project folder. Calls throw. */
+export const terminalApi = {
+  open: (cols: number, rows: number) => invoke<number>("terminal_open", { cols, rows }),
+  write: (id: number, data: string) => invoke<void>("terminal_write", { id, data }),
+  resize: (id: number, cols: number, rows: number) => invoke<void>("terminal_resize", { id, cols, rows }),
+  close: (id: number) => invoke<void>("terminal_close", { id }),
+  onEvent: (handler: (event: TerminalEvent) => void) => listen<TerminalEvent>("terminal", (e) => handler(e.payload)),
+};
+
+/**
+ * Keeping Dial current (`src-tauri/src/updates.rs`). The engine updates itself through `dial
+ * update`; the app through its signed updater. Calls throw a readable message.
+ */
+export const updatesApi = {
+  /** Whether this build checks for app updates (release builds with the update key only). */
+  appEnabled: () => invoke<boolean>("app_updates_enabled"),
+  appVersion: () => getVersion(),
+  /** The newer signed app release, or `null` when this one is current. */
+  checkApp: (): Promise<Update | null> => checkAppUpdate(),
+  /** Download, verify and install `update`, reporting progress as 0..1, then restart into it. */
+  async installApp(update: Update, progress: (fraction: number | null) => void) {
+    let total = 0;
+    let done = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") total = event.data.contentLength ?? 0;
+      else if (event.event === "Progress") {
+        done += event.data.chunkLength;
+        progress(total ? Math.min(done / total, 1) : null);
+      }
+    });
+    await relaunch();
+  },
+  checkEngine: () => invoke<EngineUpdateView>("engine_update_check"),
+  /** Run `dial update`; resolves to its output. */
+  updateEngine: () => invoke<string>("engine_update"),
+  /** Install the engine with Dial's signed installer and connect to it; resolves to its output. */
+  installEngine: () => invoke<string>("engine_install"),
 };

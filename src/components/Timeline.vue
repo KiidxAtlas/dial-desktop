@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { conversationFindOpen } from "../commands";
 import type { OpenSnapshot } from "../types";
 import { toggle, ui } from "../ui";
 import { engine } from "../bridge";
@@ -14,6 +15,62 @@ const props = defineProps<{ snap: OpenSnapshot }>();
 const scroller = ref<HTMLElement | null>(null);
 /** Follow new output only while the reader is at the bottom. */
 const pinned = ref(true);
+const searchInput = ref<HTMLInputElement | null>(null);
+const query = ref("");
+const activeMatch = ref(-1);
+const matches = computed(() => {
+  const term = query.value.trim().toLowerCase();
+  if (!conversationFindOpen.value || !term) return [];
+  return props.snap.entries.flatMap((entry, index) => {
+    const text = entry.kind === "tool" ? `${entry.label} ${entry.target}`
+      : entry.kind === "notice" || entry.kind === "error" ? entry.message
+      : entry.text;
+    return text.toLowerCase().includes(term) ? [index] : [];
+  });
+});
+const matchNumber = computed(() => matches.value.indexOf(activeMatch.value) + 1);
+
+function showMatch(index: number) {
+  activeMatch.value = index;
+  if (index < 0) return;
+  pinned.value = false;
+  scroller.value?.querySelector(`[data-entry="${index}"]`)?.scrollIntoView({ block: "center" });
+}
+
+function stepMatch(step: number) {
+  const list = matches.value;
+  if (list.length) showMatch(list[(matchNumber.value - 1 + step + list.length) % list.length]);
+}
+
+function closeFind() {
+  conversationFindOpen.value = false;
+  if (searchInput.value?.parentElement?.contains(document.activeElement)) scroller.value?.focus({ preventScroll: true });
+  onScroll();
+}
+
+function findKey(event: KeyboardEvent) {
+  if (event.defaultPrevented || event.isComposing || ui.settingsOpen || ui.menu || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen) return;
+  if (event.target instanceof Element && event.target.closest(".xterm")) return;
+  if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f" && !empty.value) {
+    event.preventDefault();
+    conversationFindOpen.value = true;
+    nextTick(() => { searchInput.value?.focus(); searchInput.value?.select(); });
+  }
+}
+
+onMounted(() => window.addEventListener("keydown", findKey));
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", findKey);
+  conversationFindOpen.value = false;
+});
+watch(searchInput, (el) => el?.focus());
+watch(query, async () => {
+  await nextTick();
+  showMatch(matches.value[0] ?? -1);
+});
+watch(matches, (list) => {
+  if (!list.includes(activeMatch.value)) showMatch(list[0] ?? -1);
+}, { flush: "post" });
 
 const empty = computed(() => props.snap.entries.length === 0 && !props.snap.turnRunning);
 const streaming = computed(() => {
@@ -82,14 +139,20 @@ watch(
     if (!pinned.value) return;
     await nextTick();
     const el = scroller.value;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && pinned.value && !matches.value.length) el.scrollTop = el.scrollHeight;
   },
   { flush: "post" },
 );
 
 watch(
-  () => props.snap.sessionId,
-  () => (pinned.value = true),
+  () => [props.snap.workspace.root, props.snap.sessionId],
+  ([root, id], [wasRoot, wasId]) => {
+    if (root === wasRoot && id === wasId) return;
+    conversationFindOpen.value = false;
+    query.value = "";
+    activeMatch.value = -1;
+    pinned.value = true;
+  },
 );
 
 function reasoningOpen(index: number, streamingAnswer: boolean, text: string) {
@@ -106,10 +169,21 @@ function gap(index: number) {
 
 <template>
   <EmptyState v-if="empty" :snap="snap" />
-  <div v-else ref="scroller" class="scroller" @scroll.passive="onScroll">
+  <div v-if="conversationFindOpen && !empty" class="find-bar" @keydown.esc.stop.prevent="closeFind">
+    <Icon name="search" :size="15" />
+    <input
+      ref="searchInput" v-model="query" placeholder="Find in conversation" aria-label="Find in conversation"
+      @keydown.enter.prevent="stepMatch($event.shiftKey ? -1 : 1)"
+    />
+    <span class="match-count" role="status">{{ query.trim() ? (matches.length ? `${matchNumber} of ${matches.length}` : 'No matches') : '' }}</span>
+    <button aria-label="Previous matching message" title="Previous matching message" :disabled="!matches.length" @click="stepMatch(-1)"><Icon name="arrowUp" :size="14" /></button>
+    <button aria-label="Next matching message" title="Next matching message" :disabled="!matches.length" @click="stepMatch(1)"><Icon name="arrowDown" :size="14" /></button>
+    <button aria-label="Close conversation search" title="Close conversation search" @click="closeFind"><Icon name="cross" :size="14" /></button>
+  </div>
+  <div v-if="!empty" ref="scroller" class="scroller" tabindex="-1" @scroll.passive="onScroll">
     <div class="column">
       <template v-for="(entry, index) in snap.entries" :key="entry.kind === 'tool' ? entry.key : index">
-        <div class="row" :class="[`k-${entry.kind}`, gap(index)]">
+        <div class="row" :class="[`k-${entry.kind}`, gap(index), { 'current-match': matches.length && index === activeMatch }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
             <div class="bubble">
               <div class="user-text">{{ entry.text }}</div>
@@ -182,7 +256,7 @@ function gap(index: number) {
         <span class="shimmer">Working…</span>
         <span class="hint">({{ elapsedLabel }} · esc to interrupt)</span>
       </div>
-      <div v-if="!pinned" class="jump">
+      <div v-if="!pinned && !matches.length" class="jump">
         <button title="Jump to the latest message" aria-label="Jump to the latest message" @click="jumpToEnd">
           <Icon name="arrowDown" :size="16" />
         </button>
@@ -192,6 +266,36 @@ function gap(index: number) {
 </template>
 
 <style scoped>
+.find-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0 var(--space-xl);
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--glass);
+  color: var(--text-muted);
+}
+.find-bar input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  font: inherit;
+}
+.match-count { font-size: 12px; white-space: nowrap; }
+.find-bar button { display: grid; place-items: center; width: 25px; height: 25px; border-radius: var(--radius-sm); }
+.find-bar button:hover:not(:disabled) { background: var(--hover); }
+.find-bar button:disabled { opacity: 0.4; }
+.row.current-match {
+  outline: 1px solid var(--accent);
+  outline-offset: 5px;
+  border-radius: var(--radius-sm);
+}
 .scroller {
   flex: 1;
   overflow-y: auto;

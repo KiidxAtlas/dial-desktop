@@ -7,6 +7,7 @@ import Icon from "./Icon.vue";
 import SettingRow from "./SettingRow.vue";
 import BackgroundSettings from "./BackgroundSettings.vue";
 import AppearanceSettings from "./AppearanceSettings.vue";
+import UpdatesSettings from "./UpdatesSettings.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -20,7 +21,9 @@ const body = ref<HTMLElement | null>(null);
 
 const live = computed(() => props.snap.connection.state === "live");
 /** The desktop app's own tabs, which work without an engine; `null` while an engine tab shows. */
-const appTab = ref<"appearance" | "background" | null>(live.value ? null : "appearance");
+const appTab = ref<"appearance" | "background" | "updates" | null>(
+  ui.settingsTab === "updates" ? "updates" : live.value ? null : "appearance",
+);
 
 onMounted(() => settings.load());
 // The search box appears once the page has loaded; typing goes straight to it.
@@ -74,7 +77,7 @@ function pick(t: string) {
   nextTick(() => body.value?.scrollTo({ top: 0 }));
 }
 
-function pickApp(which: "appearance" | "background") {
+function pickApp(which: "appearance" | "background" | "updates") {
   appTab.value = which;
   query.value = "";
   changedOnly.value = false;
@@ -83,6 +86,7 @@ function pickApp(which: "appearance" | "background") {
 
 function close() {
   ui.settingsOpen = false;
+  ui.settingsTab = "";
 }
 </script>
 
@@ -108,6 +112,9 @@ function close() {
         <button class="tab" :class="{ active: appTab === 'background' && !across }" @click="pickApp('background')">
           <span class="truncate">Background</span>
         </button>
+        <button class="tab" :class="{ active: appTab === 'updates' && !across }" @click="pickApp('updates')">
+          <span class="truncate">Updates</span>
+        </button>
         <div class="group-label">Engine</div>
         <button
           v-for="t in page?.tabs ?? []"
@@ -125,7 +132,8 @@ function close() {
       <div ref="body" class="body">
         <div v-if="appTab && !across" class="content">
           <AppearanceSettings v-if="appTab === 'appearance'" />
-          <BackgroundSettings v-else />
+          <BackgroundSettings v-else-if="appTab === 'background'" />
+          <UpdatesSettings v-else />
         </div>
 
         <div v-else-if="!page" class="state">

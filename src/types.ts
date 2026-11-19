@@ -4,8 +4,30 @@ export type Connection =
   | { state: "starting" }
   | { state: "live"; model: string; engineVersion: string | null }
   | { state: "preview" }
-  | { state: "failed"; error: string }
+  | { state: "failed"; error: string; problem: EngineProblem }
   | { state: "ended" };
+
+/** What the UI can offer for a failed connection; mirrors `updates::EngineProblem`. */
+export type EngineProblem = "missing" | "incompatible" | "other";
+
+/** `dial update --check --json`, as the engine reports it (`updates::EngineStatus`). */
+export interface EngineStatus {
+  current: string;
+  latest: string | null;
+  update_available: boolean;
+  installation: string;
+  method: string;
+  can_update: boolean;
+  update_command: string;
+  error: string | null;
+}
+
+/** Mirrors `updates::EngineUpdateView`. */
+export type EngineUpdateView =
+  | { state: "checked"; status: EngineStatus }
+  | { state: "unsupported"; detail: string }
+  | { state: "missing"; error: string }
+  | { state: "failed"; error: string };
 
 export interface Workspace {
   root: string;
@@ -220,3 +242,51 @@ export interface SettingsPage {
 
 /** Where a setting is saved: for every project, or this one only. */
 export type SettingScope = "global" | "project";
+
+// The workspace panels (files.rs, browser.rs, terminal.rs).
+
+export interface DirEntry {
+  name: string;
+  /** Relative to the workspace, `/`-separated. */
+  path: string;
+  dir: boolean;
+}
+
+export interface FileView {
+  path: string;
+  /** `null` for binary files. */
+  text: string | null;
+  size: number;
+  truncated: boolean;
+}
+
+export interface DiffView {
+  path: string;
+  /** Unified diff; empty without uncommitted changes. */
+  diff: string;
+  untracked: boolean;
+}
+
+/** Where the browser panel sits, in logical window pixels. */
+export interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserState {
+  url: string;
+  title: string;
+  loading: boolean;
+}
+
+export interface PageInfo {
+  url: string;
+  title: string;
+  selection: string;
+  text: string;
+  errors: string[];
+}
+
+export type TerminalEvent = { kind: "data"; id: number; data: string } | { kind: "exit"; id: number };

@@ -51,7 +51,7 @@ function done(item: QuestionItem) {
 
 const canSubmit = computed(() => answerable.value && !sent.value && props.question.items.every(done));
 
-function submit() {
+async function submit() {
   if (!canSubmit.value) return;
   const answers: Answer[] = props.question.items.map((item) => {
     const pick = picks[item.id];
@@ -59,13 +59,15 @@ function submit() {
     return { id: item.id, selected: pick.selected, custom: custom || null };
   });
   sent.value = true;
-  engine.answerQuestion(props.question.id, answers);
+  const id = props.question.id;
+  if (!(await engine.answerQuestion(id, answers)) && props.question.id === id) sent.value = false;
 }
 
-function skip() {
+async function skip() {
   if (!answerable.value || sent.value) return;
   sent.value = true;
-  engine.skipQuestion(props.question.id);
+  const id = props.question.id;
+  if (!(await engine.skipQuestion(id)) && props.question.id === id) sent.value = false;
 }
 
 function onKey(event: KeyboardEvent) {
@@ -120,6 +122,7 @@ function onKey(event: KeyboardEvent) {
             class="custom"
             type="text"
             :disabled="sent"
+            :aria-label="item.text"
             :placeholder="item.options.length ? 'Or type your own answer…' : 'Type your answer…'"
             @keydown="onKey"
           />

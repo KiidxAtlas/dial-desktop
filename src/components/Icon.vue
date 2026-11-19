@@ -43,6 +43,15 @@ export const PATHS = {
   minus: "M5 12h14",
   chat: "M5 5h14v10H9l-4 4z",
   compress: "M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5",
+  globe: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18",
+  arrowLeft: "M19 12H5M11 6l-6 6 6 6",
+  arrowRight: "M5 12h14M13 6l6 6-6 6",
+  list: "M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01",
+  diff: "M12 3v10M7 8h10M7 19h10",
+  activity: "M3 12h4l3-8 4 16 3-8h4",
+  external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+  send: "M4 12l16-8-6 16-2-7z",
+  files: "M4 4h6l2 2h8v4M4 4v14h7M14 13h6v7h-6z",
 } as const;
 </script>
 

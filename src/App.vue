@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted } from "vue";
+import { computed, onBeforeUnmount, onMounted, watch } from "vue";
 import { engine, snapshot } from "./bridge";
-import { ui } from "./ui";
+import { ui, type InspectorTab } from "./ui";
+import { showPanel, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -19,6 +20,8 @@ import Backdrop from "./components/Backdrop.vue";
 import ContextMenu from "./components/ContextMenu.vue";
 import Palette from "./components/Palette.vue";
 import Shortcuts from "./components/Shortcuts.vue";
+import UpdateBanner from "./components/UpdateBanner.vue";
+import { startUpdateChecks } from "./updates";
 
 const snap = computed(() => snapshot.value);
 /** The snapshot once a folder is open; until then the welcome screen shows. */
@@ -29,6 +32,15 @@ const empty = computed(() => !!opened.value && opened.value.entries.length === 0
 const showBackdrop = computed(
   () => hasBackground.value && (background.placement === "always" || empty.value),
 );
+
+// Dev servers Dial starts are offered in (or opened by) the browser panel.
+watch(opened, (s) => s && trackPreviews(s));
+
+/** Show panel `tab`, or close the inspector when it already shows it. */
+function togglePanel(tab: InspectorTab) {
+  if (ui.inspectorOpen && ui.inspectorTab === tab && !ui.settingsOpen) ui.inspectorOpen = false;
+  else showPanel(tab);
+}
 
 function onKey(event: KeyboardEvent) {
   const s = opened.value;
@@ -52,6 +64,15 @@ function onKey(event: KeyboardEvent) {
   } else if (command && event.altKey && !event.shiftKey && event.code === "KeyI") {
     event.preventDefault();
     ui.inspectorOpen = !ui.inspectorOpen;
+  } else if (command && event.shiftKey && !event.altKey && key === "b") {
+    event.preventDefault();
+    togglePanel("browser");
+  } else if (command && event.shiftKey && !event.altKey && key === "e") {
+    event.preventDefault();
+    togglePanel("files");
+  } else if (event.ctrlKey && !event.metaKey && !event.altKey && event.code === "Backquote") {
+    event.preventDefault();
+    togglePanel("terminal");
   } else if (command && !event.altKey && (key === "=" || key === "+")) {
     event.preventDefault();
     zoomBy(1);
@@ -84,6 +105,7 @@ function onKey(event: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener("keydown", onKey);
   restoreImage();
+  startUpdateChecks();
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 </script>
@@ -101,12 +123,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop }">
       <Backdrop v-if="showBackdrop" :dimmed="!empty" />
       <TopBar :snap="opened" />
+      <UpdateBanner />
       <Timeline :snap="opened" />
       <Composer :snap="opened" />
     </main>
     <Settings v-if="ui.settingsOpen" :snap="opened" />
     <Transition name="slide">
-      <Inspector v-if="ui.inspectorOpen && !ui.settingsOpen" :snap="opened" />
+      <Inspector v-show="ui.inspectorOpen && !ui.settingsOpen" :open="ui.inspectorOpen" :snap="opened" />
     </Transition>
   </div>
   <Welcome v-else-if="snap" />

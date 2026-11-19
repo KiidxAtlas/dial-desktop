@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { OpenSnapshot, Session, Workspace } from "../types";
 import { engine, folders } from "../bridge";
+import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
 import { finishRename, sessionItems, startRename } from "../sessionActions";
@@ -282,6 +283,22 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           <span class="truncate state" :class="status.tone"><i />{{ status.text }}</span>
         </span>
         <Icon name="chevronDown" :size="13" />
+      </button>
+      <button
+        v-if="snap.connection.state === 'failed' && snap.connection.problem === 'missing'"
+        class="btn btn-primary retry"
+        :disabled="!!updates.engineBusy"
+        @click="installEngine()"
+      >
+        <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}
+      </button>
+      <button
+        v-else-if="snap.connection.state === 'failed' && snap.connection.problem === 'incompatible'"
+        class="btn btn-primary retry"
+        :disabled="!!updates.engineBusy"
+        @click="updateEngine()"
+      >
+        <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}
       </button>
       <button v-if="status.retry" class="btn btn-secondary retry" @click="engine.reconnect()">
         <Icon name="refresh" :size="13" /> Reconnect

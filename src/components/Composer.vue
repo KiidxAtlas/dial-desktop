@@ -5,6 +5,7 @@ import type { Decision, OpenSnapshot } from "../types";
 import { engine, files, folders, showToast } from "../bridge";
 import * as attachments from "../attachments";
 import { ui } from "../ui";
+import { draftFor } from "../drafts";
 import { canCompact, canUndo, lastPrompt } from "../sessionActions";
 import Icon from "./Icon.vue";
 import ModelPicker from "./ModelPicker.vue";
@@ -14,6 +15,7 @@ import ContextMeter from "./ContextMeter.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
+const draft = computed(() => draftFor(props.snap));
 
 /** Slash commands handled in the app, as in a terminal agent. */
 const COMMANDS: { name: string; detail: string; run: () => void }[] = [
@@ -27,24 +29,27 @@ const COMMANDS: { name: string; detail: string; run: () => void }[] = [
 
 const approval = computed(() => props.snap.approvals[0] ?? null);
 const slash = computed(() => {
-  const text = ui.draft.trim();
-  if (!text.startsWith("/") || text.includes(" ")) return [];
+  const text = draft.value.text.trim();
+  if (draft.value.attachments.length || !/^\/\S*$/.test(text)) return [];
   return COMMANDS.filter((c) => c.name.startsWith(text.toLowerCase()) && available(c.name));
 });
 /** Slash commands that make sense right now. */
 function available(name: string) {
   if (name === "/compact") return canCompact(props.snap);
   if (name === "/undo") return props.snap.connection.state === "live" && canUndo(props.snap);
+  if (name === "/new" || name === "/clear") return props.snap.connection.state === "live";
   return true;
 }
 /** `false` only when the model is known not to take images; unknown models may try. */
 const imagesAllowed = computed(() => props.snap.model?.acceptsImages !== false);
-const hasContent = computed(() => ui.draft.trim().length > 0 || ui.attachments.length > 0);
+const hasContent = computed(() => !!draft.value.text.trim() || draft.value.attachments.length > 0);
 /** While a turn runs, typed text goes to it as guidance (images cannot). */
 const steering = computed(
-  () => props.snap.turnRunning && props.snap.connection.state === "live" && ui.draft.trim().length > 0 && !ui.attachments.length,
+  () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
 );
-const canSend = computed(() => slash.value.length > 0 || (props.snap.canSend && hasContent.value) || steering.value);
+const canSend = computed(() => !draft.value.sending && (slash.value.length === 1 || steering.value || (
+  props.snap.canSend && hasContent.value && (imagesAllowed.value || !draft.value.attachments.length)
+)));
 /** Files are being dragged over the window. */
 const dropping = ref(false);
 const caption = computed(() => {
@@ -57,6 +62,8 @@ const caption = computed(() => {
     case "preview":
       return "Design preview · prompts are not sent";
     case "failed":
+      if (c.problem === "missing") return "No Dial engine found; install it from the sidebar";
+      if (c.problem === "incompatible") return "This Dial engine is too old or too new for the app; update from the sidebar";
       return "The Dial engine could not start; see the status in the sidebar";
     case "ended":
       return "The Dial engine stopped; reconnect from the sidebar";
@@ -79,47 +86,48 @@ function focus() {
 }
 
 function runCommand(command: (typeof COMMANDS)[number]) {
-  ui.draft = "";
+  draft.value.text = "";
   command.run();
   if (command.name !== "/model") focus();
 }
 
-function send() {
-  const text = ui.draft.trim();
-  const exact = COMMANDS.find((c) => c.name === text.toLowerCase() && available(c.name));
-  const command = ui.attachments.length ? null : (exact ?? (slash.value.length === 1 ? slash.value[0] : null));
-  if (command) return runCommand(command);
-  if (props.snap.turnRunning) {
-    if (!steering.value) return;
-    engine.steer(text);
-    ui.draft = "";
-    return focus();
-  }
+async function send() {
+  const target = draft.value;
   if (!canSend.value) return;
-  if (ui.attachments.length && !imagesAllowed.value) {
-    showToast(`${props.snap.model?.label ?? "This model"} does not take images; remove them or switch models`);
-    return;
+  const original = target.text;
+  const text = original.trim();
+  if (slash.value.length === 1) return runCommand(slash.value[0]);
+  const images = [...target.attachments];
+  target.sending = true;
+  try {
+    const scope = { workspaceRoot: props.snap.workspace.root, sessionId: props.snap.sessionId };
+    const accepted = steering.value ? await engine.steer(text, scope) : await engine.send(text, images, scope);
+    if (!accepted) return;
+    if (target.text === original) target.text = "";
+    const sentKeys = new Set(images.map((a) => a.key));
+    target.attachments = target.attachments.filter((a) => !sentKeys.has(a.key));
+  } finally {
+    target.sending = false;
+    if (target === draft.value) focus();
   }
-  engine.send(text, attachments.take());
-  ui.draft = "";
-  focus();
 }
 
 async function chooseImages() {
+  const target = draft.value;
   try {
-    await attachments.addPaths(await files.chooseImages());
+    await attachments.addPaths(target, await files.chooseImages());
   } catch (error) {
     showToast(`Could not open the file picker: ${error}`);
   }
-  focus();
+  if (target === draft.value) focus();
 }
 
 /** Pasted images attach; pasted text is left to the textarea. */
 function onPaste(event: ClipboardEvent) {
   const images = [...(event.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
-  if (!images.length) return;
+  if (!images.length || !imagesAllowed.value) return;
   event.preventDefault();
-  attachments.addBlobs(images);
+  void attachments.addBlobs(draft.value, images);
 }
 
 // Files dropped anywhere on the window attach to the draft.
@@ -128,8 +136,13 @@ let unmounted = false;
 onMounted(async () => {
   const unlisten = await getCurrentWebview()
     .onDragDropEvent(({ payload }) => {
-      dropping.value = payload.type === "enter" || payload.type === "over";
-      if (payload.type === "drop" && payload.paths.length) attachments.addPaths(payload.paths).then(focus);
+      dropping.value = imagesAllowed.value && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
+      if (payload.type === "drop" && payload.paths.length && imagesAllowed.value && !ui.settingsOpen) {
+        const target = draft.value;
+        void attachments.addPaths(target, payload.paths).then(() => {
+          if (target === draft.value) focus();
+        });
+      }
     })
     .catch(() => null);
   if (unmounted) unlisten?.();
@@ -144,15 +157,15 @@ function onKey(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     send();
-  } else if (event.key === "Tab" && slash.value.length) {
+  } else if (event.key === "Tab" && !event.shiftKey && slash.value.length) {
     event.preventDefault();
-    ui.draft = slash.value[0].name;
-  } else if (event.key === "ArrowUp" && !ui.draft && !ui.attachments.length && !event.isComposing) {
+    draft.value.text = slash.value[0].name;
+  } else if (event.key === "ArrowUp" && !draft.value.text && !draft.value.attachments.length && !event.isComposing) {
     // Like a shell: an empty box recalls the last prompt.
     const previous = lastPrompt(props.snap);
     if (previous) {
       event.preventDefault();
-      ui.draft = previous;
+      draft.value.text = previous;
       nextTick(() => input.value?.setSelectionRange(previous.length, previous.length));
     }
   }
@@ -162,7 +175,7 @@ function decide(decision: Decision) {
   if (approval.value) engine.approve(approval.value.approvalId, decision);
 }
 
-watch(() => ui.draft, () => nextTick(resize));
+watch(() => draft.value.text, () => nextTick(resize));
 watch(() => ui.focusComposer, focus);
 onMounted(focus);
 </script>
@@ -204,20 +217,22 @@ onMounted(focus);
             </button>
           </div>
         </Transition>
-        <div v-if="ui.attachments.length" class="thumbs" @click.stop>
-          <div v-for="a in ui.attachments" :key="a.key" class="thumb" :title="a.name">
+        <div v-if="draft.attachments.length" class="thumbs" @click.stop>
+          <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
             <img :src="a.url" :alt="a.name" />
-            <button class="remove" :title="`Remove ${a.name}`" @click="attachments.remove(a.key)">
+            <button class="remove" :aria-label="`Remove ${a.name}`" :title="`Remove ${a.name}`" @click="draft.attachments = draft.attachments.filter((image) => image.key !== a.key)">
               <Icon name="cross" :size="11" />
             </button>
           </div>
         </div>
         <textarea
           ref="input"
-          v-model="ui.draft"
+          v-model="draft.text"
+          aria-label="Prompt"
           rows="2"
           spellcheck="true"
           :placeholder="snap.turnRunning ? 'Add a note for Dial while it works…' : 'How can I help you today?'"
+          :readonly="draft.sending"
           @keydown="onKey"
           @paste="onPaste"
         />
@@ -225,6 +240,7 @@ onMounted(focus);
           <button
             class="attach"
             :disabled="!imagesAllowed"
+            aria-label="Attach images"
             :title="imagesAllowed ? 'Attach images (or paste / drop them)' : `${snap.model?.label ?? 'This model'} does not take images`"
             @click="chooseImages"
           >
@@ -243,10 +259,11 @@ onMounted(focus);
             <Icon name="stop" :size="14" />
           </button>
           <button
-            v-else
+            v-if="!snap.turnRunning || steering"
             class="send"
             :disabled="!canSend"
-            title="Send (Enter)"
+            :title="snap.turnRunning ? 'Send note (Enter)' : 'Send (Enter)'"
+            :aria-label="snap.turnRunning ? 'Send note' : 'Send'"
             @click.stop="send"
           >
             <Icon name="arrowUp" :size="16" />

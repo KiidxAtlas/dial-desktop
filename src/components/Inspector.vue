@@ -1,16 +1,33 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, reactive, watch } from "vue";
 import type { OpenSnapshot, ToolEntry } from "../types";
 import { ui, type InspectorTab } from "../ui";
+import { inspectorWidth, setInspectorWidth } from "../workspace";
 import Icon from "./Icon.vue";
+import BrowserPane from "./workspace/BrowserPane.vue";
+import DiffPane from "./workspace/DiffPane.vue";
+import FilesPane from "./workspace/FilesPane.vue";
+import TerminalPane from "./workspace/TerminalPane.vue";
 
-const props = defineProps<{ snap: OpenSnapshot }>();
+const props = defineProps<{ snap: OpenSnapshot; open: boolean }>();
 
-const TABS: { id: InspectorTab; label: string }[] = [
-  { id: "plan", label: "Plan" },
-  { id: "changes", label: "Changes" },
-  { id: "activity", label: "Activity" },
+const TABS: { id: InspectorTab; label: string; icon: "list" | "diff" | "activity" | "files" | "terminal" | "globe" }[] = [
+  { id: "plan", label: "Plan", icon: "list" },
+  { id: "changes", label: "Changes", icon: "diff" },
+  { id: "activity", label: "Activity", icon: "activity" },
+  { id: "files", label: "Files", icon: "files" },
+  { id: "terminal", label: "Terminal", icon: "terminal" },
+  { id: "browser", label: "Browser", icon: "globe" },
 ];
+
+/** Heavy panels mount on first visit and stay mounted, so a shell or a page survives tab switches. */
+const visited = reactive(new Set<InspectorTab>());
+watch(
+  () => [ui.inspectorTab, props.open] as const,
+  ([tab, open]) => open && visited.add(tab),
+  { immediate: true },
+);
+const shown = (tab: InspectorTab) => props.open && !ui.settingsOpen && ui.inspectorTab === tab;
 
 const done = computed(() => props.snap.plan.filter((t) => t.status === "completed").length);
 const progress = computed(() => (props.snap.plan.length ? (done.value / props.snap.plan.length) * 100 : 0));
@@ -20,32 +37,68 @@ const tools = computed(() =>
     .reverse()
     .slice(0, 50),
 );
-const tabIndex = computed(() => TABS.findIndex((t) => t.id === ui.inspectorTab));
+const width = computed(() => inspectorWidth());
 
 function taskClass(status: string) {
   if (["abandoned", "cancelled", "blocked"].includes(status)) return "dropped";
   return status;
 }
+
+/** Drag the left edge to resize. */
+function startResize(event: PointerEvent) {
+  event.preventDefault();
+  const handle = event.currentTarget as HTMLElement;
+  handle.setPointerCapture(event.pointerId);
+  const move = (e: PointerEvent) => setInspectorWidth(window.innerWidth - e.clientX);
+  const stop = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", stop);
+    document.body.classList.remove("resizing");
+  };
+  document.body.classList.add("resizing");
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", stop);
+}
 </script>
 
 <template>
-  <aside class="inspector">
+  <aside class="inspector" :style="{ '--inspector-width': `${width}px` }">
+    <div class="resize" title="Drag to resize" @pointerdown="startResize" />
     <div class="drag" data-tauri-drag-region />
-    <div class="tabs" role="tablist" :style="{ '--i': tabIndex }">
-      <span class="thumb" />
+    <div class="tabs" role="tablist">
       <button
         v-for="tab in TABS"
         :key="tab.id"
         role="tab"
+        :title="tab.label"
+        :aria-label="tab.label"
         :aria-selected="ui.inspectorTab === tab.id"
         :class="{ active: ui.inspectorTab === tab.id }"
         @click="ui.inspectorTab = tab.id"
       >
-        {{ tab.label }}
+        <Icon :name="tab.icon" :size="14" />
+        <span v-if="ui.inspectorTab === tab.id">{{ tab.label }}</span>
+        <span v-else-if="tab.id === 'changes' && snap.changes.length" class="badge">{{ snap.changes.length }}</span>
+        <span v-else-if="tab.id === 'activity' && snap.stats.running" class="live" />
       </button>
     </div>
 
-    <div class="body">
+    <div v-show="['files', 'terminal', 'browser'].includes(ui.inspectorTab)" class="panel">
+      <FilesPane v-if="visited.has('files')" v-show="ui.inspectorTab === 'files'" :snap="snap" />
+      <TerminalPane
+        v-if="visited.has('terminal')"
+        v-show="ui.inspectorTab === 'terminal'"
+        :snap="snap"
+        :active="shown('terminal')"
+      />
+      <BrowserPane v-if="visited.has('browser')" v-show="ui.inspectorTab === 'browser'" :active="shown('browser')" />
+    </div>
+
+    <div v-if="ui.inspectorTab === 'changes' && ui.diffPath" class="panel">
+      <DiffPane :path="ui.diffPath" :root="snap.workspace.root" @back="ui.diffPath = null" />
+    </div>
+
+    <div v-else-if="['plan', 'changes', 'activity'].includes(ui.inspectorTab)" class="body">
       <!-- Plan -->
       <template v-if="ui.inspectorTab === 'plan'">
         <div v-if="!snap.plan.length" class="empty">
@@ -80,14 +133,22 @@ function taskClass(status: string) {
         <template v-else>
           <div class="head">
             <span class="section-label">{{ snap.changes.length }} files changed</span>
+            <span class="faint">Click for the diff</span>
           </div>
-          <div v-for="change in snap.changes" :key="change.path" class="file" :title="change.path">
+          <button
+            v-for="change in snap.changes"
+            :key="change.path"
+            class="file"
+            :title="change.path"
+            @click="ui.diffPath = change.path"
+          >
             <Icon name="file" :size="14" />
             <div class="file-text">
               <div class="mono truncate">{{ change.name }}</div>
               <div class="faint truncate">{{ change.dir || "./" }}</div>
             </div>
-          </div>
+            <Icon name="chevronRight" :size="13" />
+          </button>
         </template>
       </template>
 
@@ -124,6 +185,7 @@ function taskClass(status: string) {
 
 <style scoped>
 .inspector {
+  position: relative;
   width: var(--inspector-width);
   flex: none;
   display: flex;
@@ -131,6 +193,34 @@ function taskClass(status: string) {
   background: var(--sidebar);
   border-left: 1px solid var(--border);
   padding: 0 var(--space-lg) var(--space-md);
+  transition: width 160ms var(--ease);
+}
+:global(body.resizing) .inspector {
+  transition: none;
+}
+:global(body.resizing) {
+  cursor: col-resize;
+  user-select: none;
+}
+.resize {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 2;
+}
+.resize:hover {
+  background: var(--border-strong);
+}
+.panel {
+  flex: 1;
+  min-height: 0;
+  padding-top: var(--space-md);
+}
+.panel > * {
+  height: 100%;
 }
 .drag {
   height: 10px;
@@ -141,18 +231,19 @@ function taskClass(status: string) {
 }
 .tabs {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   height: 32px;
   flex: none;
 }
-.thumb {
-  display: none;
-}
 .tabs button {
-  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--text-faint);
+  white-space: nowrap;
   transition:
     background 120ms var(--ease),
     color 120ms var(--ease);
@@ -163,6 +254,17 @@ function taskClass(status: string) {
 .tabs button.active {
   background: var(--active);
   color: var(--text);
+}
+.badge {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.live {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
 }
 .body {
   flex: 1;
@@ -259,15 +361,18 @@ function taskClass(status: string) {
   display: flex;
   align-items: center;
   gap: 10px;
+  width: calc(100% + 16px);
   padding: 6px 8px;
   margin: 0 -8px;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
+  text-align: left;
 }
 .file:hover {
   background: var(--surface);
 }
 .file-text {
+  flex: 1;
   min-width: 0;
   color: var(--text);
   font-size: 13px;

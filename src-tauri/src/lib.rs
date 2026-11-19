@@ -7,12 +7,16 @@
 
 pub mod app;
 pub mod attachments;
+pub mod browser;
 pub mod cli;
 pub mod engine;
+pub mod files;
 pub mod launcher;
 pub mod model;
 pub mod preview;
 pub mod settings;
 pub mod tabs;
+pub mod terminal;
 pub mod time;
+pub mod updates;
 pub mod view;

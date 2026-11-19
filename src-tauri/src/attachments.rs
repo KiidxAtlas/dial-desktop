@@ -73,11 +73,27 @@ pub fn check(images: &[String], inline_images: &[String]) -> Result<(), String> 
     if let Some(path) = images.iter().find(|p| image_mime(Path::new(p)).is_none()) {
         return Err(format!("{path} is not a PNG, JPEG, GIF or WebP image"));
     }
-    if inline_images
-        .iter()
-        .any(|data| data.is_empty() || STANDARD.decode(data.trim()).is_err())
-    {
-        return Err("A pasted image could not be read".into());
+    for data in inline_images {
+        let data = data.trim();
+        if data.len() > (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4 {
+            return Err(pasted_image_too_large());
+        }
+        let bytes = STANDARD
+            .decode(data)
+            .map_err(|_| "A pasted image could not be read")?;
+        if bytes.is_empty() {
+            return Err("A pasted image could not be read".into());
+        }
+        if bytes.len() > MAX_IMAGE_BYTES as usize {
+            return Err(pasted_image_too_large());
+        }
     }
     Ok(())
+}
+
+fn pasted_image_too_large() -> String {
+    format!(
+        "Pasted images can be at most {} MB",
+        MAX_IMAGE_BYTES / (1024 * 1024)
+    )
 }

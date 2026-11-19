@@ -1,29 +1,34 @@
 // The draft's image attachments: chosen in the dialog, dropped on the window or pasted.
 
 import { files, showToast } from "./bridge";
-import { ui } from "./ui";
+import type { Draft } from "./drafts";
 
 /** Matches `MAX_IMAGES` in `src-tauri/src/attachments.rs`. */
 export const MAX_IMAGES = 10;
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/i;
+/** Matches `MAX_IMAGE_BYTES` in the desktop backend. */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 let next = 0;
 
-function room(): number {
-  const left = MAX_IMAGES - ui.attachments.length;
-  if (left <= 0) showToast(`Attach at most ${MAX_IMAGES} images to one prompt`);
-  return Math.max(left, 0);
+function hasRoom(draft: Draft): boolean {
+  if (draft.attachments.length < MAX_IMAGES) return true;
+  showToast(`Attach at most ${MAX_IMAGES} images to one prompt`);
+  return false;
 }
 
 /** Attach image files by path; other files are skipped with a message. */
-export async function addPaths(paths: string[]) {
-  const images = paths.filter((p) => IMAGE_FILE.test(p));
-  if (images.length < paths.length) showToast("Only PNG, JPEG, GIF and WebP images can be attached");
-  for (const path of images.slice(0, room())) {
-    if (ui.attachments.some((a) => a.path === path)) continue;
+export async function addPaths(draft: Draft, paths: string[]) {
+  const images = [...new Set(paths.filter((p) => IMAGE_FILE.test(p)))];
+  if (paths.some((p) => !IMAGE_FILE.test(p))) showToast("Only PNG, JPEG, GIF and WebP images can be attached");
+  for (const path of images) {
+    if (draft.attachments.some((a) => a.path === path)) continue;
+    if (!hasRoom(draft)) return;
     try {
       const image = await files.readImage(path);
-      if (room() === 0) return;
-      ui.attachments.push({ key: `a${++next}`, name: image.name, url: image.url, path: image.path, data: null });
+      if (draft.attachments.some((a) => a.path === image.path)) continue;
+      if (!hasRoom(draft)) return;
+      draft.attachments.push({ key: `a${++next}`, name: image.name, url: image.url, path: image.path, data: null });
     } catch (error) {
       showToast(String(error));
     }
@@ -31,8 +36,17 @@ export async function addPaths(paths: string[]) {
 }
 
 /** Attach pasted image data (clipboard files have no path). */
-export async function addBlobs(blobs: File[]) {
-  for (const blob of blobs.slice(0, room())) {
+export async function addBlobs(draft: Draft, blobs: File[]) {
+  for (const blob of blobs) {
+    if (!IMAGE_MIME.test(blob.type)) {
+      showToast("Only PNG, JPEG, GIF and WebP images can be attached");
+      continue;
+    }
+    if (blob.size > MAX_IMAGE_BYTES) {
+      showToast("Pasted images can be at most 20 MB");
+      continue;
+    }
+    if (!hasRoom(draft)) return;
     const url = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result));
@@ -44,17 +58,7 @@ export async function addBlobs(blobs: File[]) {
       showToast("The pasted image could not be read");
       continue;
     }
-    ui.attachments.push({ key: `a${++next}`, name: blob.name || "Pasted image", url, path: null, data });
+    if (!hasRoom(draft)) return;
+    draft.attachments.push({ key: `a${++next}`, name: blob.name || "Pasted image", url, path: null, data });
   }
-}
-
-export function remove(key: string) {
-  ui.attachments = ui.attachments.filter((a) => a.key !== key);
-}
-
-/** The attachments to send, leaving the draft without any. */
-export function take() {
-  const taken = ui.attachments;
-  ui.attachments = [];
-  return taken;
 }

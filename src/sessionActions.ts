@@ -1,6 +1,7 @@
 // What can be done to a session, shared by its sidebar menu, the title bar menu and the palette.
 
-import { engine, showToast } from "./bridge";
+import { engine, showToast, snapshot } from "./bridge";
+import { draftFor } from "./drafts";
 import type { OpenSnapshot, Session } from "./types";
 import { focusComposer, ui, type MenuItem } from "./ui";
 
@@ -56,9 +57,15 @@ export function canCompact(snap: OpenSnapshot) {
 /** Undo the last turn (after confirming) and put its prompt back in the composer to edit. */
 export async function editLastPrompt(snap: OpenSnapshot) {
   const text = lastPrompt(snap);
-  if (text === null || !(await engine.undoTurn())) return;
-  ui.draft = text;
-  focusComposer();
+  if (text === null) return;
+  const draft = draftFor(snap);
+  if (draft.text || draft.attachments.length) {
+    showToast("Send or clear your current draft before editing the last prompt");
+    return;
+  }
+  if (!(await engine.undoTurn()) || draft.text) return;
+  draft.text = text;
+  if (snapshot.value?.workspace?.root === snap.workspace.root && snapshot.value.sessionId === snap.sessionId) focusComposer();
 }
 
 /** Menu items for `session`; the open session also gets the conversation actions. */

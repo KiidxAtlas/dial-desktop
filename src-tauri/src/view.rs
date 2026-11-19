@@ -75,6 +75,8 @@ pub enum ConnectionView {
     Preview,
     Failed {
         error: String,
+        /// What the UI offers to fix it: install the engine, update it, or reconnect.
+        problem: crate::updates::EngineProblem,
     },
     Ended,
 }
@@ -93,6 +95,7 @@ impl From<&Connection> for ConnectionView {
             Connection::Preview => Self::Preview,
             Connection::Failed(error) => Self::Failed {
                 error: error.clone(),
+                problem: crate::updates::classify_failure(error),
             },
             Connection::Ended => Self::Ended,
         }

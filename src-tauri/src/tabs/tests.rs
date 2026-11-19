@@ -120,3 +120,15 @@ fn a_new_tab_starts_with_the_sidebar_on_screen() {
     tabs.open(Tab::new(Model::starting(), None));
     assert_eq!(tabs.active().model.sessions.len(), 1);
 }
+
+#[test]
+fn a_session_cannot_be_resumed_while_its_previous_engine_shuts_down() {
+    let mut tabs = Tabs::new(tab("s1", true));
+    tabs.open(tab("s2", false));
+    finish(&mut tabs.tabs[0].model);
+    let closed = tabs.close_idle();
+    assert_eq!(closed.len(), 1);
+    assert_ne!(tabs.route_resume("s1"), Route::Here, "the old engine can still own s1");
+    drop(closed);
+    assert_eq!(tabs.route_resume("s1"), Route::Here);
+}

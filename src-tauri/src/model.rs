@@ -8,7 +8,7 @@ use crate::engine::{Command, Purpose, QuestionRef, Update};
 use dial_client::{Conversation, Entry, Message, Ready, RequestId};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod tests;
@@ -203,6 +203,9 @@ pub struct Model {
     pub connection: Option<Connection>,
     pub conversation: Conversation,
     pub sessions: Vec<SessionSummary>,
+    /// Ignore late pages from a history refresh superseded by a new one.
+    session_page: Option<(RequestId, u64)>,
+    session_pages: Vec<SessionSummary>,
     /// The model in force, once the engine reported it.
     pub current_model: Option<CurrentModel>,
     /// The approval mode in force (`ask`, `write`, `auto`, `readonly`).
@@ -527,6 +530,20 @@ impl Model {
             Update::ConnectFailed(error) => self.connection = Some(Connection::Failed(error)),
             Update::Requested { command, id } => {
                 let (purpose, _, _) = command.request();
+                match &command {
+                    Command::ListSessions => {
+                        self.session_pages.clear();
+                        self.session_page = Some((id, 0));
+                    }
+                    Command::ListSessionsPage { offset, after }
+                        if self
+                            .session_page
+                            .is_some_and(|(current, _)| current == *after) =>
+                    {
+                        self.session_page = Some((id, *offset));
+                    }
+                    _ => {}
+                }
                 if let Command::Send {
                     text,
                     images,
@@ -582,13 +599,40 @@ impl Model {
                     return;
                 };
                 match (purpose, result) {
-                    (Purpose::Sessions, Ok(page)) => {
-                        self.sessions = page["sessions"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(SessionSummary::from_wire)
-                            .collect();
+                    (Purpose::Sessions, result) => {
+                        let Some((current, offset)) = self.session_page else {
+                            return;
+                        };
+                        if current != *id {
+                            return;
+                        }
+                        match result {
+                            Ok(page) => {
+                                let items = page["sessions"].as_array().into_iter().flatten();
+                                self.session_pages
+                                    .extend(items.filter_map(SessionSummary::from_wire));
+                                if let Some(next) =
+                                    page["next_offset"].as_u64().filter(|n| *n > offset)
+                                {
+                                    follow.push(Command::ListSessionsPage {
+                                        offset: next,
+                                        after: *id,
+                                    });
+                                } else {
+                                    self.session_page = None;
+                                    let mut seen = HashSet::new();
+                                    self.sessions = std::mem::take(&mut self.session_pages)
+                                        .into_iter()
+                                        .filter(|s| seen.insert(s.id.clone()))
+                                        .collect();
+                                }
+                            }
+                            Err(error) => {
+                                self.session_page = None;
+                                self.session_pages.clear();
+                                self.toast = Some(format!("Could not load sessions: {error}"));
+                            }
+                        }
                     }
                     (Purpose::Recover, Ok(snapshot)) => {
                         self.recovering = false;
@@ -811,7 +855,7 @@ fn describe(command: &Command) -> &'static str {
         Command::Send { .. } => "send the prompt",
         Command::Approve { .. } => "answer the approval",
         Command::Abort => "stop the turn",
-        Command::ListSessions => "load sessions",
+        Command::ListSessions | Command::ListSessionsPage { .. } => "load sessions",
         Command::NewSession => "start a session",
         Command::Resume(_) => "open the session",
         Command::DeleteSession(_) => "delete the session",

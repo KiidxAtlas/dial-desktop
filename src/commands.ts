@@ -1,9 +1,12 @@
 // Everything the palette (⌘K) can do, and the shortcut list. Keys here are the ones App.vue handles.
 
+import { ref } from "vue";
 import { engine, folders } from "./bridge";
 import type { OpenSnapshot } from "./types";
 import { focusComposer, ui } from "./ui";
 import { appearance, zoomBy, type Theme } from "./appearance";
+import { showPanel, workspace } from "./workspace";
+import { checkApp, checkEngine } from "./updates";
 import {
   canCompact,
   canRetry,
@@ -27,6 +30,12 @@ export interface Command {
   run: () => void;
 }
 
+export const conversationFindOpen = ref(false);
+
+function openConversationFind() {
+  ui.settingsOpen = false;
+  conversationFindOpen.value = true;
+}
 export function startNewSession(snap: OpenSnapshot) {
   if (snap.connection.state !== "live") return;
   ui.settingsOpen = false;
@@ -92,6 +101,7 @@ export function commands(snap: OpenSnapshot): Command[] {
     canCompact(snap),
   );
   add({ id: "stop", group: "Session", label: "Stop the turn", icon: "stop", hint: "Esc", run: () => engine.abort() }, snap.turnRunning);
+  add({ id: "find", group: "Session", label: "Find in conversation", icon: "search", hint: "⌘F", run: openConversationFind }, snap.entries.length > 0);
 
   add({
     id: "model",
@@ -116,6 +126,18 @@ export function commands(snap: OpenSnapshot): Command[] {
     keywords: "inspector diff",
     run: () => (ui.inspectorOpen = !ui.inspectorOpen),
   });
+  add({ id: "browser", group: "View", label: "Open the browser", icon: "globe", hint: "⇧⌘B", keywords: "web page preview localhost url", run: () => showPanel("browser") });
+  add({ id: "files", group: "View", label: "Browse files", icon: "folder", hint: "⇧⌘E", keywords: "explorer tree project open file", run: () => showPanel("files") });
+  add({ id: "terminal", group: "View", label: "Open the terminal", icon: "terminal", hint: "⌃`", keywords: "shell console commands run", run: () => showPanel("terminal") });
+  add({ id: "changes", group: "View", label: "Show changed files", icon: "diff", keywords: "diff review edits", run: () => showPanel("changes") });
+  add({
+    id: "auto-previews",
+    group: "View",
+    label: workspace.autoOpenPreviews ? "Stop opening dev servers in the browser" : "Open dev servers in the browser automatically",
+    icon: "globe",
+    keywords: "preview localhost auto open",
+    run: () => (workspace.autoOpenPreviews = !workspace.autoOpenPreviews),
+  });
   for (const t of THEMES)
     add(
       { id: `theme-${t.theme}`, group: "View", label: `Theme: ${t.label}`, icon: t.icon, keywords: "appearance color mode", run: () => (appearance.theme = t.theme) },
@@ -126,6 +148,18 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "zoom-reset", group: "View", label: "Actual size", hint: "⌘0", keywords: "zoom reset", run: () => zoomBy(0) }, appearance.zoom !== 1);
 
   add({ id: "settings", group: "App", label: "Settings", icon: "gear", hint: "⌘,", keywords: "preferences background", run: () => (ui.settingsOpen = true) });
+  add({
+    id: "updates",
+    group: "App",
+    label: "Check for updates",
+    icon: "download",
+    keywords: "upgrade version engine dial desktop",
+    run: () => {
+      ui.settingsTab = "updates";
+      ui.settingsOpen = true;
+      void Promise.all([checkApp(), checkEngine()]);
+    },
+  });
   add({ id: "shortcuts", group: "App", label: "Keyboard shortcuts", icon: "keyboard", hint: "⌘/", keywords: "help keys", run: () => (ui.shortcutsOpen = true) });
   add({ id: "folder", group: "App", label: "Open folder…", icon: "folder", keywords: "project workspace", run: () => folders.choose() });
   add({ id: "reconnect", group: "App", label: "Reconnect the engine", icon: "refresh", run: () => engine.reconnect() }, !live && snap.connection.state !== "preview");
@@ -176,6 +210,9 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["⌘/", "Keyboard shortcuts"],
       ["⌘B", "Show or hide the sidebar"],
       ["⌥⌘I", "Show or hide plan and changes"],
+      ["⇧⌘B", "Browser"],
+      ["⇧⌘E", "Files"],
+      ["⌃`", "Terminal"],
       ["⌘+  ⌘−  ⌘0", "Zoom in, out, actual size"],
     ],
   },
@@ -184,6 +221,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     keys: [
       ["Enter", "Send (while Dial works: add a note)"],
       ["⇧Enter", "New line"],
+      ["⌘F", "Find in conversation"],
       ["↑", "Previous prompt (in an empty box)"],
       ["Esc", "Stop the turn"],
       ["⇧⌘M", "Change model"],
