@@ -427,10 +427,10 @@ async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
     Ok(log)
 }
 
-/// Whether this build checks for app updates: only release builds that embed the update key.
+/// Whether this build checks for app updates: only release builds, whose config holds the key.
 #[tauri::command]
-fn app_updates_enabled() -> bool {
-    updates::UPDATER_PUBKEY.is_some_and(|key| !key.is_empty()) && !cfg!(debug_assertions)
+fn app_updates_enabled(app: AppHandle) -> bool {
+    updates::updater_configured(app.config().plugins.0.get("updater")) && !cfg!(debug_assertions)
 }
 
 fn check_session(
@@ -812,12 +812,9 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
     let app = tauri::Builder::default()
         // Links in answers open in the system browser, never in the app window.
         .plugin(tauri_plugin_dialog::init())
-        // The app's own signed updates; checked only when `app_updates_enabled`.
-        .plugin(
-            tauri_plugin_updater::Builder::new()
-                .pubkey(updates::UPDATER_PUBKEY.unwrap_or_default())
-                .build(),
-        )
+        // The app's own signed updates, verified with `plugins.updater.pubkey` from the config;
+        // checked only when `app_updates_enabled`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             snapshot,

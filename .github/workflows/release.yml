@@ -35,17 +35,17 @@ jobs:
           done
       - name: Update signing is configured
         env:
-          PUBKEY: ${{ vars.DIAL_DESKTOP_UPDATER_PUBKEY }}
           HAS_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
           HAS_APPLE: ${{ secrets.APPLE_CERTIFICATE != '' }}
         run: |
           # Without both halves installed apps could not verify (or would never see) this release.
-          if [ -z "$PUBKEY" ] || [ "$HAS_PRIVATE_KEY" != "true" ]; then
-            echo "::error::Set the DIAL_DESKTOP_UPDATER_PUBKEY variable and the TAURI_SIGNING_PRIVATE_KEY secret (see README.md › Releasing)"
+          pubkey=$(jq -r '.plugins.updater.pubkey // ""' src-tauri/tauri.release.conf.json)
+          if [ -z "$pubkey" ] || [ "$HAS_PRIVATE_KEY" != "true" ]; then
+            echo "::error::Set plugins.updater.pubkey in src-tauri/tauri.release.conf.json and the TAURI_SIGNING_PRIVATE_KEY secret (see README.md › Releasing)"
             exit 1
           fi
           if [ "$HAS_APPLE" != "true" ]; then
-            echo "::warning::No Apple Developer ID certificate: the macOS app will be unsigned and Gatekeeper will block it on download"
+            echo "::warning::No Apple Developer ID certificate: the macOS app is only ad-hoc signed, so Gatekeeper asks users to approve its first launch"
           fi
 
   build:
@@ -88,21 +88,37 @@ jobs:
 
       - run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      # Tauri imports a certificate whenever APPLE_CERTIFICATE is set, even to an empty string, so
+      # the Apple variables exist only when the secrets do. Without them macOS builds are ad-hoc
+      # signed ("-"): they run, but Gatekeeper asks users to approve the first launch.
+      - name: macOS signing
+        if: runner.os == 'macOS'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Compiled into the app: the key its updater verifies downloads with.
-          DIAL_DESKTOP_UPDATER_PUBKEY: ${{ vars.DIAL_DESKTOP_UPDATER_PUBKEY }}
-          # Signs the update bundles and `latest.json` entries.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS code signing and notarization (Developer ID Application certificate).
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              delimiter="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+            fi
+          done
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the update bundles and `latest.json` entries.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Dial Desktop ${{ github.ref_name }}

@@ -126,3 +126,13 @@ fn bounded_runs_capture_both_streams_and_stop_at_the_deadline() {
             .starts_with("could not start")
     );
 }
+
+#[test]
+fn only_a_configured_public_key_enables_app_updates() {
+    let config = |value: serde_json::Value| updater_configured(Some(&value));
+    assert!(config(serde_json::json!({ "pubkey": "dW50cnVzdGVk" })));
+    assert!(!config(serde_json::json!({ "pubkey": "" })));
+    assert!(!config(serde_json::json!({ "pubkey": "  " })));
+    assert!(!config(serde_json::json!({ "endpoints": [] })));
+    assert!(!updater_configured(None));
+}

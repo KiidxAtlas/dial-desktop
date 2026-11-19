@@ -6,8 +6,9 @@
 //! installer, the same one the website's CLI-only install uses. The app never replaces the engine
 //! binary itself, so a terminal `dial` and the app always share one engine.
 //!
-//! The app updates through Tauri's updater plugin against this repository's signed releases.
-//! Builds without [`UPDATER_PUBKEY`] (development and local builds) never check.
+//! The app updates through Tauri's updater plugin against this repository's signed releases. The
+//! verifying public key lives in `tauri.release.conf.json`, so development and local builds,
+//! which lack it, never check.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -18,8 +19,14 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod tests;
 
-/// Public key that verifies the app's own signed updates; embedded by release builds only.
-pub const UPDATER_PUBKEY: Option<&str> = option_env!("DIAL_DESKTOP_UPDATER_PUBKEY");
+/// Whether the updater plugin's config (`plugins.updater`) carries a public key, which only
+/// release builds (`--config tauri.release.conf.json`) have.
+pub fn updater_configured(updater: Option<&serde_json::Value>) -> bool {
+    updater
+        .and_then(|config| config.get("pubkey"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
+}
 
 /// Unix installer: Dial's short address, which redirects to the latest release's signed
 /// `install.sh`.

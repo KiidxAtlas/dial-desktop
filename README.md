@@ -61,8 +61,8 @@ The app and the Dial engine update separately, and nothing installs until the us
 
 - **The app** uses the Tauri updater: it polls
   `https://github.com/KiidxAtlas/dial-desktop/releases/latest/download/latest.json` and installs
-  only bundles signed with the key compiled into the build (`DIAL_DESKTOP_UPDATER_PUBKEY`). Builds
-  without that key (development, local `npm run build`) do not update themselves. On Linux only
+  only bundles signed with the key in `src-tauri/tauri.release.conf.json` (`plugins.updater.pubkey`).
+  Builds without that config (development, local `npm run build`) do not update themselves. On Linux only
   the AppImage self-updates; the `.deb` updates through its package manager.
 - **The engine** is the user's own `dial`, found on `PATH` or in the usual install directories,
   never bundled. The app asks it `dial update --check --json` and updates it with `dial update`,
@@ -85,9 +85,9 @@ One-time repository setup:
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Variable | `DIAL_DESKTOP_UPDATER_PUBKEY` | public key from `npx tauri signer generate -w ~/.tauri/dial-desktop.key` |
+| Config | `plugins.updater.pubkey` in `src-tauri/tauri.release.conf.json` | public key from `npx tauri signer generate -w ~/.tauri/dial-desktop.key` (committed; it is public) |
 | Secret | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | that private key and its password |
-| Secrets | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Developer ID Application certificate (base64 `.p12`) and notarization login; without them the macOS app is unsigned and Gatekeeper blocks it |
+| Secrets | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Developer ID Application certificate (base64 `.p12`) and notarization login; without them the macOS app is only ad-hoc signed and users must approve its first launch (right-click › Open, or System Settings › Privacy & Security) |
 | Variable / secret | `DIAL_WEB_REFRESH_URL` / `DIAL_WEB_REFRESH_TOKEN` | `https://dial.rootatlas.dev/release/refresh` and the site's `NUXT_RELEASE_REFRESH_TOKEN` (optional) |
 
 Keep the private key safe: losing it means installed apps can never verify another update.
