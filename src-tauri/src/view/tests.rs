@@ -1,0 +1,365 @@
+use super::*;
+use crate::cli::Preview;
+use crate::preview;
+use serde_json::json;
+
+fn workspace() -> Workspace {
+    Workspace::new("/home/ada/work/app", Some("/home/ada"))
+}
+
+fn image_call(arguments: &str, result: Option<dial_client::ToolOutcome>) -> ToolEntry {
+    ToolEntry {
+        call_id: "g1".into(),
+        name: "image_gen".into(),
+        arguments: arguments.into(),
+        result,
+        ..ToolEntry::default()
+    }
+}
+
+fn outcome(ok: Option<bool>, changed: &[&str]) -> dial_client::ToolOutcome {
+    dial_client::ToolOutcome {
+        is_error: ok != Some(true),
+        outcome_known: ok.is_some(),
+        changed_paths: changed.iter().map(|p| (*p).to_owned()).collect(),
+        ..dial_client::ToolOutcome::default()
+    }
+}
+
+#[test]
+fn generated_images_show_inline_from_changed_paths_else_the_output_argument() {
+    let w = workspace();
+    let args = r#"{"prompt":"a kite","output":"art/kite.png"}"#;
+    // Live result: every written image inside the workspace, in order; other files are skipped.
+    let live = image_call(
+        args,
+        Some(outcome(
+            Some(true),
+            &[
+                "/home/ada/work/app/art/kite.png",
+                "/home/ada/work/app/art/kite-2.png",
+                "/home/ada/work/app/notes.txt",
+                "/elsewhere/kite.png",
+            ],
+        )),
+    );
+    assert_eq!(
+        ToolView::new(0, &live, &w).images,
+        [
+            "/home/ada/work/app/art/kite.png",
+            "/home/ada/work/app/art/kite-2.png"
+        ]
+    );
+    // Resumed history without changed paths or a known outcome still shows the requested output.
+    let resumed = image_call(args, Some(outcome(None, &[])));
+    assert_eq!(
+        ToolView::new(0, &resumed, &w).images,
+        ["/home/ada/work/app/art/kite.png"]
+    );
+    // Running, failed, escaping or non-image outputs, and other tools, show nothing.
+    assert!(
+        ToolView::new(0, &image_call(args, None), &w)
+            .images
+            .is_empty()
+    );
+    let failed = image_call(args, Some(outcome(Some(false), &[])));
+    assert!(ToolView::new(0, &failed, &w).images.is_empty());
+    for output in ["../x.png", "/etc/x.png", "art/kite.txt"] {
+        let call = image_call(
+            &format!(r#"{{"output":"{output}"}}"#),
+            Some(outcome(Some(true), &[])),
+        );
+        assert!(ToolView::new(0, &call, &w).images.is_empty(), "{output}");
+    }
+    let mut write = live.clone();
+    write.name = "write".into();
+    assert!(ToolView::new(0, &write, &w).images.is_empty());
+}
+
+#[test]
+fn workspace_abbreviates_home_and_relativizes_paths() {
+    let w = workspace();
+    assert_eq!(w.display, "~/work/app");
+    assert_eq!(w.name, "app");
+    assert_eq!(w.relative("/home/ada/work/app/src/a.rs"), "src/a.rs");
+    assert_eq!(
+        w.relative("/home/ada/work/apple/a.rs"),
+        "/home/ada/work/apple/a.rs"
+    );
+    assert_eq!(w.relative("/home/ada/work/app"), "/home/ada/work/app");
+    assert_eq!(Workspace::new("/srv/x/", None).name, "x");
+    assert_eq!(Workspace::new("/srv/x", None).display, "/srv/x");
+}
+
+#[test]
+fn sessions_show_what_runs_in_other_tabs() {
+    let w = workspace();
+    let model = preview::model(Preview::Session, &w.root);
+    let mut snap = Snapshot::new(&model, Some(&w), crate::time::now());
+    let listed = snap.sessions[2].id.clone();
+    let activity = HashMap::from([
+        (
+            listed.clone(),
+            Activity {
+                title: "ignored".into(),
+                running: true,
+                waiting: true,
+            },
+        ),
+        (
+            "fresh".to_owned(),
+            Activity {
+                title: "First turn".into(),
+                running: true,
+                waiting: false,
+            },
+        ),
+        (
+            "idle".to_owned(),
+            Activity {
+                title: "Idle".into(),
+                running: false,
+                waiting: false,
+            },
+        ),
+    ]);
+    let count = snap.sessions.len();
+    snap.show_activity(&activity);
+    // A running session the list lacks is added on top; an idle one is not.
+    assert_eq!(snap.sessions.len(), count + 1);
+    assert_eq!(
+        (
+            snap.sessions[0].id.as_str(),
+            snap.sessions[0].title.as_str()
+        ),
+        ("fresh", "First turn")
+    );
+    assert!(snap.sessions[0].running && !snap.sessions[0].waiting);
+    let row = snap.sessions.iter().find(|s| s.id == listed).unwrap();
+    assert!(row.running && row.waiting);
+    assert!(!snap.sessions.iter().any(|s| s.id == "idle"));
+}
+
+#[test]
+fn the_session_preview_snapshot_covers_every_row_kind() {
+    let w = workspace();
+    let model = preview::model(Preview::Session, &w.root);
+    let snap = Snapshot::new(&model, Some(&w), crate::time::now());
+
+    assert_eq!(snap.connection, ConnectionView::Preview);
+    assert!(snap.turn_running);
+    assert!(!snap.can_send);
+    assert_eq!(snap.title, "Rate limiting for the public API");
+    assert_eq!(snap.approvals.len(), 1);
+    assert_eq!(snap.plan.len(), 4);
+    assert_eq!(snap.plan[2].status, "in_progress");
+    assert_eq!(
+        snap.stats,
+        StatsView {
+            running: 1,
+            succeeded: 6,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        snap.changes
+            .iter()
+            .map(|c| (c.dir.as_str(), c.name.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("src/server/", "limiter.rs"),
+            ("src/server/", "router.rs"),
+            ("src-tauri/icons/", "128x128@2x.png")
+        ]
+    );
+    assert!(
+        snap.sessions
+            .iter()
+            .any(|s| s.selected && s.meta.ends_with("· 24 messages"))
+    );
+
+    let tools: Vec<&ToolView> = snap
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            EntryView::Tool(t) => Some(&**t),
+            _ => None,
+        })
+        .collect();
+    let edit = tools.iter().find(|t| t.key == "tool:c3").unwrap();
+    assert_eq!(edit.state, ToolState::Succeeded);
+    assert_eq!(edit.label, "Edit");
+    assert_eq!(edit.changed_paths, ["src/server/limiter.rs"]);
+    let image = tools.iter().find(|t| t.key == "tool:c6g").unwrap();
+    assert_eq!(
+        image.images,
+        ["/home/ada/work/app/src-tauri/icons/128x128@2x.png"]
+    );
+    assert!(edit.images.is_empty());
+    let failed = tools.iter().find(|t| t.key == "tool:c5").unwrap();
+    assert_eq!(failed.state, ToolState::Failed);
+    assert_eq!(failed.facts, ["status: error"]);
+    let running = tools.iter().find(|t| t.key == "tool:c7").unwrap();
+    assert_eq!(running.state, ToolState::Running);
+    assert_eq!(running.progress.as_deref(), Some("8 of 12 tests passed"));
+    assert_eq!(running.output.as_ref().unwrap().caption, "output");
+}
+
+#[test]
+fn snapshots_serialize_with_camel_case_tags() {
+    let w = workspace();
+    let model = preview::model(Preview::Session, &w.root);
+    let value = serde_json::to_value(Snapshot::new(&model, Some(&w), 0)).unwrap();
+    assert_eq!(value["connection"], json!({"state": "preview"}));
+    assert_eq!(value["turnRunning"], json!(true));
+    assert_eq!(value["workspace"]["display"], json!("~/work/app"));
+    let kinds: Vec<&str> = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    for kind in ["user", "assistant", "tool", "notice"] {
+        assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+    }
+    let tool = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "tool")
+        .unwrap();
+    assert!(tool.get("changedPaths").is_some());
+    assert_eq!(
+        value["approvals"][0]["approvalId"],
+        json!("preview-approval")
+    );
+
+    let live = serde_json::to_value(ConnectionView::Live {
+        model: "m".into(),
+        engine_version: Some("1.0".into()),
+    })
+    .unwrap();
+    assert_eq!(
+        live,
+        json!({"state": "live", "model": "m", "engineVersion": "1.0"})
+    );
+}
+
+#[test]
+fn questions_become_answerable_items_or_plain_text() {
+    let request = json!({
+        "question_id": "q1", "generation": 2, "session_id": "s1",
+        "questions": [
+            {"id": "a", "header": "Push", "question": " Which remote? ",
+             "options": [{"label": "origin", "description": "fork"}, {"label": ""}, {"label": "up"}],
+             "recommended": 1},
+            {"id": "b", "question": "Also?", "options": [], "multi": true, "recommended": 3},
+            {"question": "no id is dropped", "options": []}
+        ]
+    });
+    let view = question_view(&request);
+    assert_eq!(view.id, "q1");
+    assert_eq!(view.items.len(), 2);
+    let first = &view.items[0];
+    assert_eq!(
+        (first.header.as_deref(), first.text.as_str()),
+        (Some("Push"), "Which remote?")
+    );
+    let labels: Vec<_> = first.options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(labels, ["origin", "up"]);
+    assert_eq!(first.options[0].description.as_deref(), Some("fork"));
+    assert_eq!(first.recommended, Some(1));
+    assert!(view.items[1].multi);
+    assert_eq!(view.items[1].recommended, None, "out of range");
+
+    // Without its identity, or in an older shape, the text shows but is not answerable.
+    let old = question_view(&json!({"question": "Which?"}));
+    assert_eq!(
+        (old.id.as_str(), old.items[0].text.as_str()),
+        ("", "Which?")
+    );
+    let anonymous = question_view(&json!({"questions": [{"id": "a", "question": "First?"}]}));
+    assert_eq!(
+        (anonymous.id.as_str(), anonymous.items[0].text.as_str()),
+        ("", "First?")
+    );
+    assert_eq!(
+        question_view(&json!({})).items[0].text,
+        "Dial is asking a question."
+    );
+}
+
+#[test]
+fn the_model_view_prefers_state_and_labels_from_the_list() {
+    use crate::model::{CurrentModel, ModelOption};
+    let mut model = Model::starting();
+    assert_eq!(ModelView::of(&model), None);
+    model.connection = Some(crate::model::Connection::Live {
+        model: "claude-opus".into(),
+        engine_version: None,
+    });
+    let named = ModelView::of(&model).unwrap();
+    assert_eq!(
+        (named.provider.as_str(), named.label.as_str()),
+        ("", "claude-opus")
+    );
+
+    model.current_model = Some(CurrentModel {
+        provider: "anthropic".into(),
+        model_id: "claude-opus".into(),
+        thinking: Some("high".into()),
+        levels: vec!["low".into(), "high".into()],
+        thinking_settable: true,
+        ..CurrentModel::default()
+    });
+    model.models = vec![ModelOption {
+        provider: "anthropic".into(),
+        model_id: "claude-opus".into(),
+        label: "Claude Opus".into(),
+        context_window: None,
+        reasoning: true,
+        vision: true,
+        configured: true,
+    }];
+    model.approval = Some("ask".into());
+    let value = serde_json::to_value(Snapshot::new(&model, None, 0)).unwrap();
+    assert_eq!(value["workspace"], json!(null));
+    assert_eq!(value["approval"], json!("ask"));
+    assert_eq!(value["model"]["label"], json!("Claude Opus"));
+    assert_eq!(value["model"]["modelId"], json!("claude-opus"));
+    assert_eq!(value["model"]["thinking"], json!("high"));
+    assert_eq!(value["model"]["thinkingSettable"], json!(true));
+    assert_eq!(value["model"]["acceptsImages"], json!(true));
+}
+
+#[test]
+fn image_support_comes_from_the_list_else_from_ready_for_the_starting_model() {
+    use crate::model::CurrentModel;
+    let mut model = Model::starting();
+    model.connection = Some(crate::model::Connection::Live {
+        model: "m1".into(),
+        engine_version: None,
+    });
+    model.ready_image_input = Some(true);
+    assert_eq!(ModelView::of(&model).unwrap().accepts_images, Some(true));
+    let current = |id: &str| CurrentModel {
+        provider: "p".into(),
+        model_id: id.into(),
+        ..CurrentModel::default()
+    };
+    model.current_model = Some(current("m1"));
+    assert_eq!(ModelView::of(&model).unwrap().accepts_images, Some(true));
+    // After a switch, `ready` says nothing about the new model.
+    model.current_model = Some(current("m2"));
+    assert_eq!(ModelView::of(&model).unwrap().accepts_images, None);
+}
+
+#[test]
+fn the_empty_preview_has_no_selected_session() {
+    let w = workspace();
+    let model = preview::model(Preview::Empty, &w.root);
+    let snap = Snapshot::new(&model, Some(&w), 0);
+    assert!(snap.entries.is_empty());
+    assert!(!snap.sessions.is_empty());
+    assert!(snap.sessions.iter().all(|s| !s.selected));
+}

@@ -1,0 +1,509 @@
+<script setup lang="ts">
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { Decision, OpenSnapshot } from "../types";
+import { engine, files, folders, showToast } from "../bridge";
+import * as attachments from "../attachments";
+import { ui } from "../ui";
+import { canCompact, canUndo, lastPrompt } from "../sessionActions";
+import Icon from "./Icon.vue";
+import ModelPicker from "./ModelPicker.vue";
+import ApprovalMenu from "./ApprovalMenu.vue";
+import QuestionCard from "./QuestionCard.vue";
+import ContextMeter from "./ContextMeter.vue";
+
+const props = defineProps<{ snap: OpenSnapshot }>();
+const input = ref<HTMLTextAreaElement | null>(null);
+
+/** Slash commands handled in the app, as in a terminal agent. */
+const COMMANDS: { name: string; detail: string; run: () => void }[] = [
+  { name: "/model", detail: "Switch the model or reasoning level", run: () => (ui.modelPickerOpen = true) },
+  { name: "/new", detail: "Start a fresh session", run: () => engine.newSession() },
+  { name: "/clear", detail: "Start a fresh session", run: () => engine.newSession() },
+  { name: "/compact", detail: "Summarize the conversation to free context", run: () => engine.compact() },
+  { name: "/undo", detail: "Undo the last turn and restore its files", run: () => void engine.undoTurn() },
+  { name: "/open", detail: "Open another project folder", run: () => folders.choose() },
+];
+
+const approval = computed(() => props.snap.approvals[0] ?? null);
+const slash = computed(() => {
+  const text = ui.draft.trim();
+  if (!text.startsWith("/") || text.includes(" ")) return [];
+  return COMMANDS.filter((c) => c.name.startsWith(text.toLowerCase()) && available(c.name));
+});
+/** Slash commands that make sense right now. */
+function available(name: string) {
+  if (name === "/compact") return canCompact(props.snap);
+  if (name === "/undo") return props.snap.connection.state === "live" && canUndo(props.snap);
+  return true;
+}
+/** `false` only when the model is known not to take images; unknown models may try. */
+const imagesAllowed = computed(() => props.snap.model?.acceptsImages !== false);
+const hasContent = computed(() => ui.draft.trim().length > 0 || ui.attachments.length > 0);
+/** While a turn runs, typed text goes to it as guidance (images cannot). */
+const steering = computed(
+  () => props.snap.turnRunning && props.snap.connection.state === "live" && ui.draft.trim().length > 0 && !ui.attachments.length,
+);
+const canSend = computed(() => slash.value.length > 0 || (props.snap.canSend && hasContent.value) || steering.value);
+/** Files are being dragged over the window. */
+const dropping = ref(false);
+const caption = computed(() => {
+  const c = props.snap.connection;
+  switch (c.state) {
+    case "live":
+      return props.snap.workspace.display;
+    case "starting":
+      return `Starting Dial in ${props.snap.workspace.display}…`;
+    case "preview":
+      return "Design preview · prompts are not sent";
+    case "failed":
+      return "The Dial engine could not start; see the status in the sidebar";
+    case "ended":
+      return "The Dial engine stopped; reconnect from the sidebar";
+  }
+  return "";
+});
+
+function resize() {
+  const el = input.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+}
+
+function focus() {
+  nextTick(() => {
+    input.value?.focus();
+    resize();
+  });
+}
+
+function runCommand(command: (typeof COMMANDS)[number]) {
+  ui.draft = "";
+  command.run();
+  if (command.name !== "/model") focus();
+}
+
+function send() {
+  const text = ui.draft.trim();
+  const exact = COMMANDS.find((c) => c.name === text.toLowerCase() && available(c.name));
+  const command = ui.attachments.length ? null : (exact ?? (slash.value.length === 1 ? slash.value[0] : null));
+  if (command) return runCommand(command);
+  if (props.snap.turnRunning) {
+    if (!steering.value) return;
+    engine.steer(text);
+    ui.draft = "";
+    return focus();
+  }
+  if (!canSend.value) return;
+  if (ui.attachments.length && !imagesAllowed.value) {
+    showToast(`${props.snap.model?.label ?? "This model"} does not take images; remove them or switch models`);
+    return;
+  }
+  engine.send(text, attachments.take());
+  ui.draft = "";
+  focus();
+}
+
+async function chooseImages() {
+  try {
+    await attachments.addPaths(await files.chooseImages());
+  } catch (error) {
+    showToast(`Could not open the file picker: ${error}`);
+  }
+  focus();
+}
+
+/** Pasted images attach; pasted text is left to the textarea. */
+function onPaste(event: ClipboardEvent) {
+  const images = [...(event.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
+  if (!images.length) return;
+  event.preventDefault();
+  attachments.addBlobs(images);
+}
+
+// Files dropped anywhere on the window attach to the draft.
+let unlistenDrop: (() => void) | null = null;
+let unmounted = false;
+onMounted(async () => {
+  const unlisten = await getCurrentWebview()
+    .onDragDropEvent(({ payload }) => {
+      dropping.value = payload.type === "enter" || payload.type === "over";
+      if (payload.type === "drop" && payload.paths.length) attachments.addPaths(payload.paths).then(focus);
+    })
+    .catch(() => null);
+  if (unmounted) unlisten?.();
+  else unlistenDrop = unlisten;
+});
+onUnmounted(() => {
+  unmounted = true;
+  unlistenDrop?.();
+});
+
+function onKey(event: KeyboardEvent) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    send();
+  } else if (event.key === "Tab" && slash.value.length) {
+    event.preventDefault();
+    ui.draft = slash.value[0].name;
+  } else if (event.key === "ArrowUp" && !ui.draft && !ui.attachments.length && !event.isComposing) {
+    // Like a shell: an empty box recalls the last prompt.
+    const previous = lastPrompt(props.snap);
+    if (previous) {
+      event.preventDefault();
+      ui.draft = previous;
+      nextTick(() => input.value?.setSelectionRange(previous.length, previous.length));
+    }
+  }
+}
+
+function decide(decision: Decision) {
+  if (approval.value) engine.approve(approval.value.approvalId, decision);
+}
+
+watch(() => ui.draft, () => nextTick(resize));
+watch(() => ui.focusComposer, focus);
+onMounted(focus);
+</script>
+
+<template>
+  <footer class="dock">
+    <div class="column">
+      <Transition name="pop">
+        <section v-if="approval" :key="approval.approvalId" class="card approval">
+          <div class="card-head">
+            <span>Allow <strong>{{ approval.tool }}</strong>?</span>
+            <span v-if="snap.approvals.length > 1" class="more">+{{ snap.approvals.length - 1 }} more waiting</span>
+          </div>
+          <pre v-if="approval.summary" class="summary">{{ approval.summary }}</pre>
+          <div class="actions">
+            <button class="btn btn-primary" @click="decide('allow')">Allow once</button>
+            <button class="btn btn-secondary" title="Allow this kind of call from now on" @click="decide('always')">
+              Always allow
+            </button>
+            <button class="btn btn-secondary" title="Allow this kind of call in this project" @click="decide('project')">
+              Allow for project
+            </button>
+            <span class="grow" />
+            <button class="btn btn-danger" @click="decide('deny')">Deny</button>
+          </div>
+        </section>
+      </Transition>
+
+      <Transition name="pop">
+        <QuestionCard v-if="snap.question" :key="snap.question.id" :question="snap.question" />
+      </Transition>
+      <div class="composer" :class="{ dropping }" @click="input?.focus()">
+        <div v-if="dropping" class="drop-hint"><Icon name="image" :size="16" /> Drop images to attach</div>
+        <Transition name="pop">
+          <div v-if="slash.length" class="slash" @click.stop>
+            <button v-for="c in slash" :key="c.name" class="slash-row" @click="runCommand(c)">
+              <span class="mono">{{ c.name }}</span>
+              <span class="slash-detail">{{ c.detail }}</span>
+            </button>
+          </div>
+        </Transition>
+        <div v-if="ui.attachments.length" class="thumbs" @click.stop>
+          <div v-for="a in ui.attachments" :key="a.key" class="thumb" :title="a.name">
+            <img :src="a.url" :alt="a.name" />
+            <button class="remove" :title="`Remove ${a.name}`" @click="attachments.remove(a.key)">
+              <Icon name="cross" :size="11" />
+            </button>
+          </div>
+        </div>
+        <textarea
+          ref="input"
+          v-model="ui.draft"
+          rows="2"
+          spellcheck="true"
+          :placeholder="snap.turnRunning ? 'Add a note for Dial while it works…' : 'How can I help you today?'"
+          @keydown="onKey"
+          @paste="onPaste"
+        />
+        <div class="bar" @click.stop>
+          <button
+            class="attach"
+            :disabled="!imagesAllowed"
+            :title="imagesAllowed ? 'Attach images (or paste / drop them)' : `${snap.model?.label ?? 'This model'} does not take images`"
+            @click="chooseImages"
+          >
+            <Icon name="image" :size="15" />
+          </button>
+          <ModelPicker :snap="snap" />
+          <ApprovalMenu :snap="snap" />
+          <span class="grow" />
+          <ContextMeter
+            v-if="snap.context"
+            :context="snap.context"
+            :can-compact="canCompact(snap)"
+            @compact="engine.compact()"
+          />
+          <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="engine.abort()">
+            <Icon name="stop" :size="14" />
+          </button>
+          <button
+            v-else
+            class="send"
+            :disabled="!canSend"
+            title="Send (Enter)"
+            @click.stop="send"
+          >
+            <Icon name="arrowUp" :size="16" />
+          </button>
+        </div>
+      </div>
+      <div v-if="snap.connection.state !== 'live'" class="caption truncate">{{ caption }}</div>
+    </div>
+  </footer>
+</template>
+
+<style scoped>
+.dock {
+  flex: none;
+  padding: 0 var(--space-xl) 16px;
+  scrollbar-gutter: stable both-edges;
+}
+.column {
+  max-width: var(--content);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.card {
+  padding: 14px 16px;
+  border-radius: var(--radius-lg);
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-strong);
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+.card-head strong {
+  font-weight: 600;
+  color: var(--text);
+}
+.more {
+  margin-left: auto;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.summary {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bubble);
+  font: var(--text-mono) / 1.55 var(--font-mono);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1;
+}
+.composer {
+  position: relative;
+  padding: 14px 10px 10px 18px;
+  border-radius: var(--radius-xl);
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 4px 20px rgb(0 0 0 / 18%);
+  cursor: text;
+  transition: border-color 140ms var(--ease);
+}
+.composer.dropping {
+  border-color: var(--accent);
+  border-style: dashed;
+}
+.drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--accent);
+  font-weight: 500;
+  pointer-events: none;
+}
+.thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  cursor: default;
+}
+.thumb {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+.remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+.thumb:hover .remove,
+.remove:focus-visible {
+  opacity: 1;
+}
+.remove:hover {
+  color: var(--text);
+}
+.attach {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  transition:
+    background 120ms var(--ease),
+    color 120ms var(--ease);
+}
+.attach:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.attach:disabled {
+  opacity: 0.4;
+}
+.slash {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  background: var(--raised);
+  box-shadow: var(--shadow-pop);
+}
+.slash-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+.slash-row:first-child,
+.slash-row:hover {
+  background: var(--hover);
+}
+.slash-row .mono {
+  color: var(--text);
+}
+.slash-detail {
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.composer:focus-within {
+  border-color: var(--focus-border);
+}
+textarea {
+  display: block;
+  width: 100%;
+  max-height: 220px;
+  padding: 0 6px 0 0;
+  border: none;
+  outline: none;
+  resize: none;
+  background: none;
+  color: var(--text);
+  font: 14.5px/1.55 var(--font-ui);
+}
+textarea::placeholder {
+  color: var(--text-faint);
+}
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 8px 0 0 -10px;
+  cursor: default;
+}
+.send {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: var(--on-accent);
+  transition:
+    background 120ms var(--ease),
+    opacity 120ms var(--ease);
+}
+.send:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.send:disabled {
+  opacity: 0.35;
+}
+.send.stop {
+  background: var(--text);
+  color: var(--bg);
+}
+.send.stop:hover {
+  background: var(--text-strong);
+}
+.caption {
+  text-align: center;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.pop-enter-active,
+.pop-leave-active {
+  transition:
+    opacity 180ms var(--ease),
+    transform 180ms var(--ease);
+}
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}
+</style>

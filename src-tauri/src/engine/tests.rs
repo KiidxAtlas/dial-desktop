@@ -1,0 +1,143 @@
+use super::*;
+
+#[test]
+fn commands_map_to_documented_wire_requests() {
+    let (purpose, method, params) = Command::Send {
+        text: "hi".into(),
+        images: vec![],
+        inline_images: vec![],
+    }
+    .request();
+    assert_eq!((purpose, method), (Purpose::Turn, "send"));
+    assert_eq!(
+        params,
+        json!({"text": "hi"}),
+        "a plain prompt names no attachments"
+    );
+
+    let (_, _, params) = Command::Send {
+        text: "".into(),
+        images: vec!["/tmp/a.png".into()],
+        inline_images: vec!["iVBORw==".into()],
+    }
+    .request();
+    assert_eq!(
+        params,
+        json!({"text": "", "images": ["/tmp/a.png"], "inline_images": ["iVBORw=="]})
+    );
+
+    let (purpose, method, params) = Command::Approve {
+        approval_id: "a1".into(),
+        decision: Decision::Always,
+    }
+    .request();
+    assert_eq!((purpose, method), (Purpose::Approve, "approve"));
+    assert_eq!(params, json!({"approval_id": "a1", "decision": "always"}));
+
+    let (_, method, params) = Command::Resume("s9".into()).request();
+    assert_eq!(method, "resume");
+    assert_eq!(params, json!({"session_id": "s9"}));
+
+    let (purpose, method, params) = Command::DeleteSession("s4".into()).request();
+    assert_eq!(
+        (purpose, method),
+        (Purpose::DeleteSession, "delete_session")
+    );
+    assert_eq!(params, json!({"session_id": "s4"}));
+
+    assert_eq!(Command::ListSessions.request().1, "list_sessions");
+    assert_eq!(Command::NewSession.request().1, "new_session");
+    assert_eq!(Command::Abort.request().1, "abort");
+    assert_eq!(Command::Recover.request().1, "recovery_snapshot");
+
+    let (purpose, method, params) = Command::Steer("use the v2 API".into()).request();
+    assert_eq!((purpose, method), (Purpose::Steer, "steer"));
+    assert_eq!(params, json!({"text": "use the v2 API"}));
+    // A retry is a turn, settled by its own reply.
+    assert_eq!(
+        Command::Retry.request(),
+        (Purpose::Turn, "retry", json!({}))
+    );
+    assert_eq!(
+        Command::Compact.request(),
+        (Purpose::Compact, "compact", json!({"reason": "manual"}))
+    );
+}
+
+#[test]
+fn question_commands_carry_the_correlation() {
+    let question =
+        QuestionRef::of(&json!({"question_id": "q1", "generation": 3, "session_id": "s1"}))
+            .unwrap();
+    let correlation = json!({"question_id": "q1", "generation": 3, "session_id": "s1"});
+    let (purpose, method, params) = Command::QuestionPresented(question.clone()).request();
+    assert_eq!(
+        (purpose, method),
+        (Purpose::QuestionPresented, "question_presented")
+    );
+    assert_eq!(params, correlation);
+
+    let result = json!({"id": "a", "selectedOptions": ["origin"]});
+    let (purpose, method, params) = Command::AnswerQuestion {
+        question: question.clone(),
+        kind: "answers".into(),
+        results: vec![result.clone()],
+    }
+    .request();
+    assert_eq!((purpose, method), (Purpose::Answer, "question_answer"));
+    assert_eq!(
+        params,
+        json!({"question_id": "q1", "generation": 3, "session_id": "s1", "kind": "answers", "results": [result]})
+    );
+    // The engine rejects results on cancel, so none are sent.
+    let (_, _, params) = Command::AnswerQuestion {
+        question,
+        kind: "cancel".into(),
+        results: vec![],
+    }
+    .request();
+    assert_eq!(params.get("results"), None);
+
+    assert_eq!(
+        QuestionRef::of(&json!({"question_id": "q1", "session_id": "s1"})),
+        None
+    );
+}
+
+#[test]
+fn every_decision_has_its_wire_name() {
+    let names: Vec<_> = [
+        Decision::Allow,
+        Decision::Always,
+        Decision::Project,
+        Decision::Deny,
+    ]
+    .into_iter()
+    .map(decision_str)
+    .collect();
+    assert_eq!(names, ["allow", "always", "project", "deny"]);
+    for name in names {
+        assert_eq!(parse_decision(name).map(decision_str), Some(name));
+    }
+    assert_eq!(parse_decision("maybe"), None);
+}
+
+#[test]
+fn a_missing_engine_reports_connect_failure_and_wakes_the_ui() {
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&woken);
+    let launch = Launch::new("/nonexistent/dial-engine-for-tests");
+    let mut engine = Engine::spawn(
+        launch,
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let update = engine
+        .updates
+        .recv_timeout(Duration::from_secs(10))
+        .expect("an update");
+    assert!(matches!(update, Update::ConnectFailed(_)), "{update:?}");
+    engine.shutdown();
+    assert!(woken.load(Ordering::SeqCst) >= 1);
+}

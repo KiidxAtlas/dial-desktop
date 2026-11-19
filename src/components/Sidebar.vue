@@ -1,0 +1,666 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type { OpenSnapshot, Session, Workspace } from "../types";
+import { engine, folders } from "../bridge";
+import { focusComposer, openMenu, ui } from "../ui";
+import { clickKind, pickAfter } from "../picking";
+import { finishRename, sessionItems, startRename } from "../sessionActions";
+import Icon from "./Icon.vue";
+import Logo from "./Logo.vue";
+
+const props = defineProps<{ snap: OpenSnapshot }>();
+
+const live = computed(() => props.snap.connection.state === "live");
+const matching = computed(() => {
+  const filter = ui.sessionFilter.trim().toLowerCase();
+  return props.snap.sessions.filter((s) => !filter || s.title.toLowerCase().includes(filter));
+});
+/** Pinned sessions first, in the order the list shows them (Shift-click ranges follow it). */
+const groups = computed(() =>
+  [
+    { name: "Pinned", sessions: matching.value.filter((s) => s.pinned) },
+    { name: "Recents", sessions: matching.value.filter((s) => !s.pinned) },
+  ].filter((g) => g.sessions.length),
+);
+const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
+
+const status = computed(() => {
+  const c = props.snap.connection;
+  switch (c.state) {
+    case "starting":
+      return { tone: "warning", text: "Starting…", retry: false };
+    case "live":
+      return { tone: "success", text: c.engineVersion ? `dial ${c.engineVersion}` : "Connected", retry: false };
+    case "preview":
+      return { tone: "violet", text: "Design preview", retry: false };
+    case "failed":
+      return { tone: "danger", text: c.error, retry: true };
+    case "ended":
+      return { tone: "faint", text: "Engine stopped", retry: true };
+  }
+  return { tone: "faint", text: "", retry: false };
+});
+
+// The project menu: recent projects and "Open folder…".
+const projectMenu = ref<HTMLElement | null>(null);
+const menuOpen = ref(false);
+const recent = ref<Workspace[]>([]);
+
+async function toggleMenu() {
+  menuOpen.value = !menuOpen.value;
+  if (menuOpen.value) recent.value = (await folders.recent()).filter((w) => w.root !== props.snap.workspace.root);
+}
+
+function openFolder(root: string | null) {
+  menuOpen.value = false;
+  if (root) folders.open(root);
+  else folders.choose();
+}
+
+function onOutside(event: MouseEvent) {
+  if (projectMenu.value && !projectMenu.value.contains(event.target as Node)) menuOpen.value = false;
+}
+watch(menuOpen, (isOpen) =>
+  isOpen ? document.addEventListener("mousedown", onOutside) : document.removeEventListener("mousedown", onOutside),
+);
+onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
+
+function newSession() {
+  ui.settingsOpen = false;
+  engine.newSession();
+  focusComposer();
+}
+
+// Picking several sessions (see `picking.ts`); a plain click opens the session.
+const anchor = ref<string | null>(null);
+
+function click(event: MouseEvent, id: string, selected: boolean) {
+  const kind = clickKind(event);
+  const ids = sessions.value.map((s) => s.id);
+  const current = props.snap.sessions.find((s) => s.selected)?.id ?? null;
+  const next = pickAfter({ picked: ui.picked, anchor: anchor.value }, ids, id, kind, current);
+  ui.picked.clear();
+  for (const pickedId of next.picked) ui.picked.add(pickedId);
+  anchor.value = next.anchor;
+  if (kind === "open") open(id, selected);
+}
+
+function open(id: string, selected: boolean) {
+  ui.settingsOpen = false;
+  if (!selected) engine.resume(id);
+}
+
+const pickedSessions = computed(() => props.snap.sessions.filter((s) => ui.picked.has(s.id)));
+
+async function remove(list: { id: string; title: string }[]) {
+  if (await engine.deleteSessions(list)) {
+    for (const s of list) ui.picked.delete(s.id);
+  }
+}
+
+function menuFor(event: MouseEvent, s: Session, anchor?: HTMLElement | null) {
+  // A right-click on one of several picked sessions acts on all of them.
+  if (ui.picked.size > 1 && ui.picked.has(s.id)) {
+    const list = pickedSessions.value;
+    const pinned = list.every((p) => p.pinned);
+    openMenu(event, [
+      {
+        label: pinned ? `Unpin ${list.length} sessions` : `Pin ${list.length} sessions`,
+        icon: pinned ? "unpin" : "pin",
+        run: () => list.forEach((p) => engine.pinSession(p.id, !pinned)),
+      },
+      { divider: true },
+      { label: `Delete ${list.length} sessions`, icon: "trash", danger: true, hint: "⌫", run: () => remove(list) },
+    ]);
+    return;
+  }
+  openMenu(event, sessionItems(props.snap, s, "sidebar"), anchor);
+}
+
+// Editing a session's name in its row.
+const renameInput = ref<HTMLInputElement[]>([]);
+watch(
+  () => ui.renaming,
+  async (now) => {
+    if (now?.place !== "sidebar") return;
+    await nextTick();
+    const input = renameInput.value[0];
+    input?.focus();
+    input?.select();
+  },
+);
+function onRenameKey(event: KeyboardEvent, s: Session) {
+  if (event.key === "Enter" && !event.isComposing) {
+    event.preventDefault();
+    finishRename(s.id, s.title, (event.target as HTMLInputElement).value);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    ui.renaming = null;
+  }
+}
+const renamingHere = (id: string) => ui.renaming?.id === id && ui.renaming.place === "sidebar";
+
+// Sessions that left the list (deleted, or from another folder) cannot stay picked.
+watch(
+  () => props.snap.sessions,
+  (list) => {
+    for (const id of [...ui.picked]) if (!list.some((s) => s.id === id)) ui.picked.delete(id);
+  },
+);
+
+function onKey(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null;
+  const typing = target?.closest("input, textarea, select, [contenteditable]");
+  if (typing || !ui.picked.size) return;
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    remove(pickedSessions.value);
+  } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    for (const s of sessions.value) ui.picked.add(s.id);
+  }
+}
+onMounted(() => window.addEventListener("keydown", onKey));
+onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
+</script>
+
+<template>
+  <aside class="sidebar">
+    <div class="brand" data-tauri-drag-region>
+      <Logo :size="18" />
+      <span class="word" data-tauri-drag-region>Dial</span>
+      <button class="collapse" title="Hide sidebar (⌘B)" aria-label="Hide sidebar" @click="ui.sidebarOpen = false">
+        <Icon name="panelLeft" :size="16" />
+      </button>
+    </div>
+
+    <nav class="actions">
+      <button class="item new" :disabled="!live" title="Start a fresh session (⌘N)" @click="newSession">
+        <span class="plus"><Icon name="plus" :size="13" /></span>
+        New session
+      </button>
+      <label class="item search">
+        <Icon name="search" :size="15" />
+        <input v-model="ui.sessionFilter" placeholder="Search" spellcheck="false" />
+      </label>
+    </nav>
+
+    <nav class="list">
+      <p v-if="!sessions.length" class="empty">
+        {{ snap.sessions.length ? "No sessions match." : "Your sessions appear here." }}
+      </p>
+      <template v-for="group in groups" :key="group.name">
+        <div class="label">{{ group.name }}</div>
+        <div
+          v-for="s in group.sessions"
+          :key="s.id"
+          class="session"
+          :class="{
+            selected: s.selected && !ui.settingsOpen,
+            picked: ui.picked.has(s.id),
+            editing: renamingHere(s.id),
+          }"
+          role="button"
+          tabindex="0"
+          :aria-pressed="ui.picked.has(s.id)"
+          :title="`${s.title}\n${s.waiting ? 'Waiting for you' : s.running ? 'Working' : s.meta}`"
+          @click="renamingHere(s.id) || click($event, s.id, s.selected)"
+          @dblclick="startRename(s.id, 'sidebar')"
+          @contextmenu="menuFor($event, s)"
+          @keydown.self.enter="open(s.id, s.selected)"
+          @keydown.self.f2.prevent="startRename(s.id, 'sidebar')"
+          @keydown.self.space.prevent="ui.picked.has(s.id) ? ui.picked.delete(s.id) : ui.picked.add(s.id)"
+        >
+          <input
+            v-if="renamingHere(s.id)"
+            ref="renameInput"
+            class="rename"
+            :value="s.title"
+            spellcheck="false"
+            aria-label="Session name"
+            @keydown="onRenameKey($event, s)"
+            @blur="finishRename(s.id, s.title, ($event.target as HTMLInputElement).value)"
+          />
+          <template v-else>
+            <span class="truncate">{{ s.title }}</span>
+            <i v-if="s.waiting" class="activity waiting" />
+            <i v-else-if="s.running" class="activity running" />
+            <button
+              class="row-btn"
+              title="More"
+              aria-label="More actions"
+              @click.stop="menuFor($event, s, $event.currentTarget as HTMLElement)"
+            >
+              <Icon name="more" :size="14" />
+            </button>
+            <button class="row-btn" :title="`Delete “${s.title}”`" @click.stop="remove([s])">
+              <Icon name="cross" :size="12" />
+            </button>
+          </template>
+        </div>
+      </template>
+    </nav>
+
+    <Transition name="pop">
+      <div v-if="ui.picked.size" class="picking">
+        <span>{{ ui.picked.size }} selected</span>
+        <button class="pick-action danger" title="Delete the selected sessions (⌫)" @click="remove(pickedSessions)">
+          <Icon name="trash" :size="13" /> Delete
+        </button>
+        <button class="pick-action" title="Clear the selection (Esc)" @click="ui.picked.clear()">Cancel</button>
+      </div>
+    </Transition>
+
+    <button
+      class="item settings-btn"
+      :class="{ on: ui.settingsOpen }"
+      title="Settings (⌘,)"
+      @click="ui.settingsOpen = !ui.settingsOpen"
+    >
+      <Icon name="gear" :size="15" />
+      Settings
+    </button>
+
+    <div ref="projectMenu" class="project">
+      <Transition name="pop">
+        <div v-if="menuOpen" class="menu">
+          <div class="menu-path mono truncate" :title="snap.workspace.root">{{ snap.workspace.display }}</div>
+          <button v-for="w in recent" :key="w.root" class="menu-row" :title="w.root" @click="openFolder(w.root)">
+            <Icon name="folder" :size="14" />
+            <span class="truncate">{{ w.name }}</span>
+          </button>
+          <button class="menu-row" @click="openFolder(null)">
+            <Icon name="plus" :size="14" /> <span>Open folder…</span>
+          </button>
+        </div>
+      </Transition>
+      <button class="project-btn" :title="`${snap.workspace.root} · switch project`" @click="toggleMenu">
+        <span class="avatar">{{ snap.workspace.name.slice(0, 1).toUpperCase() }}</span>
+        <span class="project-text">
+          <span class="truncate name">{{ snap.workspace.name }}</span>
+          <span class="truncate state" :class="status.tone"><i />{{ status.text }}</span>
+        </span>
+        <Icon name="chevronDown" :size="13" />
+      </button>
+      <button v-if="status.retry" class="btn btn-secondary retry" @click="engine.reconnect()">
+        <Icon name="refresh" :size="13" /> Reconnect
+      </button>
+    </div>
+  </aside>
+</template>
+
+<style scoped>
+.sidebar {
+  width: var(--sidebar-width);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 8px 10px;
+  background: var(--sidebar);
+  border-right: 1px solid var(--border);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+}
+.mac .brand {
+  /* Room for the window buttons, which sit over the content. */
+  margin-top: 26px;
+}
+.collapse {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: 0 -4px 0 auto;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  opacity: 0;
+  transition:
+    opacity 120ms var(--ease),
+    background 120ms var(--ease);
+}
+.sidebar:hover .collapse,
+.collapse:focus-visible {
+  opacity: 1;
+}
+.collapse:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.word {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 10px 0 14px;
+}
+.item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  color: var(--text-muted);
+  text-align: left;
+  transition:
+    background 120ms var(--ease),
+    color 120ms var(--ease);
+}
+.item:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.item:disabled {
+  opacity: 0.45;
+}
+.plus {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.new {
+  color: var(--text);
+}
+.search {
+  cursor: text;
+}
+.search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+}
+.search input::placeholder {
+  color: var(--text-muted);
+}
+.search:focus-within input::placeholder {
+  color: var(--text-faint);
+}
+.label {
+  padding: 0 10px 6px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.list .label {
+  padding-top: 4px;
+}
+.list .label ~ .label {
+  margin-top: 12px;
+}
+.rename {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  margin: 0 -6px;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+.list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.empty {
+  margin: 4px 10px;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.session {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  color: var(--text-muted);
+  cursor: default;
+  outline: none;
+  transition:
+    background 120ms var(--ease),
+    color 120ms var(--ease);
+}
+.session span {
+  flex: 1;
+}
+.session:hover,
+.session:focus-visible {
+  background: var(--hover);
+  color: var(--text);
+}
+.session.selected {
+  background: var(--active);
+  color: var(--text);
+}
+.session.picked {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.picking {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 6px 0 0;
+  padding: 6px 6px 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.picking span {
+  flex: 1;
+}
+.pick-action {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.pick-action:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.pick-action.danger {
+  color: var(--danger);
+}
+.pick-action.danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+.settings-btn {
+  flex: none;
+  margin: 6px 0 2px;
+}
+.settings-btn.on {
+  background: var(--active);
+  color: var(--text);
+}
+.activity {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.activity.running {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.activity.waiting {
+  background: var(--warning);
+}
+.row-btn {
+  display: none;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 6px;
+  color: var(--text-faint);
+}
+.row-btn:last-child {
+  margin-right: -6px;
+}
+.session:hover .row-btn,
+.session:focus-within .row-btn {
+  display: grid;
+}
+.row-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.project {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.project-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-md);
+  text-align: left;
+  color: var(--text-faint);
+  transition: background 120ms var(--ease);
+}
+.project-btn:hover {
+  background: var(--hover);
+}
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--raised);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.project-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.name {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+.state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  --tone: var(--text-faint);
+}
+.state i {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--tone);
+}
+.state.success {
+  --tone: var(--success);
+}
+.state.warning {
+  --tone: var(--warning);
+}
+.state.warning i {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.state.danger {
+  --tone: var(--danger);
+  color: var(--danger);
+}
+.state.violet {
+  --tone: var(--violet);
+}
+.retry {
+  width: 100%;
+}
+.menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 30;
+  padding: 5px;
+  border-radius: var(--radius-md);
+  background: var(--raised);
+  box-shadow: var(--shadow-pop);
+}
+.menu-path {
+  padding: 6px 8px 8px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.menu-row:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.pop-enter-active,
+.pop-leave-active {
+  transition:
+    opacity 140ms var(--ease),
+    transform 140ms var(--ease);
+}
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}
+</style>
