@@ -543,6 +543,23 @@ pub struct Snapshot {
     pub stats: StatsView,
     /// How full the model's context is, once the engine reported it.
     pub context: Option<ContextView>,
+    pub voice: VoiceView,
+}
+
+/// Hands-free voice mode as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceView {
+    pub phase: crate::voice::Phase,
+    pub muted: bool,
+    pub heard: Option<String>,
+    pub problem: Option<String>,
+    /// The microphone while listening, 0 to 100.
+    pub level: u8,
+    /// An utterance is being recorded.
+    pub hearing: bool,
+    /// Something is being read aloud.
+    pub reading: bool,
 }
 
 /// The conversation's size against the model's context window.
@@ -677,6 +694,15 @@ impl Snapshot {
                 window: model.context_window(),
                 estimated: usage.estimated,
             }),
+            voice: VoiceView {
+                phase: model.voice.phase,
+                muted: model.voice.muted,
+                heard: model.voice.heard.clone(),
+                problem: model.voice.problem.clone(),
+                level: model.voice.level,
+                hearing: model.voice.hearing,
+                reading: model.voice.reading,
+            },
         }
     }
 

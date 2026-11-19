@@ -27,6 +27,13 @@ import { startUpdateChecks } from "./updates";
 const snap = computed(() => snapshot.value);
 /** The snapshot once a folder is open; until then the welcome screen shows. */
 const opened = computed(() => (snap.value?.workspace ? (snap.value as OpenSnapshot) : null));
+const reviewing = computed(() => ui.inspectorOpen && ui.inspectorTab === "changes" && !!ui.diffPath && ui.diffExpanded && !ui.settingsOpen);
+watch(() => [opened.value?.workspace.root, opened.value?.sessionId] as const, ([root, id], [previousRoot, previousId]) => {
+  if (root !== previousRoot || id !== previousId) {
+    ui.diffPath = null;
+    ui.diffExpanded = false;
+  }
+});
 
 /** No conversation yet: the background shows at full strength. */
 const empty = computed(() => !!opened.value && opened.value.entries.length === 0 && !opened.value.turnRunning);
@@ -93,6 +100,10 @@ function onKey(event: KeyboardEvent) {
   } else if (command && event.shiftKey && key === "m") {
     event.preventDefault();
     ui.modelPickerOpen = !ui.modelPickerOpen;
+  } else if (command && event.shiftKey && !event.altKey && key === "v") {
+    // Voice: start it, or do what tapping the orb does (talk, stop recording, interrupt).
+    event.preventDefault();
+    void (s.voice.phase === "off" ? engine.voiceStart() : engine.voiceTap());
   } else if (event.key === "Escape" && !event.isComposing && ui.modelPickerOpen) {
     ui.modelPickerOpen = false;
   } else if (event.key === "Escape" && !event.isComposing && ui.picked.size) {
@@ -128,7 +139,7 @@ onBeforeUnmount(() => {
     :class="{ mac: opened.platform === 'macos', 'no-sidebar': !ui.sidebarOpen }"
   >
     <Transition name="drawer">
-      <Sidebar v-if="ui.sidebarOpen" :snap="opened" />
+      <Sidebar v-if="ui.sidebarOpen && !reviewing" :snap="opened" />
     </Transition>
     <!-- Kept mounted under the settings page, so the conversation keeps its scroll and draft. -->
     <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop }">

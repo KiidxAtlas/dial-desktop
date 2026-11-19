@@ -95,6 +95,61 @@ fn a_background_tab_reports_when_done_and_then_closes() {
 }
 
 #[test]
+fn session_notices_target_the_waiting_session_and_do_not_repeat() {
+    let mut tabs = Tabs::new(tab("s1", true));
+    tabs.open(tab("s2", false));
+    for tab in tabs.iter_mut().filter(|t| t.session() == Some("s1")) {
+        tab.apply(Update::Message(Message::Event(Event {
+            kind: "question".into(),
+            body: json!({"event": "question", "seq": 2, "request": {
+                "question_id": "q1", "generation": 1, "session_id": "s1",
+                "questions": [{"id": "a", "question": "Remote?", "options": [{"label": "origin"}]}]
+            }}),
+        })));
+    }
+    assert_eq!(
+        tabs.session_notices(),
+        [SessionNotice {
+            session_id: "s1".into(),
+            kind: NoticeKind::Question,
+        }]
+    );
+    assert!(tabs.session_notices().is_empty());
+}
+
+#[test]
+fn a_completed_turn_notifies_once_but_an_engine_exit_does_not() {
+    let mut tabs = Tabs::new(tab("s1", false));
+    tabs.active_mut().apply(Update::Requested {
+        command: Command::Send {
+            text: "quick turn".into(),
+            images: vec![],
+            inline_images: vec![],
+        },
+        id: request_id(1),
+    });
+    // Both updates may have arrived in the same frame.
+    tabs.active_mut().apply(Update::Message(Message::Response {
+        id: request_id(1),
+        method: "send".into(),
+        result: Ok(json!({"outcome": "completed"})),
+    }));
+    assert_eq!(
+        tabs.session_notices(),
+        [SessionNotice {
+            session_id: "s1".into(),
+            kind: NoticeKind::Finished,
+        }]
+    );
+    assert!(tabs.session_notices().is_empty());
+    let mut disconnected = Tabs::new(tab("s2", true));
+    disconnected
+        .active_mut()
+        .apply(Update::ConnectFailed("test exit".into()));
+    assert!(disconnected.session_notices().is_empty());
+}
+
+#[test]
 fn switching_back_leaves_the_idle_tab_to_close() {
     let mut tabs = Tabs::new(tab("s1", true));
     tabs.open(tab("s2", false));

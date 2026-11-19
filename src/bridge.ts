@@ -176,6 +176,16 @@ export const engine = {
   retryTurn: () => call("retry_turn"),
   /** Summarize the conversation so far to free context. */
   compact: () => call("compact_session"),
+  /** Start voice mode, or talk again while it waits. */
+  voiceStart: () => call("voice_start"),
+  /** Talk over the reply being read, or stop recording. */
+  voiceTap: () => call("voice_tap"),
+  /** Stop the turn voice mode started from a misheard request; voice then waits for a tap. */
+  voiceCancel: () => call("voice_cancel"),
+  voiceMute: (muted: boolean) => call("voice_mute", { muted }),
+  voiceStop: () => call("voice_stop"),
+  /** Read a reply aloud; with no text, stop reading. */
+  readAloud: (text: string | null) => call("read_aloud", { text }),
   refreshSessions: () => call("refresh_sessions"),
   refreshModels: () => call("refresh_models"),
   setModel: (provider: string, modelId: string) => call("set_model", { provider, modelId }),
@@ -267,13 +277,22 @@ export const settings = {
   reset: (key: string, scope: SettingScope) => call("reset_setting", { key, scope }),
 };
 
+interface NotificationDestination { workspaceRoot: string; sessionId: string }
+
+export const notificationApi = {
+  setEnabled: (enabled: boolean, interactive: boolean) => invoke<void>("set_notifications", { enabled, interactive }),
+  resume: (destination: NotificationDestination) => call("resume", { ...destination, waitForClose: true }),
+  onOpen: (handler: (destination: NotificationDestination) => void) =>
+    listen<NotificationDestination>("notification-open", ({ payload }) => handler(payload)),
+};
+
 /** The open project's files, for the Files and Changes panels. Calls throw a readable message. */
 export const workspaceFiles = {
   /** Folder `path` relative to the project; `""` is its root. */
   list: (path: string) => invoke<DirEntry[]>("list_dir", { path }),
   read: (path: string) => invoke<FileView>("read_file", { path }),
   /** Uncommitted changes of `path` (relative or absolute inside the project). */
-  diff: (path: string) => invoke<DiffView>("file_diff", { path }),
+  diff: (path: string, workspaceRoot: string) => invoke<DiffView>("file_diff", { path, workspaceRoot }),
   /** Fuzzy-search workspace files for `@` mentions in the composer. */
   search: (query: string, limit = 20) => invoke<string[]>("search_files", { query, limit }),
 };

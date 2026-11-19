@@ -8,6 +8,9 @@ import SettingRow from "./SettingRow.vue";
 import BackgroundSettings from "./BackgroundSettings.vue";
 import AppearanceSettings from "./AppearanceSettings.vue";
 import UpdatesSettings from "./UpdatesSettings.vue";
+import NotificationSettings from "./NotificationSettings.vue";
+
+type DesktopTab = "appearance" | "background" | "updates" | "notifications";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -21,7 +24,7 @@ const body = ref<HTMLElement | null>(null);
 
 const live = computed(() => props.snap.connection.state === "live");
 /** The desktop app's own tabs, which work without an engine; `null` while an engine tab shows. */
-const appTab = ref<"appearance" | "background" | "updates" | null>(
+const appTab = ref<DesktopTab | null>(
   ui.settingsTab === "updates" ? "updates" : live.value ? null : "appearance",
 );
 
@@ -77,7 +80,7 @@ function pick(t: string) {
   nextTick(() => body.value?.scrollTo({ top: 0 }));
 }
 
-function pickApp(which: "appearance" | "background" | "updates") {
+function pickApp(which: DesktopTab) {
   appTab.value = which;
   query.value = "";
   changedOnly.value = false;
@@ -115,6 +118,9 @@ function close() {
         <button class="tab" :class="{ active: appTab === 'updates' && !across }" @click="pickApp('updates')">
           <span class="truncate">Updates</span>
         </button>
+        <button class="tab" :class="{ active: appTab === 'notifications' && !across }" @click="pickApp('notifications')">
+          <span class="truncate">Notifications</span>
+        </button>
         <div class="group-label">Engine</div>
         <button
           v-for="t in page?.tabs ?? []"
@@ -133,6 +139,7 @@ function close() {
         <div v-if="appTab && !across" class="content">
           <AppearanceSettings v-if="appTab === 'appearance'" />
           <BackgroundSettings v-else-if="appTab === 'background'" />
+          <NotificationSettings v-else-if="appTab === 'notifications'" />
           <UpdatesSettings v-else />
         </div>
 

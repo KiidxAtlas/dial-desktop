@@ -61,8 +61,15 @@ pub struct DiffView {
     pub path: String,
     /// Empty when the file has no uncommitted changes.
     pub diff: String,
-    /// Git does not track the file yet; the diff shows all of it as added.
-    pub untracked: bool,
+    pub base: DiffBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffBase {
+    Head,
+    Index,
+    Untracked,
 }
 
 /// `path` (absolute, or relative to `root`) as an absolute path inside `root`; refuses anything
@@ -198,7 +205,7 @@ pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
     let tracked = git(&["ls-files", "--error-unmatch", "--", &rel])?
         .status
         .success();
-    let output = if tracked {
+    let (output, base) = if tracked {
         let has_head = git(&["rev-parse", "--verify", "--quiet", "HEAD"])?
             .status
             .success();
@@ -207,18 +214,28 @@ pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
             args.push("HEAD");
         }
         args.extend(["--", &rel]);
-        git(&args)?
+        (
+            git(&args)?,
+            if has_head {
+                DiffBase::Head
+            } else {
+                DiffBase::Index
+            },
+        )
     } else {
         // Exit status 1 just means the files differ.
-        git(&[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-index",
-            "--",
-            null_device(),
-            &rel,
-        ])?
+        (
+            git(&[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                null_device(),
+                &rel,
+            ])?,
+            DiffBase::Untracked,
+        )
     };
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(format!(
@@ -229,7 +246,7 @@ pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
     Ok(DiffView {
         path: rel,
         diff: String::from_utf8_lossy(&output.stdout).into_owned(),
-        untracked: !tracked,
+        base,
     })
 }
 

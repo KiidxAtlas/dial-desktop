@@ -125,6 +125,15 @@ const lastAnswer = computed(() =>
   props.snap.turnRunning ? -1 : lastIndex((e) => e.kind === "assistant" && !!e.text.trim()),
 );
 
+/** The reply "Read aloud" was pressed on, while it is being read. */
+const readingEntry = ref(-1);
+watch(() => props.snap.voice.reading, (reading, was) => { if (was && !reading) readingEntry.value = -1; });
+function toggleReading(index: number, text: string) {
+  const stop = readingEntry.value === index && props.snap.voice.reading;
+  readingEntry.value = stop ? -1 : index;
+  void engine.readAloud(stop ? null : text);
+}
+
 watch(
   () => props.snap.entries,
   async () => {
@@ -225,6 +234,14 @@ function gap(index: number) {
             >
               <button class="act" title="Copy answer as Markdown" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
+              </button>
+              <button
+                v-if="snap.connection.state === 'live'"
+                class="act"
+                :title="readingEntry === index && snap.voice.reading ? 'Stop reading' : 'Read aloud'"
+                @click="toggleReading(index, entry.text)"
+              >
+                <Icon :name="readingEntry === index && snap.voice.reading ? 'volumeOff' : 'volume'" :size="14" />
               </button>
             </div>
           </template>

@@ -4,12 +4,14 @@ import { connect, openExternal, showToast } from "./bridge";
 import { loadHighlighter } from "./markdown";
 import { startAppearance } from "./appearance";
 import { openInBrowser, previewUrlsIn } from "./workspace";
+import { startNotifications } from "./notifications";
 import "./styles.css";
 
 startAppearance();
 createApp(App).mount("#app");
 
 connect().catch((error) => showToast(`Could not reach the app: ${error}`));
+startNotifications().catch((error) => showToast(`Could not initialize notifications: ${error}`));
 loadHighlighter().catch((error) => console.warn("syntax highlighting unavailable", error));
 
 // Web links open in the browser: this computer's (a dev server) in the Browser panel, others in

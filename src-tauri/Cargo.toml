@@ -1,6 +1,6 @@
 [package]
 name = "dial-desktop"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Native desktop interface for the Dial coding agent"
@@ -36,9 +36,17 @@ tauri-plugin-process = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
+mac-usernotifications = { version = "0.3.1", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSError", "NSString", "NSValue"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSView", "NSResponder"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKSnapshotConfiguration"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri-winrt-notification = "0.8.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.19", default-features = false, features = ["z-with-tokio"] }
+tokio = { version = "1", features = ["time"] }
 
 [lints.clippy]
 dbg_macro = "deny"

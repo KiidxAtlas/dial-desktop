@@ -212,6 +212,25 @@ export interface Snapshot {
   stats: Stats;
   /** How full the conversation is; `null` until the engine reports it. */
   context: ContextView | null;
+  voice: VoiceView;
+}
+
+export type VoicePhase = "off" | "starting" | "listening" | "thinking" | "speaking" | "paused";
+
+/** Hands-free voice mode: Dial listens, works, then reads its answer aloud. */
+export interface VoiceView {
+  phase: VoicePhase;
+  muted: boolean;
+  /** What the microphone last heard. */
+  heard: string | null;
+  /** Why voice mode paused, when it was not the user's choice. */
+  problem: string | null;
+  /** The microphone while listening, 0 to 100. */
+  level: number;
+  /** An utterance is being recorded. */
+  hearing: boolean;
+  /** Something is being read aloud. */
+  reading: boolean;
 }
 
 export interface ContextView {
@@ -287,7 +306,7 @@ export interface DiffView {
   path: string;
   /** Unified diff; empty without uncommitted changes. */
   diff: string;
-  untracked: boolean;
+  base: "head" | "index" | "untracked";
 }
 
 /** Where the browser panel sits, in logical window pixels. */

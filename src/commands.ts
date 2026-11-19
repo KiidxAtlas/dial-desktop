@@ -58,6 +58,12 @@ export function commands(snap: OpenSnapshot): Command[] {
   const add = (command: Command, when = true) => when && list.push(command);
 
   add({ id: "new", group: "Session", label: "New session", icon: "plus", hint: "⌘N", run: () => startNewSession(snap) }, live);
+  add(
+    snap.voice.phase === "off"
+      ? { id: "voice", group: "Session", label: "Talk to Dial (voice mode)", icon: "mic", hint: "⇧⌘V", keywords: "voice speak talk microphone", run: () => void engine.voiceStart() }
+      : { id: "voice-end", group: "Session", label: "End voice mode", icon: "mic", keywords: "voice stop", run: () => void engine.voiceStop() },
+    live && (snap.voice.phase !== "off" || !snap.turnRunning),
+  );
   if (session) {
     add({ id: "rename", group: "Session", label: "Rename session", icon: "pencil", run: () => startRename(session.id, "title") });
     add({
@@ -242,6 +248,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["↑", "Previous prompt (in an empty box)"],
       ["Esc", "Stop the turn"],
       ["⇧⌘M", "Change model"],
+      ["⇧⌘V", "Voice: start talking, stop recording, or interrupt a spoken reply"],
       ["/", "Slash commands"],
     ],
   },

@@ -38,6 +38,13 @@ const tools = computed(() =>
     .slice(0, 50),
 );
 const width = computed(() => inspectorWidth());
+const expanded = computed(() => shown("changes") && !!ui.diffPath && ui.diffExpanded);
+const fileIndex = computed(() => props.snap.changes.findIndex((file) => file.path === ui.diffPath));
+function moveFile(step: -1 | 1) {
+  if (fileIndex.value < 0) return;
+  const file = props.snap.changes[fileIndex.value + step];
+  if (file) ui.diffPath = file.path;
+}
 
 function taskClass(status: string) {
   if (["abandoned", "cancelled", "blocked"].includes(status)) return "dropped";
@@ -62,8 +69,8 @@ function startResize(event: PointerEvent) {
 </script>
 
 <template>
-  <aside class="inspector" :style="{ '--inspector-width': `${width}px` }">
-    <div class="resize" title="Drag to resize" @pointerdown="startResize" />
+  <aside class="inspector" :class="{ 'wide-review': expanded }" :style="{ '--inspector-width': `${width}px` }">
+    <div v-if="!expanded" class="resize" title="Drag to resize" @pointerdown="startResize" />
     <div class="drag" data-tauri-drag-region />
     <div class="tabs" role="tablist">
       <button
@@ -95,7 +102,11 @@ function startResize(event: PointerEvent) {
     </div>
 
     <div v-if="ui.inspectorTab === 'changes' && ui.diffPath" class="panel">
-      <DiffPane :path="ui.diffPath" :root="snap.workspace.root" @back="ui.diffPath = null" />
+      <DiffPane
+        :path="ui.diffPath" :root="snap.workspace.root" :expanded="expanded"
+        :position="fileIndex < 0 ? null : { index: fileIndex, total: snap.changes.length }"
+        @back="ui.diffPath = null" @expand="ui.diffExpanded = !ui.diffExpanded" @move="moveFile"
+      />
     </div>
 
     <div v-else-if="['plan', 'changes', 'activity'].includes(ui.inspectorTab)" class="body">
@@ -135,6 +146,7 @@ function startResize(event: PointerEvent) {
             <span class="section-label">{{ snap.changes.length }} {{ snap.changes.length === 1 ? "file" : "files" }} changed</span>
             <button class="btn btn-secondary" @click="addToPrompt('Review the changes to these files for bugs and missing tests:\n' + snap.changes.map(c => mention(c.path)).join('\n'))">Review files</button>
           </div>
+          <p class="faint">Files touched in this session. Diffs show current changes, not just Dial’s edits.</p>
           <button
             v-for="change in snap.changes"
             :key="change.path"
@@ -194,6 +206,9 @@ function startResize(event: PointerEvent) {
   border-left: 1px solid var(--border);
   padding: 0 var(--space-lg) var(--space-md);
   transition: width 160ms var(--ease);
+}
+.inspector.wide-review {
+  width: min(68%, calc(100% - 320px));
 }
 :global(body.resizing) .inspector {
   transition: none;

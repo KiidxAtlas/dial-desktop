@@ -173,8 +173,9 @@ continues. Local builds without the release config do not contact Azure.
   send. While Dial works, Enter or the send-note button adds guidance to the running turn.
   <kbd>↑</kbd> in an empty box recalls the last prompt.
   During a live turn, **Queue** (⌘/Ctrl+Enter) saves text and images for the next turn instead.
-  Queues stay in memory for this app run. Switching sessions, stopping a turn, or a failed turn
-  pauses automatic sending; **Send next** resumes from the open, idle session.
+  Queues are saved locally per project and session, and restart paused. Switching sessions, stopping a
+  turn, or a failed turn also pauses automatic sending. Review the transcript if a send may have
+  been interrupted, then use **Send next** from the open, idle session.
   Type `@` and part of a filename to insert its project-relative path. Use ↑/↓ to select a match
   and Tab or Enter to insert it. Slash commands include `/model`, `/think`, `/mode`, `/fork`,
   `/retry`, `/new`, `/clear`, `/compact`, `/undo`, `/open`, and the task recipes (e.g. `/fix-test`).
@@ -182,15 +183,20 @@ continues. Local builds without the release config do not contact Azure.
 - **Questions**: when the agent asks (`ask`), its questions appear above the composer with their
   options (single or multiple choice, the suggested one preselected) and a free-text answer.
   Answer or skip from the app; the engine is started as an interactive client for this.
+- **Desktop notifications**: opt in under Settings → Notifications to get an alert for approvals,
+  questions, and ended turns while Dial is unfocused. Click it to return to the session while Dial
+  is running. Alerts do not show prompts, session names, or project names. macOS uses the installed
+  app bundle; Linux needs a notification daemon with action support for click-through.
 - **Images**: attach PNG, JPEG, GIF or WebP images to a prompt with the image button, by
   pasting, or by dropping files on the window (up to 10, 20 MB each). Files are sent by path; pasted images
   are sent inline. The button is disabled when the model is known not to take images.
 - **Side panel** (drag its left edge to resize; the width is remembered per kind of panel):
   - **Plan**: the agent's todo list with progress. **Activity**: recent tool calls.
-  - **Changes**: the files the agent changed; click one for its diff against `HEAD` (new files
-    against nothing), with added and removed line counts, "open in Files", copy, and "ask Dial".
-    **Review files** adds the changed paths to your draft. Expanded tool rows also link to their
-    files' diffs, and failed calls can add the reported error to your draft.
+  - **Changes**: files Dial touched in this session. Open a file to inspect its current Git diff,
+    which may include unrelated edits and is not a per-turn patch. Expand the review view, step
+    through files, or use **Ask Dial** beside a hunk to add it to the draft. Both sides’ line numbers
+    are shown. You can also copy the diff, open it in Files, or add all listed paths with **Review files**.
+    Expanded tool rows link to their files’ diffs, and failed calls can add their error to the draft.
   - **Files**: the project tree (folders first, `.git` hidden) with a filter and a viewer with
     syntax highlighting. Right-click to mention a file in the prompt, copy its path, or show it in
     the system file browser. Reads stay inside the project (symlinks that leave it are refused)

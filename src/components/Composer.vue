@@ -15,6 +15,7 @@ import ModelPicker from "./ModelPicker.vue";
 import ApprovalMenu from "./ApprovalMenu.vue";
 import QuestionCard from "./QuestionCard.vue";
 import ContextMeter from "./ContextMeter.vue";
+import VoicePanel from "./VoicePanel.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
@@ -67,6 +68,7 @@ const COMMANDS: { name: string; detail: string; run: () => void }[] = [
   { name: "/mode", detail: "Choose an approval mode", run: () => approvalMenu.value?.show() },
   { name: "/retry", detail: "Retry the failed turn", run: () => engine.retryTurn() },
   { name: "/fork", detail: "Duplicate this session", run: () => props.snap.sessionId && engine.forkSession(props.snap.sessionId) },
+  { name: "/voice", detail: "Talk to Dial and hear the answer (⇧⌘V)", run: () => void engine.voiceStart() },
   ...taskRecipes.map(r => ({ name: `/${r.id}`, detail: r.title, run: () => { draft.value.text = r.prompt; } })),
 ];
 
@@ -85,17 +87,33 @@ function available(name: string) {
   if (name === "/compact") return canCompact(props.snap);
   if (name === "/undo") return props.snap.connection.state === "live" && canUndo(props.snap);
   if (name === "/new" || name === "/clear") return props.snap.connection.state === "live";
+  if (name === "/voice") return props.snap.connection.state === "live" && !props.snap.turnRunning && props.snap.voice.phase === "off";
   return true;
+}
+/** Voice misheard: the request was stopped, so put what was heard in the box to fix and send. */
+function editHeard(text: string) {
+  draft.value.text = text;
+  focus();
 }
 /** `false` only when the model is known not to take images; unknown models may try. */
 const imagesAllowed = computed(() => props.snap.model?.acceptsImages !== false);
 const hasContent = computed(() => !!draft.value.text.trim() || draft.value.attachments.length > 0);
-const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && hasContent.value && (!draft.value.attachments.length || imagesAllowed.value));
-function queueDraft() {
-  if (!canQueue.value || !enqueuePrompt(props.snap, draft.value.text, draft.value.attachments)) return;
-  draft.value.text = "";
-  draft.value.attachments = [];
-  focus();
+const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && !queue.value.loading && !queue.value.saving && !queue.value.sending && hasContent.value && (!draft.value.attachments.length || imagesAllowed.value));
+async function queueDraft() {
+  if (!canQueue.value) return;
+  const target = draft.value;
+  const text = target.text;
+  const images = [...target.attachments];
+  target.sending = true;
+  try {
+    if (!(await enqueuePrompt(props.snap, text, images))) return;
+    if (target.text === text) target.text = "";
+    const keys = new Set(images.map((image) => image.key));
+    target.attachments = target.attachments.filter((image) => !keys.has(image.key));
+  } finally {
+    target.sending = false;
+    if (target === draft.value) focus();
+  }
 }
 /** While a turn runs, typed text goes to it as guidance (images cannot). */
 const steering = computed(
@@ -279,13 +297,17 @@ onMounted(focus);
       </Transition>
       <section v-if="queue.items.length" class="queue card" aria-label="Follow-up queue">
         <strong>{{ queue.paused ? 'Queue paused' : 'Queued follow-ups' }}</strong>
+        <p v-if="queue.recovered" class="faint queue-recovery">Restored after restart. Check the transcript before sending a follow-up that may already have been sent.</p>
         <div v-for="item in queue.items" :key="item.id" class="queue-row">
-          <span class="truncate">{{ item.text || 'Image prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} image(s)` : '' }}</span>
-          <button class="icon-btn" title="Edit queued prompt" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
-          <button class="icon-btn" title="Remove queued prompt" @click="removeQueued(snap, item.id)"><Icon name="cross" :size="14" /></button>
+          <span class="truncate" :title="item.text">{{ item.text || 'Image prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} image(s)` : '' }}</span>
+          <button class="icon-btn" title="Edit queued prompt" aria-label="Edit queued prompt" :disabled="queue.saving || queue.sending || draft.sending" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
+          <button class="icon-btn" title="Remove queued prompt" aria-label="Remove queued prompt" :disabled="queue.saving || queue.sending" @click="removeQueued(snap, item.id)"><Icon name="cross" :size="14" /></button>
         </div>
-        <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.sending || !snap.canSend" @click="sendQueuedNext(snap)">Send next</button>
+        <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.loading || queue.saving || queue.sending || !snap.canSend || (!imagesAllowed && !!queue.items[0]?.attachments.length)" @click="sendQueuedNext(snap)">Send next</button>
       </section>
+      <Transition name="pop">
+        <VoicePanel v-if="snap.voice.phase !== 'off'" :voice="snap.voice" :turn-running="snap.turnRunning" @edit="editHeard" />
+      </Transition>
       <div class="composer" :class="{ dropping }" @click="input?.focus()">
         <div v-if="dropping" class="drop-hint"><Icon name="image" :size="16" /> Drop images to attach</div>
         <Transition name="pop">
@@ -338,6 +360,16 @@ onMounted(focus);
             :can-compact="canCompact(snap)"
             @compact="engine.compact()"
           />
+          <button
+            v-if="snap.voice.phase === 'off' && snap.connection.state === 'live' && !(snap.turnRunning && steering)"
+            class="attach mic"
+            :disabled="snap.turnRunning"
+            aria-label="Talk to Dial"
+            :title="snap.turnRunning ? 'Voice mode starts once Dial finishes' : 'Talk to Dial: speak, and hear the answer'"
+            @click="engine.voiceStart()"
+          >
+            <Icon name="mic" :size="16" />
+          </button>
           <button v-if="snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" title="Queue for the next turn (⌘/Ctrl+Enter)" @click="queueDraft">Queue</button>
           <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="markTurnAborted(snap); engine.abort()">
             <Icon name="stop" :size="14" />
@@ -510,6 +542,12 @@ onMounted(focus);
 .attach:disabled {
   opacity: 0.4;
 }
+.mic {
+  width: 32px;
+  height: 32px;
+  margin-right: 4px;
+  border-radius: 50%;
+}
 .slash {
   position: absolute;
   left: 8px;
@@ -522,6 +560,7 @@ onMounted(focus);
   box-shadow: var(--shadow-pop);
 }
 .slash, .queue { max-height: 30vh; overflow-y: auto; }
+.queue-recovery { margin: 3px 0 6px; }
 .queue-row { display: flex; align-items: center; gap: 6px; }
 .queue-row span { flex: 1; }
 .slash-row {

@@ -9,7 +9,7 @@
 use crate::engine::{Command, Engine, Update};
 use crate::model::Model;
 use dial_client::{Message, RequestId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
@@ -23,6 +23,8 @@ pub struct Tab {
     pub engine: Option<Engine>,
     /// The user was told this background tab is waiting for them.
     alerted: bool,
+    notified: HashSet<(NoticeKind, String)>,
+    turn_ended: bool,
     opening: Option<(String, Option<RequestId>)>,
     restore_target: Option<String>,
     turn_queued: bool,
@@ -36,6 +38,8 @@ impl Tab {
             model,
             engine,
             alerted: false,
+            notified: HashSet::new(),
+            turn_ended: false,
             opening: None,
             restore_target: None,
             turn_queued: false,
@@ -138,7 +142,10 @@ impl Tab {
             }
             _ => {}
         }
-        self.model.apply(update)
+        let was_running = self.model.conversation.turn_running();
+        let follow = self.model.apply(update);
+        self.turn_ended |= was_running && !self.model.conversation.turn_running();
+        follow
     }
 
     fn owns(&self, id: &str) -> bool {
@@ -185,6 +192,18 @@ pub struct Activity {
     pub waiting: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoticeKind {
+    Approval,
+    Question,
+    Finished,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionNotice {
+    pub session_id: String,
+    pub kind: NoticeKind,
+}
 /// The open tabs; one is on screen.
 pub struct Tabs {
     tabs: Vec<Tab>,
@@ -363,6 +382,54 @@ impl Tabs {
     /// Each tab's busy state, to pass to [`Tabs::background_news`] after the next updates.
     pub fn busy_states(&self) -> Vec<bool> {
         self.tabs.iter().map(Tab::busy).collect()
+    }
+
+    /// Native alerts are emitted only for new requests and live-to-idle turns, not on every poll.
+    pub fn session_notices(&mut self) -> Vec<SessionNotice> {
+        let mut notices = Vec::new();
+        for tab in &mut self.tabs {
+            let turn_ended = std::mem::take(&mut tab.turn_ended);
+            let Some(session_id) = tab.session().map(str::to_owned) else {
+                continue;
+            };
+            if !matches!(
+                tab.model.connection,
+                Some(crate::model::Connection::Live { .. })
+            ) {
+                tab.notified.clear();
+                continue;
+            }
+            let conversation = &tab.model.conversation;
+            let mut pending = HashSet::new();
+            for approval in conversation.pending_approvals() {
+                pending.insert((NoticeKind::Approval, approval.request.approval_id.clone()));
+            }
+            if let Some(id) = conversation
+                .question()
+                .and_then(|question| question["question_id"].as_str())
+            {
+                pending.insert((NoticeKind::Question, id.to_owned()));
+            }
+            for kind in [NoticeKind::Approval, NoticeKind::Question] {
+                if pending
+                    .difference(&tab.notified)
+                    .any(|(new, _)| *new == kind)
+                {
+                    notices.push(SessionNotice {
+                        session_id: session_id.clone(),
+                        kind,
+                    });
+                }
+            }
+            tab.notified = pending;
+            if turn_ended && !tab.busy() && !tab.waiting() {
+                notices.push(SessionNotice {
+                    session_id,
+                    kind: NoticeKind::Finished,
+                });
+            }
+        }
+        notices
     }
 
     /// What each open session is doing, by session id.

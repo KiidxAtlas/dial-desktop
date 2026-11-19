@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Voice mode: the Dial engine records the microphone as a child of this app. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dial listens to the microphone while voice mode is on, so you can talk to the agent.</string>
+</dict>
+</plist>

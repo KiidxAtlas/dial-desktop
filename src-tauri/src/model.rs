@@ -5,6 +5,7 @@
 //! [`dial_client::Conversation`], the shared view model every Dial frontend uses.
 
 use crate::engine::{Command, Purpose, QuestionRef, Update};
+use crate::voice::{self, Voice};
 use dial_client::{Conversation, Entry, Message, Ready, RequestId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -240,6 +241,8 @@ pub struct Model {
     apply_pending: bool,
     /// The conversation's size in tokens as the engine last reported it (`context_usage`).
     pub context: Option<ContextUsage>,
+    /// Hands-free voice mode.
+    pub voice: Voice,
 }
 
 /// How much of the model's context the conversation fills.
@@ -283,6 +286,43 @@ impl Model {
     /// Whether a new prompt can be sent now.
     pub fn can_send(&self) -> bool {
         matches!(self.connection(), Connection::Live { .. }) && !self.conversation.turn_running()
+    }
+
+    /// Start voice mode, or talk again while it waits. Replies are asked to suit speech unless
+    /// the user set their own `voice.live.instructions`.
+    pub fn start_voice(&mut self) -> Result<Option<Command>, String> {
+        if !matches!(self.connection(), Connection::Live { .. }) {
+            return Err("Dial is not connected".into());
+        }
+        if self.conversation.turn_running() && !self.voice.active() {
+            return Err("Wait for Dial to finish, then talk".into());
+        }
+        let custom = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.get("voice.live.instructions"))
+            .and_then(|s| s.value.as_str())
+            .is_some_and(|text| !text.trim().is_empty());
+        let instructions = (!custom).then(|| voice::SPOKEN_STYLE.to_owned());
+        Ok(self.voice.start(instructions))
+    }
+
+    /// The voice panel's main control: talk over a reply, or stop recording.
+    pub fn voice_tap(&mut self) -> Option<Command> {
+        self.voice.tap(self.conversation.turn_running())
+    }
+
+    /// Stop the turn voice mode started from a misheard request.
+    pub fn voice_cancel(&mut self) -> Option<Command> {
+        self.voice.cancel(self.conversation.turn_running())
+    }
+
+    /// "Read aloud" on a reply, or stop reading with `None`.
+    pub fn read_aloud(&self, text: Option<String>) -> Result<Command, String> {
+        if !matches!(self.connection(), Connection::Live { .. }) {
+            return Err("Dial is not connected".into());
+        }
+        Ok(Command::LiveSpeak(text.filter(|t| !t.trim().is_empty())))
     }
 
     /// The requests that delete sessions `ids`. The engine refuses to delete its active session,
@@ -563,6 +603,7 @@ impl Model {
                 if purpose == Purpose::Recover {
                     self.recovering = true;
                 }
+                self.voice.requested(&command, id);
                 self.pending.insert(id, purpose);
             }
             Update::RequestFailed { command, error } => {
@@ -585,6 +626,7 @@ impl Model {
     }
 
     fn connect(&mut self, ready: &Ready) {
+        self.voice.reset();
         self.conversation.new_connection(ready);
         self.pending.clear();
         self.recovering = false;
@@ -596,7 +638,13 @@ impl Model {
     }
 
     fn message(&mut self, message: &Message, follow: &mut Vec<Command>) {
-        self.conversation.apply(message);
+        // A recording that failed before any speech was heard is the voice panel's to show,
+        // not a failed turn.
+        let failed_listen = matches!(message, Message::Response { id, result, .. }
+            if self.voice.owns_failed_listen(*id, result.is_err()));
+        if !failed_listen {
+            self.conversation.apply(message);
+        }
         match message {
             Message::Response { id, result, .. } => {
                 let Some(purpose) = self.pending.remove(id) else {
@@ -644,6 +692,26 @@ impl Model {
                             self.toast = Some("The engine's recovery snapshot was incomplete; the view may be out of date".into());
                         }
                     }
+                    (Purpose::LiveStart, result) => {
+                        let result = result.as_ref().map_err(ToString::to_string);
+                        if let Err(error) = &result {
+                            self.toast = Some(format!("Could not start voice mode: {error}"));
+                        }
+                        follow.extend(self.voice.started(result));
+                    }
+                    (Purpose::Listen, result) => {
+                        let result = result
+                            .as_ref()
+                            .map_err(|error| (error.code.as_deref(), error.to_string()));
+                        follow.extend(self.voice.listened(*id, result));
+                        if !failed_listen {
+                            follow.push(Command::ListSessions);
+                            self.apply_after_turn(follow);
+                        }
+                    }
+                    (Purpose::LiveMute | Purpose::LiveStop | Purpose::Speak, Ok(_)) => {}
+                    // Ending voice mode after the engine's session is gone is not a problem.
+                    (Purpose::LiveStop, Err(_)) => {}
                     (Purpose::State, Ok(state)) => {
                         if let Some(current) = CurrentModel::from_wire(&state["current_model"]) {
                             self.current_model = Some(current);
@@ -796,6 +864,7 @@ impl Model {
             Message::Disconnected { .. } => {
                 self.pending.clear();
                 self.recovering = false;
+                self.voice.reset();
                 self.connection = Some(Connection::Ended);
             }
             Message::Event(event) => match event.kind.as_str() {
@@ -807,6 +876,30 @@ impl Model {
                 }
                 // Another session's size is unknown until the engine reports it.
                 "active_session" => self.context = None,
+                "live_transcript" => {
+                    let text = event.body["text"].as_str().unwrap_or_default();
+                    if let Some((id, repeated)) = self.voice.transcript(text) {
+                        self.conversation.push_turn(text, 0, id);
+                        if repeated {
+                            follow.push(Command::Abort);
+                        }
+                    }
+                }
+                "live_level" => {
+                    let level = event.body["level"].as_f64().unwrap_or_default();
+                    let speech = event.body["speech"].as_bool().unwrap_or_default();
+                    self.voice.heard_level(level, speech);
+                }
+                "live_speech" => {
+                    let speaking = event.body["speaking"].as_bool().unwrap_or_default();
+                    let running = self.conversation.turn_running();
+                    follow.extend(self.voice.speech(speaking, running));
+                }
+                // A read-out failed, in voice mode or one asked for with "Read aloud".
+                "live_error" => {
+                    let message = event.body["message"].as_str().unwrap_or("speech failed");
+                    self.toast = Some(format!("Voice: {message}"));
+                }
                 _ => {}
             },
             Message::ProtocolError(_) => {}
@@ -884,6 +977,11 @@ fn describe(command: &Command) -> &'static str {
         Command::Steer(_) => "add to the running turn",
         Command::Retry => "retry the prompt",
         Command::Compact => "compact the conversation",
+        Command::LiveStart { .. } => "start voice mode",
+        Command::LiveListen => "listen",
+        Command::LiveMute(_) => "mute voice replies",
+        Command::LiveStop => "end voice mode",
+        Command::LiveSpeak(_) => "read aloud",
     }
 }
 
@@ -916,5 +1014,10 @@ fn purpose_label(purpose: Purpose) -> &'static str {
         Purpose::Undo => "Could not undo the last turn",
         Purpose::Steer => "Could not add to the running turn",
         Purpose::Compact => "Could not compact the conversation",
+        Purpose::LiveStart => "Could not start voice mode",
+        Purpose::Listen => "Could not listen",
+        Purpose::LiveMute => "Could not mute voice replies",
+        Purpose::LiveStop => "Could not end voice mode",
+        Purpose::Speak => "Could not read aloud",
     }
 }

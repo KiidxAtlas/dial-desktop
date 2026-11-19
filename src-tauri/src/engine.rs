@@ -116,6 +116,18 @@ pub enum Command {
     Retry,
     /// Summarize the conversation so far to free context.
     Compact,
+    /// Start voice mode: the engine reads each final answer aloud.
+    LiveStart {
+        instructions: Option<String>,
+    },
+    /// Record one utterance and run it as a turn.
+    LiveListen,
+    /// Silence (or unsilence) spoken replies.
+    LiveMute(bool),
+    /// End voice mode.
+    LiveStop,
+    /// Read text aloud (`None` stops reading), in or out of voice mode.
+    LiveSpeak(Option<String>),
 }
 
 /// Identity of one open question; the engine rejects answers for any other.
@@ -178,6 +190,11 @@ pub enum Purpose {
     Undo,
     Steer,
     Compact,
+    LiveStart,
+    Listen,
+    LiveMute,
+    LiveStop,
+    Speak,
 }
 
 impl Command {
@@ -290,6 +307,18 @@ impl Command {
             // A retry starts a turn, so its reply settles the turn like `send`'s.
             Self::Retry => (Purpose::Turn, "retry", json!({})),
             Self::Compact => (Purpose::Compact, "compact", json!({ "reason": "manual" })),
+            Self::LiveStart { instructions } => {
+                let mut params = json!({});
+                if let Some(instructions) = instructions {
+                    params["instructions"] = json!(instructions);
+                }
+                (Purpose::LiveStart, "live_start", params)
+            }
+            Self::LiveListen => (Purpose::Listen, "live_listen", json!({})),
+            Self::LiveMute(muted) => (Purpose::LiveMute, "live_mute", json!({ "muted": muted })),
+            Self::LiveStop => (Purpose::LiveStop, "live_stop", json!({})),
+            Self::LiveSpeak(Some(text)) => (Purpose::Speak, "live_speak", json!({ "text": text })),
+            Self::LiveSpeak(None) => (Purpose::Speak, "live_speak", json!({})),
         }
     }
 }

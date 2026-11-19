@@ -138,12 +138,17 @@ fn diffs_show_tracked_and_untracked_changes() {
     git(&["init", "-q"]);
     fs::write(root.0.join("a.txt"), "one\n").unwrap();
     git(&["add", "a.txt"]);
+    fs::write(root.0.join("a.txt"), "unstaged\n").unwrap();
+    let against_index = diff(&root.0, "a.txt").unwrap();
+    assert_eq!(against_index.base, DiffBase::Index);
+    assert!(against_index.diff.contains("+unstaged"));
+    fs::write(root.0.join("a.txt"), "one\n").unwrap();
     git(&["commit", "-qm", "init"]);
     fs::write(root.0.join("a.txt"), "two\n").unwrap();
     fs::write(root.0.join("new.txt"), "fresh\n").unwrap();
 
     let changed = diff(&root.0, "a.txt").unwrap();
-    assert!(!changed.untracked);
+    assert_eq!(changed.base, DiffBase::Head);
     assert!(
         changed.diff.contains("-one") && changed.diff.contains("+two"),
         "{}",
@@ -151,7 +156,7 @@ fn diffs_show_tracked_and_untracked_changes() {
     );
 
     let added = diff(&root.0, &root.0.join("new.txt").to_string_lossy()).unwrap();
-    assert!(added.untracked);
+    assert_eq!(added.base, DiffBase::Untracked);
     assert_eq!(added.path, "new.txt");
     assert!(added.diff.contains("+fresh"), "{}", added.diff);
 

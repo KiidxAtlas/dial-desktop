@@ -13,6 +13,7 @@ export const ui = reactive({
   inspectorTab: "plan" as InspectorTab,
   /** The changed file whose diff the Changes panel shows, or `null` for the list. */
   diffPath: null as string | null,
+  diffExpanded: false,
   /** The file open in the Files panel's viewer. */
   filePath: null as string | null,
   /** Expanded tool calls and reasoning sections, by key. */

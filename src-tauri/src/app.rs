@@ -16,6 +16,7 @@ use crate::engine::{self, APPROVAL_MODES, Command, Engine};
 use crate::files::{self, DiffView, DirEntryView, FileView};
 use crate::launcher::{self, Recents};
 use crate::model::{Answer, Model, Reply};
+use crate::notifications::{self, Notifications};
 use crate::preview;
 use crate::settings::{self, SettingsView};
 use crate::tabs::{Route, Tab, Tabs};
@@ -265,7 +266,7 @@ fn snapshot_of(inner: &Inner) -> Snapshot {
 /// Fold queued engine updates into the models and publish the tab on screen.
 fn publish(app: &AppHandle) {
     let shared = app.state::<Shared>();
-    let (snapshot, models, settings, messages, closed) = {
+    let (snapshot, models, settings, messages, closed, notices) = {
         let mut inner = shared.lock();
         let tabs = &mut inner.tabs;
         let before = tabs.busy_states();
@@ -279,6 +280,7 @@ fn publish(app: &AppHandle) {
             messages.extend(tab.model.toast.take());
         }
         messages.extend(tabs.background_news(&before));
+        let notices = tabs.session_notices();
         let closed = tabs.close_idle();
         let active = tabs.active_mut();
         if !closed.is_empty() {
@@ -290,7 +292,14 @@ fn publish(app: &AppHandle) {
         let settings = std::mem::take(&mut active.model.settings_changed)
             .then(|| settings_of(&active.model))
             .flatten();
-        (snapshot_of(&inner), models, settings, messages, closed)
+        (
+            snapshot_of(&inner),
+            models,
+            settings,
+            messages,
+            closed,
+            notices,
+        )
     };
     retire(closed);
     if let Some(models) = models {
@@ -298,6 +307,9 @@ fn publish(app: &AppHandle) {
     }
     if let Some(settings) = settings {
         let _ = app.emit("settings", settings);
+    }
+    if let Some(workspace) = snapshot.workspace.as_ref() {
+        notifications::publish(app, &workspace.root, notices);
     }
     let _ = app.emit("snapshot", snapshot);
     for message in messages {
@@ -660,31 +672,54 @@ fn new_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> 
 
 /// Show session `session_id`: the tab already running it, this tab when idle, or a new engine.
 #[tauri::command]
-fn resume(
-    shared: State<'_, Shared>,
+async fn resume(
+    app: AppHandle,
     session_id: String,
     workspace_root: Option<String>,
+    wait_for_close: Option<bool>,
 ) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let shared = app.state::<Shared>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            if resume_once(&shared, &session_id, workspace_root.as_deref())? {
+                return Ok(());
+            }
+            if wait_for_close != Some(true) || std::time::Instant::now() >= deadline {
+                return Err("That session just finished. Try opening it again in a moment.".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn resume_once(
+    shared: &Shared,
+    session_id: &str,
+    workspace_root: Option<&str>,
+) -> Result<bool, String> {
     let mut inner = shared.lock();
-    if let Some(root) = workspace_root.as_deref()
+    if let Some(root) = workspace_root
         && inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(root)
     {
         return Err("That search result belongs to a different project".into());
     }
-    match inner.tabs.route_resume(&session_id) {
+    match inner.tabs.route_resume(session_id) {
         Route::Switch(index) => inner.tabs.switch(index),
-        Route::Spawn => shared.open_tab(&mut inner, Some(Command::Resume(session_id)))?,
+        Route::Spawn => {
+            shared.open_tab(&mut inner, Some(Command::Resume(session_id.to_owned())))?
+        }
         Route::Here => inner
             .tabs
             .active_mut()
-            .enqueue(Command::Resume(session_id))?,
-        Route::Closing => {
-            return Err("That session just finished. Try opening it again in a moment.".into());
-        }
+            .enqueue(Command::Resume(session_id.to_owned()))?,
+        Route::Closing => return Ok(false),
     }
     drop(inner);
     shared.poke();
-    Ok(())
+    Ok(true)
 }
 
 /// Delete sessions `session_ids` (one or several selected in the sidebar).
@@ -850,6 +885,68 @@ fn compact_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), Stri
     Ok(())
 }
 
+/// Start voice mode in the session on screen, or talk again while it waits.
+#[tauri::command]
+fn voice_start(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    if tab.transitioning() {
+        return Err("Wait for the session to finish opening".into());
+    }
+    let command = tab.model.start_voice()?;
+    dispatch(&app, tab.engine.as_ref(), command.into_iter().collect());
+    Ok(())
+}
+
+/// The voice orb: talk over the reply being read, or stop recording.
+#[tauri::command]
+fn voice_tap(app: AppHandle, shared: State<'_, Shared>) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let command = tab.model.voice_tap();
+    dispatch(&app, tab.engine.as_ref(), command.into_iter().collect());
+}
+
+/// Stop the turn voice mode started, because Dial misheard.
+#[tauri::command]
+fn voice_cancel(app: AppHandle, shared: State<'_, Shared>) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let command = tab.model.voice_cancel();
+    dispatch(&app, tab.engine.as_ref(), command.into_iter().collect());
+}
+
+#[tauri::command]
+fn voice_mute(app: AppHandle, shared: State<'_, Shared>, muted: bool) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let command = tab.model.voice.mute(muted);
+    dispatch(&app, tab.engine.as_ref(), command.into_iter().collect());
+}
+
+/// End voice mode; a turn already running carries on.
+#[tauri::command]
+fn voice_stop(app: AppHandle, shared: State<'_, Shared>) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let commands = tab.model.voice.stop();
+    dispatch(&app, tab.engine.as_ref(), commands);
+}
+
+/// Read a reply aloud; without `text`, stop reading.
+#[tauri::command]
+fn read_aloud(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    text: Option<String>,
+) -> Result<(), String> {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let command = tab.model.read_aloud(text)?;
+    dispatch(&app, tab.engine.as_ref(), vec![command]);
+    Ok(())
+}
+
 #[tauri::command]
 fn refresh_sessions(app: AppHandle, shared: State<'_, Shared>) {
     request(&app, &shared, Command::ListSessions);
@@ -920,8 +1017,16 @@ async fn read_file(shared: State<'_, Shared>, path: String) -> Result<FileView, 
 
 /// The uncommitted changes of file `path` in the workspace.
 #[tauri::command]
-async fn file_diff(shared: State<'_, Shared>, path: String) -> Result<DiffView, String> {
-    files::diff(&shared.root()?, &path)
+async fn file_diff(
+    shared: State<'_, Shared>,
+    path: String,
+    workspace_root: String,
+) -> Result<DiffView, String> {
+    let root = shared.root()?;
+    if root != Path::new(&workspace_root) {
+        return Err("The project changed before the diff could load".into());
+    }
+    files::diff(&root, &path)
 }
 
 /// Fuzzy-search files inside the workspace for `@` mentions in the composer.
@@ -985,6 +1090,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
+            notifications::set_notifications,
             snapshot,
             models,
             settings,
@@ -1012,6 +1118,12 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             steer,
             retry_turn,
             compact_session,
+            voice_start,
+            voice_tap,
+            voice_cancel,
+            voice_mute,
+            voice_stop,
+            read_aloud,
             refresh_sessions,
             search_transcripts,
             local_model_removal,
@@ -1039,6 +1151,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         ])
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
+            app.manage(Notifications::default());
             app.manage(Shared {
                 inner: Mutex::new(Inner {
                     tabs: Tabs::new(Tab::new(Model::default(), None)),
