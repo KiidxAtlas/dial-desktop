@@ -25,9 +25,10 @@ dial rpc (engine) ──stdio MCP──▶ dial-desktop --browser-mcp (bridge)
   `initialize`, `ping`, `tools/list`, `tools/call`. It holds no browser. Each call goes to the
   running app. With no app running it lists no tools, so Dial sessions in a terminal see nothing.
 - **The app side** (`agent_browser.rs`) listens on a random loopback port and writes
-  `{port, token, pid}` to `browser-endpoint.json` in the app's folder
+  `{port, token, pid}` to `browser-endpoints/<pid>.json` in the app's folder
   (`~/Library/Application Support/dev.dial.desktop/` on macOS), mode `0600`. Each request carries
   the 256-bit token; anything else is refused. The file is removed when the app quits.
+  The bridge matches its project directory to one live window; zero or ambiguous matches are not routed. The app checks the project again on every authenticated call.
 - **The tools** run small scripts in the page through `eval_with_callback`, so they work with each
   platform's system web view; nothing needs the Chrome DevTools Protocol, which WKWebView and
   WebKitGTK lack. Screenshots use WebKit's own `takeSnapshot` (macOS only for now).

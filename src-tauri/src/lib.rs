@@ -15,6 +15,7 @@ pub mod engine;
 pub mod files;
 pub mod launcher;
 pub mod model;
+mod model_library;
 mod notifications;
 pub mod preview;
 pub mod settings;

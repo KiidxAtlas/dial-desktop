@@ -141,3 +141,24 @@ fn a_missing_engine_reports_connect_failure_and_wakes_the_ui() {
     engine.shutdown();
     assert!(woken.load(Ordering::SeqCst) >= 1);
 }
+
+#[test]
+fn presets_do_not_write_to_a_changed_session_or_continue_after_model_failure() {
+    let main = || Some(PresetModel { provider: "p".into(), model: "m".into(), thinking: Some("high".into()) });
+    let mut calls = Vec::new();
+    let changed = apply_preset(&mut |method, _| {
+        calls.push(method.to_owned());
+        Ok(json!({"session_id":"other"}))
+    }, "target", json!({}), main());
+    assert!(changed.is_err());
+    assert_eq!(calls, ["get_session_stats"]);
+
+    calls.clear();
+    let rejected = apply_preset(&mut |method, _| {
+        calls.push(method.to_owned());
+        if method == "set_model" { Err("Unknown model".into()) }
+        else { Ok(json!({"session_id":"target"})) }
+    }, "target", json!({}), main());
+    assert_eq!(rejected, Err("Unknown model".into()));
+    assert_eq!(calls, ["get_session_stats", "set_setting", "apply_settings", "set_model"]);
+}

@@ -187,6 +187,7 @@ pub struct ToolView {
     pub target: String,
     /// Card tone: `tools`, `shell`, `edit`, `connect` or `workers`.
     pub tone: Option<String>,
+    pub check: bool,
     pub state: ToolState,
     /// Live progress while running.
     pub progress: Option<String>,
@@ -271,6 +272,12 @@ impl ToolView {
             },
             label,
             target,
+            check: (tool.name == "verify"
+                && !serde_json::from_str::<Value>(&tool.arguments)
+                    .is_ok_and(|v| v["plan"] == true))
+                || (tool.name == "bash"
+                    && serde_json::from_str::<Value>(&tool.arguments)
+                        .is_ok_and(|v| v["check"] == true)),
             tone: card.and_then(|c| c.tone.clone()),
             state: ToolState::of(tool),
             progress: tool.progress.clone().filter(|_| tool.result.is_none()),
@@ -593,6 +600,13 @@ impl Snapshot {
                         format!("{meta} · {} messages", s.messages)
                     };
                 }
+                if s.open_elsewhere {
+                    meta = if meta.is_empty() {
+                        "Open in another Dial process".to_owned()
+                    } else {
+                        format!("{meta} · open in another Dial process")
+                    };
+                }
                 SessionView {
                     id: s.id.clone(),
                     title: s.title.clone(),
@@ -742,6 +756,141 @@ impl Snapshot {
             );
         }
     }
+}
+
+/// The `snapshot` event: the whole snapshot the first time, then only what changed since the
+/// previous one. While a reply streams the transcript is republished about once a frame, and
+/// sending all of it each time made long sessions slower the longer they got.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotEvent {
+    /// This snapshot's number; published snapshots are numbered 1, 2, 3, …
+    pub seq: u64,
+    /// The snapshot `patch` applies to (`seq - 1`).
+    pub base: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full: Option<Snapshot>,
+    /// Changed top-level fields under their camelCase names. A changed transcript comes as
+    /// `entriesFrom` (the entries before it are unchanged) and `entriesTail` (the new rest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<serde_json::Map<String, Value>>,
+}
+
+/// The latest published snapshot with its number, as the UI asks for it on start or when it
+/// missed an event.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SnapshotAt {
+    pub seq: u64,
+    pub snapshot: Snapshot,
+}
+
+/// The last snapshot sent to the UI, to send only what changes next.
+#[derive(Debug, Default)]
+pub struct Published {
+    seq: u64,
+    last: Option<Snapshot>,
+}
+
+impl Published {
+    /// The event that brings the UI to `next`, or `None` when nothing changed.
+    pub fn advance(&mut self, next: Snapshot) -> Option<SnapshotEvent> {
+        let (full, patch) = match &self.last {
+            Some(prev) => {
+                let patch = patch(prev, &next);
+                if patch.is_empty() {
+                    return None;
+                }
+                (None, Some(patch))
+            }
+            None => (Some(next.clone()), None),
+        };
+        self.seq += 1;
+        self.last = Some(next);
+        Some(SnapshotEvent {
+            seq: self.seq,
+            base: self.seq - 1,
+            full,
+            patch,
+        })
+    }
+
+    /// The last published snapshot; `fresh` is published first when there is none yet.
+    pub fn current(&mut self, fresh: impl FnOnce() -> Snapshot) -> SnapshotAt {
+        if self.last.is_none() {
+            self.advance(fresh());
+        }
+        SnapshotAt {
+            seq: self.seq,
+            snapshot: self.last.clone().expect("published above"),
+        }
+    }
+}
+
+/// The fields of `next` that differ from `prev` (see [`SnapshotEvent::patch`]).
+pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let mut put = |key: &str, value: Value| {
+        out.insert(key.to_owned(), value);
+    };
+    // Destructured so a new field cannot be forgotten here.
+    let Snapshot {
+        platform,
+        workspace,
+        connection,
+        title,
+        model,
+        approval,
+        session_id,
+        turn_running,
+        can_send,
+        sessions,
+        entries,
+        approvals,
+        question,
+        plan,
+        changes,
+        stats,
+        context,
+        voice,
+    } = next;
+    macro_rules! field {
+        ($name:ident, $key:literal) => {
+            if &prev.$name != $name {
+                put($key, serde_json::to_value($name).unwrap_or(Value::Null));
+            }
+        };
+    }
+    field!(platform, "platform");
+    field!(workspace, "workspace");
+    field!(connection, "connection");
+    field!(title, "title");
+    field!(model, "model");
+    field!(approval, "approval");
+    field!(session_id, "sessionId");
+    field!(turn_running, "turnRunning");
+    field!(can_send, "canSend");
+    field!(sessions, "sessions");
+    field!(approvals, "approvals");
+    field!(question, "question");
+    field!(plan, "plan");
+    field!(changes, "changes");
+    field!(stats, "stats");
+    field!(context, "context");
+    field!(voice, "voice");
+    let same = prev
+        .entries
+        .iter()
+        .zip(entries)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if same < prev.entries.len() || same < entries.len() {
+        put("entriesFrom", same.into());
+        put(
+            "entriesTail",
+            serde_json::to_value(&entries[same..]).unwrap_or(Value::Null),
+        );
+    }
+    out
 }
 
 /// The UI's view of a `question` request. A request without its identity or questions still

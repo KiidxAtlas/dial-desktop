@@ -181,6 +181,8 @@ pub enum Route {
     Spawn,
     /// The old worker has not finished releasing the journal yet.
     Closing,
+    /// Another Dial process holds the session; resuming it would fork a copy.
+    Elsewhere,
 }
 
 /// What a session is doing in some tab, for the sidebar.
@@ -280,6 +282,15 @@ impl Tabs {
                 .is_some_and(|owner| owner.strong_count() > 0) =>
             {
                 Route::Closing
+            }
+            None if self
+                .active()
+                .model
+                .sessions
+                .iter()
+                .any(|s| s.id == id && s.open_elsewhere) =>
+            {
+                Route::Elsewhere
             }
             None => self.route_new(),
         }

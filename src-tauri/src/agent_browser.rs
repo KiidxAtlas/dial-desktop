@@ -61,6 +61,7 @@ pub struct Endpoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub token: String,
+    pub workspace: String,
     pub tool: String,
     #[serde(default)]
     pub arguments: Value,
@@ -95,7 +96,10 @@ impl Reply {
 
 /// The endpoint file in the app's per-user folder.
 pub fn endpoint_file(home: Option<&Path>) -> Option<PathBuf> {
-    crate::launcher::app_dir(home).map(|dir| dir.join("browser-endpoint.json"))
+    crate::launcher::app_dir(home).map(|dir| {
+        dir.join("browser-endpoints")
+            .join(format!("{}.json", std::process::id()))
+    })
 }
 
 /// What the tools say about themselves, for the bridge's `initialize`.
@@ -621,6 +625,7 @@ pub fn describe_call(tool: &str, args: &Value) -> String {
 pub fn handle(
     line: &str,
     token: &str,
+    project_matches: impl FnOnce(&str) -> bool,
     run: impl FnOnce(&str, &Value) -> Result<Reply, String>,
 ) -> Reply {
     let Ok(request) = serde_json::from_str::<Request>(line) else {
@@ -628,6 +633,9 @@ pub fn handle(
     };
     if !same(&request.token, token) {
         return Reply::error("Not authorized");
+    }
+    if !project_matches(&request.workspace) {
+        return Reply::error("Different project window");
     }
     if request.tool == PING {
         return Reply::text("pong");
@@ -729,15 +737,20 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
     {
         return;
     }
-    let reply = handle(line.trim(), token, |tool, args| {
-        let _ = app.emit(
-            "agent-browser",
-            json!({"kind": "activity", "text": describe_call(tool, args), "busy": true}),
-        );
-        let result = call(app, tool, args);
-        let _ = app.emit("agent-browser", json!({"kind": "activity", "busy": false}));
-        result
-    });
+    let reply = handle(
+        line.trim(),
+        token,
+        |root| crate::app::browser_project(app, root),
+        |tool, args| {
+            let _ = app.emit(
+                "agent-browser",
+                json!({"kind": "activity", "text": describe_call(tool, args), "busy": true}),
+            );
+            let result = call(app, tool, args);
+            let _ = app.emit("agent-browser", json!({"kind": "activity", "busy": false}));
+            result
+        },
+    );
     let mut out = serde_json::to_string(&reply).unwrap_or_default();
     out.push('\n');
     let mut stream = stream;

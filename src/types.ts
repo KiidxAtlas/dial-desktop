@@ -60,6 +60,7 @@ export interface ToolEntry {
   label: string;
   target: string;
   tone: string | null;
+  check: boolean;
   state: ToolState;
   progress: string | null;
   input: Block | null;
@@ -250,13 +251,20 @@ export type Decision = "allow" | "always" | "project" | "deny";
 export interface Choice {
   value: string;
   label: string;
+  /** Distinguishes choices whose persisted values are identical. */
+  id?: string;
+  /** Other settings saved with this choice (an image model's endpoint and protocol). */
+  with?: Record<string, unknown>;
 }
+
+/** What a text setting names, so the page can offer a picker instead of a text box. */
+export type TextHint = "plain" | "model" | "provider" | "program" | "file" | "folder" | "url" | "envVar" | "microphone";
 
 export type SettingControl =
   | { type: "toggle" }
   | { type: "select"; options: Choice[] }
-  | { type: "number"; min: number | null; max: number | null; step: number | null; integer: boolean; auto: boolean }
-  | { type: "text"; suggestions: Choice[] }
+  | { type: "number"; min: number | null; max: number | null; step: number | null; integer: boolean; auto: boolean; unit: string | null }
+  | { type: "text"; suggestions: Choice[]; hint: TextHint }
   | { type: "list" }
   | { type: "table" };
 

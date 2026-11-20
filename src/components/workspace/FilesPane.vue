@@ -49,11 +49,14 @@ function toggle(entry: DirEntry) {
 }
 
 async function openFile(path: string) {
+  const root = props.snap.workspace.root;
   ui.filePath = path;
   fileError.value = null;
   try {
-    file.value = await workspaceFiles.read(path);
+    const result = await workspaceFiles.read(path);
+    if (ui.filePath === path && props.snap.workspace.root === root) file.value = result;
   } catch (error) {
+    if (ui.filePath !== path || props.snap.workspace.root !== root) return;
     file.value = null;
     fileError.value = String(error);
   }
@@ -122,6 +125,7 @@ watch(
   () => props.snap.changes.length,
   () => void refresh(),
 );
+watch(() => ui.filePath, path => { if (path) void openFile(path); });
 
 onMounted(() => {
   void load("");
@@ -149,7 +153,7 @@ defineExpose({ openFile });
           :class="{ on: !entry.dir && entry.path === ui.filePath }"
           :style="{ paddingLeft: `${6 + depth * 12}px` }"
           :title="entry.path"
-          @click="entry.dir ? toggle(entry) : openFile(entry.path)"
+          @click="entry.dir ? toggle(entry) : (ui.filePath = entry.path)"
           @contextmenu="menu($event, entry)"
         >
           <Icon

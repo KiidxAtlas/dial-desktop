@@ -12,7 +12,7 @@
     "core:webview:allow-set-webview-zoom",
     "opener:default",
     "dialog:allow-open",
-    "dialog:allow-ask",
+    "dialog:allow-message",
     "dialog:allow-save",
     "updater:default",
     "process:allow-restart"

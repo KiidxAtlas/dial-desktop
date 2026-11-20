@@ -40,6 +40,7 @@ export async function loadHighlighter() {
     // The JavaScript engine needs no WebAssembly, so the strict CSP stays as is.
     engine: createJavaScriptRegexEngine(),
   });
+  highlighted.clear();
   highlighterVersion.value++;
 }
 
@@ -47,32 +48,106 @@ function escape(text: string) {
   return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
+/** Highlighted code by language and text. A streamed answer is re-rendered about once a frame, and
+ * highlighting its finished code blocks again each time was the costliest part of that. */
+const highlighted = new Map<string, string | null>();
+const HIGHLIGHT_CACHE = 300;
+
 /** Highlighted `<pre>` for `code`, or `null` when the language is unknown. */
 export function highlight(code: string, lang: string): string | null {
   const name = lang.trim().toLowerCase();
   if (!highlighter || !name) return null;
-  const loaded = highlighter.getLoadedLanguages();
-  if (!loaded.includes(name)) return null;
-  try {
-    return highlighter.codeToHtml(code, { lang: name, themes: THEMES, defaultColor: false });
-  } catch {
-    return null;
+  const key = `${name}\0${code}`;
+  const cached = highlighted.get(key);
+  if (cached !== undefined) {
+    // Most recently used last, so the oldest goes first.
+    highlighted.delete(key);
+    highlighted.set(key, cached);
+    return cached;
   }
+  let html: string | null = null;
+  if (highlighter.getLoadedLanguages().includes(name)) {
+    try {
+      html = highlighter.codeToHtml(code, { lang: name, themes: THEMES, defaultColor: false });
+    } catch {
+      html = null;
+    }
+  }
+  highlighted.set(key, html);
+  if (highlighted.size > HIGHLIGHT_CACHE) highlighted.delete(highlighted.keys().next().value!);
+  return html;
 }
 
-/** A code block with a header (`label`, default the language, and a copy button). */
-export function codeBlock(code: string, lang: string, label = lang.trim() || "text"): string {
-  const body = highlight(code, lang) ?? `<pre class="plain"><code>${escape(code)}</code></pre>`;
+/** A code block with a header (`label`, default the language, and a copy button). `plain` skips
+ * highlighting, for a block that is still being written. */
+export function codeBlock(code: string, lang: string, label = lang.trim() || "text", plain = false): string {
+  const body = (plain ? null : highlight(code, lang)) ?? `<pre class="plain"><code>${escape(code)}</code></pre>`;
   return `<div class="code-block"><div class="code-head"><span>${escape(label)}</span><button type="button" class="copy" data-copy>Copy</button></div>${body}</div>`;
 }
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
-md.renderer.rules.fence = (tokens, idx) => {
+const renderImage = md.renderer.rules.image!;
+md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
+  const token = tokens[idx];
+  const src = token.attrGet("src");
+  // Relative raster images belong to the workspace and load through the app. The CSP blocks every
+  // other image except inline data, so show those as a link or label instead of a broken icon.
+  if (src && /^(?![\\/]|[a-z][a-z\d+.-]*:)[^?#]+\.(png|jpe?g|gif|webp)$/i.test(src)) {
+    token.attrSet("data-workspace-image", src);
+    token.attrs?.splice(token.attrIndex("src"), 1);
+    return renderImage(tokens, idx, options, env, renderer);
+  }
+  if (src && /^data:image\/(png|jpeg|gif|webp);/i.test(src)) return renderImage(tokens, idx, options, env, renderer);
+  const alt = renderer.renderInlineAsText(token.children ?? [], options, env) || src || "image";
+  const label = escape(`Image: ${alt}`);
+  return src && /^https?:/i.test(src) ? `<a href="${escape(src)}">${label}</a>` : `<span class="image-ref">${label}</span>`;
+};
+md.renderer.rules.fence = (tokens, idx, _options, env: { streaming?: boolean } | undefined) => {
   const token = tokens[idx];
   const lang = token.info.trim().split(/\s+/)[0] ?? "";
-  return codeBlock(token.content.replace(/\n$/, ""), lang);
+  // While an answer streams, its last block may still be growing: highlight it once it is done.
+  const growing = !!env?.streaming && idx === tokens.length - 1;
+  return codeBlock(token.content.replace(/\n$/, ""), lang, undefined, growing);
 };
 
-export function renderMarkdown(text: string): string {
-  return md.render(text);
+// Image files the answer names (`out.png`, `images/a sunset.png` in code, `./b.jpg` in prose)
+// become links that open the image viewer; the click handler in `main.ts` takes `data-image-path`.
+const IMAGE_CODE = /^(?:~|\.{0,2}\/)?(?:[^\s`<>"'|*?:]+\/)*[^\s/`<>"'|*?:][^/`<>"'|*?:]*\.(?:png|jpe?g|gif|webp)$/i;
+const IMAGE_TEXT = /(^|[\s(["'])((?:\.{1,2}\/|\/)?(?:[\w@.+-]+\/)*[\w@+-][\w@.+-]*\.(?:png|jpe?g|gif|webp))(?=$|[\s)\]"',;:!?]|\.(?:\s|$))/gi;
+
+function imageLink(path: string, inner: string) {
+  return `<a href="${escape(encodeURI(path))}" class="image-path" data-image-path="${escape(path)}">${inner}</a>`;
+}
+
+function insideLink(tokens: { type: string }[], idx: number) {
+  for (let i = idx - 1; i >= 0; i--) {
+    if (tokens[i].type === "link_close") return false;
+    if (tokens[i].type === "link_open") return true;
+  }
+  return false;
+}
+
+md.renderer.rules.code_inline = (tokens, idx) => {
+  const code = tokens[idx].content;
+  const html = `<code>${escape(code)}</code>`;
+  return IMAGE_CODE.test(code.trim()) && !/^[a-z][a-z\d+.-]*:/i.test(code.trim()) && !insideLink(tokens, idx)
+    ? imageLink(code.trim(), html)
+    : html;
+};
+md.renderer.rules.text = (tokens, idx) => {
+  const text = tokens[idx].content;
+  if (insideLink(tokens, idx)) return escape(text);
+  let out = "";
+  let last = 0;
+  for (const m of text.matchAll(IMAGE_TEXT)) {
+    const start = m.index! + m[1].length;
+    out += escape(text.slice(last, start)) + imageLink(m[2], escape(m[2]));
+    last = start + m[2].length;
+  }
+  return out + escape(text.slice(last));
+};
+
+/** `streaming`: the text is still arriving (see the `fence` rule). */
+export function renderMarkdown(text: string, streaming = false): string {
+  return md.render(text, { streaming });
 }

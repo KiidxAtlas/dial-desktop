@@ -42,6 +42,9 @@ pub struct SessionSummary {
     pub messages: u64,
     pub pinned: bool,
     pub current: bool,
+    /// Another Dial process (a terminal, another window) holds the session; resuming it here
+    /// would make the engine open a copy instead.
+    pub open_elsewhere: bool,
 }
 
 impl SessionSummary {
@@ -70,6 +73,7 @@ impl SessionSummary {
             messages: entry["messages"].as_u64().unwrap_or_default(),
             pinned: entry["pinned"].as_bool().unwrap_or_default(),
             current: entry["current"].as_bool().unwrap_or_default(),
+            open_elsewhere: entry["open_elsewhere"].as_bool().unwrap_or_default(),
         })
     }
 }
@@ -229,6 +233,9 @@ pub struct Model {
     pub settings: Option<HashMap<String, SavedSetting>>,
     /// Set when the settings or their reference changed; the app publishes them and clears it.
     pub settings_changed: bool,
+    /// Models that generate images (`list_models` rows with `purpose: "image"`), once asked; empty
+    /// when the engine predates that listing.
+    pub image_models: Option<Vec<Value>>,
     pending: HashMap<RequestId, Purpose>,
     recovering: bool,
     /// The open question already acknowledged as presented; the engine refuses a second ack.
@@ -729,6 +736,22 @@ impl Model {
                             .collect();
                         self.models_changed = true;
                     }
+                    // An engine without image listings answers with its chat list, whose rows have
+                    // no `image_api`; that counts as no listing, not as image models.
+                    (Purpose::ImageModels, Ok(page)) => {
+                        let rows = page["models"].as_array().cloned().unwrap_or_default();
+                        self.image_models = Some(
+                            rows.into_iter()
+                                .filter(|row| row.get("image_api").is_some())
+                                .collect(),
+                        );
+                        self.settings_changed = true;
+                    }
+                    // Optional: the page keeps its built-in list, so a refusal is not an error.
+                    (Purpose::ImageModels, Err(_)) => {
+                        self.image_models = Some(Vec::new());
+                        self.settings_changed = true;
+                    }
                     // A switch can change the model, its reasoning levels and the approval mode.
                     (Purpose::SetModel | Purpose::SetThinking | Purpose::SetApproval, Ok(_)) => {
                         follow.push(Command::State);
@@ -736,9 +759,18 @@ impl Model {
                     // Titles and activity change when a turn settles; a session switch can also
                     // restore that session's model. `dial rpc` replays no history on a switch, so
                     // an opened or forked session's transcript is loaded from `recovery_snapshot`.
-                    (Purpose::NewSession | Purpose::Resume, Ok(_)) => {
+                    (Purpose::NewSession | Purpose::Resume, Ok(result)) => {
                         if purpose == Purpose::Resume {
                             follow.push(Command::Recover);
+                            // The source was claimed elsewhere after the sidebar last looked.
+                            if result["forked_from"]
+                                .as_str()
+                                .is_some_and(|s| !s.is_empty())
+                            {
+                                self.toast = Some(
+                                    "That session is open in another Dial process, so Dial opened a copy of it".into(),
+                                );
+                            }
                         }
                         follow.extend(
                             self.delete_after_switch
@@ -964,6 +996,7 @@ fn describe(command: &Command) -> &'static str {
         Command::Recover => "reload the session",
         Command::State => "read the session settings",
         Command::ListModels => "load models",
+        Command::ListImageModels => "load image models",
         Command::SetModel { .. } => "switch the model",
         Command::SetThinking(_) => "set the reasoning level",
         Command::SetApproval(_) => "set the approval mode",
@@ -1002,6 +1035,7 @@ fn purpose_label(purpose: Purpose) -> &'static str {
         Purpose::Recover => "Could not reload the session",
         Purpose::State => "Could not read the session settings",
         Purpose::Models => "Could not load models",
+        Purpose::ImageModels => "Could not load image models",
         Purpose::SetModel => "Could not switch the model",
         Purpose::SetThinking => "Could not set the reasoning level",
         Purpose::SetApproval => "Could not set the approval mode",

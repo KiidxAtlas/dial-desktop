@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import { showToast, terminalApi } from "../../bridge";
 import { appearance } from "../../appearance";
 import { addToPrompt } from "../../workspace";
+import { terminalRequest } from "../../commandRunner";
 import type { OpenSnapshot, ToolEntry } from "../../types";
 import Icon from "../Icon.vue";
 
@@ -156,6 +157,27 @@ watch(
 watch(
   () => appearance.theme,
   () => requestAnimationFrame(() => term && (term.options.theme = theme())),
+);
+
+// A slash command the desktop cannot run itself (`/doctor`, `/commit`…) runs here, in the shell.
+watch(
+  () => terminalRequest.value?.n,
+  async () => {
+    const request = terminalRequest.value;
+    if (!request) return;
+    terminalRequest.value = null;
+    mode.value = "shell";
+    await nextTick();
+    if (!term) await create();
+    else if (shell === null && exited.value) await start();
+    // The panel may still be opening its shell; give it a moment.
+    for (let i = 0; i < 30 && shell === null; i++) await new Promise((r) => setTimeout(r, 100));
+    if (shell === null) return showToast("The terminal did not start; run the command there yourself");
+    // Ctrl-U clears anything half-typed at the prompt first.
+    await terminalApi.write(shell, `\x15${request.line}\r`).catch((error) => showToast(String(error)));
+    term?.focus();
+  },
+  { immediate: true },
 );
 
 onMounted(() => {

@@ -65,6 +65,7 @@ function more(event: MouseEvent) {
     </button>
     <h1 v-else class="truncate" data-tauri-drag-region>{{ snap.title }}</h1>
     <span v-if="snap.connection.state === 'preview'" class="pill" data-tauri-drag-region>Preview</span>
+    <span v-if="snap.turnRunning" class="pill working" role="status" data-tauri-drag-region><span class="live-dot" />Working</span>
     <div class="spacer" data-tauri-drag-region />
     <button
       v-if="snap.entries.length"
@@ -158,11 +159,27 @@ h1 {
   color: var(--text-faint);
   transition:
     background 120ms var(--ease),
-    color 120ms var(--ease);
+    color 120ms var(--ease),
+    transform 90ms var(--ease);
 }
 .icon-btn:hover,
 .icon-btn.on {
   background: var(--hover);
   color: var(--text);
+}
+.icon-btn:active {
+  transform: scale(0.94);
+}
+.working {
+  gap: 6px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.2s ease-in-out infinite;
 }
 </style>

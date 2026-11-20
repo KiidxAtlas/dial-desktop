@@ -128,6 +128,39 @@ fn session_listing_follows_the_engine_offset() {
 }
 
 #[test]
+fn sessions_held_elsewhere_are_marked_and_a_forced_copy_is_explained() {
+    let mut model = Model::starting();
+    let (id, _) = requested(&mut model, Command::ListSessions, 1);
+    respond(
+        &mut model,
+        id,
+        "list_sessions",
+        json!({"sessions": [{"session_id": "s1", "open_elsewhere": true}, {"session_id": "s2"}]}),
+    );
+    assert_eq!(
+        model
+            .sessions
+            .iter()
+            .map(|s| s.open_elsewhere)
+            .collect::<Vec<_>>(),
+        [true, false]
+    );
+    let (id, _) = requested(&mut model, Command::Resume("s1".into()), 2);
+    respond(
+        &mut model,
+        id,
+        "resume",
+        json!({"session_id": "s9", "forked_from": "s1"}),
+    );
+    assert!(
+        model
+            .toast
+            .as_deref()
+            .is_some_and(|t| t.contains("opened a copy"))
+    );
+}
+
+#[test]
 fn stale_session_pages_cannot_replace_a_newer_refresh() {
     let mut model = Model::starting();
     let (first, _) = requested(&mut model, Command::ListSessions, 1);

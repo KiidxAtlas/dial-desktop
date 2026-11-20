@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from "vue";
+import { computed, nextTick, reactive, watch } from "vue";
 import type { OpenSnapshot, ToolEntry } from "../types";
 import { ui, type InspectorTab } from "../ui";
 import { addToPrompt, inspectorWidth, mention, setInspectorWidth } from "../workspace";
@@ -38,6 +38,17 @@ const tools = computed(() =>
     .slice(0, 50),
 );
 const width = computed(() => inspectorWidth());
+/** Show a tool call in the conversation, opened, and flash it. */
+async function reveal(key: string) {
+  ui.expanded.add(key);
+  await nextTick();
+  const row = document.querySelector<HTMLElement>(`[data-tool="${CSS.escape(key)}"]`);
+  if (!row) return;
+  row.scrollIntoView({ block: "center", behavior: "smooth" });
+  row.classList.remove("flash");
+  void row.offsetWidth;
+  row.classList.add("flash");
+}
 const expanded = computed(() => shown("changes") && !!ui.diffPath && ui.diffExpanded);
 const fileIndex = computed(() => props.snap.changes.findIndex((file) => file.path === ui.diffPath));
 function moveFile(step: -1 | 1) {
@@ -49,6 +60,13 @@ function moveFile(step: -1 | 1) {
 function taskClass(status: string) {
   if (["abandoned", "cancelled", "blocked"].includes(status)) return "dropped";
   return status;
+}
+
+/** `text` split on backticks: odd parts were code spans. An unmatched backtick stays literal. */
+function codeParts(text: string): { text: string; code: boolean }[] {
+  const parts = text.split("`");
+  if (parts.length % 2 === 0) return [{ text, code: false }];
+  return parts.map((part, i) => ({ text: part, code: i % 2 === 1 })).filter((p) => p.text);
 }
 
 /** Drag the left edge to resize. */
@@ -129,7 +147,7 @@ function startResize(event: PointerEvent) {
                 <span v-else-if="task.status === 'in_progress'" class="spinner" />
                 <Icon v-else-if="taskClass(task.status) === 'dropped'" name="cross" :size="11" />
               </span>
-              <span class="text">{{ task.text }}</span>
+              <span class="text"><template v-for="(part, j) in codeParts(task.text)" :key="j"><code v-if="part.code">{{ part.text }}</code><template v-else>{{ part.text }}</template></template></span>
             </li>
           </ul>
         </template>
@@ -177,7 +195,7 @@ function startResize(event: PointerEvent) {
         </div>
         <template v-else>
           <div class="head"><span class="section-label">Recent</span></div>
-          <div v-for="tool in tools" :key="tool.key" class="activity" :title="tool.target">
+          <button v-for="tool in tools" :key="tool.key" class="activity" :title="`Show in conversation: ${tool.target}`" @click="reveal(tool.key)">
             <span
               class="dot"
               :class="{
@@ -188,7 +206,7 @@ function startResize(event: PointerEvent) {
             />
             <span class="activity-label">{{ tool.label }}</span>
             <span class="mono faint truncate">{{ tool.target }}</span>
-          </div>
+          </button>
         </template>
       </template>
     </div>
@@ -269,6 +287,7 @@ function startResize(event: PointerEvent) {
 .tabs button.active {
   background: var(--active);
   color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 .badge {
   font-size: var(--text-xs);
@@ -325,7 +344,7 @@ function startResize(event: PointerEvent) {
   display: block;
   height: 100%;
   border-radius: 2px;
-  background: var(--text-muted);
+  background: linear-gradient(90deg, var(--accent), var(--accent-soft));
   transition: width 300ms var(--ease);
 }
 .tasks {
@@ -371,6 +390,14 @@ function startResize(event: PointerEvent) {
 .dropped .text {
   color: var(--text-faint);
   text-decoration: line-through;
+}
+.tasks code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.1em 0.36em;
+  border-radius: 5px;
+  background: var(--active);
+  color: var(--code-inline);
 }
 .file {
   display: flex;
@@ -435,8 +462,17 @@ function startResize(event: PointerEvent) {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 26px;
+  width: calc(100% + 16px);
+  height: 28px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
   font-size: var(--text-sm);
+  text-align: left;
+  transition: background 120ms var(--ease);
+}
+.activity:hover {
+  background: var(--hover);
 }
 .activity-label {
   white-space: nowrap;

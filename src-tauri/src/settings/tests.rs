@@ -31,6 +31,21 @@ fn schema() -> Vec<Value> {
                "default": "auto"}),
         json!({"path": "harness.temperature", "tab": "Model", "kind": "Float { min: 0.0, max: 2.0, step: 0.1 }",
                "constraints": {"maximum": 2.0, "minimum": 0.0, "step": 0.1, "type": "number"}, "default": 0.2}),
+        json!({"path": "retry.max_delay_secs", "label": "Longest retry wait (s)", "tab": "Model",
+               "kind": "Int { min: 1, max: 3600, step: 1 }",
+               "constraints": {"maximum": 3600, "minimum": 1, "type": "integer"}, "default": 30}),
+        json!({"path": "shell.idle_secs", "label": "Idle limit", "tab": "Tools",
+               "kind": "Int { min: 1, max: 3600, step: 1 }",
+               "constraints": {"maximum": 3600, "minimum": 1, "type": "integer"}, "default": 30}),
+        json!({"path": "image.label_test", "label": "Images (beta)", "tab": "Tools", "kind": "Text",
+               "constraints": {"type": "string"}, "default": ""}),
+        json!({"path": "ui.theme", "label": "Theme", "tab": "Common", "kind": "Theme",
+               "constraints": {"type": "string"}, "default": "auto"}),
+        json!({"path": "weights.model", "tab": "Learning", "kind": "Text", "constraints": {"type": "string"}, "default": ""}),
+        json!({"path": "lsp.pyright.program", "tab": "Tools", "kind": "Text", "constraints": {"type": "string"}, "default": ""}),
+        json!({"path": "memory.hindsight.api_key_env", "tab": "Memory", "kind": "Text", "constraints": {"type": "string"}, "default": ""}),
+        json!({"path": "image.base_url", "tab": "Tools", "kind": "Text", "constraints": {"type": "string"}, "default": ""}),
+        json!({"path": "ida.idadir", "tab": "Tools", "kind": "Text", "constraints": {"type": "string"}, "default": ""}),
         json!({"path": "assistance.lean_local", "tab": "Learning", "kind": "AutoBool",
                "constraints": {"anyOf": [{"type": "boolean"}, {"const": "auto"}]}, "default": true}),
         json!({"path": "memory.semantic.embedding_model", "tab": "Memory", "kind": "Choice([...])",
@@ -55,7 +70,11 @@ fn every_kind_gets_its_control() {
             .map(|s| s.control.clone())
             .unwrap()
     };
-    assert_eq!(page.settings.len(), 9, "an entry without a path is skipped");
+    assert_eq!(
+        page.settings.len(),
+        18,
+        "an entry without a path is skipped"
+    );
     assert_eq!(
         control("sandbox.mode"),
         Control::Select {
@@ -70,7 +89,8 @@ fn every_kind_gets_its_control() {
             max: Some(2_097_152.0),
             step: Some(1024.0),
             integer: true,
-            auto: true
+            auto: true,
+            unit: None,
         }
     );
     assert_eq!(
@@ -80,7 +100,8 @@ fn every_kind_gets_its_control() {
             max: Some(2.0),
             step: Some(0.1),
             integer: false,
-            auto: false
+            auto: false,
+            unit: None,
         }
     );
     assert!(
@@ -89,7 +110,8 @@ fn every_kind_gets_its_control() {
     assert_eq!(
         control("memory.semantic.embedding_model"),
         Control::Text {
-            suggestions: vec![choice("nomic-embed-text", "nomic · 768 dims")]
+            suggestions: vec![choice("nomic-embed-text", "nomic · 768 dims")],
+            hint: TextHint::Plain,
         }
     );
     assert_eq!(control("sandbox.extra_write"), Control::List);
@@ -101,11 +123,107 @@ fn every_kind_gets_its_control() {
             "Common",
             "Safety",
             "Model",
+            "Tools",
             "Learning",
             "Memory",
             "Connections"
         ]
     );
+}
+
+#[test]
+fn text_settings_name_what_they_hold_so_the_page_can_offer_a_picker() {
+    let page = view(&schema(), &HashMap::new());
+    let row = |key: &str| page.settings.iter().find(|s| s.key == key).unwrap();
+    let hint = |key: &str| match &row(key).control {
+        Control::Text { hint, .. } => *hint,
+        other => panic!("{key} is not text: {other:?}"),
+    };
+    assert_eq!(hint("weights.model"), TextHint::Model);
+    assert_eq!(hint("lsp.pyright.program"), TextHint::Program);
+    assert_eq!(hint("memory.hindsight.api_key_env"), TextHint::EnvVar);
+    assert_eq!(hint("image.base_url"), TextHint::Url);
+    assert_eq!(hint("ida.idadir"), TextHint::Folder);
+    // Terminal themes are a dropdown, with "auto" first for the main theme.
+    let Control::Select { options } = &row("ui.theme").control else {
+        panic!("theme is a dropdown")
+    };
+    assert_eq!(options[0].value, "auto");
+    assert!(options.iter().any(|s| s.value == "dial-dark"));
+}
+
+#[test]
+fn the_image_model_accepts_text_and_suggests_image_models_not_chat_models() {
+    let entry = json!({"path": "image.model", "label": "Image model", "tab": "Tools", "kind": "Text",
+                       "constraints": {"type": "string"}, "default": "gpt-image-1.5"});
+    let page = view(&[entry], &HashMap::new());
+    let Control::Text { suggestions: options, hint: TextHint::Plain } = &page.settings[0].control else {
+        panic!("image.model accepts custom text without chat model suggestions")
+    };
+    assert!(options.iter().any(|s| s.value == "gpt-image-1.5"));
+    assert!(
+        options
+            .iter()
+            .any(|s| s.value.starts_with("gemini-") && s.value.contains("image"))
+    );
+}
+
+#[test]
+fn engine_image_models_replace_the_built_in_list_and_bring_their_endpoint() {
+    let entry = json!({"path": "image.model", "label": "Image model", "tab": "Tools", "kind": "Text",
+                       "constraints": {"type": "string"}, "default": "gpt-image-1.5"});
+    let mut page = view(&[entry], &HashMap::new());
+    let built_in = page.settings[0].control.clone();
+    // An engine without the listing sends none: the built-in list stays.
+    offer_image_models(&mut page, &[]);
+    assert_eq!(page.settings[0].control, built_in);
+    offer_image_models(
+        &mut page,
+        &[
+            json!({"provider": "gemini", "model_id": "gemini-3-pro-image", "label": "Gemini 3 Pro Image",
+                   "base_url": "https://generativelanguage.googleapis.com/v1beta", "image_api": "gemini"}),
+            json!({"provider": "mlx", "model_id": "/models/flux", "label": "", "base_url": null, "image_api": null}),
+            json!({"provider": "gateway", "model_id": "gemini-3-pro-image", "label": "Gemini via gateway",
+                   "base_url": "https://gateway.example/v1", "image_api": "openai"}),
+        ],
+    );
+    let Control::Text { suggestions: options, .. } = &page.settings[0].control else {
+        panic!("image.model still accepts custom text")
+    };
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[0].value, options[2].value);
+    assert_ne!(options[0].id, options[2].id);
+    assert_eq!(options[2].with["image.base_url"], "https://gateway.example/v1");
+    assert_eq!(options[0].value, "gemini-3-pro-image");
+    assert_eq!(options[0].label, "Gemini 3 Pro Image · gemini");
+    assert_eq!(
+        options[0].with,
+        json!({"image.base_url": "https://generativelanguage.googleapis.com/v1beta", "image.api": "gemini"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(options[1].label, "/models/flux · mlx");
+    assert!(
+        options[1].with.is_empty(),
+        "nothing unknown is saved alongside"
+    );
+}
+
+#[test]
+fn numbers_carry_their_unit_out_of_the_label_or_key() {
+    let page = view(&schema(), &HashMap::new());
+    let row = |key: &str| page.settings.iter().find(|s| s.key == key).unwrap();
+    let unit = |key: &str| match &row(key).control {
+        Control::Number { unit, .. } => unit.clone(),
+        other => panic!("{key} is not a number: {other:?}"),
+    };
+    assert_eq!(row("retry.max_delay_secs").label, "Longest retry wait");
+    assert_eq!(unit("retry.max_delay_secs").as_deref(), Some("s"));
+    assert_eq!(unit("shell.idle_secs").as_deref(), Some("s"));
+    assert_eq!(unit("context_window"), None);
+    // Only numbers lose a parenthetical; for other settings it is part of the name.
+    assert_eq!(row("image.label_test").label, "Images (beta)");
 }
 
 #[test]

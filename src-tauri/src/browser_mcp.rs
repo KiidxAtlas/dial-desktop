@@ -25,7 +25,10 @@ pub fn run() -> i32 {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
-    let file = agent_browser::endpoint_file(home.as_deref());
+    let directory =
+        crate::launcher::app_dir(home.as_deref()).map(|dir| dir.join("browser-endpoints"));
+    let workspace = std::env::current_dir().and_then(|p| p.canonicalize()).ok();
+    let endpoint = || find_window(directory.as_deref(), workspace.as_deref());
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -36,8 +39,16 @@ pub fn run() -> i32 {
         let reply = match serde_json::from_str::<Value>(&line) {
             Ok(message) => respond(
                 &message,
-                &mut |tool, args| forward(file.as_deref(), tool, args),
-                &|| reachable(file.as_deref()),
+                &mut |tool, args| {
+                    exchange(
+                        &endpoint()?,
+                        workspace.as_deref().ok_or(NOT_RUNNING)?,
+                        tool,
+                        args,
+                        CALL_TIMEOUT,
+                    )
+                },
+                &|| endpoint().is_ok(),
             ),
             Err(error) => Some(json!({
                 "jsonrpc": "2.0",
@@ -104,6 +115,7 @@ pub fn content(reply: Reply) -> Value {
 /// Send one call to the app and read its reply.
 pub fn exchange(
     endpoint: &agent_browser::Endpoint,
+    workspace: &Path,
     tool: &str,
     args: &Value,
     timeout: Duration,
@@ -116,6 +128,7 @@ pub fn exchange(
         .map_err(|e| e.to_string())?;
     let request = Request {
         token: endpoint.token.clone(),
+        workspace: workspace.to_string_lossy().into_owned(),
         tool: tool.to_owned(),
         arguments: args.clone(),
     };
@@ -133,16 +146,23 @@ pub fn exchange(
 
 const NOT_RUNNING: &str = "Dial Desktop is not running, so its Browser panel is not available";
 
-fn forward(file: Option<&Path>, tool: &str, args: &Value) -> Result<Reply, String> {
-    let endpoint = file
-        .and_then(agent_browser::read_endpoint)
-        .ok_or(NOT_RUNNING)?;
-    exchange(&endpoint, tool, args, CALL_TIMEOUT)
-}
-
-/// Whether the app answers with the token on file.
-fn reachable(file: Option<&Path>) -> bool {
-    file.and_then(agent_browser::read_endpoint)
-        .and_then(|endpoint| exchange(&endpoint, PING, &Value::Null, Duration::from_secs(2)).ok())
-        .is_some_and(|reply| reply.ok)
+/// Never route a call to an arbitrary window when two windows have the same workspace.
+fn find_window(dir: Option<&Path>, root: Option<&Path>) -> Result<agent_browser::Endpoint, String> {
+    let root = root.ok_or(NOT_RUNNING)?;
+    let entries = std::fs::read_dir(dir.ok_or(NOT_RUNNING)?).map_err(|_| NOT_RUNNING)?;
+    let mut found = None;
+    for file in entries.flatten().map(|e| e.path()) {
+        if file.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(endpoint) = agent_browser::read_endpoint(&file) else {
+            continue;
+        };
+        if exchange(&endpoint, root, PING, &Value::Null, Duration::from_secs(2)).is_ok_and(|r| r.ok)
+            && found.replace(endpoint).is_some()
+        {
+            return Err("More than one window has this project open".into());
+        }
+    }
+    found.ok_or_else(|| "No Dial Desktop window for this project".into())
 }

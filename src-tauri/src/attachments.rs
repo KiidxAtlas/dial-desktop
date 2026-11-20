@@ -97,3 +97,39 @@ fn pasted_image_too_large() -> String {
         MAX_IMAGE_BYTES / (1024 * 1024)
     )
 }
+
+/// Read only image data, called on macOS when the composer receives a paste without a DOM file.
+#[cfg(target_os = "macos")]
+pub fn clipboard_image() -> Result<Option<String>, String> {
+    use objc2_app_kit::{
+        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
+        NSPasteboardTypeTIFF,
+    };
+    use objc2_foundation::NSDictionary;
+
+    let board = NSPasteboard::generalPasteboard();
+    // SAFETY: these are AppKit's constant pasteboard type names.
+    let (png, tiff) = unsafe { (NSPasteboardTypePNG, NSPasteboardTypeTIFF) };
+    let data = if let Some(data) = board.dataForType(png) {
+        data
+    } else if let Some(data) = board.dataForType(tiff) {
+        if data.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(pasted_image_too_large());
+        }
+        let rep = NSBitmapImageRep::imageRepWithData(&data).ok_or("Unreadable clipboard image")?;
+        // SAFETY: an empty options dictionary is valid for PNG encoding.
+        unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        }
+        .ok_or("Could not encode the clipboard image")?
+    } else {
+        return Ok(None);
+    };
+    if data.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(pasted_image_too_large());
+    }
+    if data.is_empty() {
+        return Err("Unreadable clipboard image".into());
+    }
+    Ok(Some(STANDARD.encode(data.to_vec())))
+}

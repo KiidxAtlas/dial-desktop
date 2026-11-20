@@ -23,7 +23,7 @@ use crate::tabs::{Route, Tab, Tabs};
 use crate::terminal::{self, Terminals};
 use crate::time;
 use crate::updates;
-use crate::view::{ModelOptionView, Snapshot, Workspace};
+use crate::view::{ModelOptionView, Published, Snapshot, SnapshotAt, Workspace};
 use dial_client::{Diagnostics, Launch};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ const FRAME: Duration = Duration::from_millis(16);
 /// Republish this often without engine activity, so relative times stay current.
 const TICK: Duration = Duration::from_secs(30);
 const PREVIEW_NOTICE: &str = "Design preview: nothing is sent to an engine";
+const OPEN_ELSEWHERE: &str = "That session is open in another Dial process (a terminal or another window). Finish it there, or duplicate it to work on a copy.";
 
 /// What the app connects to.
 pub enum Source {
@@ -69,6 +70,8 @@ struct Shared {
     /// The engine installed from the app after none was found; used instead of the launch
     /// choice from then on.
     installed: Mutex<Option<PathBuf>>,
+    /// The snapshot the UI has, so each `snapshot` event carries only what changed.
+    published: Mutex<Published>,
 }
 
 impl Shared {
@@ -166,6 +169,18 @@ impl Shared {
             .clone();
         Some(installed.unwrap_or_else(|| program.clone()))
     }
+    fn launch(&self, path: &Path) -> Option<Launch> {
+        let Source::Engine { args, .. } = &self.source else {
+            return None;
+        };
+        Some(
+            Launch::new(self.program()?)
+                .args(args.iter().cloned())
+                .current_dir(path)
+                .diagnostics(Diagnostics::Inherit)
+                .interactive(true),
+        )
+    }
 
     /// A new engine in `path`; `None` in the design preview.
     fn spawn(&self, path: &Path) -> Option<Engine> {
@@ -177,10 +192,7 @@ impl Shared {
         path: &Path,
         previous: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
     ) -> Option<Engine> {
-        let Source::Engine { args, .. } = &self.source else {
-            return None;
-        };
-        let program = self.program()?;
+        let launch = self.launch(path)?;
         let wake = self
             .wake
             .lock()
@@ -189,12 +201,6 @@ impl Shared {
         let waker = Arc::new(move || {
             let _ = wake.send(());
         });
-        // A person answers this client, so the engine may ask questions.
-        let launch = Launch::new(&program)
-            .args(args.iter().cloned())
-            .current_dir(path)
-            .diagnostics(Diagnostics::Inherit)
-            .interactive(true);
         Some(match previous {
             Some(previous) => Engine::spawn_after(launch, waker, Some(previous)),
             None => Engine::spawn(launch, waker),
@@ -311,7 +317,14 @@ fn publish(app: &AppHandle) {
     if let Some(workspace) = snapshot.workspace.as_ref() {
         notifications::publish(app, &workspace.root, notices);
     }
-    let _ = app.emit("snapshot", snapshot);
+    let event = shared
+        .published
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .advance(snapshot);
+    if let Some(event) = event {
+        let _ = app.emit("snapshot", event);
+    }
     for message in messages {
         toast(app, &message);
     }
@@ -338,8 +351,12 @@ fn request(app: &AppHandle, shared: &Shared, command: Command) {
 }
 
 #[tauri::command]
-fn snapshot(shared: State<'_, Shared>) -> Snapshot {
-    snapshot_of(&shared.lock())
+fn snapshot(shared: State<'_, Shared>) -> SnapshotAt {
+    shared
+        .published
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .current(|| snapshot_of(&shared.lock()))
 }
 
 #[tauri::command]
@@ -349,10 +366,11 @@ fn models(shared: State<'_, Shared>) -> Vec<ModelOptionView> {
 
 /// The settings page, once the engine sent both the reference and the saved values.
 fn settings_of(model: &Model) -> Option<SettingsView> {
-    Some(settings::view(
-        model.settings_schema.as_deref()?,
-        model.settings.as_ref()?,
-    ))
+    let mut view = settings::view(model.settings_schema.as_deref()?, model.settings.as_ref()?);
+    if let Some(rows) = &model.image_models {
+        settings::offer_image_models(&mut view, rows);
+    }
+    Some(view)
 }
 
 /// The settings page as far as loaded; (re)loads it from the engine on screen, and the fresh
@@ -365,6 +383,8 @@ fn settings(shared: State<'_, Shared>) -> Option<SettingsView> {
     if model.settings_schema.is_none() {
         load.insert(0, Command::SettingsSchema);
     }
+    // Asked each time the page opens: a `/models` refresh or a download can add image models.
+    load.push(Command::ListImageModels);
     if let Some(engine) = inner.tabs.active().engine.as_ref() {
         for command in load {
             engine.send(command);
@@ -398,9 +418,44 @@ fn reset_setting(
     Ok(())
 }
 
+/// Re-read the saved settings and apply them to the session, after several `set_setting` writes
+/// made through `engine_call` (roles, presets) so the session rebuilds once.
+#[tauri::command]
+fn apply_saved_settings(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
+    let inner = shared.lock();
+    dispatch(
+        &app,
+        inner.tabs.active().engine.as_ref(),
+        vec![Command::GetSettings, Command::ApplySettings],
+    );
+    Ok(())
+}
+
+/// Apply the preset on the selected tab's worker and wait for the engine's result.
+#[tauri::command]
+async fn apply_model_preset(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: String,
+    roles: serde_json::Value,
+    main: Option<engine::PresetModel>,
+) -> Result<(), String> {
+    let reply = {
+        let inner = shared.lock();
+        check_session(&inner, &workspace_root, Some(&session_id))?;
+        let tab = inner.tabs.active();
+        if tab.transitioning() || tab.model.conversation.turn_running() {
+            return Err("Wait for the session to settle before applying a preset".into());
+        }
+        tab.engine.as_ref().ok_or(PREVIEW_NOTICE)?.apply_preset(session_id, roles, main)?
+    };
+    rpc_reply(reply, None).await.map(|_| ())
+}
+
 #[tauri::command]
 fn recent_workspaces(shared: State<'_, Shared>) -> Vec<Workspace> {
-    let inner = shared.lock();
+    let mut inner = shared.lock();
+    inner.recents.refresh();
     let current = inner.workspace.as_ref().map(|w| w.root.as_str());
     inner
         .recents
@@ -410,6 +465,12 @@ fn recent_workspaces(shared: State<'_, Shared>) -> Vec<Workspace> {
         .map(|path| shared.workspace(path))
         .filter(|w| Some(w.root.as_str()) != current)
         .collect()
+}
+
+/// Remove a folder from the recent projects list. The folder and its sessions stay on disk.
+#[tauri::command]
+fn forget_workspace(shared: State<'_, Shared>, path: String) -> bool {
+    shared.lock().recents.forget(Path::new(&path))
 }
 
 #[tauri::command]
@@ -536,6 +597,95 @@ fn workspace_rpc(
         .rpc(method, params)
 }
 
+/// Engine methods the UI may call directly through [`engine_call`], with how long each may take.
+/// Read-only views and small, explicit changes the user starts from a control; anything that
+/// starts a turn, contacts a relay or needs an interactive sign-in stays out.
+const ENGINE_CALLS: &[(&str, u64)] = &[
+    ("get_available_commands", 20),
+    ("get_session_stats", 20),
+    ("usage", 60),
+    ("stats", 60),
+    ("get_modes", 20),
+    ("set_mode", 120),
+    ("plan", 20),
+    ("list_dirs", 20),
+    ("add_dir", 20),
+    ("remove_dir", 20),
+    ("list_jobs", 20),
+    ("stop_job", 30),
+    ("list_checks", 30),
+    ("add_check", 30),
+    ("remove_check", 30),
+    ("list_skills", 60),
+    ("skill_action", 120),
+    ("list_extensions", 30),
+    ("memory", 30),
+    ("list_schedules", 20),
+    ("remove_schedule", 20),
+    ("list_checkpoints", 20),
+    ("checkpoint_files", 20),
+    ("checkpoint_diff", 20),
+    ("restore_checkpoint_files", 60),
+    ("label_session", 20),
+    ("restart_model", 60),
+    ("get_settings", 20),
+    ("set_setting", 20),
+    ("reset_setting", 20),
+    ("extension_action", 180),
+    ("list_models", 30),
+    ("image_settings", 20),
+    // Slash commands typed with their arguments (see `src/commandRunner.ts`).
+    ("state", 20),
+    ("list_sessions", 20),
+    ("search_sessions", 60),
+    ("export", 60),
+    ("compact", 600),
+    ("undo", 120),
+    ("goal", 600),
+    ("side_thread", 120),
+    ("task_start", 120),
+    ("task_status", 20),
+    ("task_message", 20),
+    ("task_cancel", 30),
+    ("archive", 60),
+    ("pack_session", 120),
+    ("branch_session", 60),
+    ("move_session", 300),
+    ("evidence", 60),
+    ("evidence_correct", 30),
+    ("evidence_compare", 300),
+    ("policy", 20),
+    ("reliability", 20),
+    ("code_history", 60),
+    ("benchmark", 60),
+    ("schedule_status", 20),
+    ("collaboration_start", 60),
+    ("collaboration_status", 20),
+    ("collaboration_stop", 30),
+    ("collaboration_leave", 30),
+    ("collaboration_join", 60),
+    ("apply_settings", 180),
+    ("mcp_logout", 30),
+    ("logout", 60),
+];
+
+/// Call one allowed engine method in the open project and return its result.
+#[tauri::command]
+async fn engine_call(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    method: String,
+    params: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let &(method, secs) = ENGINE_CALLS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .ok_or_else(|| format!("Dial Desktop does not call `{method}`"))?;
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    let reply = workspace_rpc(&shared, &workspace_root, method, params)?;
+    rpc_reply(reply, Some(Duration::from_secs(secs))).await
+}
+
 #[tauri::command]
 async fn search_transcripts(
     shared: State<'_, Shared>,
@@ -626,6 +776,65 @@ async fn read_image(path: String) -> Result<ImageFile, String> {
     attachments::read_image(Path::new(&path))
 }
 
+/// Read the native clipboard only for the app UI, never for the integrated browser.
+#[tauri::command]
+fn read_clipboard_image(webview: tauri::Webview) -> Result<Option<String>, String> {
+    if webview.label() != "main" {
+        return Err("Clipboard images are only available in the composer".into());
+    }
+    #[cfg(target_os = "macos")]
+    return attachments::clipboard_image();
+    #[cfg(not(target_os = "macos"))]
+    Ok(None)
+}
+
+/// Load a relative transcript image from the conversation's project, not the web app bundle.
+#[tauri::command]
+async fn read_transcript_image(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    path: String,
+) -> Result<ImageFile, String> {
+    if webview.label() != "main" {
+        return Err("Transcript images are only available in the app UI".into());
+    }
+    {
+        let inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed".into());
+        }
+    }
+    let resolved = files::resolve(Path::new(&workspace_root), &path)?;
+    attachments::read_image(&resolved)
+}
+
+/// Open an image from the conversation's project in the system's default viewer (Preview on a
+/// Mac). Only raster images inside the open project; never anything the transcript names elsewhere.
+#[tauri::command]
+async fn open_transcript_image(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    path: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Transcript images are only available in the app UI".into());
+    }
+    {
+        let inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed".into());
+        }
+    }
+    let resolved = files::resolve(Path::new(&workspace_root), &path)?;
+    if attachments::image_mime(&resolved).is_none() || !resolved.is_file() {
+        return Err(format!("{path} is not an image file"));
+    }
+    tauri_plugin_opener::open_path(&resolved, None::<&str>)
+        .map_err(|e| format!("Could not open {path}: {e}"))
+}
+
 #[tauri::command]
 fn approve(
     app: AppHandle,
@@ -657,7 +866,7 @@ fn new_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> 
     let mut inner = shared.lock();
     match inner.tabs.route_new() {
         Route::Spawn => shared.open_tab(&mut inner, None)?,
-        Route::Here | Route::Switch(_) | Route::Closing => {
+        Route::Here | Route::Switch(_) | Route::Closing | Route::Elsewhere => {
             dispatch(
                 &app,
                 inner.tabs.active().engine.as_ref(),
@@ -682,7 +891,7 @@ async fn resume(
         let shared = app.state::<Shared>();
         let deadline = std::time::Instant::now() + Duration::from_secs(6);
         loop {
-            if resume_once(&shared, &session_id, workspace_root.as_deref())? {
+            if resume_once(&app, &shared, &session_id, workspace_root.as_deref())? {
                 return Ok(());
             }
             if wait_for_close != Some(true) || std::time::Instant::now() >= deadline {
@@ -696,6 +905,7 @@ async fn resume(
 }
 
 fn resume_once(
+    app: &AppHandle,
     shared: &Shared,
     session_id: &str,
     workspace_root: Option<&str>,
@@ -716,6 +926,12 @@ fn resume_once(
             .active_mut()
             .enqueue(Command::Resume(session_id.to_owned()))?,
         Route::Closing => return Ok(false),
+        Route::Elsewhere => {
+            // Refresh the sidebar so a session released meanwhile opens on the next click.
+            let tab = inner.tabs.active();
+            dispatch(app, tab.engine.as_ref(), vec![Command::ListSessions]);
+            return Err(OPEN_ELSEWHERE.into());
+        }
     }
     drop(inner);
     shared.poke();
@@ -758,6 +974,7 @@ fn rename_session(
         Route::Closing => {
             return Err("That session is still closing. Try again in a moment.".into());
         }
+        Route::Elsewhere => return Err(OPEN_ELSEWHERE.into()),
     };
     let tab = tabs
         .iter_mut()
@@ -771,6 +988,72 @@ fn rename_session(
 #[tauri::command]
 fn pin_session(app: AppHandle, shared: State<'_, Shared>, session_id: String, pinned: bool) {
     request(&app, &shared, Command::PinSession { session_id, pinned });
+}
+
+/// The copy is made and rewound on a private connection. No request can rewind the source.
+#[tauri::command]
+async fn fork_before(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: String,
+    prompt: String,
+) -> Result<String, String> {
+    let launch = {
+        let inner = shared.lock();
+        check_session(&inner, &workspace_root, Some(&session_id))?;
+        if inner.tabs.active().model.conversation.turn_running() {
+            return Err("Wait for the turn to finish".into());
+        }
+        shared
+            .launch(Path::new(&workspace_root))
+            .ok_or(PREVIEW_NOTICE)?
+    };
+    tauri::async_runtime::spawn_blocking(move || engine::fork_before(&launch, &session_id, &prompt))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn project_window(shared: State<'_, Shared>, path: String) -> Result<(), String> {
+    let path = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !path.is_dir() {
+        return Err("Choose a project directory".into());
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    match &shared.source {
+        Source::Engine { args, .. } => {
+            child
+                .arg("--dial")
+                .arg(shared.program().ok_or("No engine configured")?)
+                .arg(&path)
+                .arg("--")
+                .args(args);
+        }
+        Source::Preview(kind) => {
+            child
+                .arg(match kind {
+                    Preview::Empty => "--preview=empty",
+                    Preview::Question => "--preview=question",
+                    Preview::Session => "--preview",
+                })
+                .arg(&path);
+        }
+    }
+    let mut child = child
+        .spawn()
+        .map_err(|e| format!("Could not open window: {e}"))?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+pub(crate) fn browser_project(app: &AppHandle, root: &str) -> bool {
+    app.state::<Shared>()
+        .root()
+        .is_ok_and(|p| p == Path::new(root))
 }
 
 /// Copy session `session_id` into a new one and open the copy.
@@ -1084,6 +1367,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
 
     let app = tauri::Builder::default()
         // Links in answers open in the system browser, never in the app window.
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // The app's own signed updates, verified with `plugins.updater.pubkey` from the config;
         // checked only when `app_updates_enabled`.
@@ -1096,7 +1380,10 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             settings,
             save_setting,
             reset_setting,
+            apply_saved_settings,
+            apply_model_preset,
             recent_workspaces,
+            forget_workspace,
             open_workspace,
             reconnect,
             engine_update_check,
@@ -1105,6 +1392,9 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             app_updates_enabled,
             send_prompt,
             read_image,
+            read_clipboard_image,
+            read_transcript_image,
+            open_transcript_image,
             approve,
             abort,
             new_session,
@@ -1113,6 +1403,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             rename_session,
             pin_session,
             fork_session,
+            fork_before,
+            project_window,
             export_session,
             undo_turn,
             steer,
@@ -1126,7 +1418,15 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             read_aloud,
             refresh_sessions,
             search_transcripts,
+            engine_call,
             local_model_removal,
+            crate::model_library::model_download_status,
+            crate::model_library::model_download_start,
+            crate::model_library::model_download_cancel,
+            crate::model_library::model_cache_list,
+            crate::model_library::model_cache_remove,
+            crate::model_library::model_hub_search,
+            crate::model_library::model_hub_files,
             refresh_models,
             set_model,
             set_thinking,
@@ -1152,6 +1452,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
             app.manage(Notifications::default());
+            app.manage(crate::model_library::Downloads::default());
             app.manage(Shared {
                 inner: Mutex::new(Inner {
                     tabs: Tabs::new(Tab::new(Model::default(), None)),
@@ -1163,6 +1464,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 wake: Mutex::new(wake_tx),
                 terminals: Mutex::new(Terminals::default()),
                 installed: Mutex::new(None),
+                published: Mutex::new(Published::default()),
             });
             app.manage(Browser::default());
             // The agent's tools for the Browser panel (`agent_browser`); without them the panel
@@ -1200,6 +1502,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             && let Some(shared) = app.try_state::<Shared>()
         {
             shared.terminals().close_all();
+            app.state::<crate::model_library::Downloads>().stop();
             if let Some(file) = &endpoint_on_exit {
                 crate::agent_browser::remove_endpoint(file);
             }

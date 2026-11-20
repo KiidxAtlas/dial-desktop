@@ -24,6 +24,38 @@ export function openSession(snap: OpenSnapshot): Session | null {
   return snap.sessions.find((s) => s.selected) ?? null;
 }
 
+/** Sessions as the sidebar groups them (Active, Pinned, Recents), keeping those whose title matches `filter`. */
+export function sessionGroups(sessions: Session[], filter = ""): { name: string; sessions: Session[] }[] {
+  const f = filter.trim().toLowerCase();
+  const matching = sessions.filter((s) => !f || s.title.toLowerCase().includes(f));
+  return [
+    { name: "Active", sessions: matching.filter((s) => s.running || s.waiting) },
+    { name: "Pinned", sessions: matching.filter((s) => s.pinned && !s.running && !s.waiting) },
+    { name: "Recents", sessions: matching.filter((s) => !s.pinned && !s.running && !s.waiting) },
+  ].filter((g) => g.sessions.length);
+}
+
+/** The sidebar's sessions top to bottom: what ⌘1–9 and next/previous session step through. */
+export function sessionOrder(snap: OpenSnapshot): Session[] {
+  return sessionGroups(snap.sessions, ui.sessionFilter).flatMap((g) => g.sessions);
+}
+
+/** Open `session` from the keyboard or a list. */
+export function goToSession(session: Session) {
+  ui.transcriptJump = null;
+  ui.settingsOpen = false;
+  if (!session.selected) engine.resume(session.id);
+}
+
+/** Open the session `step` places below (or above, when negative) the open one, wrapping around. */
+export function stepSession(snap: OpenSnapshot, step: number) {
+  const list = sessionOrder(snap);
+  if (!list.length) return;
+  const at = list.findIndex((s) => s.selected);
+  const next = at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length;
+  goToSession(list[next]);
+}
+
 /** Whether the conversation on screen has a turn that can be undone. */
 export function canUndo(snap: OpenSnapshot) {
   return !snap.turnRunning && snap.entries.some((e) => e.kind === "user");
@@ -36,6 +68,19 @@ export function lastPrompt(snap: OpenSnapshot): string | null {
     if (entry.kind === "user") return entry.text;
   }
   return null;
+}
+
+/** This session's prompts, newest first, with repeats removed (for ↑/↓ in the composer). */
+export function promptHistory(snap: OpenSnapshot): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (let i = snap.entries.length - 1; i >= 0; i--) {
+    const entry = snap.entries[i];
+    if (entry.kind !== "user" || !entry.text.trim() || seen.has(entry.text)) continue;
+    seen.add(entry.text);
+    out.push(entry.text);
+  }
+  return out;
 }
 
 /** Whether the last turn failed, so its prompt can be sent again: the conversation ends in an error. */

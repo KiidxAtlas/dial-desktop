@@ -61,3 +61,14 @@ export async function addBlobs(draft: Draft, blobs: File[]) {
     draft.attachments.push({ key: crypto.randomUUID(), name: blob.name || "Pasted image", url, path: null, data });
   }
 }
+
+/** Fallback for WebKit paste events that do not expose the clipboard's image bytes. */
+export async function addNativeClipboardImage(draft: Draft) {
+  try {
+    const data = await files.readClipboardImage();
+    if (!data || !hasRoom(draft)) return;
+    draft.attachments.push({ key: crypto.randomUUID(), name: "Pasted image", url: `data:image/png;base64,${data}`, path: null, data });
+  } catch (error) {
+    showToast(String(error));
+  }
+}

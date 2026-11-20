@@ -11,6 +11,8 @@ import {
   updates,
 } from "../updates";
 import Icon from "./Icon.vue";
+import SGroup from "./settings/SGroup.vue";
+import SRow from "./settings/SRow.vue";
 
 const INSTALLATIONS: Record<string, string> = {
   installer: "the Dial installer",
@@ -67,152 +69,65 @@ const appProgressText = computed(() => {
 </script>
 
 <template>
-  <h2>Updates</h2>
-  <p class="note">
-    Dial Desktop and the Dial engine update separately. The engine is the same <code>dial</code> your terminal
-    runs, so updating it here updates it there too. Nothing installs until you ask.
+  <SGroup title="Dial Desktop">
+    <SRow :label="`Version ${updates.appVersion || 'unknown'}`" :description="appProgressText || appLine">
+      <button v-if="updates.app" class="btn btn-primary" :disabled="updates.appProgress !== undefined" @click="installApp">
+        <Icon name="download" :size="14" /> Install and restart
+      </button>
+      <button v-else class="btn btn-secondary" :disabled="!updates.appEnabled || updates.appChecking" @click="checkApp">
+        <Icon name="refresh" :size="14" /> Check
+      </button>
+      <template v-if="updates.app?.notes" #below-text>
+        <div class="notes">{{ updates.app.notes }}</div>
+      </template>
+    </SRow>
+  </SGroup>
+
+  <SGroup title="Dial engine" description="The same dial your terminal runs; updating it here updates it there too.">
+    <SRow
+      :label="engineStatus ? `Version ${engineStatus.current}` : 'Engine'"
+      :description="updates.engineBusy === 'updating' ? 'Updating… (a source or Cargo install rebuilds Dial; this can take minutes)' : updates.engineBusy === 'installing' ? 'Installing the signed Dial release…' : engineLine"
+    >
+      <button v-if="updates.engine?.state === 'missing'" class="btn btn-primary" :disabled="!!updates.engineBusy" @click="installEngine">
+        <Icon name="download" :size="14" /> Install engine
+      </button>
+      <button v-else-if="canUpdateEngine" class="btn btn-primary" :disabled="!!updates.engineBusy" @click="updateEngine">
+        <Icon name="download" :size="14" /> Update engine
+      </button>
+      <button class="btn btn-secondary" :disabled="updates.engineChecking || !!updates.engineBusy" @click="checkEngine">
+        <Icon name="refresh" :size="14" /> Check
+      </button>
+      <template v-if="manualEngine" #below-text>
+        <div class="s-desc">To update: <code>{{ manualEngine }}</code></div>
+      </template>
+    </SRow>
+    <template #after>
+      <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
+      <details v-if="updates.engineLog" class="log">
+        <summary>Output of the last install or update</summary>
+        <pre>{{ updates.engineLog }}</pre>
+      </details>
+    </template>
+  </SGroup>
+
+  <p class="s-note">
+    Nothing installs until you ask. To use Dial without this app, install the engine alone with
+    <code>curl -fsSL https://dial.rootatlas.dev/install | sh</code> (PowerShell:
+    <code>irm https://dial.rootatlas.dev/install | iex</code>) and keep it current with <code>dial update</code>.
   </p>
-
-  <section class="group">
-    <h3>Dial Desktop</h3>
-    <div class="row">
-      <div class="text">
-        <div class="title">Version {{ updates.appVersion || "unknown" }}</div>
-        <div class="detail">{{ appProgressText || appLine }}</div>
-        <div v-if="updates.app?.notes" class="notes">{{ updates.app.notes }}</div>
-      </div>
-      <div class="actions">
-        <button
-          v-if="updates.app"
-          class="btn btn-primary"
-          :disabled="updates.appProgress !== undefined"
-          @click="installApp"
-        >
-          <Icon name="download" :size="14" /> Install and restart
-        </button>
-        <button
-          v-else
-          class="btn btn-secondary"
-          :disabled="!updates.appEnabled || updates.appChecking"
-          @click="checkApp"
-        >
-          <Icon name="refresh" :size="14" /> Check
-        </button>
-      </div>
-    </div>
-  </section>
-
-  <section class="group">
-    <h3>Dial engine</h3>
-    <div class="row">
-      <div class="text">
-        <div class="title">{{ engineStatus ? `Version ${engineStatus.current}` : "Engine" }}</div>
-        <div class="detail">
-          {{ updates.engineBusy === "updating" ? "Updating… (a source or Cargo install rebuilds Dial; this can take minutes)" : updates.engineBusy === "installing" ? "Installing the signed Dial release…" : engineLine }}
-        </div>
-        <div v-if="manualEngine" class="detail">To update: <code>{{ manualEngine }}</code></div>
-      </div>
-      <div class="actions">
-        <button
-          v-if="updates.engine?.state === 'missing'"
-          class="btn btn-primary"
-          :disabled="!!updates.engineBusy"
-          @click="installEngine"
-        >
-          <Icon name="download" :size="14" /> Install engine
-        </button>
-        <button
-          v-else-if="canUpdateEngine"
-          class="btn btn-primary"
-          :disabled="!!updates.engineBusy"
-          @click="updateEngine"
-        >
-          <Icon name="download" :size="14" /> Update engine
-        </button>
-        <button
-          class="btn btn-secondary"
-          :disabled="updates.engineChecking || !!updates.engineBusy"
-          @click="checkEngine"
-        >
-          <Icon name="refresh" :size="14" /> Check
-        </button>
-      </div>
-    </div>
-    <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
-    <details v-if="updates.engineLog" class="log">
-      <summary>Output of the last install or update</summary>
-      <pre>{{ updates.engineLog }}</pre>
-    </details>
-  </section>
-
-  <section class="group">
-    <h3>Terminal only</h3>
-    <p class="note">
-      To use Dial without this app, install the engine alone with
-      <code>curl -fsSL https://dial.rootatlas.dev/install | sh</code> (PowerShell:
-      <code>irm https://dial.rootatlas.dev/install | iex</code>) and keep it current with <code>dial update</code>.
-    </p>
-  </section>
 </template>
 
 <style scoped>
-h2 {
-  margin: 0;
-  font-family: ui-serif, Georgia, "Times New Roman", serif;
-  font-size: 24px;
-  font-weight: 400;
-}
-.note {
-  margin: 10px 0 8px;
-  font-size: var(--text-sm);
-  line-height: 1.55;
-  color: var(--text-faint);
-}
 code {
   font-family: var(--font-mono);
   font-size: 0.95em;
   color: var(--text-muted);
 }
-.group h3 {
-  margin: 26px 0 0;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border-strong);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-.row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 0;
-  border-bottom: 1px solid var(--border);
-}
-.text {
-  min-width: 0;
-}
-.title {
-  font-size: 14px;
-}
-.detail {
-  margin-top: 3px;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
 .notes {
   margin-top: 6px;
-  font-size: var(--text-sm);
+  font-size: 12px;
   color: var(--text-faint);
   white-space: pre-wrap;
-}
-.actions {
-  flex: none;
-  display: flex;
-  gap: 8px;
 }
 .error {
   margin: 10px 0 0;

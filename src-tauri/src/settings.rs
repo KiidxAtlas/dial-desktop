@@ -59,10 +59,14 @@ pub enum Control {
         step: Option<f64>,
         integer: bool,
         auto: bool,
+        /// What the number counts (`s`, `bytes`, `tokens`, `%`…), when known.
+        unit: Option<String>,
     },
-    /// Free text, optionally with suggestions.
+    /// Free text, optionally with suggestions; `hint` says what the text names, so the page can
+    /// offer a picker (a model, a file) instead of a bare text box.
     Text {
         suggestions: Vec<Choice>,
+        hint: TextHint,
     },
     /// A list of strings.
     List,
@@ -70,11 +74,93 @@ pub enum Control {
     Table,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// What a text setting holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextHint {
+    Plain,
+    /// A model id from the engine's model list.
+    Model,
+    /// A provider name from the engine's model list.
+    Provider,
+    /// An executable file.
+    Program,
+    /// Any file.
+    File,
+    /// A folder.
+    Folder,
+    /// A web address.
+    Url,
+    /// The name of an environment variable (never its value).
+    EnvVar,
+    /// An audio input device by name.
+    Microphone,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Choice {
     pub value: String,
     pub label: String,
+    /// Picker identity when several providers expose the same saved value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Other settings saved with this choice: an image model's endpoint and protocol.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub with: Map<String, Value>,
 }
+
+/// The terminal's built-in color themes (`dial-ui` `BUILTINS`); a custom name stays possible.
+const TERMINAL_THEMES: &[&str] = &[
+    "dial",
+    "dial-dark",
+    "dark",
+    "light",
+    "mono",
+    "gruvbox",
+    "nord",
+    "paper",
+    "dark-one",
+    "light-one",
+    "dark-github",
+    "dark-nord",
+    "dark-ocean",
+    "dark-forest",
+    "obsidian",
+    "graphite",
+    "porcelain",
+];
+
+/// Image models the engine documents (`dial-llm` catalog `documented_image_generation` and the
+/// image config); any other id the endpoint accepts can still be typed.
+const IMAGE_MODELS: &[(&str, &str)] = &[
+    ("gpt-image-1.5", "GPT Image 1.5 · OpenAI"),
+    ("gpt-image-2", "GPT Image 2 · OpenAI"),
+    ("gpt-image-1", "GPT Image 1 · OpenAI"),
+    ("gpt-image-1-mini", "GPT Image 1 mini · OpenAI"),
+    ("dall-e-3", "DALL·E 3 · OpenAI"),
+    ("grok-imagine-image-2.0", "Grok Imagine 2.0 · xAI"),
+    ("gemini-3-pro-image-preview", "Gemini 3 Pro Image · Google"),
+    (
+        "gemini-3.1-flash-image-preview",
+        "Gemini 3.1 Flash Image · Google",
+    ),
+    ("gemini-2.5-flash-image", "Gemini 2.5 Flash Image · Google"),
+    ("imagen-4.0-generate-001", "Imagen 4 · Google"),
+    ("flux-2-pro", "FLUX.2 Pro · Black Forest Labs"),
+    ("flux-pro-1.1", "FLUX 1.1 Pro · Black Forest Labs"),
+    ("flux-kontext-pro", "FLUX Kontext Pro · Black Forest Labs"),
+    ("flux-schnell", "FLUX Schnell"),
+];
+
+/// Web search backends `web.search_provider` names in its description.
+const SEARCH_PROVIDERS: &[(&str, &str)] = &[
+    ("auto", "Automatic"),
+    ("brave", "Brave"),
+    ("tavily", "Tavily"),
+    ("exa", "Exa"),
+    ("searxng", "SearXNG"),
+    ("duckduckgo", "DuckDuckGo"),
+];
 
 /// Build the page from the reference and the saved values.
 pub fn view(schema: &[Value], saved: &HashMap<String, SavedSetting>) -> SettingsView {
@@ -105,16 +191,22 @@ pub fn view(schema: &[Value], saved: &HashMap<String, SavedSetting>) -> Settings
         } else {
             value
         };
+        // A number's label may name its unit, which the control shows instead.
+        let (label, label_unit) = if matches!(control, Control::Number { .. }) {
+            split_unit(&text("label"))
+        } else {
+            (text("label"), None)
+        };
         settings.push(SettingView {
             key: key.to_owned(),
-            label: Some(text("label"))
+            label: Some(label)
                 .filter(|l| !l.is_empty())
                 .unwrap_or_else(|| key.to_owned()),
             description: text("description"),
             section: text("section"),
             modified: !redacted && !same(&value, &default),
             tab,
-            control,
+            control: with_unit(control, label_unit.or_else(|| key_unit(key))),
             value,
             default,
             redacted,
@@ -132,6 +224,7 @@ pub fn view(schema: &[Value], saved: &HashMap<String, SavedSetting>) -> Settings
 /// The control for one reference entry, from its kind and constraints.
 fn control(entry: &Value) -> Control {
     let kind = entry["kind"].as_str().unwrap_or_default();
+    let key = entry["path"].as_str().unwrap_or_default();
     let c = &entry["constraints"];
     let name = kind
         .split(|ch: char| !ch.is_alphanumeric())
@@ -164,13 +257,109 @@ fn control(entry: &Value) -> Control {
                 step: c["step"].as_f64().or_else(|| bounds["step"].as_f64()),
                 integer: name.ends_with("Int"),
                 auto: name.starts_with("Auto"),
+                unit: None,
             }
         }
         "StringList" => Control::List,
         "Toml" | "Table" => Control::Table,
+        // Fixed lists are dropdowns; a value set elsewhere that is not listed still shows.
+        "Theme" => {
+            let auto = (key == "ui.theme").then(|| choice("auto", "Match the terminal"));
+            Control::Select {
+                options: auto
+                    .into_iter()
+                    .chain(TERMINAL_THEMES.iter().map(|t| choice(t, t)))
+                    .collect(),
+            }
+        }
+        _ if key == "web.search_provider" => Control::Select {
+            options: SEARCH_PROVIDERS.iter().map(|(v, l)| choice(v, l)).collect(),
+        },
+        // Image models are not chat models: offer the ones the engine documents, by provider.
+        _ if key == "image.model" => Control::Text {
+            suggestions: IMAGE_MODELS.iter().map(|(v, l)| choice(v, l)).collect(),
+            hint: TextHint::Plain,
+        },
         _ => Control::Text {
             suggestions: choices(&c["suggestions"], &Value::Null),
+            hint: text_hint(key),
         },
+    }
+}
+
+/// What a free-text setting names, from its key.
+fn text_hint(key: &str) -> TextHint {
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    match leaf {
+        "model" | "draft_model" => TextHint::Model,
+        "provider" => TextHint::Provider,
+        "python" | "node" | "worker" | "program" => TextHint::Program,
+        "idadir" => TextHint::Folder,
+        "progress_file" => TextHint::File,
+        "input_device" => TextHint::Microphone,
+        _ if leaf.ends_with("_env") => TextHint::EnvVar,
+        _ if leaf.ends_with("endpoint") || leaf.ends_with("_url") => TextHint::Url,
+        _ => TextHint::Plain,
+    }
+}
+
+/// `("Worker timeout", Some("s"))` from `"Worker timeout (s)"`.
+fn split_unit(label: &str) -> (String, Option<String>) {
+    if let Some(open) = label.rfind(" (")
+        && label.ends_with(')')
+    {
+        let unit = &label[open + 2..label.len() - 1];
+        let unit = match unit {
+            "seconds" => "s",
+            "minutes" => "min",
+            other => other,
+        };
+        if !unit.is_empty() && unit.len() <= 8 && !unit.contains(' ') {
+            return (label[..open].to_owned(), Some(unit.to_owned()));
+        }
+    }
+    (label.to_owned(), None)
+}
+
+/// The unit a numeric key's suffix names (`retry_delay_secs` → `s`).
+fn key_unit(key: &str) -> Option<String> {
+    let suffix = key.rsplit(['.', '_']).next()?;
+    let unit = match suffix {
+        "secs" | "seconds" => "s",
+        "ms" => "ms",
+        "minutes" | "mins" => "min",
+        "hours" => "hours",
+        "days" => "days",
+        "bytes" => "bytes",
+        "tokens" => "tokens",
+        "percent" | "pct" => "%",
+        "chars" => "chars",
+        "lines" => "lines",
+        "turns" => "turns",
+        "usd" => "USD",
+        _ => return None,
+    };
+    Some(unit.to_owned())
+}
+
+fn with_unit(control: Control, found: Option<String>) -> Control {
+    match control {
+        Control::Number {
+            min,
+            max,
+            step,
+            integer,
+            auto,
+            ..
+        } => Control::Number {
+            min,
+            max,
+            step,
+            integer,
+            auto,
+            unit: found,
+        },
+        other => other,
     }
 }
 
@@ -198,6 +387,45 @@ fn choice(value: &str, label: &str) -> Choice {
     Choice {
         value: value.to_owned(),
         label: label.to_owned(),
+        id: None,
+        with: Map::new(),
+    }
+}
+
+/// Offer the engine's image models (`list_models` with `purpose: "image"`) for `image.model`
+/// instead of the built-in list. Each choice also saves the endpoint and image protocol the model
+/// needs, so picking a Gemini or OpenRouter model does not leave the OpenAI endpoint in place.
+/// No rows (an engine without the listing) keeps the built-in list.
+pub fn offer_image_models(view: &mut SettingsView, rows: &[Value]) {
+    let options: Vec<Choice> = rows
+        .iter()
+        .filter_map(|row| {
+            let model = row["model_id"].as_str().filter(|m| !m.is_empty())?;
+            let label = row["label"]
+                .as_str()
+                .filter(|l| !l.is_empty())
+                .unwrap_or(model);
+            let provider = row["provider"].as_str().unwrap_or_default();
+            let mut with = Map::new();
+            if let Some(url) = row["base_url"].as_str().filter(|u| !u.is_empty()) {
+                with.insert("image.base_url".into(), Value::from(url));
+            }
+            if let Some(api) = row["image_api"].as_str().filter(|a| !a.is_empty()) {
+                with.insert("image.api".into(), Value::from(api));
+            }
+            Some(Choice {
+                value: model.to_owned(),
+                id: Some(format!("\0{}", serde_json::json!([provider, model, &with]))),
+                label: format!("{label} · {provider}"),
+                with,
+            })
+        })
+        .collect();
+    if options.is_empty() {
+        return;
+    }
+    if let Some(setting) = view.settings.iter_mut().find(|s| s.key == "image.model") {
+        setting.control = Control::Text { suggestions: options, hint: TextHint::Plain };
     }
 }
 

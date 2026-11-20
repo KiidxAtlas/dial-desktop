@@ -1,16 +1,14 @@
 <script setup lang="ts">
 // Shown when no folder is open: pick a project, like starting a terminal agent in one.
-import { onMounted, ref } from "vue";
-import type { Workspace } from "../types";
+import { onMounted } from "vue";
 import { folders } from "../bridge";
 import { installEngine, updates } from "../updates";
+import { openMenu } from "../ui";
+import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
 
-const recent = ref<Workspace[]>([]);
-onMounted(async () => {
-  recent.value = await folders.recent();
-});
+onMounted(loadRecentProjects);
 </script>
 
 <template>
@@ -35,12 +33,20 @@ onMounted(async () => {
         <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
       </div>
       <div v-if="recent.length" class="recent">
-        <div class="section-label">Recent</div>
-        <button v-for="w in recent" :key="w.root" class="row" :title="w.root" @click="folders.open(w.root)">
-          <Icon name="folder" :size="15" />
-          <span class="name truncate">{{ w.name }}</span>
-          <span class="path truncate">{{ w.display }}</span>
-        </button>
+        <div class="section-label head">
+          <span>Recent</span>
+          <button class="clear" title="Remove every project from this list (folders stay on disk)" @click="clearRecentProjects()">Clear</button>
+        </div>
+        <div v-for="w in recent" :key="w.root" class="item" @contextmenu="openMenu($event, projectItems(w))">
+          <button class="row" :title="w.root" @click="folders.open(w.root)">
+            <Icon name="folder" :size="15" />
+            <span class="name truncate">{{ w.name }}</span>
+            <span class="path truncate">{{ w.display }}</span>
+          </button>
+          <button class="forget" :aria-label="`Remove ${w.name} from recent projects`" title="Remove from this list (the folder stays on disk)" @click="forgetProject(w.root)">
+            <Icon name="cross" :size="13" />
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -88,6 +94,23 @@ h1 {
 .recent .section-label {
   padding: 0 10px 6px;
 }
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.clear {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.clear:hover {
+  background: var(--hover);
+  color: var(--text);
+}
 .row {
   display: grid;
   grid-template-columns: auto minmax(0, auto) minmax(0, 1fr);
@@ -100,6 +123,35 @@ h1 {
 }
 .row:hover {
   background: var(--hover);
+}
+.item {
+  position: relative;
+}
+.item .row {
+  width: 100%;
+  padding-right: 40px;
+}
+.forget {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
+}
+.item:hover .forget,
+.forget:focus-visible {
+  opacity: 1;
+}
+.forget:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
 }
 .name {
   color: var(--text);

@@ -57,8 +57,8 @@ Shortcuts: <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line
 Running sessions and sessions waiting for a reply appear under **Active** in the sidebar. Open
 one there to return to its running conversation. To browse local chat models that Dial already
 detects on disk, open the composer’s model picker and choose **Downloaded**. Model details show
-the source, folder and size. You can confirm removal of an unused model from a supported store;
-add models outside Desktop, then reload the list.
+the source, folder and size. Use **Get models…** to download a library model, or reload the list
+after adding one outside Desktop. You can also confirm removal of an unused model from a supported store.
 
 ## Updates
 
@@ -145,13 +145,15 @@ continues. Local builds without the release config do not contact Azure.
   engine setting from Dial's own settings reference (`settings_schema`), grouped in its tabs and
   sections, with search, a "changed" filter, the default beside each value and a per-setting reset.
   Each setting gets a fitting control: switch, menu, number (with bounds and "Auto"), text with
-  suggestions, a list, or a JSON editor for tables. Save to every project or to this one; a change
+  suggestions, or a structured editor for lists and nested groups. Add and remove fields, choose a value type, then Save or Cancel without editing JSON. Save to every project or to this one; a change
   is written with `set_setting` and applied to the running session (`apply_settings`) at once, or
   when the running turn ends. Settings marked "Restart" take effect the next time Dial starts.
   Credentials are never shown and cannot be edited here.
+- **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (read straight from disk, honoring `HF_HUB_CACHE` and `HF_HOME`; no CLI needed). **Search Hugging Face** finds any MLX or GGUF model on the Hub, most downloaded first; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. A few suggested models follow, pinned to tested revisions. Every download is confirmed with its size first and uses the official Hugging Face CLI (`hf` on PATH, also used for search) and its normal cache. You can leave Settings while downloading, return to see the outcome, or cancel. Downloading does not select a model or install an inference runtime.
 - **Backgrounds** (Settings → Background): artwork behind your sessions, drawn by the app at the
   window's resolution, with no image files. There are still ones (Warp, Dune, Aurora, Nebula,
-  Terrain), animated ones (Hyperspace, Drift, Flow, Fireflies) and your own image. Over a
+  Terrain), animated ones (Hyperspace, Drift, Flow, Fireflies, and the ASCII presets Trace Route,
+  Hex Swarm and Stack Rain) and your own image. Over a
   background the composer and cards turn to frosted glass. Choose whether it shows behind every
   session or only a new one, how much a conversation dims it, and whether animated ones move.
   They hold still when the system asks to reduce motion. Saved on this computer, for every project.
@@ -159,7 +161,8 @@ continues. Local builds without the release config do not contact Azure.
   (with copy buttons), collapsible reasoning, and compact tool-call rows. Expand a row to see its
   arguments, live output, result and changed files. Images an `image_gen` call writes always show
   inline under its row, including in resumed sessions; click one to show it in its folder. Text is
-  selectable; links open in the browser.
+  selectable; links open in the browser, and links to project files open in the Files panel.
+  Images an answer cannot load (remote addresses, unsupported formats) show as a link or label.
   Hover a message to copy it (the last answer keeps its copy button in view); the last prompt also
   offers undo, and edit (undo, then put the prompt back in the box). A failed turn offers Retry.
   Scrolling up stops following new output, and a button jumps back to the latest.
@@ -187,9 +190,11 @@ continues. Local builds without the release config do not contact Azure.
   questions, and ended turns while Dial is unfocused. Click it to return to the session while Dial
   is running. Alerts do not show prompts, session names, or project names. macOS uses the installed
   app bundle; Linux needs a notification daemon with action support for click-through.
-- **Images**: attach PNG, JPEG, GIF or WebP images to a prompt with the image button, by
-  pasting, or by dropping files on the window (up to 10, 20 MB each). Files are sent by path; pasted images
-  are sent inline. The button is disabled when the model is known not to take images.
+- **Images**: paste screenshots or copied images directly into the prompt (⌘V / Ctrl+V), or use
+  the image button or drop files on the window. Supports PNG, JPEG, GIF and WebP (up to 10 images,
+  20 MB each); macOS clipboard TIFF images are converted to PNG when needed. Files are sent by
+  path; pasted images are sent inline. The button is disabled when the model is known not to take
+  images. Relative Markdown image links in replies preview supported images inside the open project.
 - **Side panel** (drag its left edge to resize; the width is remembered per kind of panel):
   - **Plan**: the agent's todo list with progress. **Activity**: recent tool calls.
   - **Changes**: files Dial touched in this session. Open a file to inspect its current Git diff,
@@ -222,8 +227,12 @@ continues. Local builds without the release config do not contact Azure.
   dropped engine is shown as stopped, and tool calls it left running are marked as having
   unknown outcomes, never as succeeded.
 
-Not yet: images in question answers, multiple windows, agent screenshots of the browser outside
-macOS.
+- **Turn review**: expand the card after a completed prompt to inspect reported files, recorded edit hunks and explicit verification calls. Missing patches or checks aren't reconstructed from the working tree. Receipts link back to tool output; **Compare current working tree** shows today's Git diff separately.
+- **Quick-open** (⌘/Ctrl+P): search project paths without expanding folders; Enter opens the selected file in Files.
+- **Open project in new window…** in the palette starts an independent Desktop process without stopping the original project's engines or terminals.
+- **Fork before a prompt**: hover a user message in an idle live session and choose the fork action. Desktop copies the session and branches only the copy; files are not rewound. Repeated or missing prompt text is refused rather than guessing the branch point.
+
+Not yet: images in question answers, agent screenshots of the browser outside macOS.
 
 ## Layout
 
@@ -256,9 +265,12 @@ macOS.
 | `src/components/` | `Sidebar`, `TopBar`, `Timeline`, `ToolRow`, `Composer` (+ approvals, attachments, `ContextMeter`), `QuestionCard`, `Inspector` (+ `workspace/BrowserPane`, `FilesPane`, `DiffPane`, `TerminalPane`), `Settings` (+ `SettingRow`, `AppearanceSettings`, `BackgroundSettings`), `ContextMenu`, `Palette`, `Shortcuts`, `EmptyState`, `Toasts` |
 | `src/styles.css` | Design tokens (palette, spacing, radii, type) and shared styles |
 
-The data flow is one-way: engine updates are folded into the `Model` on the Rust side, published as
-a full `Snapshot` (coalesced to about one per frame while text streams), and rendered by Vue. The UI
-keeps only its own state (draft, filter, expanded rows, inspector tab) and sends requests back
+The data flow is one-way: engine updates are folded into the `Model` on the Rust side, turned into a
+`Snapshot` (coalesced to about one per frame while text streams), and rendered by Vue. Only what
+changed since the last published snapshot is sent: changed fields and the changed end of the
+transcript (`view::Published`); the UI applies it, and reloads the whole snapshot if it ever
+misses one. While an answer streams, its unfinished last code block is highlighted once it is done.
+The UI keeps only its own state (draft, filter, expanded rows, inspector tab) and sends requests back
 through Tauri commands.
 
 Rust unit tests live next to each module in `<module>/tests.rs`:

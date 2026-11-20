@@ -225,22 +225,57 @@ impl Recents {
     /// Move `path` to the front and save. Saving is best effort: a read-only disk only loses
     /// the list.
     pub fn touch(&mut self, path: &Path) {
-        self.paths.retain(|p| p != path);
-        self.paths.insert(0, path.to_owned());
-        self.paths.truncate(MAX_RECENTS);
-        if let Some(file) = &self.file {
-            let list: Vec<String> = self
-                .paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
+        self.update(|paths| {
+            paths.retain(|p| p != path);
+            paths.insert(0, path.to_owned());
+            paths.truncate(MAX_RECENTS);
+            true
+        });
+    }
+
+    /// Drop `path` from the list (the folder itself is untouched) and save. Whether it was listed.
+    pub fn forget(&mut self, path: &Path) -> bool {
+        self.update(|paths| {
+            let before = paths.len();
+            paths.retain(|p| p != path);
+            paths.len() != before
+        })
+    }
+
+    pub fn refresh(&mut self) {
+        if self.file.is_some() {
+            self.paths = Self::load(self.file.clone()).paths;
+        }
+    }
+
+    fn update(&mut self, change: impl FnOnce(&mut Vec<PathBuf>) -> bool) -> bool {
+        let Some(file) = self.file.clone() else {
+            return change(&mut self.paths);
+        };
+        // Keep a separate lock file: the recents file is replaced atomically for readers.
+        let lock = (|| -> std::io::Result<_> {
+            if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
             }
+            let lock = std::fs::File::options()
+                .create(true).truncate(false).read(true).write(true)
+                .open(file.with_extension("lock"))?;
+            lock.lock()?;
+            Ok(lock)
+        })();
+        let Ok(_lock) = lock else { return change(&mut self.paths) };
+        self.refresh();
+        let changed = change(&mut self.paths);
+        if changed {
+            let list: Vec<_> = self.paths.iter().map(|p| p.to_string_lossy()).collect();
             if let Ok(json) = serde_json::to_vec_pretty(&list) {
-                let _ = std::fs::write(file, json);
+                let tmp = file.with_extension("tmp");
+                if std::fs::write(&tmp, json).is_ok() {
+                    let _ = std::fs::rename(&tmp, &file);
+                }
             }
         }
+        changed
     }
 }
 

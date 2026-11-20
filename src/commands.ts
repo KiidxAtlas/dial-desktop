@@ -1,9 +1,10 @@
 // Everything the palette (⌘K) can do, and the shortcut list. Keys here are the ones App.vue handles.
 
 import { ref } from "vue";
-import { engine, folders } from "./bridge";
+import { engine, files, folders } from "./bridge";
+import { recentProjects } from "./projects";
 import type { OpenSnapshot } from "./types";
-import { focusComposer, ui } from "./ui";
+import { focusComposer, ui, type SettingsTab } from "./ui";
 import { appearance, zoomBy, type Theme } from "./appearance";
 import { showPanel, workspace } from "./workspace";
 import { checkApp, checkEngine } from "./updates";
@@ -17,7 +18,9 @@ import {
   copyText,
   editLastPrompt,
   openSession,
+  sessionOrder,
   startRename,
+  stepSession,
 } from "./sessionActions";
 
 export interface Command {
@@ -110,6 +113,10 @@ export function commands(snap: OpenSnapshot): Command[] {
   );
   add({ id: "stop", group: "Session", label: "Stop the turn", icon: "stop", hint: "Esc", run: () => { markTurnAborted(snap); return engine.abort(); } }, snap.turnRunning);
   add({ id: "find", group: "Session", label: "Find in conversation", icon: "search", hint: "⌘F", run: openConversationFind }, snap.entries.length > 0);
+  add({ id: "focus-composer", group: "Session", label: "Focus the message box", icon: "pencil", hint: "⌘L", keywords: "type prompt input", run: () => { ui.settingsOpen = false; focusComposer(); } });
+  add({ id: "next-session", group: "Session", label: "Next session", icon: "arrowDown", hint: "⇧⌘]", keywords: "switch down", run: () => stepSession(snap, 1) }, sessionOrder(snap).length > 1);
+  add({ id: "prev-session", group: "Session", label: "Previous session", icon: "arrowUp", hint: "⇧⌘[", keywords: "switch up", run: () => stepSession(snap, -1) }, sessionOrder(snap).length > 1);
+  add({ id: "search-sessions", group: "Session", label: "Search sessions", icon: "search", hint: "⇧⌘F", keywords: "filter find sidebar", run: () => { ui.sidebarOpen = true; ui.focusSearch++; } });
 
   if (canUseTaskRecipes(snap)) {
     for (const recipe of taskRecipes) {
@@ -149,6 +156,7 @@ export function commands(snap: OpenSnapshot): Command[] {
   });
   add({ id: "browser", group: "View", label: "Open the browser", icon: "globe", hint: "⇧⌘B", keywords: "web page preview localhost url", run: () => showPanel("browser") });
   add({ id: "files", group: "View", label: "Browse files", icon: "folder", hint: "⇧⌘E", keywords: "explorer tree project open file", run: () => showPanel("files") });
+  add({ id: "quick-open", group: "View", label: "Quick-open project file", icon: "file", hint: "⌘P", run: () => { ui.filePalette = true; ui.paletteOpen = true; } });
   add({ id: "terminal", group: "View", label: "Open the terminal", icon: "terminal", hint: "⌃`", keywords: "shell console commands run", run: () => showPanel("terminal") });
   add({ id: "changes", group: "View", label: "Show changed files", icon: "diff", keywords: "diff review edits", run: () => showPanel("changes") });
   add({
@@ -169,6 +177,16 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "zoom-reset", group: "View", label: "Actual size", hint: "⌘0", keywords: "zoom reset", run: () => zoomBy(0) }, appearance.zoom !== 1);
 
   add({ id: "settings", group: "App", label: "Settings", icon: "gear", hint: "⌘,", keywords: "preferences background", run: () => (ui.settingsOpen = true) });
+  const page = (tab: SettingsTab) => () => { ui.settingsTab = tab; ui.settingsOpen = true; };
+  add({ id: "roles", group: "Project", label: "Model roles & presets", icon: "gear", keywords: "roles presets small task coach tester memory /modelpreset", run: page("roles") }, live);
+  add({ id: "library", group: "App", label: "Model library", icon: "gear", keywords: "download local models mlx gguf hugging face delete", run: page("library") });
+  add({ id: "usage", group: "Project", label: "Usage limits & stats", icon: "gear", keywords: "usage cost tokens stats limits context /usage /stats /cost", run: page("usage") }, live);
+  add({ id: "memory", group: "Project", label: "What Dial remembers", icon: "gear", keywords: "memory facts remember forget /memory", run: page("memory") }, live);
+  add({ id: "skills", group: "Project", label: "Skills", icon: "gear", keywords: "skills install enable /skills", run: page("skills") }, live);
+  add({ id: "extensions", group: "Project", label: "Extensions & MCP servers", icon: "gear", keywords: "mcp extensions plugins /extensions", run: page("extensions") }, live);
+  add({ id: "checks", group: "Project", label: "Checks after edits", icon: "gear", keywords: "checks tests lint verify /checks", run: page("checks") }, live);
+  add({ id: "folders", group: "Project", label: "Extra folders", icon: "gear", keywords: "dirs add-dir directories folders /dirs", run: page("folders") }, live);
+  add({ id: "schedules", group: "Project", label: "Schedules", icon: "gear", keywords: "schedule cron recurring timer /schedule", run: page("schedules") }, live);
   add({
     id: "updates",
     group: "App",
@@ -182,8 +200,16 @@ export function commands(snap: OpenSnapshot): Command[] {
     },
   });
   add({ id: "shortcuts", group: "App", label: "Keyboard shortcuts", icon: "keyboard", hint: "⌘/", keywords: "help keys", run: () => (ui.shortcutsOpen = true) });
+  add({ id: "project-window", group: "App", label: "Open project in new window…", icon: "folder", run: () => folders.choose(true) });
   add({ id: "folder", group: "App", label: "Open folder…", icon: "folder", keywords: "project workspace", run: () => folders.choose() });
   add({ id: "reconnect", group: "App", label: "Reconnect the engine", icon: "refresh", run: () => engine.reconnect() }, !live && snap.connection.state !== "preview");
+
+  // The open project, and switching to a recent one.
+  add({ id: "reveal-project", group: "Project", label: "Reveal project in Finder", icon: "folder", keywords: "show explorer folder", run: () => void files.reveal(snap.workspace.root) });
+  add({ id: "copy-project-path", group: "Project", label: "Copy project path", icon: "copy", keywords: "folder directory", run: () => void copyText(snap.workspace.root, "Project path copied") });
+  for (const w of recentProjects.value)
+    if (w.root !== snap.workspace.root)
+      add({ id: `project-${w.root}`, group: "Switch project", label: w.name, icon: "folder", keywords: `${w.display} project open recent`, run: () => void folders.open(w.root) });
 
   // Switching sessions, most recent first.
   for (const s of snap.sessions)
@@ -216,9 +242,49 @@ export function filterCommands(list: Command[], query: string): Command[] {
     else if (label.includes(q)) score = 2;
     else if (extra.includes(q)) score = 3;
     else if (q.split(/\s+/).every((part) => label.includes(part) || extra.includes(part))) score = 4;
+    else if (subsequence(label, q.replace(/\s+/g, "")) !== null) score = 5;
     if (score >= 0) scored.push({ command, score, at });
   });
   return scored.sort((a, b) => a.score - b.score || a.at - b.at).map((s) => s.command);
+}
+
+/** Positions of `q`'s characters in order within `text` (both lower case), or `null`. */
+function subsequence(text: string, q: string): number[] | null {
+  const at: number[] = [];
+  let from = 0;
+  for (const ch of q) {
+    const i = text.indexOf(ch, from);
+    if (i < 0) return null;
+    at.push(i);
+    from = i + 1;
+  }
+  return at;
+}
+
+/** `label` split into runs, marking what `query` matched: a substring if there is one, else its letters in order. */
+export function highlightMatch(label: string, query: string): { text: string; hit: boolean }[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [{ text: label, hit: false }];
+  const lower = label.toLowerCase();
+  const marked = new Array<boolean>(label.length).fill(false);
+  const start = lower.indexOf(q);
+  if (start >= 0) marked.fill(true, start, start + q.length);
+  else {
+    const words = q.split(/\s+/).filter(Boolean);
+    let any = false;
+    for (const word of words) {
+      const i = lower.indexOf(word);
+      if (i >= 0) { marked.fill(true, i, i + word.length); any = true; }
+    }
+    if (!any) for (const i of subsequence(lower, q.replace(/\s+/g, "")) ?? []) marked[i] = true;
+  }
+  const out: { text: string; hit: boolean }[] = [];
+  for (let i = 0; i < label.length; i++) {
+    const last = out.at(-1);
+    if (last && last.hit === marked[i]) last.text += label[i];
+    else out.push({ text: label[i], hit: marked[i] });
+  }
+  return out;
 }
 
 export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
@@ -226,6 +292,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     group: "General",
     keys: [
       ["⌘K", "Command palette"],
+      ["⌘/Ctrl+P", "Quick-open project file"],
       ["⌘N", "New session"],
       ["⌘,", "Settings"],
       ["⌘/", "Keyboard shortcuts"],
@@ -235,6 +302,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["⇧⌘E", "Files"],
       ["⌃`", "Terminal"],
       ["⌘+  ⌘−  ⌘0", "Zoom in, out, actual size"],
+      ["⌘L", "Focus the message box"],
     ],
   },
   {
@@ -242,10 +310,11 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     keys: [
       ["Enter", "Send (while Dial works: add a note)"],
       ["⇧Enter", "New line"],
+      ["⌥⌘↑ / ⌥⌘↓", "Previous / next prompt you sent"],
       ["⌘/Ctrl+Enter", "Queue a follow-up during a turn"],
       ["@", "Find and insert a project file path"],
       ["⌘F", "Find in conversation"],
-      ["↑", "Previous prompt (in an empty box)"],
+      ["↑  ↓", "Earlier prompts (in an empty box)"],
       ["Esc", "Stop the turn"],
       ["⇧⌘M", "Change model"],
       ["⇧⌘V", "Voice: start talking, stop recording, or interrupt a spoken reply"],
@@ -258,6 +327,9 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["⌘-click  ⇧-click", "Select several"],
       ["⌘A", "Select all (with a selection)"],
       ["⌫", "Delete the selected"],
+      ["⌘1 … ⌘9", "Open a session by position (hold ⌘ to see numbers)"],
+      ["⇧⌘[  ⇧⌘]", "Previous or next session (also ⌃⇧Tab, ⌃Tab)"],
+      ["⇧⌘F", "Search sessions (Esc clears)"],
       ["F2  double-click", "Rename"],
       ["Right-click", "Session actions"],
     ],

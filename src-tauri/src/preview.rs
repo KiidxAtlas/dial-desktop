@@ -244,6 +244,7 @@ fn sessions(now: i64) -> Vec<SessionSummary> {
         messages,
         pinned,
         current: id == SESSION,
+        open_elsewhere: false,
     };
     vec![
         row(

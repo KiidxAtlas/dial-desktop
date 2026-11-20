@@ -2,12 +2,16 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
-import { engine, files, folders, showToast, workspaceFiles } from "../bridge";
+import { engine, files, showToast, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
 import { ui } from "../ui";
 import { draftFor } from "../drafts";
-import { canCompact, canRetry, canUndo, lastPrompt } from "../sessionActions";
+import { canCompact, promptHistory } from "../sessionActions";
 import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
+import { engineCommands, loadEngineCommands } from "../engineTools";
+import { matchSlash, slashCommands, type SlashCommand } from "../slashCommands";
+import { runTyped, typedCommand } from "../commandRunner";
+import CommandPanel from "./CommandPanel.vue";
 import { editQueued, enqueuePrompt, markTurnAborted, queueFor, removeQueued, sendQueuedNext } from "../queue";
 import { mention } from "../workspace";
 import Icon from "./Icon.vue";
@@ -16,6 +20,7 @@ import ApprovalMenu from "./ApprovalMenu.vue";
 import QuestionCard from "./QuestionCard.vue";
 import ContextMeter from "./ContextMeter.vue";
 import VoicePanel from "./VoicePanel.vue";
+import ModesMenu from "./ModesMenu.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
@@ -56,40 +61,33 @@ function pickPath(path: string) {
   nextTick(() => { input.value?.focus(); input.value?.setSelectionRange(start + insert.length, start + insert.length); });
 }
 
-/** Slash commands handled in the app, as in a terminal agent. */
-const COMMANDS: { name: string; detail: string; run: () => void }[] = [
-  { name: "/model", detail: "Switch the model or reasoning level", run: () => (ui.modelPickerOpen = true) },
-  { name: "/new", detail: "Start a fresh session", run: () => engine.newSession() },
-  { name: "/clear", detail: "Start a fresh session", run: () => engine.newSession() },
-  { name: "/compact", detail: "Summarize the conversation to free context", run: () => engine.compact() },
-  { name: "/undo", detail: "Undo the last turn and restore its files", run: () => void engine.undoTurn() },
-  { name: "/open", detail: "Open another project folder", run: () => folders.choose() },
-  { name: "/think", detail: "Open model and reasoning options", run: () => (ui.modelPickerOpen = true) },
-  { name: "/mode", detail: "Choose an approval mode", run: () => approvalMenu.value?.show() },
-  { name: "/retry", detail: "Retry the failed turn", run: () => engine.retryTurn() },
-  { name: "/fork", detail: "Duplicate this session", run: () => props.snap.sessionId && engine.forkSession(props.snap.sessionId) },
-  { name: "/voice", detail: "Talk to Dial and hear the answer (⇧⌘V)", run: () => void engine.voiceStart() },
-  ...taskRecipes.map(r => ({ name: `/${r.id}`, detail: r.title, run: () => { draft.value.text = r.prompt; } })),
-];
+/** Slash commands: the terminal's, run the desktop way (see `slashCommands.ts`), plus task recipes. */
+const modesMenu = ref<InstanceType<typeof ModesMenu> | null>(null);
+const allCommands = computed<SlashCommand[]>(() => [
+  ...slashCommands(
+    { snap: props.snap, showApprovals: () => approvalMenu.value?.show(), showModes: () => modesMenu.value?.show() },
+    engineCommands.value,
+  ),
+  ...(canUseTaskRecipes(props.snap)
+    ? taskRecipes.map((r) => ({ name: `/${r.id}`, detail: r.title, kind: "desktop" as const, run: () => { draft.value.text = r.prompt; } }))
+    : []),
+]);
+watch(() => [props.snap.workspace.root, props.snap.connection.state] as const, () => void loadEngineCommands(), { immediate: true });
 
 const approval = computed(() => props.snap.approvals[0] ?? null);
-const slash = computed(() => {
-  const text = draft.value.text.trim();
-  if (draft.value.attachments.length || !/^\/\S*$/.test(text)) return [];
-  return COMMANDS.filter((c) => c.name.startsWith(text.toLowerCase()) && available(c.name));
+/** The built-in command a typed `/name args` will run (shown in the key hint), else `""`. */
+const typedName = computed(() => {
+  const text = draft.value.text;
+  if (draft.value.attachments.length || !text.startsWith("/") || /^\/\S*$/.test(text)) return "";
+  return typedCommand(text, engineCommands.value)?.name ?? "";
 });
-/** Slash commands that make sense right now. */
-function available(name: string) {
-  if (name === "/retry") return canRetry(props.snap);
-  if (name === "/fork") return !!props.snap.sessionId && props.snap.connection.state === "live" && !props.snap.turnRunning;
-  if (name === "/mode") return !!props.snap.approval && ["live", "preview"].includes(props.snap.connection.state);
-  if (taskRecipes.some(r => `/${r.id}` === name)) return canUseTaskRecipes(props.snap);
-  if (name === "/compact") return canCompact(props.snap);
-  if (name === "/undo") return props.snap.connection.state === "live" && canUndo(props.snap);
-  if (name === "/new" || name === "/clear") return props.snap.connection.state === "live";
-  if (name === "/voice") return props.snap.connection.state === "live" && !props.snap.turnRunning && props.snap.voice.phase === "off";
-  return true;
-}
+// Only a lone `/word` opens the menu; `/word ` (with a space) is text to send, so a custom
+// command or skill with its task goes to the engine, which expands it.
+const slash = computed(() => {
+  const text = draft.value.text;
+  if (draft.value.attachments.length || !/^\/\S*$/.test(text)) return [];
+  return matchSlash(allCommands.value, text).slice(0, 60);
+});
 /** Voice misheard: the request was stopped, so put what was heard in the box to fix and send. */
 function editHeard(text: string) {
   draft.value.text = text;
@@ -147,7 +145,7 @@ function resize() {
   const el = input.value;
   if (!el) return;
   el.style.height = "auto";
-  el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+  el.style.height = `${Math.min(el.scrollHeight, Math.max(220, Math.round(window.innerHeight * 0.4)))}px`;
 }
 
 function focus() {
@@ -157,10 +155,19 @@ function focus() {
   });
 }
 
-function runCommand(command: (typeof COMMANDS)[number]) {
+function runCommand(command: SlashCommand) {
+  if (command.insert) {
+    draft.value.text = `${command.name} `;
+    focus();
+    return;
+  }
+  if (!command.run) {
+    showToast(`${command.name} is only in the terminal for now: ${command.reason ?? "no desktop control yet"}`);
+    return;
+  }
   draft.value.text = "";
   command.run();
-  if (!["/model", "/think", "/mode"].includes(command.name)) focus();
+  if (!["/model", "/think", "/mode", "/approval", "/switch", "/effort"].includes(command.name)) focus();
 }
 
 async function send() {
@@ -169,6 +176,15 @@ async function send() {
   const original = target.text;
   const text = original.trim();
   if (slash.value.length) return runCommand(slash.value[selected.value] ?? slash.value[0]);
+  // `/goal set …`, `/effort high`, `/doctor`: the desktop runs built-in commands itself, as the
+  // terminal does; custom commands and skills still go to the engine, which expands them.
+  const typed = !target.attachments.length && typedCommand(text, engineCommands.value);
+  if (typed) {
+    const bare = allCommands.value.find((c) => c.name === `/${typed.name}` && c.run);
+    runTyped(props.snap, typed.name, typed.rest, engineCommands.value, bare?.run);
+    if (target.text === original) target.text = "";
+    return;
+  }
   const images = [...target.attachments];
   target.sending = true;
   try {
@@ -194,12 +210,26 @@ async function chooseImages() {
   if (target === draft.value) focus();
 }
 
-/** Pasted images attach; pasted text is left to the textarea. */
+/** Attach clipboard images without interfering with normal text paste. */
 function onPaste(event: ClipboardEvent) {
-  const images = [...(event.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"));
-  if (!images.length || !imagesAllowed.value) return;
-  event.preventDefault();
-  void attachments.addBlobs(draft.value, images);
+  if (!imagesAllowed.value) return;
+  const clipboard = event.clipboardData;
+  const images = Array.from(clipboard?.files ?? []).filter((f) => f.type.startsWith("image/"));
+  if (!images.length) {
+    for (const item of Array.from(clipboard?.items ?? [])) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (file?.type.startsWith("image/")) images.push(file);
+    }
+  }
+  const target = draft.value;
+  if (images.length) {
+    event.preventDefault();
+    void attachments.addBlobs(target, images);
+  } else if (event.isTrusted && !clipboard?.getData("text/plain")) {
+    // WKWebView can omit native clipboard images from both DOM lists.
+    void attachments.addNativeClipboardImage(target);
+  }
 }
 
 // Files dropped anywhere on the window attach to the draft.
@@ -247,20 +277,48 @@ function onKey(event: KeyboardEvent) {
     send();
   } else if (event.key === "Tab" && !event.shiftKey && slash.value.length) {
     event.preventDefault();
-    draft.value.text = (slash.value[selected.value] ?? slash.value[0]).name;
-  } else if (event.key === "ArrowUp" && !draft.value.text && !draft.value.attachments.length && !event.isComposing) {
-    // Like a shell: an empty box recalls the last prompt.
-    const previous = lastPrompt(props.snap);
-    if (previous) {
-      event.preventDefault();
-      draft.value.text = previous;
-      nextTick(() => input.value?.setSelectionRange(previous.length, previous.length));
-    }
+    const pick = slash.value[selected.value] ?? slash.value[0];
+    draft.value.text = `${pick.name}${pick.insert ? " " : ""}`;
+  } else if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.altKey && !event.metaKey && !draft.value.attachments.length && browsable()) {
+    // Like a shell: ↑ in an empty box walks back through this session's prompts, ↓ forward.
+    recall(event.key === "ArrowUp" ? 1 : -1, event);
   }
 }
 
+/** Position in the session's earlier prompts (0 = newest) while ↑/↓ browses them, else -1. */
+const historyAt = ref(-1);
+const history = computed(() => promptHistory(props.snap));
+/** Browsing starts from an empty box and continues while the recalled text is untouched. */
+function browsable() {
+  const text = draft.value.text;
+  return historyAt.value < 0 ? !text : text === history.value[historyAt.value];
+}
+function recall(step: 1 | -1, event: KeyboardEvent) {
+  const next = historyAt.value + step;
+  if (next < -1 || next >= history.value.length || (step < 0 && historyAt.value < 0)) return;
+  event.preventDefault();
+  historyAt.value = next;
+  const text = next < 0 ? "" : history.value[next];
+  draft.value.text = text;
+  nextTick(() => input.value?.setSelectionRange(text.length, text.length));
+}
+watch(() => draft.value.text, (text) => {
+  if (historyAt.value >= 0 && text !== history.value[historyAt.value]) historyAt.value = -1;
+});
+watch(draft, () => (historyAt.value = -1));
+
+/** Requests the engine grants for this one request only: "always"/"project" would count as a denial. */
+const ONE_TIME_TOOLS = new Set(["request_directory", "request_sensitive_directory", "batch"]);
+const oneTime = computed(() => !!approval.value && ONE_TIME_TOOLS.has(approval.value.tool));
+/** The folder a directory request names, from its "Canonical directory:" line. */
+const requestedFolder = computed(() => {
+  if (!approval.value?.tool.includes("directory")) return null;
+  return /^Canonical directory: (.+)$/m.exec(approval.value.summary)?.[1]?.trim() ?? null;
+});
 function decide(decision: Decision) {
-  if (approval.value) engine.approve(approval.value.approvalId, decision);
+  if (!approval.value) return;
+  // Never send a reusable answer the engine would read as "no".
+  engine.approve(approval.value.approvalId, oneTime.value && decision !== "deny" ? "allow" : decision);
 }
 
 watch(() => draft.value.text, () => { selected.value = 0; nextTick(resize); });
@@ -274,18 +332,23 @@ onMounted(focus);
       <Transition name="pop">
         <section v-if="approval" :key="approval.approvalId" class="card approval">
           <div class="card-head">
-            <span>Allow <strong>{{ approval.tool }}</strong>?</span>
+            <span class="card-icon"><Icon name="shield" :size="14" /></span>
+            <span v-if="requestedFolder">{{ approval.tool === 'request_sensitive_directory' ? 'Allow protected-file access in' : 'Give Dial access to' }} <strong class="mono">{{ requestedFolder }}</strong>?</span>
+            <span v-else>Allow <strong>{{ approval.tool }}</strong>?</span>
             <span v-if="snap.approvals.length > 1" class="more">+{{ snap.approvals.length - 1 }} more waiting</span>
           </div>
           <pre v-if="approval.summary" class="summary">{{ approval.summary }}</pre>
           <div class="actions">
-            <button class="btn btn-primary" @click="decide('allow')">Allow once</button>
-            <button class="btn btn-secondary" title="Allow this kind of call from now on" @click="decide('always')">
-              Always allow
-            </button>
-            <button class="btn btn-secondary" title="Allow this kind of call in this project" @click="decide('project')">
-              Allow for project
-            </button>
+            <button class="btn btn-primary" @click="decide('allow')">{{ oneTime ? "Allow" : "Allow once" }}</button>
+            <template v-if="!oneTime">
+              <button class="btn btn-secondary" title="Allow this kind of call from now on" @click="decide('always')">
+                Always allow
+              </button>
+              <button class="btn btn-secondary" title="Allow this kind of call in this project" @click="decide('project')">
+                Allow for project
+              </button>
+            </template>
+            <span v-else class="once-note">Applies to this request only</span>
             <span class="grow" />
             <button class="btn btn-danger" @click="decide('deny')">Deny</button>
           </div>
@@ -312,14 +375,22 @@ onMounted(focus);
         <div v-if="dropping" class="drop-hint"><Icon name="image" :size="16" /> Drop images to attach</div>
         <Transition name="pop">
           <div v-if="slash.length" class="slash" @click.stop>
-            <button v-for="(c, i) in slash" :key="c.name" class="slash-row" :class="{active: i === selected}" @click="runCommand(c)">
-              <span class="mono">{{ c.name }}</span>
-              <span class="slash-detail">{{ c.detail }}</span>
+            <div class="slash-head">Commands</div>
+            <button v-for="(c, i) in slash" :key="c.name" class="slash-row" :class="{ active: i === selected }" :title="c.reason ?? (c.usage ? `${c.name} ${c.usage}` : '')" @click="runCommand(c)" @mouseenter="selected = i">
+              <span class="mono">{{ c.name }}<span v-if="c.usage" class="usage"> {{ c.usage }}</span></span>
+              <span class="slash-detail truncate">{{ c.detail }}</span>
+              <span v-if="c.kind !== 'desktop'" class="kind" :class="c.kind">{{ c.kind === 'terminal' ? 'Terminal' : c.kind === 'skill' ? 'Skill' : 'Custom' }}</span>
             </button>
+            <div class="slash-foot"><kbd>↑</kbd><kbd>↓</kbd> choose <kbd>Tab</kbd> complete <kbd>Enter</kbd> run</div>
           </div>
         </Transition>
         <div v-if="paths.length" class="slash" aria-label="Matching files" @mousedown.prevent @click.stop>
-          <button v-for="(path, i) in paths" :key="path" class="slash-row mono" :class="{active: i === selected}" @click="pickPath(path)">{{ path }}</button>
+          <div class="slash-head">Files</div>
+          <button v-for="(path, i) in paths" :key="path" class="slash-row file-row" :class="{active: i === selected}" @click="pickPath(path)" @mouseenter="selected = i">
+            <Icon name="file" :size="13" />
+            <span class="mono truncate">{{ path }}</span>
+          </button>
+          <div class="slash-foot"><kbd>↑</kbd><kbd>↓</kbd> choose <kbd>Tab</kbd> insert <kbd>Esc</kbd> dismiss</div>
         </div>
         <div v-if="draft.attachments.length" class="thumbs" @click.stop>
           <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
@@ -353,7 +424,10 @@ onMounted(focus);
           </button>
           <ModelPicker :snap="snap" />
           <ApprovalMenu ref="approvalMenu" :snap="snap" />
+          <ModesMenu ref="modesMenu" :snap="snap" />
           <span class="grow" />
+          <span v-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
+          <span v-else-if="hasContent && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> {{ snap.turnRunning ? 'note' : 'send' }} <kbd>⇧ Enter</kbd> new line</span>
           <ContextMeter
             v-if="snap.context"
             :context="snap.context"
@@ -388,6 +462,7 @@ onMounted(focus);
       </div>
       <div v-if="snap.connection.state !== 'live'" class="caption truncate">{{ caption }}</div>
     </div>
+    <CommandPanel />
   </footer>
 </template>
 
@@ -412,6 +487,19 @@ onMounted(focus);
   backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border-strong);
 }
+.card.approval {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border-strong));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 10%, transparent), 0 8px 28px rgb(0 0 0 / 22%);
+}
+.card-icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+}
 .card-head {
   display: flex;
   align-items: center;
@@ -428,6 +516,8 @@ onMounted(focus);
   font-size: var(--text-sm);
   color: var(--text-faint);
 }
+.once-note { align-self: center; font-size: var(--text-sm); color: var(--text-faint); }
+.card-head .mono { font-family: var(--font-mono); font-weight: 500; overflow-wrap: anywhere; }
 .summary {
   margin: 10px 0 0;
   padding: 8px 12px;
@@ -559,6 +649,42 @@ onMounted(focus);
   background: var(--raised);
   box-shadow: var(--shadow-pop);
 }
+.slash-head {
+  padding: 4px 10px 6px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-faint);
+}
+.slash-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 6px 10px 2px;
+  border-top: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.slash-foot kbd { margin-left: 4px; }
+.slash-foot kbd:first-child { margin-left: 0; }
+.file-row {
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+.file-row .mono { color: var(--text); font-size: var(--text-mono); }
+.keyhint {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.keyhint kbd:last-of-type { margin-left: 6px; }
+.composer:focus-within .keyhint { display: inline-flex; }
+@media (max-width: 880px) { .composer:focus-within .keyhint { display: none; } }
 .slash, .queue { max-height: 30vh; overflow-y: auto; }
 .queue-recovery { margin: 3px 0 6px; }
 .queue-row { display: flex; align-items: center; gap: 6px; }
@@ -580,8 +706,34 @@ onMounted(focus);
   color: var(--text);
 }
 .slash-detail {
+  flex: 1;
+  min-width: 0;
   font-size: var(--text-sm);
   color: var(--text-faint);
+}
+.slash-row .mono {
+  flex: none;
+}
+.slash-row .usage {
+  color: var(--text-faint);
+}
+.slash-row.off .mono,
+.slash-row.off .slash-detail {
+  opacity: 0.55;
+}
+.slash-row .kind {
+  flex: none;
+  align-self: center;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 17px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+}
+.slash-row .kind.skill {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
 .composer:focus-within {
   border-color: var(--focus-border);
@@ -589,7 +741,7 @@ onMounted(focus);
 textarea {
   display: block;
   width: 100%;
-  max-height: 220px;
+  max-height: max(220px, 40vh);
   padding: 0 6px 0 0;
   border: none;
   outline: none;
@@ -618,7 +770,11 @@ textarea::placeholder {
   color: var(--on-accent);
   transition:
     background 120ms var(--ease),
-    opacity 120ms var(--ease);
+    opacity 120ms var(--ease),
+    transform 90ms var(--ease);
+}
+.send:active:not(:disabled) {
+  transform: scale(0.92);
 }
 .send:hover:not(:disabled) {
   background: var(--accent-hover);

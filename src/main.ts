@@ -1,9 +1,11 @@
 import { createApp } from "vue";
 import App from "./App.vue";
-import { connect, openExternal, showToast } from "./bridge";
+import { connect, openExternal, showToast, snapshot } from "./bridge";
 import { loadHighlighter } from "./markdown";
 import { startAppearance } from "./appearance";
-import { openInBrowser, previewUrlsIn } from "./workspace";
+import { openInBrowser, previewUrlsIn, showPanel } from "./workspace";
+import { IMAGE_EXT, viewImage } from "./imageViewer";
+import { ui } from "./ui";
 import { startNotifications } from "./notifications";
 import "./styles.css";
 
@@ -15,15 +17,51 @@ startNotifications().catch((error) => showToast(`Could not initialize notificati
 loadHighlighter().catch((error) => console.warn("syntax highlighting unavailable", error));
 
 // Web links open in the browser: this computer's (a dev server) in the Browser panel, others in
-// the system browser. Nothing navigates the app window away.
-document.addEventListener("click", (event) => {
-  const link = (event.target as Element | null)?.closest?.("a[href]");
-  if (!link) return;
-  event.preventDefault();
-  const href = link.getAttribute("href") ?? "";
-  if (previewUrlsIn(href).length && !(event.metaKey || event.ctrlKey)) openInBrowser(href);
-  else if (/^(https?|mailto):/i.test(href)) openExternal(href);
-});
+// the system browser. Image files open in the image viewer; other project file links in the Files
+// panel. Nothing navigates the app window. Captured, and the same with ⌥/⌘/⇧ held: WebKit would
+// otherwise download an ⌥-clicked link or open a ⇧-clicked one in a new window.
+document.addEventListener(
+  "click",
+  (event) => {
+    const link = (event.target as Element | null)?.closest?.("a[href]");
+    if (!link) return;
+    event.preventDefault();
+    const href = link.getAttribute("href") ?? "";
+    const image = link.getAttribute("data-image-path");
+    if (image) return viewImage(image);
+    if (previewUrlsIn(href).length && !(event.metaKey || event.ctrlKey)) openInBrowser(href);
+    else if (/^(https?|mailto):/i.test(href)) openExternal(href);
+    else if (!/^[a-z][a-z\d+.-]*:|^#/i.test(href)) {
+      const path = href.replace(/[?#].*$/, "");
+      if (IMAGE_EXT.test(path)) {
+        try {
+          return viewImage(decodeURIComponent(path));
+        } catch {
+          return showToast(`Could not open ${href}`);
+        }
+      }
+      openProjectFile(href);
+    }
+  },
+  true,
+);
+
+/** `src/app.ts#L12` or an absolute path inside the project; the backend refuses anything else. */
+function openProjectFile(href: string) {
+  const root = snapshot.value?.workspace?.root;
+  if (!root) return;
+  let path: string;
+  try {
+    path = decodeURIComponent(href.replace(/[?#].*$/, ""));
+  } catch {
+    return showToast(`Could not open ${href}`);
+  }
+  if (path.startsWith(`${root}/`)) path = path.slice(root.length + 1);
+  path = path.replace(/^\.\//, "");
+  if (!path) return;
+  ui.filePath = path;
+  showPanel("files");
+}
 
 // Copy buttons in rendered code blocks.
 document.addEventListener("click", (event) => {
@@ -32,8 +70,12 @@ document.addEventListener("click", (event) => {
   const code = button.closest(".code-block")?.querySelector("pre")?.textContent ?? "";
   navigator.clipboard.writeText(code).then(
     () => {
-      button.textContent = "Copied";
-      setTimeout(() => (button.textContent = "Copy"), 1400);
+      button.textContent = "✓ Copied";
+      button.classList.add("copied");
+      setTimeout(() => {
+        button.textContent = "Copy";
+        button.classList.remove("copied");
+      }, 1400);
     },
     () => showToast("Could not copy to the clipboard"),
   );

@@ -98,29 +98,52 @@ fn requests_need_the_token() {
     let line = |token: &str, tool: &str| {
         serde_json::to_string(&Request {
             token: token.into(),
+            workspace: "a".into(),
             tool: tool.into(),
             arguments: json!({}),
         })
         .unwrap()
     };
     let mut ran = false;
-    let denied = handle(&line("wrong", "browser_read"), "secret", |_, _| {
-        ran = true;
-        Ok(Reply::text("x"))
-    });
+    let denied = handle(
+        &line("wrong", "browser_read"),
+        "secret",
+        |_| true,
+        |_, _| {
+            ran = true;
+            Ok(Reply::text("x"))
+        },
+    );
     assert_eq!(denied, Reply::error("Not authorized"));
     assert!(!ran);
     assert_eq!(
-        handle("{", "secret", |_, _| unreachable!()),
+        handle("{", "secret", |_| true, |_, _| unreachable!()),
         Reply::error("Bad request")
     );
     assert_eq!(
-        handle(&line("secret", PING), "secret", |_, _| unreachable!()),
+        handle(
+            &line("secret", PING),
+            "secret",
+            |_| true,
+            |_, _| unreachable!()
+        ),
         Reply::text("pong")
     );
-    let failed = handle(&line("secret", "browser_read"), "secret", |tool, _| {
-        Err(format!("{tool} failed"))
-    });
+    assert!(
+        !handle(
+            &line("secret", "browser_click"),
+            "secret",
+            |root| root == "b",
+            |_, _| unreachable!()
+        )
+        .ok
+    );
+    let failed = handle(
+        &line("secret", "browser_read"),
+        "secret",
+        |_| true,
+        |tool, _| Err(format!("{tool} failed")),
+    );
     assert_eq!(failed, Reply::error("browser_read failed"));
 }
 

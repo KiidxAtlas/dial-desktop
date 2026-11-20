@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, watch } from "vue";
 import { engine, snapshot } from "./bridge";
-import { ui, type InspectorTab } from "./ui";
+import { focusComposer, ui, type InspectorTab } from "./ui";
+import { goToSession, sessionOrder, stepSession } from "./sessionActions";
 import { followAgentBrowser, showPanel, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
@@ -21,6 +22,7 @@ import Backdrop from "./components/Backdrop.vue";
 import ContextMenu from "./components/ContextMenu.vue";
 import Palette from "./components/Palette.vue";
 import Shortcuts from "./components/Shortcuts.vue";
+import ImageViewer from "./components/ImageViewer.vue";
 import UpdateBanner from "./components/UpdateBanner.vue";
 import { startUpdateChecks } from "./updates";
 
@@ -54,19 +56,71 @@ function togglePanel(tab: InspectorTab) {
   else showPanel(tab);
 }
 
+// Holding ⌘ (Ctrl elsewhere) alone for a moment shows the sessions' ⌘1–9 numbers.
+const mac = navigator.platform.toLowerCase().includes("mac");
+let hintTimer: ReturnType<typeof setTimeout> | undefined;
+function hideHints() {
+  clearTimeout(hintTimer);
+  ui.jumpHints = false;
+}
+function onKeyUp(event: KeyboardEvent) {
+  if (event.key === (mac ? "Meta" : "Control")) hideHints();
+}
+
 function onKey(event: KeyboardEvent) {
   const s = opened.value;
   if (!s) return;
+  if (event.key === (mac ? "Meta" : "Control")) {
+    if (!event.repeat) {
+      clearTimeout(hintTimer);
+      hintTimer = setTimeout(() => (ui.jumpHints = true), 450);
+    }
+    return;
+  }
+  hideHints();
   const command = event.metaKey || event.ctrlKey;
   const plain = command && !event.shiftKey && !event.altKey;
   const key = event.key.toLowerCase();
+  if (plain && /^Digit[1-9]$/.test(event.code)) {
+    const target = sessionOrder(s)[Number(event.code.slice(5)) - 1];
+    if (target) {
+      event.preventDefault();
+      goToSession(target);
+    }
+    return;
+  }
+  if (
+    (command && event.shiftKey && !event.altKey && (event.code === "BracketLeft" || event.code === "BracketRight")) ||
+    (event.ctrlKey && !event.metaKey && !event.altKey && event.key === "Tab")
+  ) {
+    event.preventDefault();
+    stepSession(s, event.code === "BracketLeft" || (event.key === "Tab" && event.shiftKey) ? -1 : 1);
+    return;
+  }
+  if (command && event.shiftKey && !event.altKey && key === "f") {
+    event.preventDefault();
+    ui.sidebarOpen = true;
+    ui.focusSearch++;
+    return;
+  }
+  if (plain && key === "l") {
+    event.preventDefault();
+    ui.settingsOpen = false;
+    focusComposer();
+    return;
+  }
   if (plain && key === "n") {
     event.preventDefault();
     startNewSession(s);
   } else if (plain && key === "k") {
+    ui.filePalette = false;
     event.preventDefault();
     ui.menu = null;
     ui.paletteOpen = !ui.paletteOpen;
+  } else if (plain && key === "p" && !event.defaultPrevented) {
+    event.preventDefault();
+    ui.filePalette = true;
+    ui.paletteOpen = true;
   } else if (plain && key === "/") {
     event.preventDefault();
     ui.shortcutsOpen = !ui.shortcutsOpen;
@@ -122,12 +176,16 @@ function onKey(event: KeyboardEvent) {
 let stopFollowing: (() => void) | null = null;
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
+  window.addEventListener("keyup", onKeyUp);
+  window.addEventListener("blur", hideHints);
   restoreImage();
   startUpdateChecks();
   stopFollowing = await followAgentBrowser();
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
+  window.removeEventListener("keyup", onKeyUp);
+  window.removeEventListener("blur", hideHints);
   stopFollowing?.();
 });
 </script>
@@ -163,6 +221,7 @@ onBeforeUnmount(() => {
   <template v-if="opened">
     <Palette :snap="opened" />
     <Shortcuts />
+    <ImageViewer />
   </template>
 </template>
 

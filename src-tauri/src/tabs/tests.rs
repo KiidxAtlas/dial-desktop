@@ -170,6 +170,7 @@ fn a_new_tab_starts_with_the_sidebar_on_screen() {
         messages: 1,
         pinned: false,
         current: true,
+        open_elsewhere: false,
     }];
     let mut tabs = Tabs::new(first);
     tabs.open(Tab::new(Model::starting(), None));
@@ -186,6 +187,30 @@ fn a_session_cannot_be_resumed_while_its_previous_engine_shuts_down() {
     assert_eq!(tabs.route_resume("s1"), Route::Closing);
     drop(closed);
     assert_eq!(tabs.route_resume("s1"), Route::Here);
+}
+
+#[test]
+fn a_session_held_by_another_dial_process_is_not_resumed_into_a_copy() {
+    let mut here = tab("s1", false);
+    here.model.sessions = ["s2", "s3"]
+        .into_iter()
+        .map(|id| crate::model::SessionSummary {
+            id: id.into(),
+            title: "Same title".into(),
+            updated: String::new(),
+            messages: 4,
+            pinned: false,
+            current: false,
+            open_elsewhere: id == "s2",
+        })
+        .collect();
+    let mut tabs = Tabs::new(here);
+    // Resuming would make the engine fork a sibling with the same title on every click.
+    assert_eq!(tabs.route_resume("s2"), Route::Elsewhere);
+    assert_eq!(tabs.route_resume("s3"), Route::Here);
+    // A session another tab of this window runs is still reached through that tab.
+    tabs.open(tab("s2", false));
+    assert_eq!(tabs.route_resume("s2"), Route::Switch(1));
 }
 
 #[test]

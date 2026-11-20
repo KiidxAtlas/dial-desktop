@@ -3,6 +3,8 @@
 // preference of this computer, kept in local storage.
 
 import { computed, reactive, ref, watch } from "vue";
+import { hexSwarm, stackRain, traceRoute } from "./asciiBackgrounds";
+import { koiPond } from "./koiPond";
 import { files, showToast } from "./bridge";
 
 /**
@@ -554,6 +556,10 @@ export const PRESETS: Preset[] = [
   { id: "drift", name: "Drift", paint: drift, moving: true },
   { id: "flow", name: "Flow", paint: flow, moving: true },
   { id: "fireflies", name: "Fireflies", paint: fireflies, moving: true },
+  { id: "trace-route", name: "Trace Route", paint: traceRoute, moving: true },
+  { id: "hex-swarm", name: "Hex Swarm", paint: hexSwarm, moving: true },
+  { id: "stack-rain", name: "Stack Rain", paint: stackRain, moving: true },
+  { id: "koi-pond", name: "Koi Pond", paint: koiPond, moving: true },
 ];
 
 // ---------------------------------------------------------------------------------------------

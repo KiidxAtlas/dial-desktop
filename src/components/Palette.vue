@@ -3,8 +3,11 @@
 import { computed, nextTick, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
 import { ui } from "../ui";
-import { commands, filterCommands, type Command } from "../commands";
+import { commands, filterCommands, highlightMatch, type Command } from "../commands";
 import Icon, { PATHS } from "./Icon.vue";
+import { workspaceFiles } from "../bridge";
+import { showPanel } from "../workspace";
+import { loadRecentProjects } from "../projects";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -13,7 +16,23 @@ const active = ref(0);
 const input = ref<HTMLInputElement | null>(null);
 const list = ref<HTMLElement | null>(null);
 
-const results = computed(() => filterCommands(commands(props.snap), query.value));
+const paths = ref<string[]>([]);
+const status = ref("");
+watch(() => [ui.filePalette, ui.paletteOpen, props.snap.workspace.root, query.value] as const, ([files, open, , q], _, cleanup) => {
+  paths.value = [];
+  status.value = "Type part of a file path";
+  if (!files || !open || !q.trim()) return;
+  status.value = "Searching…";
+  let current = true;
+  const timer = setTimeout(async () => {
+    try {
+      const found = await workspaceFiles.search(q.trim());
+      if (current) { paths.value = found; status.value = "No matching files"; }
+    } catch (e) { if (current) status.value = String(e); }
+  }, 100);
+  cleanup(() => { current = false; clearTimeout(timer); });
+});
+const results = computed<Command[]>(() => ui.filePalette ? paths.value.map(path => ({ id: path, group: "Project files", label: path, icon: "file", run: () => { ui.filePath = path; showPanel("files"); } })) : filterCommands(commands(props.snap), query.value));
 /** Results under group headings, keeping their ranked order; `index` counts across groups. */
 const groups = computed(() => {
   const out: { name: string; items: { command: Command; index: number }[] }[] = [];
@@ -30,9 +49,10 @@ const ordered = computed(() => groups.value.flatMap((g) => g.items));
 const icon = (name?: string) => (name && name in PATHS ? (name as keyof typeof PATHS) : null);
 
 watch(
-  () => ui.paletteOpen,
-  async (open) => {
+  () => [ui.paletteOpen, ui.filePalette] as const,
+  async ([open]) => {
     if (!open) return;
+    void loadRecentProjects();
     query.value = "";
     active.value = 0;
     await nextTick();
@@ -43,6 +63,7 @@ watch(query, () => (active.value = 0));
 
 function close() {
   ui.paletteOpen = false;
+  ui.filePalette = false;
 }
 
 function run(command: Command | undefined) {
@@ -82,13 +103,13 @@ function onKey(event: KeyboardEvent) {
 <template>
   <Transition name="fade">
     <div v-if="ui.paletteOpen" class="overlay" @mousedown.self="close">
-      <div class="palette" role="dialog" aria-label="Command palette">
+      <div class="palette" role="dialog" :aria-label="ui.filePalette ? 'Quick-open project file' : 'Command palette'">
         <label class="field">
           <Icon name="search" :size="16" />
           <input
             ref="input"
             v-model="query"
-            placeholder="Search actions and sessions"
+            :placeholder="ui.filePalette ? 'Find a project file' : 'Search actions and sessions'"
             spellcheck="false"
             role="combobox"
             aria-expanded="true"
@@ -97,7 +118,7 @@ function onKey(event: KeyboardEvent) {
           <kbd>esc</kbd>
         </label>
         <div ref="list" class="results" role="listbox">
-          <p v-if="!results.length" class="none">Nothing matches “{{ query }}”.</p>
+          <p v-if="!results.length" class="none">{{ ui.filePalette ? status : `Nothing matches “${query}”.` }}</p>
           <template v-for="group in groups" :key="group.name">
             <div class="group">{{ group.name }}</div>
             <button
@@ -111,7 +132,7 @@ function onKey(event: KeyboardEvent) {
             >
               <Icon v-if="icon(command.icon)" :name="icon(command.icon)!" :size="15" />
               <span v-else class="blank" />
-              <span class="label truncate">{{ command.label }}</span>
+              <span class="label truncate"><template v-for="(part, p) in highlightMatch(command.label, query)" :key="p"><mark v-if="part.hit">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template></span>
               <kbd v-if="command.hint">{{ command.hint }}</kbd>
             </button>
           </template>
@@ -130,7 +151,9 @@ function onKey(event: KeyboardEvent) {
   justify-content: center;
   align-items: flex-start;
   padding-top: 12vh;
-  background: rgb(0 0 0 / 28%);
+  background: rgb(0 0 0 / 32%);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
 }
 .palette {
   width: min(600px, calc(100vw - 48px));
@@ -205,11 +228,29 @@ button.on {
 .label {
   flex: 1;
 }
+.label mark {
+  background: none;
+  color: var(--text-strong);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  text-underline-offset: 3px;
+}
+button.on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+button {
+  position: relative;
+}
 kbd {
   flex: none;
-  font-family: var(--font-ui);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
 }
 .none {
   margin: 14px 10px;

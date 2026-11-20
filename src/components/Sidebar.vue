@@ -5,7 +5,8 @@ import { engine, folders } from "../bridge";
 import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
-import { finishRename, sessionItems, startRename } from "../sessionActions";
+import { finishRename, sessionGroups, sessionItems, startRename } from "../sessionActions";
+import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
 
@@ -50,19 +51,30 @@ async function openHit(hit: TranscriptHit) {
     if (ui.transcriptJump === pending) ui.transcriptJump = null;
   }
 }
-const matching = computed(() => {
-  const filter = ui.sessionFilter.trim().toLowerCase();
-  return props.snap.sessions.filter((s) => !filter || s.title.toLowerCase().includes(filter));
-});
 /** Each session belongs to one group (Shift-click ranges follow the displayed order). */
-const groups = computed(() =>
-  [
-    { name: "Active", sessions: matching.value.filter((s) => s.running || s.waiting) },
-    { name: "Pinned", sessions: matching.value.filter((s) => s.pinned && !s.running && !s.waiting) },
-    { name: "Recents", sessions: matching.value.filter((s) => !s.pinned && !s.running && !s.waiting) },
-  ].filter((g) => g.sessions.length),
-);
+const groups = computed(() => sessionGroups(props.snap.sessions, ui.sessionFilter));
 const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
+/** ⌘1–9 numbers for the first nine rows, shown while ⌘ is held. */
+const jumpNumber = computed(() => new Map(sessions.value.slice(0, 9).map((s, i) => [s.id, i + 1])));
+const mod = navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl+";
+
+// ⇧⌘F: focus the session search; Esc in it clears the search, then leaves it.
+const searchInput = ref<HTMLInputElement | null>(null);
+watch(
+  () => ui.focusSearch,
+  async () => {
+    await nextTick();
+    searchInput.value?.focus();
+    searchInput.value?.select();
+  },
+);
+function onSearchKey(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.isComposing) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (ui.sessionFilter) ui.sessionFilter = "";
+  else (event.target as HTMLInputElement).blur();
+}
 
 const status = computed(() => {
   const c = props.snap.connection;
@@ -84,17 +96,21 @@ const status = computed(() => {
 // The project menu: recent projects and "Open folder…".
 const projectMenu = ref<HTMLElement | null>(null);
 const menuOpen = ref(false);
-const recent = ref<Workspace[]>([]);
 
 async function toggleMenu() {
   menuOpen.value = !menuOpen.value;
-  if (menuOpen.value) recent.value = (await folders.recent()).filter((w) => w.root !== props.snap.workspace.root);
+  if (menuOpen.value) await loadRecentProjects();
 }
 
 function openFolder(root: string | null) {
   menuOpen.value = false;
   if (root) folders.open(root);
   else folders.choose();
+}
+
+/** Right-click (or "…") on a project: open it elsewhere, reveal it, copy its path, forget it. */
+function projectMenuFor(event: MouseEvent, w: Workspace, current = false, anchor?: HTMLElement | null) {
+  openMenu(event, projectItems(w, current), anchor);
 }
 
 function onOutside(event: MouseEvent) {
@@ -223,11 +239,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       </button>
       <form class="item search" @submit.prevent="searchTranscripts">
         <Icon name="search" :size="15" />
-        <input v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search titles'" :aria-label="searchMessages ? 'Search messages' : 'Search titles'" spellcheck="false" />
+        <input ref="searchInput" v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search titles'" :aria-label="searchMessages ? 'Search messages' : 'Search titles'" spellcheck="false" @keydown="onSearchKey" />
+        <button
+          type="button" class="scope" :aria-pressed="searchMessages"
+          :title="searchMessages ? 'Searching every message in this project; click to search titles' : 'Searching titles; click to search every message in this project'"
+          @click="searchMessages = !searchMessages"
+        >{{ searchMessages ? 'Messages' : 'Titles' }}</button>
       </form>
-      <button class="item" :aria-pressed="searchMessages" @click="searchMessages = !searchMessages">
-        {{ searchMessages ? 'Search titles instead' : 'Search project messages' }}
-      </button>
     </nav>
 
     <nav v-if="searchMessages" class="list" aria-label="Transcript search results">
@@ -281,6 +299,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           />
           <template v-else>
             <span class="truncate">{{ s.title }}</span>
+            <kbd v-if="ui.jumpHints && jumpNumber.has(s.id)" class="jump-hint">{{ mod }}{{ jumpNumber.get(s.id) }}</kbd>
             <i v-if="s.waiting" class="activity waiting" />
             <i v-else-if="s.running" class="activity running" />
             <button
@@ -322,13 +341,33 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <div ref="projectMenu" class="project">
       <Transition name="pop">
         <div v-if="menuOpen" class="menu">
-          <div class="menu-path mono truncate" :title="snap.workspace.root">{{ snap.workspace.display }}</div>
-          <button v-for="w in recent" :key="w.root" class="menu-row" :title="w.root" @click="openFolder(w.root)">
-            <Icon name="folder" :size="14" />
-            <span class="truncate">{{ w.name }}</span>
-          </button>
+          <div class="menu-head">
+            <span class="menu-path mono truncate" :title="snap.workspace.root">{{ snap.workspace.display }}</span>
+            <button class="head-btn" title="Project actions" aria-label="Project actions" @click.stop="projectMenuFor($event, snap.workspace, true, $event.currentTarget as HTMLElement)">
+              <Icon name="more" :size="13" />
+            </button>
+          </div>
+          <template v-if="recent.length">
+            <div class="menu-label">
+              <span>Recent</span>
+              <button class="clear" title="Remove every project from this list (folders stay on disk)" @click.stop="clearRecentProjects()">Clear</button>
+            </div>
+            <div v-for="w in recent" :key="w.root" class="menu-item" @contextmenu="projectMenuFor($event, w)">
+              <button class="menu-row" :title="`${w.root}\nRight-click for more`" @click="openFolder(w.root)">
+                <Icon name="folder" :size="14" />
+                <span class="truncate">{{ w.name }}</span>
+              </button>
+              <button class="forget" :aria-label="`Remove ${w.name} from recent projects`" :title="`Remove from this list (the folder stays on disk)`" @click.stop="forgetProject(w.root)">
+                <Icon name="cross" :size="12" />
+              </button>
+            </div>
+          </template>
+          <div class="menu-divider" />
           <button class="menu-row" @click="openFolder(null)">
             <Icon name="plus" :size="14" /> <span>Open folder…</span>
+          </button>
+          <button class="menu-row" @click="menuOpen = false; folders.choose(true)">
+            <Icon name="external" :size="14" /> <span>Open folder in new window…</span>
           </button>
         </div>
       </Transition>
@@ -446,12 +485,28 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   border-radius: 50%;
   background: var(--accent);
   color: var(--on-accent);
+  transition: transform 160ms var(--ease), background 120ms var(--ease);
 }
 .new {
   color: var(--text);
 }
+.new:hover:not(:disabled) .plus {
+  background: var(--accent-hover);
+  transform: rotate(90deg);
+}
 .search {
+  margin: 4px 0;
+  padding-right: 5px;
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
   cursor: text;
+}
+.item.search:hover {
+  background: var(--hover);
+}
+.search:focus-within {
+  box-shadow: inset 0 0 0 1px var(--focus-border);
+  color: var(--text);
 }
 .search input {
   flex: 1;
@@ -467,6 +522,23 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 .search:focus-within input::placeholder {
   color: var(--text-faint);
+}
+.scope {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transition: color 120ms var(--ease), background 120ms var(--ease);
+}
+.scope:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.scope[aria-pressed="true"] {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .label {
   padding: 0 10px 6px;
@@ -580,6 +652,20 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 .settings-btn.on {
   background: var(--active);
   color: var(--text);
+}
+.jump-hint {
+  flex: none;
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  font: 500 10px/16px var(--font-mono);
+  color: var(--text-muted);
+  background: var(--raised);
+  animation: hint-in 120ms var(--ease);
+}
+@keyframes hint-in {
+  from { opacity: 0; transform: scale(0.9); }
 }
 .activity {
   flex: none;
@@ -704,10 +790,52 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   background: var(--raised);
   box-shadow: var(--shadow-pop);
 }
+.menu-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 3px 6px 8px;
+}
 .menu-path {
-  padding: 6px 8px 8px;
+  flex: 1;
+  min-width: 0;
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+.head-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+}
+.head-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.menu-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 4px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.menu-label .clear {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.menu-label .clear:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.menu-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
 }
 .menu-row {
   display: flex;
@@ -724,6 +852,34 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 .menu-row:hover {
   background: var(--hover);
   color: var(--text);
+}
+.menu-item {
+  position: relative;
+}
+.menu-item .menu-row {
+  padding-right: 32px;
+}
+.forget {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
+}
+.menu-item:hover .forget,
+.forget:focus-visible {
+  opacity: 1;
+}
+.forget:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
 }
 .pop-enter-active,
 .pop-leave-active {

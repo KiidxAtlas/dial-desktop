@@ -4,6 +4,22 @@ import { reactive } from "vue";
 
 export type InspectorTab = "plan" | "changes" | "activity" | "files" | "terminal" | "browser";
 
+/** Settings pages the desktop draws itself; `""` opens the usual first one. */
+export type SettingsTab =
+  | ""
+  | "updates"
+  | "library"
+  | "roles"
+  | "images"
+  | "appearance"
+  | "usage"
+  | "skills"
+  | "extensions"
+  | "checks"
+  | "folders"
+  | "memory"
+  | "schedules";
+
 export const ui = reactive({
   /** Bumped to move keyboard focus to the composer. */
   focusComposer: 0,
@@ -23,7 +39,7 @@ export const ui = reactive({
   /** The settings page replaces the conversation while open. */
   settingsOpen: false,
   /** The Desktop tab to open settings on (`updates`), or `""` for the usual first tab. */
-  settingsTab: "" as "" | "updates",
+  settingsTab: "" as SettingsTab,
   /** Sessions picked in the sidebar with ⌘/Ctrl- or Shift-click, by id. */
   picked: new Set<string>(),
   /** The session whose name is being edited, and where: the sidebar row or the title bar. */
@@ -32,9 +48,14 @@ export const ui = reactive({
   menu: null as { x: number; y: number; items: MenuItem[] } | null,
   /** The command palette (⌘K). */
   paletteOpen: false,
+  filePalette: false,
   /** The keyboard shortcuts sheet (⌘/). */
   shortcutsOpen: false,
   sidebarOpen: true,
+  /** Bumped to focus the sidebar's session search (⇧⌘F). */
+  focusSearch: 0,
+  /** ⌘ is held down: sessions show their ⌘1–9 numbers. */
+  jumpHints: false,
 });
 
 export type MenuItem =

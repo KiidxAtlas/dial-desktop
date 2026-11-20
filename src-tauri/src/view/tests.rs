@@ -192,6 +192,78 @@ fn sessions_show_what_runs_in_other_tabs() {
     assert!(!snap.sessions.iter().any(|s| s.id == "idle"));
 }
 
+/// The UI's side of [`patch`]: replace the changed fields and the transcript's tail.
+fn apply(prev: &Snapshot, patch: &serde_json::Map<String, Value>) -> Value {
+    let mut out = serde_json::to_value(prev).unwrap();
+    let object = out.as_object_mut().unwrap();
+    for (key, value) in patch {
+        if key == "entriesFrom" || key == "entriesTail" {
+            continue;
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    if let Some(from) = patch.get("entriesFrom").and_then(Value::as_u64) {
+        let entries = object["entries"].as_array_mut().unwrap();
+        entries.truncate(from as usize);
+        entries.extend(patch["entriesTail"].as_array().unwrap().iter().cloned());
+    }
+    out
+}
+
+#[test]
+fn published_snapshots_send_only_what_changed() {
+    let w = workspace();
+    let model = preview::model(Preview::Session, &w.root);
+    let first = Snapshot::new(&model, Some(&w), 0);
+    let mut published = Published::default();
+
+    let event = published.advance(first.clone()).unwrap();
+    assert_eq!((event.seq, event.base), (1, 0));
+    assert_eq!(event.full.as_ref(), Some(&first));
+    assert!(published.advance(first.clone()).is_none(), "nothing changed");
+
+    // A reply streams: only the last entry and the title change.
+    let mut next = first.clone();
+    next.title = "Renamed".into();
+    let last = next.entries.len() - 1;
+    next.entries[last] = EntryView::Assistant {
+        text: "still streaming".into(),
+        reasoning: String::new(),
+        streaming: true,
+        abandoned: false,
+    };
+    let event = published.advance(next.clone()).unwrap();
+    assert_eq!((event.seq, event.base), (2, 1));
+    let patch = event.patch.unwrap();
+    let mut keys: Vec<&str> = patch.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["entriesFrom", "entriesTail", "title"]);
+    assert_eq!(patch["entriesFrom"], last);
+    assert_eq!(apply(&first, &patch), serde_json::to_value(&next).unwrap());
+
+    // Undoing a turn shortens the transcript.
+    let mut shorter = next.clone();
+    shorter.entries.truncate(2);
+    let patch = published.advance(shorter.clone()).unwrap().patch.unwrap();
+    assert_eq!(patch["entriesFrom"], 2);
+    assert_eq!(patch["entriesTail"], json!([]));
+    assert_eq!(apply(&next, &patch), serde_json::to_value(&shorter).unwrap());
+
+    let at = published.current(|| unreachable!("already published"));
+    assert_eq!((at.seq, &at.snapshot), (3, &shorter));
+}
+
+#[test]
+fn the_first_request_publishes_a_snapshot() {
+    let w = workspace();
+    let model = preview::model(Preview::Session, &w.root);
+    let snap = Snapshot::new(&model, Some(&w), 0);
+    let mut published = Published::default();
+    let at = published.current(|| snap.clone());
+    assert_eq!((at.seq, &at.snapshot), (1, &snap));
+    assert!(published.advance(snap).is_none());
+}
+
 #[test]
 fn the_session_preview_snapshot_covers_every_row_kind() {
     let w = workspace();

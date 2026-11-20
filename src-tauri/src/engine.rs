@@ -79,6 +79,8 @@ pub enum Command {
     State,
     /// Load the models `SetModel` accepts.
     ListModels,
+    /// Load the models that generate images (`list_models` with `purpose: "image"`).
+    ListImageModels,
     /// Switch this session's model.
     SetModel {
         provider: String,
@@ -178,6 +180,7 @@ pub enum Purpose {
     Recover,
     State,
     Models,
+    ImageModels,
     SetModel,
     SetThinking,
     SetApproval,
@@ -258,6 +261,11 @@ impl Command {
             Self::Recover => (Purpose::Recover, "recovery_snapshot", json!({})),
             Self::State => (Purpose::State, "state", json!({})),
             Self::ListModels => (Purpose::Models, "list_models", json!({})),
+            Self::ListImageModels => (
+                Purpose::ImageModels,
+                "list_models",
+                json!({ "purpose": "image" }),
+            ),
             Self::SetModel { provider, model_id } => (
                 Purpose::SetModel,
                 "set_model",
@@ -370,6 +378,32 @@ struct Work {
 enum Call {
     Command(Command),
     Rpc(&'static str, Value),
+    Preset { session: String, roles: Value, main: Option<PresetModel> },
+}
+
+#[derive(serde::Deserialize)]
+pub struct PresetModel {
+    provider: String,
+    model: String,
+    thinking: Option<String>,
+}
+
+fn apply_preset(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, String>,
+    session: &str,
+    roles: Value,
+    main: Option<PresetModel>,
+) -> Result<(), String> {
+    if rpc("get_session_stats", json!({}))?["session_id"].as_str() != Some(session) {
+        return Err("The active session changed; try again from that session".into());
+    }
+    rpc("set_setting", json!({"key":"model_roles", "value":roles, "scope":"global"}))?;
+    rpc("apply_settings", json!({}))?;
+    if let Some(main) = main {
+        rpc("set_model", json!({"provider":main.provider,"model_id":main.model}))?;
+        rpc("set_thinking", json!({"level":main.thinking.as_deref().unwrap_or("default")}))?;
+    }
+    Ok(())
 }
 
 /// Handle to the worker thread.
@@ -450,6 +484,11 @@ impl Engine {
         self.with_reply(Call::Rpc(method, params))
     }
 
+    /// Run the steps consecutively on this worker; switching tabs cannot redirect a later step.
+    pub fn apply_preset(&self, session: String, roles: Value, main: Option<PresetModel>) -> Result<RpcReply, String> {
+        self.with_reply(Call::Preset { session, roles, main })
+    }
+
     fn with_reply(&self, call: Call) -> Result<RpcReply, String> {
         let (tx, rx) = mpsc::channel();
         self.queue(Work {
@@ -494,6 +533,77 @@ impl Drop for Engine {
     }
 }
 
+pub fn fork_before(launch: &Launch, source: &str, prompt: &str) -> Result<String, String> {
+    let mut client = Client::connect(launch, CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    let result = (|| {
+        if !client.supports("branch_session") {
+            return Err("This engine does not support branching".into());
+        }
+        let mut rpc = |method: &str, params| {
+            client
+                .call(method, params, Duration::from_secs(120))
+                .map_err(|e| e.to_string())
+        };
+        let fork = rpc("fork_session", json!({"session_id":source}))?;
+        let id = fork["session_id"]
+            .as_str()
+            .filter(|s| !s.is_empty() && *s != source)
+            .ok_or("Dial did not confirm a new session")?;
+        let trim = (|| {
+            let mut offset = 0;
+            let mut turns = None;
+            loop {
+                let page = rpc("messages_page", json!({"offset":offset,"limit":32}))?;
+                for message in page["messages"]
+                    .as_array()
+                    .ok_or("Invalid conversation page")?
+                {
+                    if message["role"] != "user" {
+                        continue;
+                    }
+                    let content = &message["content"];
+                    let text = content.as_str().map(str::to_owned).unwrap_or_else(|| {
+                        content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|p| p["type"] == "text")
+                            .filter_map(|p| p["text"].as_str())
+                            .collect()
+                    });
+                    if text == prompt {
+                        if turns.is_some() {
+                            return Err("This prompt occurs more than once".to_string());
+                        }
+                        turns = Some(0usize);
+                    }
+                    if let Some(n) = &mut turns {
+                        *n += 1;
+                    }
+                }
+                if page["next_offset"].is_null() {
+                    break;
+                }
+                offset = page["next_offset"]
+                    .as_u64()
+                    .filter(|n| *n > offset)
+                    .ok_or("Invalid conversation cursor")?;
+            }
+            let turns = turns.ok_or("Cannot identify this prompt in the saved conversation")?;
+            rpc("branch_session", json!({"turns":turns,"confirm":true}))?;
+            Ok(())
+        })();
+        trim.map_err(|e| {
+            format!(
+                "Could not confirm branch point in copy {id}: {e}. The original was not changed."
+            )
+        })?;
+        Ok(id.to_owned())
+    })();
+    let _ = client.shutdown(SHUTDOWN);
+    result
+}
+
 fn run(
     launch: &Launch,
     commands: &Receiver<Work>,
@@ -529,6 +639,22 @@ fn run(
                             (Some(command), method, params)
                         }
                         Call::Rpc(method, params) => (None, method, params),
+                        Call::Preset { session, roles, main } => {
+                            let result = apply_preset(&mut |method, params| {
+                                client.call(method, params, Duration::from_secs(30)).map_err(|e| e.to_string())
+                            }, &session, roles, main);
+                            // Even a partial failure can have saved settings or changed the model.
+                            for command in [Command::GetSettings, Command::State] {
+                                let (_, method, params) = command.request();
+                                if let Ok(id) = client.request(method, params) {
+                                    emit(Update::Requested { command, id });
+                                }
+                            }
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result.map(|()| Value::Null));
+                            }
+                            continue;
+                        }
                     };
                     match client.request(method, params) {
                         Ok(id) => {

@@ -193,6 +193,8 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         <div class="filters" role="group" aria-label="Model source">
           <button :aria-pressed="!downloadedOnly" @click="downloadedOnly = false">All models</button>
           <button :aria-pressed="downloadedOnly" @click="downloadedOnly = true">Downloaded</button>
+          <button @click="close(false); ui.settingsTab = 'library'; ui.settingsOpen = true">Get models…</button>
+          <button title="Helper models for background work, and saved model sets" @click="close(false); ui.settingsTab = 'roles'; ui.settingsOpen = true">Roles &amp; presets…</button>
         </div>
 
         <div class="list">
@@ -269,7 +271,8 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 320px;
+  max-width: min(320px, 100%);
+  overflow: hidden;
   height: 28px;
   padding: 0 8px;
   border-radius: var(--radius-sm);
@@ -289,6 +292,13 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .level {
   color: var(--text-faint);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex-shrink: 3;
+}
+.trigger > :deep(svg) {
+  flex: none;
 }
 .menu {
   position: absolute;

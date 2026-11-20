@@ -131,3 +131,42 @@ fn recents_move_to_front_dedupe_and_persist() {
     assert_eq!(reloaded.paths, recents.paths);
     std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn recents_forget_removes_a_folder_and_persists() {
+    let file = std::env::temp_dir()
+        .join(format!(
+            "dial-desktop-recents-forget-{}",
+            std::process::id()
+        ))
+        .join("recent.json");
+    let mut recents = Recents::load(Some(file.clone()));
+    recents.touch(Path::new("/a"));
+    recents.touch(Path::new("/b"));
+    recents.touch(Path::new("/c"));
+    assert!(recents.forget(Path::new("/b")));
+    assert_eq!(recents.paths, [PathBuf::from("/c"), PathBuf::from("/a")]);
+    assert!(
+        !recents.forget(Path::new("/missing")),
+        "forgetting an unknown folder changes nothing"
+    );
+    let reloaded = Recents::load(Some(file.clone()));
+    assert_eq!(reloaded.paths, recents.paths);
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn recents_merge_changes_from_independent_windows() {
+    let file = std::env::temp_dir()
+        .join(format!("dial-desktop-recents-windows-{}", std::process::id()))
+        .join("recent.json");
+    let mut first = Recents::load(Some(file.clone()));
+    first.touch(Path::new("/old"));
+    let mut second = Recents::load(Some(file.clone()));
+    second.touch(Path::new("/new"));
+    assert!(first.forget(Path::new("/old")));
+    second.touch(Path::new("/another"));
+    let actual = Recents::load(Some(file.clone())).paths;
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    assert_eq!(actual, [PathBuf::from("/another"), PathBuf::from("/new")]);
+}

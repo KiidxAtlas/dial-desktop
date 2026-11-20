@@ -1,7 +1,7 @@
 // The only place the UI talks to the Rust side.
 
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -28,11 +28,62 @@ import type {
   Workspace,
 } from "./types";
 
-/** Latest state published by the app; `null` until the first one arrives. */
+/** Latest state published by the app; `null` until the first one arrives. Parts unchanged since
+ * the previous snapshot keep their identity (see {@link share}), so Vue skips redrawing them. */
 export const snapshot = shallowRef<Snapshot | null>(null);
+
+/**
+ * `next`, reusing every object or array of `prev` that holds the same data. The app republishes the
+ * whole transcript about once a frame while a turn streams; without this every message and tool row
+ * would get a new object, and be redrawn, on every update. Returns `prev` itself when nothing changed.
+ */
+export function share<T>(prev: unknown, next: T): T {
+  if (prev === next || typeof prev !== "object" || typeof next !== "object" || !prev || !next) return next;
+  if (Array.isArray(prev) !== Array.isArray(next)) return next;
+  if (Array.isArray(next)) {
+    const old = prev as unknown[];
+    let same = old.length === next.length;
+    for (let i = 0; i < next.length; i++) {
+      next[i] = share(old[i], next[i]);
+      if (next[i] !== old[i]) same = false;
+    }
+    return same ? (prev as T) : next;
+  }
+  const old = prev as Record<string, unknown>;
+  const fresh = next as Record<string, unknown>;
+  const keys = Object.keys(fresh);
+  let same = keys.length === Object.keys(old).length;
+  for (const key of keys) {
+    fresh[key] = share(old[key], fresh[key]);
+    if (fresh[key] !== old[key] || !(key in old)) same = false;
+  }
+  return same ? (prev as T) : next;
+}
 
 /** Models the user can switch to; empty until the engine listed them. */
 export const models = shallowRef<ModelOption[]>([]);
+
+export interface DownloadStatus { repo: string; running: boolean; message: string }
+export interface CachedModel { repo: string; bytes: number }
+export interface HubModel { id: string; downloads: number; likes: number; pipeline_tag: string | null }
+export interface HubFile { path: string; size: number; split: boolean }
+export const modelDownloads = {
+  status: () => invoke<DownloadStatus>('model_download_status'),
+  cancel: () => invoke<DownloadStatus>('model_download_cancel'),
+  cached: () => invoke<CachedModel[]>('model_cache_list'),
+  search: (query: string, format: 'MLX' | 'GGUF') => invoke<HubModel[]>('model_hub_search', { query, format }),
+  files: (repo: string) => invoke<HubFile[]>('model_hub_files', { repo }),
+  async start(repo: string, size: string, file?: string) {
+    const what = file ? `${file} from ${repo}` : repo;
+    if (!await ask(`Download ${what} (about ${size}) from Hugging Face to this computer? This does not switch your session model.`, { title: 'Download model?' })) return null;
+    return invoke<DownloadStatus>('model_download_start', { repo, file: file ?? null });
+  },
+  /** Delete a downloaded model from the Hugging Face cache after confirming; the bytes freed, or `null` if cancelled. */
+  async remove(repo: string, size: string) {
+    if (!await ask(`Delete ${repo} (${size}) from this computer?\n\nIt is removed from the Hugging Face cache and can be downloaded again later.`, { title: 'Delete model?', kind: 'warning', okLabel: 'Delete' })) return null;
+    return invoke<number>('model_cache_remove', { repo });
+  },
+};
 
 /** The settings page; `null` until the engine sent it. */
 export const settingsPage = shallowRef<SettingsPage | null>(null);
@@ -68,11 +119,78 @@ export function showToast(message: string) {
   dismissLater(id);
 }
 
+/** Remove a toast now (its close button). */
+export function dismissToast(id: number) {
+  clearTimeout(timers.get(id));
+  timers.delete(id);
+  toasts.value = toasts.value.filter((t) => t.id !== id);
+}
+
+/** Keep a toast while the pointer rests on it, so it can be read or copied. */
+export function holdToast(id: number) {
+  clearTimeout(timers.get(id));
+  timers.delete(id);
+}
+
+/** Resume a held toast's countdown. */
+export function releaseToast(id: number) {
+  if (toasts.value.some((t) => t.id === id)) dismissLater(id);
+}
+
+/** The `snapshot` event (`view::SnapshotEvent`): the whole snapshot, or what changed since `base`. */
+interface SnapshotEvent {
+  seq: number;
+  base: number;
+  full?: Snapshot;
+  patch?: Partial<Snapshot> & { entriesFrom?: number; entriesTail?: Snapshot["entries"] };
+}
+
+/** Number of the snapshot on screen; `0` before the first. */
+let snapshotSeq = 0;
+let resyncing = false;
+let resyncAgain = false;
+
+function accept(seq: number, next: Snapshot) {
+  snapshotSeq = seq;
+  snapshot.value = share(snapshot.value, next);
+}
+
+/** `prev` with `patch` applied; unchanged entries keep their identity. */
+export function applyPatch(prev: Snapshot, patch: NonNullable<SnapshotEvent["patch"]>): Snapshot {
+  const { entriesFrom, entriesTail, ...fields } = patch;
+  const next = { ...prev, ...fields };
+  if (entriesFrom !== undefined) next.entries = prev.entries.slice(0, entriesFrom).concat(entriesTail ?? []);
+  return next;
+}
+
+function receive(event: SnapshotEvent) {
+  if (event.seq <= snapshotSeq) return; // Already included in a snapshot loaded meanwhile.
+  if (event.full) accept(event.seq, event.full);
+  else if (snapshot.value && event.base === snapshotSeq && event.patch) accept(event.seq, applyPatch(snapshot.value, event.patch));
+  else void resync();
+}
+
+/** Load the latest snapshot whole, after missing an event (or at start). */
+async function resync() {
+  if (resyncing) {
+    resyncAgain = true;
+    return;
+  }
+  resyncing = true;
+  try {
+    do {
+      resyncAgain = false;
+      const latest = await invoke<{ seq: number; snapshot: Snapshot }>("snapshot");
+      if (latest.seq > snapshotSeq) accept(latest.seq, latest.snapshot);
+    } while (resyncAgain);
+  } finally {
+    resyncing = false;
+  }
+}
+
 /** Subscribe to updates, then load the current state. */
 export async function connect() {
-  await listen<Snapshot>("snapshot", (event) => {
-    snapshot.value = event.payload;
-  });
+  await listen<SnapshotEvent>("snapshot", (event) => receive(event.payload));
   await listen<ModelOption[]>("models", (event) => {
     models.value = event.payload;
   });
@@ -80,12 +198,7 @@ export async function connect() {
     settingsPage.value = event.payload;
   });
   await listen<string>("toast", (event) => showToast(event.payload));
-  const [initial, list] = await Promise.all([
-    invoke<Snapshot>("snapshot"),
-    invoke<ModelOption[]>("models"),
-  ]);
-  // An event that arrived meanwhile is newer than these replies.
-  if (!snapshot.value) snapshot.value = initial;
+  const [, list] = await Promise.all([resync(), invoke<ModelOption[]>("models")]);
   if (!models.value.length) models.value = list;
 }
 
@@ -144,6 +257,14 @@ export const engine = {
   pinSession: (sessionId: string, pinned: boolean) => call("pin_session", { sessionId, pinned }),
   /** Copy a session into a new one and open the copy. */
   forkSession: (sessionId: string) => call("fork_session", { sessionId }),
+  async forkBefore(root: string, sessionId: string, prompt: string) {
+    try {
+      if (!await ask("Create a copy ending before this prompt? The original conversation and working files stay unchanged.", { title: "Fork from this message?" })) return;
+      const id = await invoke<string>("fork_before", { workspaceRoot: root, sessionId, prompt });
+      if (snapshot.value?.workspace?.root === root && snapshot.value.sessionId === sessionId) await engine.resume(id, root);
+      else showToast("Fork created in the original project");
+    } catch (e) { showToast(String(e)); }
+  },
   /** Ask where to save, inside the project folder, and export the session on screen as Markdown. */
   async exportSession(root: string, title: string) {
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "session";
@@ -202,6 +323,16 @@ export const engine = {
 
 export const folders = {
   recent: () => invoke<Workspace[]>("recent_workspaces").catch(() => [] as Workspace[]),
+  /** Drop a folder from the recent projects list; the folder itself stays on disk. */
+  async forget(path: string) {
+    try {
+      if (!(await invoke<boolean>("forget_workspace", { path }))) showToast("That project was already gone from the list");
+      return true;
+    } catch (error) {
+      showToast(`Could not remove the project from the list: ${error}`);
+      return false;
+    }
+  },
   async open(path: string) {
     try {
       let from = await invoke<string | null>("open_workspace", { path });
@@ -216,14 +347,18 @@ export const folders = {
     }
   },
   /** Ask for a folder with the system dialog and open it. */
-  async choose() {
+  async choose(newWindow = false) {
     try {
       const path = await openDialog({ directory: true, multiple: false, title: "Open a project folder" });
-      if (typeof path === "string") await folders.open(path);
+      if (typeof path === "string") {
+        if (newWindow) await folders.openInWindow(path); else await folders.open(path);
+      }
     } catch (error) {
       showToast(`Could not open the folder picker: ${error}`);
     }
   },
+  /** Open `path` in another Dial window, leaving this one as it is. */
+  openInWindow: (path: string) => call("project_window", { path }),
 };
 
 /** A checked image file and its thumbnail. */
@@ -236,6 +371,12 @@ export interface ImageFile {
 export const files = {
   /** Check the image at `path` and read its thumbnail; throws a readable message. */
   readImage: (path: string) => invoke<ImageFile>("read_image", { path }),
+  readClipboardImage: () => isTauri() ? invoke<string | null>("read_clipboard_image") : Promise.resolve(null),
+  readTranscriptImage: (workspaceRoot: string, path: string) =>
+    invoke<ImageFile>("read_transcript_image", { workspaceRoot, path }),
+  /** Open a project image in the system's default viewer (Preview on a Mac). */
+  openTranscriptImage: (workspaceRoot: string, path: string) =>
+    invoke<void>("open_transcript_image", { workspaceRoot, path }).catch((error) => showToast(String(error))),
   /** Show the file in the system file manager (Finder, Explorer). */
   reveal: (path: string) => revealItemInDir(path).catch((error) => showToast(`Could not show the file: ${error}`)),
   /** Ask for images with the system dialog; empty when cancelled. */

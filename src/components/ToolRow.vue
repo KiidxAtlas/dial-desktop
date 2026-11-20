@@ -24,7 +24,7 @@ const result = computed(() => {
   const t = props.tool;
   if (t.progress) return t.progress;
   if (t.state === "failed") return t.facts.join(" · ") || "Failed";
-  if (t.changedPaths.length === 1) return `Updated ${t.changedPaths[0]}`;
+  if (t.changedPaths.length === 1) return t.changedPaths[0] === t.target ? null : `Updated ${t.changedPaths[0]}`;
   if (t.changedPaths.length > 1) return `Updated ${t.changedPaths.length} files`;
   if (t.state === "unknown") return "Outcome unknown";
   return null;
@@ -32,9 +32,10 @@ const result = computed(() => {
 </script>
 
 <template>
-  <div class="tool" :class="[tool.state, { open }]">
+  <div class="tool" :class="[tool.state, { open }]" :data-tool="tool.key">
     <button class="head" :aria-expanded="open" @click="toggle(tool.key)">
-      <span class="dot" :title="tool.state" />
+      <span v-if="tool.state === 'running'" class="spinner run-spin" :title="tool.state" />
+      <span v-else class="dot" :title="tool.state" />
       <span class="label">{{ tool.label }}</span>
       <span class="target mono truncate">{{ tool.target }}</span>
       <Icon class="chevron" :name="open ? 'chevronDown' : 'chevronRight'" :size="12" />
@@ -74,6 +75,14 @@ const result = computed(() => {
 .tool {
   --tone: var(--text-faint);
 }
+.tool.flash {
+  border-radius: var(--radius-sm);
+  animation: flash 1.4s var(--ease);
+}
+@keyframes flash {
+  0%, 30% { background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 16%, transparent); }
+  100% { background: transparent; box-shadow: 0 0 0 6px transparent; }
+}
 .tool.succeeded {
   --tone: var(--success);
 }
@@ -85,8 +94,19 @@ const result = computed(() => {
   align-items: center;
   gap: 10px;
   max-width: 100%;
-  padding: 2px 0;
+  margin-left: -6px;
+  padding: 3px 8px 3px 6px;
+  border-radius: var(--radius-sm);
   text-align: left;
+  transition: background 120ms var(--ease);
+}
+.head:hover {
+  background: var(--hover);
+}
+.run-spin {
+  width: 10px;
+  height: 10px;
+  color: var(--text-muted);
 }
 .dot {
   width: 8px;
@@ -126,7 +146,7 @@ const result = computed(() => {
   display: flex;
   gap: 8px;
   padding-left: 18px;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-faint);
 }
 .failed .result {

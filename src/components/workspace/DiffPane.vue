@@ -191,22 +191,34 @@ function copy() {
   user-select: none;
   -webkit-user-select: none;
 }
+.line:hover {
+  background: var(--hover);
+}
 .line.add {
   background: color-mix(in srgb, var(--success) 14%, transparent);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--success) 70%, transparent);
 }
 .line.del {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--danger) 70%, transparent);
+}
+.line.add:hover {
+  background: color-mix(in srgb, var(--success) 22%, transparent);
+}
+.line.del:hover {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
 }
 .hunk {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 6px;
-  padding: 3px 6px;
+  padding: 4px 8px;
   position: sticky;
   left: 0;
   color: var(--info);
-  background: var(--hover);
+  background: color-mix(in srgb, var(--info) 9%, transparent);
+  border-block: 1px solid color-mix(in srgb, var(--info) 18%, transparent);
 }
 .hunk button { flex: none; }
 .note {

@@ -1,0 +1,312 @@
+/* Shared look of every Settings page: a page header, titled groups drawn as cards, and rows with
+   the label on the left and the control on the right. Prefixed `s-` because it is global. */
+
+.s-page {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 30px 40px 96px;
+}
+.s-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+.s-head h2 {
+  margin: 0;
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-size: 26px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.s-head p {
+  margin: 6px 0 0;
+  max-width: 58ch;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+.s-head-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.s-group {
+  margin-top: 26px;
+  scroll-margin-top: 16px;
+}
+.s-group:first-of-type {
+  margin-top: 0;
+}
+.s-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 4px 8px;
+}
+.s-group-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.s-group-head p {
+  margin: 2px 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+.s-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+/* Not clipped, so pickers can open over the next card; children keep the corners instead. */
+.s-card > :first-child {
+  border-top-left-radius: 11px;
+  border-top-right-radius: 11px;
+}
+.s-card > :last-child {
+  border-bottom-left-radius: 11px;
+  border-bottom-right-radius: 11px;
+}
+.s-card > * + * {
+  border-top: 1px solid var(--border);
+}
+.s-card-pad {
+  padding: 14px 16px;
+}
+.s-empty {
+  padding: 18px 16px;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.s-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-height: 52px;
+  padding: 11px 16px;
+}
+.s-row.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.s-row-text {
+  flex: 1;
+  min-width: 0;
+}
+.s-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.s-desc {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.s-control {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 52%;
+}
+.s-row.stacked .s-control {
+  max-width: none;
+  justify-content: flex-start;
+}
+.s-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.s-tag {
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.s-tag.ok {
+  border-color: color-mix(in srgb, var(--success) 40%, transparent);
+  color: var(--success);
+}
+.s-error {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--danger);
+}
+.s-muted {
+  color: var(--text-faint);
+}
+.s-note {
+  margin: 8px 4px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* Controls */
+.s-input,
+.s-select {
+  height: 30px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+.s-input:focus,
+.s-select:focus,
+.s-select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.s-input::placeholder {
+  color: var(--text-faint);
+}
+.s-select {
+  appearance: none;
+  max-width: 260px;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b8981' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.s-select:hover {
+  border-color: var(--focus-border);
+}
+
+.s-switch {
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 21px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  transition: background 160ms var(--ease);
+}
+.s-switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 25%);
+  transition: transform 160ms var(--ease);
+}
+.s-switch.on {
+  background: var(--accent);
+}
+.s-switch.on i {
+  transform: translateX(15px);
+}
+.s-switch:disabled {
+  opacity: 0.5;
+}
+.s-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.s-seg {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--active);
+}
+.s-seg button {
+  height: 26px;
+  padding: 0 11px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+.s-seg button:hover {
+  color: var(--text);
+}
+.s-seg button.on {
+  background: var(--raised);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 14%), 0 0 0 1px var(--border);
+}
+
+.s-link {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.s-link:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+}
+.s-link.danger:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+/* Tiles: pictures to pick from (themes, backgrounds). */
+.s-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 14px;
+  padding: 16px;
+}
+.s-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: left;
+}
+.s-tile:hover,
+.s-tile.on {
+  color: var(--text);
+}
+.s-tile .art {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  border-radius: 9px;
+  box-shadow: 0 0 0 1px var(--border-strong);
+  overflow: hidden;
+  object-fit: cover;
+  transition: box-shadow 140ms var(--ease);
+}
+.s-tile:hover .art {
+  box-shadow: 0 0 0 1px var(--text-faint);
+}
+.s-tile.on .art {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
+}

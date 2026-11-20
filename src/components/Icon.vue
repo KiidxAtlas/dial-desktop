@@ -32,6 +32,7 @@ export const PATHS = {
   pencil: "M4 20h4L19 9l-4-4L4 16zM14 6l4 4",
   copy: "M9 9h10v10H9zM5 15V5h10",
   duplicate: "M8 8h11v11H8zM5 16V5h11M13.5 11v5M11 13.5h5",
+  quote: "M5 7h5v5c0 3-1.5 5-4 5.5M14 7h5v5c0 3-1.5 5-4 5.5",
   download: "M12 4v11M7 10l5 5 5-5M5 20h14",
   keyboard: "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M8 14h8",
   sun: "M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4",

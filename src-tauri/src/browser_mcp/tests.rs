@@ -121,14 +121,18 @@ fn the_bridge_talks_to_the_app_over_loopback() {
         let (stream, _) = listener.accept().unwrap();
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line).unwrap();
-        let reply = agent_browser::handle(line.trim(), "tok", |tool, args| {
-            Ok(Reply::text(format!("{tool} {args}")))
-        });
+        let reply = agent_browser::handle(
+            line.trim(),
+            "tok",
+            |root| root == "project",
+            |tool, args| Ok(Reply::text(format!("{tool} {args}"))),
+        );
         let mut stream = &stream;
         writeln!(stream, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
     });
     let reply = exchange(
         &endpoint,
+        Path::new("project"),
         "browser_click",
         &json!({"ref": 2}),
         Duration::from_secs(5),
