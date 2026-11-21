@@ -8,7 +8,7 @@ export const MAX_IMAGES = 10;
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
 const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/i;
 /** Matches `MAX_IMAGE_BYTES` in the desktop backend. */
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
 
 function hasRoom(draft: Draft): boolean {
   if (draft.attachments.length < MAX_IMAGES) return true;
@@ -42,7 +42,7 @@ export async function addBlobs(draft: Draft, blobs: File[]) {
       continue;
     }
     if (blob.size > MAX_IMAGE_BYTES) {
-      showToast("Pasted images can be at most 20 MB");
+      showToast(`Pasted images can be at most ${MAX_IMAGE_BYTES / (1024 * 1024)} MiB`);
       continue;
     }
     if (!hasRoom(draft)) return;
@@ -66,7 +66,8 @@ export async function addBlobs(draft: Draft, blobs: File[]) {
 export async function addNativeClipboardImage(draft: Draft) {
   try {
     const data = await files.readClipboardImage();
-    if (!data || !hasRoom(draft)) return;
+    if (!data) return showToast('No clipboard image found. Copy the screenshot, or choose its file.');
+    if (!hasRoom(draft)) return;
     draft.attachments.push({ key: crypto.randomUUID(), name: "Pasted image", url: `data:image/png;base64,${data}`, path: null, data });
   } catch (error) {
     showToast(String(error));

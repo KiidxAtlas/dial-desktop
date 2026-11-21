@@ -60,6 +60,9 @@ detects on disk, open the composer’s model picker and choose **Downloaded**. M
 the source, folder and size. Use **Get models…** to download a library model, or reload the list
 after adding one outside Desktop. You can also confirm removal of an unused model from a supported store.
 
+If Desktop cannot load its initial state, **Reconnect** retries the UI connection without
+resending a prompt. **Copy error** copies the diagnostic for troubleshooting.
+
 ## Updates
 
 The app and the Dial engine update separately, and nothing installs until the user asks
@@ -153,9 +156,9 @@ continues. Local builds without the release config do not contact Azure.
 - **Backgrounds** (Settings → Background): artwork behind your sessions, drawn by the app at the
   window's resolution, with no image files. There are still ones (Warp, Dune, Aurora, Nebula,
   Terrain), animated ones (Hyperspace, Drift, Flow, Fireflies, and the ASCII presets Trace Route,
-  Hex Swarm and Stack Rain) and your own image. Over a
+  Hex Swarm, Stack Rain, Koi Pond and Crab Beach) and your own image. Over a
   background the composer and cards turn to frosted glass. Choose whether it shows behind every
-  session or only a new one, how much a conversation dims it, and whether animated ones move.
+  session or only a new one (the default), how much a conversation dims it, and whether animated ones move.
   They hold still when the system asks to reduce motion. Saved on this computer, for every project.
 - **Conversation**: prompts, streamed answers with Markdown and syntax-highlighted code blocks
   (with copy buttons), collapsible reasoning, and compact tool-call rows. Expand a row to see its
@@ -171,11 +174,11 @@ continues. Local builds without the release config do not contact Azure.
   A ring by the send button shows how full the model's context is; click it (or type `/compact`)
   to summarize the conversation and free context.
 - **Composer**: unsent text and images are saved locally per project and session, including across
-  restarts. If Dial rejects a submission or disconnects before confirming it, the draft remains
+  restarts. Enter clears the composer immediately and shows “Sending…” while it waits. If Dial rejects a submission or disconnects before confirming it, the draft remains
   available and is never resent automatically. Check the transcript before retrying an unconfirmed
   send. While Dial works, Enter or the send-note button adds guidance to the running turn.
   <kbd>↑</kbd> in an empty box recalls the last prompt.
-  During a live turn, **Queue** (⌘/Ctrl+Enter) saves text and images for the next turn instead.
+  During a live turn, **Queue for next turn** (⌘/Ctrl+Enter) saves text and images for the next turn instead. The model picker also holds **Session modes**; permission settings stay beside it.
   Queues are saved locally per project and session, and restart paused. Switching sessions, stopping a
   turn, or a failed turn also pauses automatic sending. Review the transcript if a send may have
   been interrupted, then use **Send next** from the open, idle session.
@@ -191,12 +194,15 @@ continues. Local builds without the release config do not contact Azure.
   is running. Alerts do not show prompts, session names, or project names. macOS uses the installed
   app bundle; Linux needs a notification daemon with action support for click-through.
 - **Images**: paste screenshots or copied images directly into the prompt (⌘V / Ctrl+V), or use
-  the image button or drop files on the window. Supports PNG, JPEG, GIF and WebP (up to 10 images,
-  20 MB each); macOS clipboard TIFF images are converted to PNG when needed. Files are sent by
-  path; pasted images are sent inline. The button is disabled when the model is known not to take
+  the image button or drop files on the window. On macOS the image button also offers **Paste image from clipboard** if the system does not deliver a paste event. Supports PNG, JPEG, GIF and WebP (up to 10 images,
+  64 MiB each); macOS clipboard TIFF images are converted to PNG when needed. Pasted images are
+  saved in private files so both pasted and chosen images travel by path. The button is disabled when the model is known not to take
   images. Relative Markdown image links in replies preview supported images inside the open project.
 - **Side panel** (drag its left edge to resize; the width is remembered per kind of panel):
-  - **Plan**: the agent's todo list with progress. **Activity**: recent tool calls.
+  - **Plan** and **Changes** are always named. The panel menu opens **Files**, **Terminal**, **Browser**, **App**, and **Activity** (recent tool calls).
+  - **App**: Dial defaults to a private Windows guest on Windows and a private Linux guest on Linux. The [packaged QEMU runtime](docs/app-runtime-packaging.md) tries Windows Hypervisor Platform (WHPX) or Linux KVM first; it still needs an imported guest disk. On Apple Silicon, [prepare and import a virtual Mac](packaging/macos-guest/prepare/README.md) to use the native macOS default. You can still explicitly select a different guest, including an existing unlabelled QEMU disk. Dial never downloads an OS or runs the project on the host as a fallback.
+    Agent-started guests have no project files. To run a project, select **Share a read-only snapshot of committed HEAD** before starting. With a committed [`.dial/app.json` recipe](packaging/guest/README.md), open the project disc inside the guest and run `python3 -I DIAL-LAUNCH.py .` (Windows: `py -3 -I DIAL-LAUNCH.py .`). The guest needs its own toolchain and dependencies. Hiding the pane leaves it running; **Stop** discards run-local guest changes. The ordinary Terminal is unchanged.
+    In the top-right **VM** mode, choose an existing registered VirtualBox or VMware machine instead. Connecting to it uses its real disk and configured devices, not a disposable copy. You can hand the guest console to the agent, take control back by interacting, and **Disconnect** without powering the machine off. See [provider prerequisites](docs/app-runtime-packaging.md#registered-virtual-machines).
   - **Changes**: files Dial touched in this session. Open a file to inspect its current Git diff,
     which may include unrelated edits and is not a per-turn patch. Expand the review view, step
     through files, or use **Ask Dial** beside a hunk to add it to the draft. Both sides’ line numbers
@@ -206,6 +212,8 @@ continues. Local builds without the release config do not contact Azure.
     syntax highlighting. Right-click to mention a file in the prompt, copy its path, or show it in
     the system file browser. Reads stay inside the project (symlinks that leave it are refused)
     and stop at 512 KB; binary files are not shown.
+    Links such as `src/app.ts#L12-L18` open the cited range without the tree; **Browse files** restores it. Reported edits
+    refresh the affected folder and open file, including repeated edits to the same path.
   - **Terminal**: your own login shell in the project folder (a real terminal, xterm.js over a
     PTY), kept running while you switch panels; send its selection or screen to the prompt. The
     "Dial's commands" view lists the commands the agent ran with their output.
@@ -227,10 +235,10 @@ continues. Local builds without the release config do not contact Azure.
   dropped engine is shown as stopped, and tool calls it left running are marked as having
   unknown outcomes, never as succeeded.
 
-- **Turn review**: expand the card after a completed prompt to inspect reported files, recorded edit hunks and explicit verification calls. Missing patches or checks aren't reconstructed from the working tree. Receipts link back to tool output; **Compare current working tree** shows today's Git diff separately.
+- **Turn review**: turns with reported file changes or explicit checks have an expandable review. Inspect recorded edit hunks and check receipts there; missing patches or checks aren't reconstructed. **Compare current working tree** opens today's Git diff separately.
 - **Quick-open** (⌘/Ctrl+P): search project paths without expanding folders; Enter opens the selected file in Files.
 - **Open project in new window…** in the palette starts an independent Desktop process without stopping the original project's engines or terminals.
-- **Fork before a prompt**: hover a user message in an idle live session and choose the fork action. Desktop copies the session and branches only the copy; files are not rewound. Repeated or missing prompt text is refused rather than guessing the branch point.
+- **Fork before a prompt**: hover a user message in an idle live session and choose the fork action. Desktop verifies the selected occurrence against the saved history and branches only the copy, even when prompts repeat. Files are not rewound.
 
 Not yet: images in question answers, agent screenshots of the browser outside macOS.
 

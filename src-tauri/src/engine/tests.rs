@@ -16,15 +16,25 @@ fn commands_map_to_documented_wire_requests() {
     );
 
     let (_, _, params) = Command::Send {
-        text: "".into(),
+        text: "  \n".into(),
         images: vec!["/tmp/a.png".into()],
         inline_images: vec!["iVBORw==".into()],
     }
     .request();
-    assert_eq!(
-        params,
-        json!({"text": "", "images": ["/tmp/a.png"], "inline_images": ["iVBORw=="]})
-    );
+    let prompt = params["text"].as_str().unwrap();
+    for instruction in ["infer my intent", "take the relevant action", "ask a focused question"] {
+        assert!(prompt.contains(instruction), "missing instruction: {instruction}");
+    }
+    assert_eq!(params["images"], json!(["/tmp/a.png"]));
+    assert_eq!(params["inline_images"], json!(["iVBORw=="]));
+
+    let (_, _, params) = Command::Send {
+        text: "Only describe the layout.".into(),
+        images: vec!["/tmp/a.png".into()],
+        inline_images: vec![],
+    }
+    .request();
+    assert_eq!(params["text"], "Only describe the layout.");
 
     let (purpose, method, params) = Command::Approve {
         approval_id: "a1".into(),

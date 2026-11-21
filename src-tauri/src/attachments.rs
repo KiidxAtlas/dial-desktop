@@ -12,8 +12,8 @@ use std::path::Path;
 #[cfg(test)]
 mod tests;
 
-/// Larger files are refused before reading; model providers reject them anyway.
-pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Match the engine's source limit; it bounds the model-facing encoding separately.
+pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// Attachments per prompt.
 pub const MAX_IMAGES: usize = 10;
 
@@ -52,7 +52,7 @@ pub fn read_image(path: &Path) -> Result<ImageFile, String> {
         .len();
     if size > MAX_IMAGE_BYTES {
         return Err(format!(
-            "{name} is {} MB; images can be at most {} MB",
+            "{name} is {} MiB; images can be at most {} MiB",
             size.div_ceil(1024 * 1024),
             MAX_IMAGE_BYTES / (1024 * 1024)
         ));
@@ -93,9 +93,91 @@ pub fn check(images: &[String], inline_images: &[String]) -> Result<(), String> 
 
 fn pasted_image_too_large() -> String {
     format!(
-        "Pasted images can be at most {} MB",
+        "Pasted images can be at most {} MiB",
         MAX_IMAGE_BYTES / (1024 * 1024)
     )
+}
+
+/// Pasted images older than this are removed the next time one is saved.
+const PASTED_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The image file extension for `bytes`, from its signature; `None` for anything else.
+pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Turn pasted images (base64, already [`check`]ed) into private files in `dir` and return their
+/// paths, so the prompt sends them by path like chosen files.
+///
+/// The engine's RPC refuses a request over 1 MiB, and a pasted screenshot as base64 is usually
+/// larger, so inline images made such prompts fail. Each file is created with a random name and
+/// owner-only permissions; files older than a week are pruned here.
+pub fn save_pasted(dir: &Path, inline_images: &[String]) -> Result<Vec<String>, String> {
+    if inline_images.is_empty() {
+        return Ok(Vec::new());
+    }
+    create_private_dir(dir).map_err(|e| format!("Could not save the pasted image: {e}"))?;
+    prune(dir, PASTED_KEEP);
+    inline_images
+        .iter()
+        .map(|data| {
+            let bytes = STANDARD
+                .decode(data.trim())
+                .map_err(|_| "A pasted image could not be read".to_owned())?;
+            let ext = sniff_extension(&bytes)
+                .ok_or("A pasted image is not a PNG, JPEG, GIF or WebP image")?;
+            let mut file = tempfile::Builder::new()
+                .prefix("pasted-")
+                .suffix(&format!(".{ext}"))
+                .tempfile_in(dir)
+                .map_err(|e| format!("Could not save the pasted image: {e}"))?;
+            std::io::Write::write_all(&mut file, &bytes)
+                .map_err(|e| format!("Could not save the pasted image: {e}"))?;
+            let (_, path) = file
+                .keep()
+                .map_err(|e| format!("Could not save the pasted image: {e}"))?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Remove this folder's `pasted-*` files last changed more than `keep` ago. Best effort.
+fn prune(dir: &Path, keep: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > keep);
+        let ours = entry.file_name().to_string_lossy().starts_with("pasted-");
+        if old && ours {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Read only image data, called on macOS when the composer receives a paste without a DOM file.

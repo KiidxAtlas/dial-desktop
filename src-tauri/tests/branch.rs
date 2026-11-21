@@ -19,11 +19,11 @@ fn branch_preserves_source_and_files() {
     original
         .call(
             "seed_context",
-            json!({"messages":["first","selected","later"]}),
+            json!({"messages":["continue","middle","continue","later"]}),
             wait,
         )
         .unwrap();
-    let id = fork_before(&launch, &source, "selected").unwrap();
+    let id = fork_before(&launch, &source, "continue", 2, 2).unwrap();
     assert_ne!(id, source);
     let mut copy = Client::connect(&launch, wait).unwrap();
     copy.call("resume", json!({"session_id":id}), wait).unwrap();
@@ -36,10 +36,15 @@ fn branch_preserves_source_and_files() {
             .map(|m| m["content"].clone())
             .collect::<Vec<_>>()
     };
-    assert_eq!(history(&mut copy), vec![json!("first")]);
+    assert_eq!(history(&mut copy), vec![json!("continue"), json!("middle")]);
     assert_eq!(
         history(&mut original),
-        vec![json!("first"), json!("selected"), json!("later")]
+        vec![
+            json!("continue"),
+            json!("middle"),
+            json!("continue"),
+            json!("later")
+        ]
     );
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "current bytes");
 }

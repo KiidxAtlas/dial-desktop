@@ -6,6 +6,7 @@ import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
 import { engine, models } from "../bridge";
 import { focusComposer, ui } from "../ui";
 import Icon from "./Icon.vue";
+import ModesMenu from "./ModesMenu.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -16,6 +17,13 @@ const active = ref(0);
 const downloadedOnly = ref(false);
 const details = ref<{ row: ModelOption; plan?: LocalModelRemoval; error?: string } | null>(null);
 const managing = ref(false);
+const modesPage = ref(false);
+function showModes() {
+  if (props.snap.connection.state !== 'live') return;
+  modesPage.value = true;
+  open();
+}
+defineExpose({ showModes });
 
 async function inspectModel(row: ModelOption) {
   const root = props.snap.workspace.root;
@@ -159,6 +167,7 @@ watch(
       });
       document.addEventListener("mousedown", onOutside);
     } else {
+      modesPage.value = false;
       document.removeEventListener("mousedown", onOutside);
     }
   },
@@ -172,7 +181,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
     <button
       class="trigger"
       :disabled="!usable"
-      :title="current ? `${current.provider ? current.provider + '/' : ''}${current.modelId} · switch model (/model)` : 'Model'"
+      :title="`Model and session modes · ${current?.label ?? 'Choose model'}`" :aria-expanded="ui.modelPickerOpen"
       @click.stop="ui.modelPickerOpen ? close() : open()"
     >
       <Icon name="chip" :size="14" />
@@ -182,7 +191,13 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
     </button>
 
     <Transition name="pop">
-      <div v-if="ui.modelPickerOpen" class="menu" @click.stop>
+      <div v-if="ui.modelPickerOpen" class="menu" @click.stop @keydown.esc.stop="close()">
+        <div v-if="snap.connection.state === 'live'" class="filters" role="group" aria-label="Session settings">
+          <button :aria-pressed="!modesPage" @click="modesPage = false; nextTick(() => search?.focus())">Model</button>
+          <button :aria-pressed="modesPage" @click="showModes">Session modes</button>
+        </div>
+        <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
+        <template v-else>
         <label class="search">
           <Icon name="search" :size="14" />
           <input ref="search" v-model="query" placeholder="Search models" spellcheck="false" @keydown="onKey" />
@@ -257,6 +272,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
           </div>
         </div>
         <div class="foot">↑↓ to move · Enter to switch · Esc to close · applies to this session</div>
+        </template>
       </div>
     </Transition>
   </div>

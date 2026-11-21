@@ -8,6 +8,8 @@ interface Draft {
   text: string;
   attachments: Attachment[];
   sending: boolean;
+  /** Hide the submitted draft until the engine confirms it; keep its persisted copy intact. */
+  submitting: boolean;
   loading: boolean;
 }
 
@@ -45,7 +47,7 @@ export function draftFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): D
   const key = JSON.stringify([snap.workspace.root, snap.sessionId]);
   let draft = drafts.get(key);
   if (!draft) {
-    const created = reactive<Draft>({ text: "", attachments: [], sending: false, loading: true });
+    const created = reactive<Draft>({ text: "", attachments: [], sending: false, submitting: false, loading: true });
     drafts.set(key, created);
     void attachPersistence(key, created).catch(storageError).finally(() => { created.loading = false; });
     draft = created;

@@ -3,6 +3,7 @@ import { computed } from "vue";
 import type { OpenSnapshot } from "../types";
 import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes";
 import Logo from "./Logo.vue";
+import { ui } from "../ui";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -12,12 +13,12 @@ const enabled = computed(() => canUseTaskRecipes(props.snap));
 <template>
   <div class="empty">
     <div class="hero">
-      <h2><Logo :size="30" /> What should we build?</h2>
+      <h2><Logo :size="30" /> {{ snap.workspace.name }}</h2>
       <p class="mono">{{ snap.workspace.display }}</p>
     </div>
     <div class="chips">
       <button
-        v-for="(s, i) in taskRecipes"
+        v-for="(s, i) in taskRecipes.slice(0, 3)"
         :key="s.id"
         class="chip"
         :style="{ animationDelay: `${80 + i * 35}ms` }"
@@ -28,13 +29,7 @@ const enabled = computed(() => canUseTaskRecipes(props.snap));
         {{ s.title }}
       </button>
     </div>
-    <div class="tips">
-      <span><kbd>/</kbd> commands</span>
-      <span><kbd>@</kbd> mention a file</span>
-      <span><kbd>⌘K</kbd> palette</span>
-      <span><kbd>⌘P</kbd> open file</span>
-      <span><kbd>⌘/</kbd> shortcuts</span>
-    </div>
+    <button class="tips" @click="ui.shortcutsOpen = true">Keyboard shortcuts</button>
   </div>
 </template>
 
@@ -122,9 +117,5 @@ p {
   text-shadow: var(--hero-shadow);
   animation: rise 420ms 260ms var(--ease) both;
 }
-.tips span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
+.tips:hover { color: var(--text); text-decoration: underline; }
 </style>

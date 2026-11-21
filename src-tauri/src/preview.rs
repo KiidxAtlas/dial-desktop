@@ -301,7 +301,7 @@ fn models() -> Vec<ModelOption> {
         label: label.into(),
         context_window: Some(window),
         reasoning: true,
-        vision: true,
+        vision: Some(true),
         configured,
         local: provider == "mlx",
     };

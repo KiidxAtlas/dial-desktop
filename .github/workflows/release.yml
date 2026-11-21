@@ -56,12 +56,16 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+            guest_config: src-tauri/tauri.macos-guest.conf.json
           - os: macos-latest
             target: x86_64-apple-darwin
+            guest_config: ''
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            guest_config: ''
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            guest_config: ''
     runs-on: ${{ matrix.os }}
     environment: ${{ matrix.os == 'windows-latest' && 'windows-signing' || 'desktop-build' }}
     permissions:
@@ -147,7 +151,15 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json${{ matrix.guest_config != '' && format(' --config {0}', matrix.guest_config) || '' }}
+
+      - name: Check the bundled virtual Mac helper before publication
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          app=$(find . -type d -path '*/release/bundle/macos/Dial.app' -print -quit)
+          test -n "$app"
+          sh packaging/macos-guest/verify-bundle.sh "$app"
 
   publish:
     needs: build

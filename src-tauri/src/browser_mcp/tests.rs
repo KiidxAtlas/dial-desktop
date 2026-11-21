@@ -68,7 +68,7 @@ fn tools_are_listed_only_while_the_app_runs() {
             .as_array()
             .map(Vec::len)
     };
-    assert_eq!(list(true), Some(12));
+    assert_eq!(list(true), Some(13));
     assert_eq!(list(false), Some(0));
 }
 
@@ -125,7 +125,12 @@ fn the_bridge_talks_to_the_app_over_loopback() {
             line.trim(),
             "tok",
             |root| root == "project",
-            |tool, args| Ok(Reply::text(format!("{tool} {args}"))),
+            |request| {
+                Ok(Reply::text(format!(
+                    "{} {}",
+                    request.tool, request.arguments
+                )))
+            },
         );
         let mut stream = &stream;
         writeln!(stream, "{}", serde_json::to_string(&reply).unwrap()).unwrap();

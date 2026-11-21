@@ -8,7 +8,9 @@ export function turnReviews(entries: Entry[], running: boolean) {
   const byEnd = new Map<number, Review[]>();
   let start = -1, checks: Receipt[] = [], files = new Map<string, Receipt[]>();
   function finish(end: number) {
-    if (start >= 0 && end > start) byEnd.set(end, [{ start, checks, files: Array.from(files, ([path, calls]) => ({ path, calls })) }]);
+    if (start >= 0 && end > start && (checks.length || files.size)) {
+      byEnd.set(end, [{ start, checks, files: Array.from(files, ([path, calls]) => ({ path, calls })) }]);
+    }
   }
   entries.forEach((entry, index) => {
     if (entry.kind === 'user') {

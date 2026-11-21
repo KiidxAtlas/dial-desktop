@@ -1,17 +1,13 @@
 <script setup lang="ts">
 // Session modes the terminal toggles with /plan, /vibe, /fast and friends, as one menu.
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
 import { loadModes, modes, setMode, setPlanMode } from "../engineTools";
-import Icon from "./Icon.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
-const root = ref<HTMLElement | null>(null);
-const open = ref(false);
 const busy = ref("");
 const live = computed(() => props.snap.connection.state === "live");
-defineExpose({ show: () => { if (live.value) open.value = true; } });
 interface Row { id: string; label: string; detail: string; on: boolean; run: () => Promise<boolean> }
 
 const rows = computed<{ title: string; items: Row[] }[]>(() => {
@@ -40,12 +36,6 @@ const rows = computed<{ title: string; items: Row[] }[]>(() => {
     },
   ];
 });
-const active = computed(() => rows.value.flatMap((g) => g.items).filter((r) => r.on));
-const summary = computed(() => {
-  const list = active.value;
-  if (!list.length) return "Modes";
-  return list.length === 1 ? list[0].label : `${list.length} modes`;
-});
 
 async function run(row: Row) {
   if (busy.value) return;
@@ -57,32 +47,12 @@ async function run(row: Row) {
   }
 }
 
-watch(open, (isOpen) => {
-  if (isOpen) void loadModes();
-  isOpen ? document.addEventListener("mousedown", onOutside) : document.removeEventListener("mousedown", onOutside);
-});
 // Fresh modes for each session and after reconnecting.
 watch(() => [props.snap.sessionId, live.value] as const, ([, now]) => now && void loadModes(), { immediate: true });
-function onOutside(event: MouseEvent) {
-  if (root.value && !root.value.contains(event.target as Node)) open.value = false;
-}
-onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 </script>
 
 <template>
-  <div v-if="live" ref="root" class="modes-menu">
-    <button
-      class="trigger"
-      :class="{ lit: active.length }"
-      :title="active.length ? `On: ${active.map((r) => r.label).join(', ')}` : 'Plan mode, vibe, fast and other session modes'"
-      @click.stop="open = !open"
-    >
-      <Icon name="sparkle" :size="13" />
-      <span>{{ summary }}</span>
-      <Icon name="chevronDown" :size="12" />
-    </button>
-    <Transition name="pop">
-      <div v-if="open" class="menu" @keydown.esc.stop="open = false">
+      <div class="modes-list" aria-label="Session modes">
         <p v-if="!modes" class="empty">Loading modes…</p>
         <template v-for="group in rows" :key="group.title">
           <div class="head">{{ group.title }}</div>
@@ -105,46 +75,10 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         </template>
         <p v-if="snap.turnRunning" class="note">Modes change between turns.</p>
       </div>
-    </Transition>
-  </div>
 </template>
 
 <style scoped>
-.modes-menu {
-  position: relative;
-}
-.trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 8px;
-  border-radius: var(--radius-sm);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  white-space: nowrap;
-  transition: background 120ms var(--ease);
-}
-.trigger:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-.trigger.lit {
-  color: var(--accent);
-}
-.menu {
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 10px);
-  z-index: 30;
-  width: 330px;
-  max-height: 60vh;
-  overflow: auto;
-  padding: 6px;
-  border-radius: var(--radius-md);
-  background: var(--raised);
-  box-shadow: var(--shadow-pop);
-}
+.modes-list { min-height: 0; max-height: 52vh; overflow: auto; padding: 4px; }
 .head {
   padding: 8px 10px 4px;
   font-size: var(--text-xs);
@@ -214,16 +148,5 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   padding: 8px 10px;
   font-size: var(--text-sm);
   color: var(--text-faint);
-}
-.pop-enter-active,
-.pop-leave-active {
-  transition:
-    opacity 140ms var(--ease),
-    transform 140ms var(--ease);
-}
-.pop-enter-from,
-.pop-leave-to {
-  opacity: 0;
-  transform: translateY(4px);
 }
 </style>

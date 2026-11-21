@@ -7,6 +7,8 @@
 
 pub mod agent_browser;
 pub mod app;
+mod app_disk;
+pub mod app_runner;
 pub mod attachments;
 pub mod browser;
 pub mod browser_mcp;

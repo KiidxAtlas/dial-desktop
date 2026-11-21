@@ -781,7 +781,10 @@ fn changed_paths_and_tool_stats_summarize_tool_rows() {
         body["seq"] = json!(seq as u64 + 2);
         model.apply(event(body));
     }
-    assert_eq!(model.changed_paths(), ["/w/src/a.rs", "/w/src/b.rs"]);
+    assert_eq!(
+        model.changed_paths(),
+        [("/w/src/a.rs".into(), 2), ("/w/src/b.rs".into(), 1)]
+    );
     assert_eq!(
         model.tool_stats(),
         ToolStats {

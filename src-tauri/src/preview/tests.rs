@@ -19,7 +19,11 @@ fn the_session_preview_exercises_every_row_kind() {
     assert_eq!(model.conversation.todo().len(), 4);
     assert!(model.conversation.turn_running());
     assert_eq!(
-        model.changed_paths(),
+        model
+            .changed_paths()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
         [
             "/work/app/src/server/limiter.rs",
             "/work/app/src/server/router.rs",

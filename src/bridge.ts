@@ -31,6 +31,8 @@ import type {
 /** Latest state published by the app; `null` until the first one arrives. Parts unchanged since
  * the previous snapshot keep their identity (see {@link share}), so Vue skips redrawing them. */
 export const snapshot = shallowRef<Snapshot | null>(null);
+export const startupError = ref<string | null>(null);
+export const connecting = ref(false);
 
 /**
  * `next`, reusing every object or array of `prev` that holds the same data. The app republishes the
@@ -153,6 +155,7 @@ let resyncAgain = false;
 function accept(seq: number, next: Snapshot) {
   snapshotSeq = seq;
   snapshot.value = share(snapshot.value, next);
+  startupError.value = null;
 }
 
 /** `prev` with `patch` applied; unchanged entries keep their identity. */
@@ -167,7 +170,7 @@ function receive(event: SnapshotEvent) {
   if (event.seq <= snapshotSeq) return; // Already included in a snapshot loaded meanwhile.
   if (event.full) accept(event.seq, event.full);
   else if (snapshot.value && event.base === snapshotSeq && event.patch) accept(event.seq, applyPatch(snapshot.value, event.patch));
-  else void resync();
+  else void resync().catch(connectionError);
 }
 
 /** Load the latest snapshot whole, after missing an event (or at start). */
@@ -188,18 +191,34 @@ async function resync() {
   }
 }
 
-/** Subscribe to updates, then load the current state. */
+function connectionError(error: unknown) {
+  if (snapshot.value) showToast(`Could not refresh Dial: ${error}`);
+  else startupError.value = String(error);
+}
+
+let subscribed = false;
+/** Retry only bridge setup. Keep successful listeners across snapshot retries. */
 export async function connect() {
-  await listen<SnapshotEvent>("snapshot", (event) => receive(event.payload));
-  await listen<ModelOption[]>("models", (event) => {
-    models.value = event.payload;
-  });
-  await listen<SettingsPage>("settings", (event) => {
-    settingsPage.value = event.payload;
-  });
-  await listen<string>("toast", (event) => showToast(event.payload));
-  const [, list] = await Promise.all([resync(), invoke<ModelOption[]>("models")]);
-  if (!models.value.length) models.value = list;
+  if (connecting.value) return;
+  connecting.value = true;
+  const partial: (() => void)[] = [];
+  try {
+    if (!subscribed) {
+      partial.push(await listen<SnapshotEvent>("snapshot", e => receive(e.payload)));
+      partial.push(await listen<ModelOption[]>("models", e => { models.value = e.payload; }));
+      partial.push(await listen<SettingsPage>("settings", e => { settingsPage.value = e.payload; }));
+      partial.push(await listen<string>("toast", e => showToast(e.payload)));
+      subscribed = true;
+    }
+    await resync();
+    const list = await invoke<ModelOption[]>("models");
+    if (!models.value.length) models.value = list;
+  } catch (error) {
+    if (!subscribed) partial.forEach(unlisten => unlisten());
+    connectionError(error);
+  } finally {
+    connecting.value = false;
+  }
 }
 
 async function call(command: string, args?: Record<string, unknown>) {
@@ -257,10 +276,10 @@ export const engine = {
   pinSession: (sessionId: string, pinned: boolean) => call("pin_session", { sessionId, pinned }),
   /** Copy a session into a new one and open the copy. */
   forkSession: (sessionId: string) => call("fork_session", { sessionId }),
-  async forkBefore(root: string, sessionId: string, prompt: string) {
+  async forkBefore(root: string, sessionId: string, prompt: string, occurrence: number, matches: number) {
     try {
       if (!await ask("Create a copy ending before this prompt? The original conversation and working files stay unchanged.", { title: "Fork from this message?" })) return;
-      const id = await invoke<string>("fork_before", { workspaceRoot: root, sessionId, prompt });
+      const id = await invoke<string>("fork_before", { workspaceRoot: root, sessionId, prompt, occurrence, matches });
       if (snapshot.value?.workspace?.root === root && snapshot.value.sessionId === sessionId) await engine.resume(id, root);
       else showToast("Fork created in the original project");
     } catch (e) { showToast(String(e)); }
@@ -430,8 +449,8 @@ export const notificationApi = {
 /** The open project's files, for the Files and Changes panels. Calls throw a readable message. */
 export const workspaceFiles = {
   /** Folder `path` relative to the project; `""` is its root. */
-  list: (path: string) => invoke<DirEntry[]>("list_dir", { path }),
-  read: (path: string) => invoke<FileView>("read_file", { path }),
+  list: (path: string, workspaceRoot: string) => invoke<DirEntry[]>("list_dir", { path, workspaceRoot }),
+  read: (path: string, workspaceRoot: string) => invoke<FileView>("read_file", { path, workspaceRoot }),
   /** Uncommitted changes of `path` (relative or absolute inside the project). */
   diff: (path: string, workspaceRoot: string) => invoke<DiffView>("file_diff", { path, workspaceRoot }),
   /** Fuzzy-search workspace files for `@` mentions in the composer. */

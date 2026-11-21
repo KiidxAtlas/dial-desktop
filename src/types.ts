@@ -123,6 +123,7 @@ export interface Change {
   path: string;
   dir: string;
   name: string;
+  revision: number;
 }
 
 export interface Stats {

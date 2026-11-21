@@ -417,6 +417,7 @@ pub struct ChangeView {
     /// Directory relative to the workspace, with a trailing separator, or empty.
     pub dir: String,
     pub name: String,
+    pub revision: usize,
 }
 
 /// Tool calls by state.
@@ -464,7 +465,7 @@ impl ModelView {
         };
         let accepts_images = |provider: &str, id: &str| {
             option(provider, id)
-                .map(|m| m.vision)
+                .and_then(|m| m.vision)
                 .or_else(|| model.ready_image_input.filter(|_| started_with == Some(id)))
         };
         if let Some(current) = &model.current_model {
@@ -517,7 +518,7 @@ impl From<&ModelOption> for ModelOptionView {
             label: m.label.clone(),
             context_window: m.context_window,
             reasoning: m.reasoning,
-            vision: m.vision,
+            vision: m.vision == Some(true),
             configured: m.configured,
             local: m.local,
         }
@@ -668,7 +669,7 @@ impl Snapshot {
         let changes = model
             .changed_paths()
             .into_iter()
-            .map(|path| {
+            .map(|(path, revision)| {
                 let shown = shown.relative(&path);
                 let (dir, name) = match shown.rfind(['/', '\\']) {
                     Some(i) => (&shown[..=i], &shown[i + 1..]),
@@ -677,6 +678,7 @@ impl Snapshot {
                 ChangeView {
                     dir: dir.to_owned(),
                     name: name.to_owned(),
+                    revision,
                     path: path.clone(),
                 }
             })

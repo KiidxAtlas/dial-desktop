@@ -6,7 +6,7 @@ import { ui } from "../ui";
 import { commands, filterCommands, highlightMatch, type Command } from "../commands";
 import Icon, { PATHS } from "./Icon.vue";
 import { workspaceFiles } from "../bridge";
-import { showPanel } from "../workspace";
+import { showFile } from "../workspace";
 import { loadRecentProjects } from "../projects";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
@@ -32,7 +32,7 @@ watch(() => [ui.filePalette, ui.paletteOpen, props.snap.workspace.root, query.va
   }, 100);
   cleanup(() => { current = false; clearTimeout(timer); });
 });
-const results = computed<Command[]>(() => ui.filePalette ? paths.value.map(path => ({ id: path, group: "Project files", label: path, icon: "file", run: () => { ui.filePath = path; showPanel("files"); } })) : filterCommands(commands(props.snap), query.value));
+const results = computed<Command[]>(() => ui.filePalette ? paths.value.map(path => ({ id: path, group: "Project files", label: path, icon: "file", run: () => showFile(path) })) : filterCommands(commands(props.snap), query.value));
 /** Results under group headings, keeping their ranked order; `index` counts across groups. */
 const groups = computed(() => {
   const out: { name: string; items: { command: Command; index: number }[] }[] = [];

@@ -108,7 +108,12 @@ browser the user watches beside this conversation. Use them to open and check we
 dev servers: browser_open loads a page and lists its interactive elements with refs like [3]; \
 browser_click, browser_type and browser_select act on a ref; browser_read returns the page text \
 and console errors; browser_screenshot shows how it looks. Take a new snapshot after the page \
-changes. Prefer these tools over other browser tools while the user works in Dial Desktop.";
+changes. For a request to launch a graphical app, use app_desktop when the guest is configured; \
+the user need not name the App panel. Check state first. When app_desktop state reports ssh for a \
+VM, run shell commands and read files in that VM with the ssh tool (host ssh.host) instead of \
+typing into its screen; keep frame and input for graphical apps. If setup or project files are \
+missing, explain what is needed. Never download a guest or launch the app on the host as a \
+fallback. Ordinary non-GUI build and test commands are unchanged.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -240,7 +245,50 @@ pub fn tools() -> Value {
             "A PNG of what the Browser panel shows.",
             none,
         ),
+        tool(
+            "app_desktop",
+            "App desktop",
+            false,
+            "Use the project's guest for explicit graphical app launches. Never use the host. For a registered VirtualBox or VMware VM, use guestTarget vm; state reports the user's one-time approvedVmId or current run (a running VM is attached, not restarted). Start only the approved VM. An installed VM is persistent and keeps its provider sharing settings. When state for guestTarget vm includes ssh {host, source}, the user linked that SSH host to the VM: run commands, read logs and check results with the ssh tool (host = ssh.host; read/grep also take ssh://host/path) instead of typing in a terminal and taking screenshots, and use frame/input only for graphical apps. ssh is reported only while Agent access is on or for the approved VM. Workflow: state -> frame {runId} -> input {runId, frameSeq, token, actions}. Put a whole step in one input: actions run in order (up to 64), e.g. [{kind:click,x,y},{kind:type,text:\"root\\n\"},{kind:wait,ms:800},{kind:press,keys:\"ctrl+l\"}]. type sends whole strings (US layout ASCII, \\n is Enter, \\t is Tab); press takes combos like \"ctrl+c\", \"alt+F4\", \"Enter\" with optional repeat. Coordinates are pixels of the frame you were given. Every input reply contains the screen after the batch with the next frameSeq and token, so chain from it; call frame only when told to. A token survives redraws until the next frame, a resize or 2 minutes. A batch stops early if the user acts in the app; the reply says how many actions ran. Frame and input need Agent access, which only the user switches on or off in the App sidebar; if it is off, ask the user to turn it on.",
+            json!({"type":"object", "required":["action"], "additionalProperties":false, "properties":{
+                "action":{"enum":["state","start","frame","input"], "description":"start opens a configured guest; it does not install one"},
+                "guestTarget":{"enum":["default","linux","windows","macos","vm"], "description":"Omit for the private guest preference. default explicitly selects the unlabelled QEMU disk; vm selects the user-approved installed VM."},
+                "vmId":{"type":"string", "description":"Only with start and guestTarget vm: exact approvedVmId from state; never a path or VM name."},
+                "runId":{"type":"string", "description":"From state; required for frame and input"},
+                "frameSeq":{"type":"integer", "description":"From the last frame or input reply; required for input"},
+                "token":{"type":"string", "description":"Single-use token from the last frame or input reply; required for input. One token covers the whole actions list."},
+                "actions":{"type":"array", "minItems":1, "maxItems":64, "description":"Input steps run in order on that frame; required for input", "items": app_desktop_action_items()}
+            }}),
+        ),
     ])
+}
+
+/// The `actions` items of `app_desktop` (see `app_runner::actions::Action`). Built apart from the
+/// tool schema, which would otherwise exceed `json!`'s macro recursion limit.
+fn app_desktop_action_items() -> Value {
+    let point = || json!({"type":"integer","minimum":0});
+    let button = json!({"enum":["left","middle","right"]});
+    json!({"oneOf": [
+        json!({"type":"object","required":["kind","x","y"],"additionalProperties":false,"properties":{
+            "kind":{"const":"click"},"x":point(),"y":point(),"button":button,
+            "count":{"type":"integer","minimum":1,"maximum":3,"description":"2 double-clicks, 3 triple-clicks"}}}),
+        json!({"type":"object","required":["kind","x","y"],"additionalProperties":false,"properties":{
+            "kind":{"enum":["double_click","move"]},"x":point(),"y":point()}}),
+        json!({"type":"object","required":["kind","x","y","toX","toY"],"additionalProperties":false,"properties":{
+            "kind":{"const":"drag"},"x":point(),"y":point(),"toX":point(),"toY":point(),"button":button}}),
+        json!({"type":"object","required":["kind","x","y","dy"],"additionalProperties":false,"properties":{
+            "kind":{"const":"scroll"},"x":point(),"y":point(),
+            "dy":{"type":"integer","minimum":-100,"maximum":100,"description":"Wheel notches; positive scrolls down"}}}),
+        json!({"type":"object","required":["kind","keys"],"additionalProperties":false,"properties":{
+            "kind":{"const":"press"},
+            "keys":{"type":"string","description":"A key or combo: Enter, Escape, Tab, Backspace, Up, PageDown, F5, a, ctrl+c, ctrl+shift+t, alt+F4, cmd+space"},
+            "repeat":{"type":"integer","minimum":1,"maximum":50}}}),
+        json!({"type":"object","required":["kind","text"],"additionalProperties":false,"properties":{
+            "kind":{"const":"type"},
+            "text":{"type":"string","maxLength":4000,"description":"Typed as keystrokes (US layout, printable ASCII; \\n Enter, \\t Tab)"}}}),
+        json!({"type":"object","required":["kind","ms"],"additionalProperties":false,"properties":{
+            "kind":{"const":"wait"},"ms":{"type":"integer","minimum":0,"maximum":5000}}}),
+    ]})
 }
 
 /// Shared helpers every action script installs once per page (`window.__dialAgent`).
@@ -626,7 +674,7 @@ pub fn handle(
     line: &str,
     token: &str,
     project_matches: impl FnOnce(&str) -> bool,
-    run: impl FnOnce(&str, &Value) -> Result<Reply, String>,
+    run: impl FnOnce(&Request) -> Result<Reply, String>,
 ) -> Reply {
     let Ok(request) = serde_json::from_str::<Request>(line) else {
         return Reply::error("Bad request");
@@ -640,7 +688,7 @@ pub fn handle(
     if request.tool == PING {
         return Reply::text("pong");
     }
-    run(&request.tool, &request.arguments).unwrap_or_else(Reply::error)
+    run(&request).unwrap_or_else(Reply::error)
 }
 
 /// Compare without stopping at the first difference.
@@ -741,7 +789,12 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
         line.trim(),
         token,
         |root| crate::app::browser_project(app, root),
-        |tool, args| {
+        |request| {
+            let tool = request.tool.as_str();
+            let args = &request.arguments;
+            if tool == "app_desktop" {
+                return crate::app_runner::agent_call(app, &request.workspace, args);
+            }
             let _ = app.emit(
                 "agent-browser",
                 json!({"kind": "activity", "text": describe_call(tool, args), "busy": true}),

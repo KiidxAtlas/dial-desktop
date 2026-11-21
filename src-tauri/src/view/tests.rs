@@ -442,7 +442,7 @@ fn the_model_view_prefers_state_and_labels_from_the_list() {
         label: "Claude Opus".into(),
         context_window: None,
         reasoning: true,
-        vision: true,
+        vision: Some(true),
         configured: true,
         local: false,
     }];
@@ -473,10 +473,19 @@ fn image_support_comes_from_the_list_else_from_ready_for_the_starting_model() {
         ..CurrentModel::default()
     };
     model.current_model = Some(current("m1"));
+    let row = |id: &str| json!({"provider":"p", "model_id":id});
+    model.models = [row("m1"), row("m2")]
+        .iter()
+        .filter_map(crate::model::ModelOption::from_wire)
+        .collect();
     assert_eq!(ModelView::of(&model).unwrap().accepts_images, Some(true));
     // After a switch, `ready` says nothing about the new model.
     model.current_model = Some(current("m2"));
     assert_eq!(ModelView::of(&model).unwrap().accepts_images, None);
+    let mut text_only = row("m2");
+    text_only["vision"] = json!(false);
+    model.models = vec![crate::model::ModelOption::from_wire(&text_only).unwrap()];
+    assert_eq!(ModelView::of(&model).unwrap().accepts_images, Some(false));
 }
 
 #[test]

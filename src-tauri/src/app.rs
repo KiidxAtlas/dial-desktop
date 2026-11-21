@@ -99,7 +99,12 @@ impl Shared {
     }
 
     /// Run in `path` from now on: a fresh engine there (or the preview), remembered as recent.
-    fn open(&self, path: &Path, confirmed_from: Option<&str>) -> Result<Option<String>, String> {
+    fn open(
+        &self,
+        path: &Path,
+        confirmed_from: Option<&str>,
+        runner: &crate::app_runner::AppRunner,
+    ) -> Result<Option<String>, String> {
         let workspace = self.workspace(path);
         let mut inner = self.lock();
         let current = inner.workspace.as_ref().map(|w| w.root.as_str());
@@ -112,6 +117,9 @@ impl Shared {
             && (inner.tabs.protects_work() || terminals.has_shells())
         {
             return Ok(Some(root.to_owned()));
+        }
+        if let Some(root) = current {
+            runner.revoke_vm_launch(root);
         }
         let tab = match &self.source {
             Source::Preview(kind) => Tab::new(preview::model(*kind, &workspace.root), None),
@@ -476,6 +484,7 @@ fn forget_workspace(shared: State<'_, Shared>, path: String) -> bool {
 #[tauri::command]
 fn open_workspace(
     shared: State<'_, Shared>,
+    runner: State<'_, crate::app_runner::AppRunner>,
     path: String,
     confirmed_from: Option<String>,
 ) -> Result<Option<String>, String> {
@@ -484,7 +493,7 @@ fn open_workspace(
     if !path.is_dir() {
         return Err(format!("{} is not a folder", path.display()));
     }
-    shared.open(&path, confirmed_from.as_deref())
+    shared.open(&path, confirmed_from.as_deref(), &runner)
 }
 
 #[tauri::command]
@@ -753,6 +762,18 @@ async fn send_prompt(
         return Err("The prompt is empty".into());
     }
     attachments::check(&images, &inline_images)?;
+    // Pasted images go by path like chosen files: inline base64 pushed the request past the
+    // engine's 1 MiB RPC limit.
+    let mut images = images;
+    if !inline_images.is_empty() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        let dir = launcher::app_dir(home.as_deref())
+            .ok_or("Could not find a folder to save the pasted image in")?
+            .join("pasted-images");
+        images.extend(attachments::save_pasted(&dir, &inline_images)?);
+    }
     let reply = {
         let mut inner = shared.lock();
         check_session(&inner, &workspace_root, session_id.as_deref())?;
@@ -763,7 +784,7 @@ async fn send_prompt(
         tab.submit_prompt(Command::Send {
             text: text.to_owned(),
             images,
-            inline_images,
+            inline_images: Vec::new(),
         })?
     };
     rpc_reply(reply, None).await.map(|_| ())
@@ -997,6 +1018,8 @@ async fn fork_before(
     workspace_root: String,
     session_id: String,
     prompt: String,
+    occurrence: usize,
+    matches: usize,
 ) -> Result<String, String> {
     let launch = {
         let inner = shared.lock();
@@ -1008,9 +1031,11 @@ async fn fork_before(
             .launch(Path::new(&workspace_root))
             .ok_or(PREVIEW_NOTICE)?
     };
-    tauri::async_runtime::spawn_blocking(move || engine::fork_before(&launch, &session_id, &prompt))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::fork_before(&launch, &session_id, &prompt, occurrence, matches)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1288,14 +1313,22 @@ fn answer_question(
 
 /// The entries of folder `path` in the workspace (`""` for its root).
 #[tauri::command]
-async fn list_dir(shared: State<'_, Shared>, path: String) -> Result<Vec<DirEntryView>, String> {
-    files::list(&shared.root()?, &path)
+async fn list_dir(
+    shared: State<'_, Shared>,
+    path: String,
+    workspace_root: String,
+) -> Result<Vec<DirEntryView>, String> {
+    files::list(&panel_root(&shared, &workspace_root)?, &path)
 }
 
 /// File `path` in the workspace, for the viewer.
 #[tauri::command]
-async fn read_file(shared: State<'_, Shared>, path: String) -> Result<FileView, String> {
-    files::read(&shared.root()?, &path)
+async fn read_file(
+    shared: State<'_, Shared>,
+    path: String,
+    workspace_root: String,
+) -> Result<FileView, String> {
+    files::read(&panel_root(&shared, &workspace_root)?, &path)
 }
 
 /// The uncommitted changes of file `path` in the workspace.
@@ -1305,11 +1338,15 @@ async fn file_diff(
     path: String,
     workspace_root: String,
 ) -> Result<DiffView, String> {
+    files::diff(&panel_root(&shared, &workspace_root)?, &path)
+}
+
+fn panel_root(shared: &Shared, expected: &str) -> Result<PathBuf, String> {
     let root = shared.root()?;
-    if root != Path::new(&workspace_root) {
-        return Err("The project changed before the diff could load".into());
+    if root != Path::new(expected) {
+        return Err("The project changed before the file panel could load".into());
     }
-    files::diff(&root, &path)
+    Ok(root)
 }
 
 /// Fuzzy-search files inside the workspace for `@` mentions in the composer.
@@ -1447,7 +1484,23 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             browser::browser_navigate,
             browser::browser_go,
             browser::browser_inspect,
-            browser::browser_state
+            browser::browser_state,
+            crate::app_disk::app_runner_import,
+            crate::app_runner::app_runner_preferred_target,
+            crate::app_runner::host::app_runner_host,
+            crate::app_runner::host::app_runner_host_install,
+            crate::app_runner::installed::app_runner_vms,
+            crate::app_runner::app_runner_frame_bytes,
+            crate::app_runner::installed::app_runner_vm_grant,
+            crate::app_runner::installed::app_runner_vm_shutdown,
+            crate::app_runner::installed::app_runner_vm_ssh_link,
+            crate::app_runner::installed::app_runner_vm_ssh_setup,
+            crate::app_runner::app_runner_state,
+            crate::app_runner::app_runner_frame,
+            crate::app_runner::app_runner_start,
+            crate::app_runner::app_runner_stop,
+            crate::app_runner::app_runner_input,
+            crate::app_runner::app_runner_set_agent_access
         ])
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
@@ -1467,6 +1520,11 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 published: Mutex::new(Published::default()),
             });
             app.manage(Browser::default());
+            app.manage(crate::app_runner::AppRunner::new(
+                app.handle().clone(),
+                app.path().resource_dir()?,
+                app.path().app_data_dir()?,
+            ));
             // The agent's tools for the Browser panel (`agent_browser`); without them the panel
             // still works for the user.
             if let Some(file) = &endpoint
@@ -1475,7 +1533,11 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 eprintln!("dial-desktop: the agent's browser tools are off: {error}");
             }
             if let Some(path) = workspace {
-                app.state::<Shared>().open(&path, None)?;
+                app.state::<Shared>().open(
+                    &path,
+                    None,
+                    &app.state::<crate::app_runner::AppRunner>(),
+                )?;
             }
             let handle = app.handle().clone();
             thread::Builder::new()
@@ -1501,6 +1563,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         if let RunEvent::Exit = event
             && let Some(shared) = app.try_state::<Shared>()
         {
+            app.state::<crate::app_runner::AppRunner>().stop_all();
             shared.terminals().close_all();
             app.state::<crate::model_library::Downloads>().stop();
             if let Some(file) = &endpoint_on_exit {

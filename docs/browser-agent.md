@@ -56,6 +56,7 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 | `browser_wait(text?, timeout_ms?)` | Wait for text to show (up to 30 s) |
 | `browser_eval(script)` | Run a function body (async; `await` works) and return JSON |
 | `browser_screenshot()` | PNG of the panel, returned as an MCP image block |
+| `app_desktop(action, runId?, frameSeq?, token?, actions?)` | Launch graphical apps in a configured private guest or a connected VM. `state` checks readiness; `start` opens the guest in the App panel; `frame` returns the screen and a token; `input` runs a batch of up to 64 actions (`click` with `count`, `double_click`, `move`, `drag`, `scroll`, `press` with combos like `ctrl+c`, `type` with whole strings, `wait`) on that frame with one token and replies with the screen after it, plus the next token. Agent access is the user's switch in the App panel. |
 
 Reads, waits, scrolls and screenshots declare `readOnlyHint`, and the entry sets
 `trust_read_only_hint`, so they run without approval. Everything else follows the session's
@@ -66,6 +67,32 @@ approval mode.
 The panel opens on `browser_open` and shows each step. A "Dial: Clicking [4]" line sits above
 the page while a tool runs (`agent-browser` events, `workspace.agentActivity`). The user can take
 over at any time; it is one shared browser.
+
+## Native apps in the private guest
+
+When asked to launch a graphical app, the agent checks the private guest first; the user need not
+name the panel each time. If setup or project files are missing, explain what is needed. Do not
+download an image or fall back to the host. This guidance does not redirect ordinary shell commands.
+
+- **Start** (`app_desktop` `start`) opens a fresh guest with no network and no shares. The agent
+  holds Agent access from the first frame, and the App panel opens at once so the user sees it. The
+  agent cannot start a second run while one is open. Only the user's **Agent access** switch gives
+  or removes access; while it is off the agent gets no frame and no input.
+- **Input batches:** one `input` call carries a whole step (click a field, type a command with
+  `\n`, wait, press a combo). The batch is checked before anything is sent, runs in order, and
+  stops early if the user acts in the guest, turns access off, or the screen changes size; the
+  reply says how many actions ran. A token survives screen redraws until the next frame, a resize
+  or two minutes. `type` uses a US keyboard layout (printable ASCII, `\n`, `\t`).
+- **Project files** are never shared by an agent start. The user's own start in the App panel can
+  attach a read-only snapshot of committed HEAD (the share option), and only for that start.
+- **Guest target:** Omit `guestTarget` on `state` or `start` to use Windows on Windows, Linux on Linux, or a virtual Mac on Apple Silicon. Other hosts prefer the unlabelled QEMU disk. An explicit `default` always requests that unlabelled disk. `macos`, `linux`, and `windows` select only that target. A virtual Mac requires its own imported base and guest companion. Never substitute another guest or the host. Windows guest boot is unverified.
+- **Project recipe:** With an explicitly shared project containing a committed `.dial/app.json`, run `python3 -I DIAL-LAUNCH.py .` from the mounted project disc **inside the guest** (`py -3 -I DIAL-LAUNCH.py .` on Windows). A failure is not permission to download dependencies or run it on the host.
+
+### Using an existing VirtualBox or VMware VM
+
+Use `app_desktop` with `action: "state", guestTarget: "vm"` when asked to use an existing machine. The agent does not get the host's VM inventory. In **App → VM**, the user chooses a machine and can either connect personally and hand off control, or grant one agent launch. For the latter, send `action: "start", guestTarget: "vm", vmId: approvedVmId` using the ID returned by `state`. A grant for one project or machine does not authorize another. Only the local app UI can grant permission.
+
+Use the returned run ID with the usual `frame` and `input` actions. A VM already running is attached as it is, not restarted. No agent frame or input is allowed while Agent access is off. A user gesture voids the agent's outstanding token and stops a running batch, but does not change access. **Disconnect** releases the console; it does **not** stop the VM or revert disk writes. **Shut down** (user only, after a confirmation) disconnects and asks the guest OS to shut down gracefully (VirtualBox ACPI power button, VMware soft stop); it never forces power off. The VM's own network, clipboard and shared-folder settings still apply. Dial does not install a guest agent or add a host share.
 
 ## Safety
 

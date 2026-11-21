@@ -3,14 +3,15 @@
 
 import { reactive, watch } from "vue";
 import type { Entry, OpenSnapshot } from "./types";
-import { focusComposer, ui, type InspectorTab } from "./ui";
+import { focusComposer, ui, type InspectorTab, type LineRange } from "./ui";
+import { appRevealRequest, appRunnerApi } from "./appRunner";
 import { browserApi, showToast, snapshot } from "./bridge";
 import { draftFor } from "./drafts";
 
 const KEY = "dial.workspace";
 
 /** Panels that need room: the inspector widens while they show. */
-const WIDE: InspectorTab[] = ["files", "terminal", "browser"];
+const WIDE: InspectorTab[] = ["files", "terminal", "browser", "app"];
 export const MIN_WIDTH = 260;
 
 interface Prefs {
@@ -91,9 +92,16 @@ export function setInspectorWidth(width: number) {
 
 /** Show panel `tab` in the inspector. */
 export function showPanel(tab: InspectorTab) {
+  if (tab === "files") ui.fileLines = null;
   ui.settingsOpen = false;
   ui.inspectorOpen = true;
   ui.inspectorTab = tab;
+}
+
+export function showFile(path: string, lines: LineRange | null = null) {
+  ui.filePath = path;
+  showPanel("files");
+  ui.fileLines = lines;
 }
 
 /** Open `url` (an address or a search) in the browser panel. */
@@ -112,6 +120,25 @@ export async function followAgentBrowser(): Promise<() => void> {
     });
   } catch {
     // Outside Tauri there is no browser.
+    return () => {};
+  }
+}
+
+/**
+ * Reveal the App panel when the agent starts a guest for the open project, even if the panel was
+ * closed. Listens only to the reveal notification, never the frame stream, and checks the open
+ * project's root before showing anything.
+ */
+export async function followAgentApp(): Promise<() => void> {
+  try {
+    return await appRunnerApi.onReveal((event) => {
+      if (event.workspaceRoot !== snapshot.value?.workspace?.root) return;
+      // Select the target the agent booted, so the pane shows that run; without the field, nothing moves.
+      if (event.guestTarget) appRevealRequest.value = { workspaceRoot: event.workspaceRoot, guestTarget: event.guestTarget };
+      showPanel("app");
+    });
+  } catch {
+    // Outside Tauri there is no app runner.
     return () => {};
   }
 }
@@ -138,25 +165,33 @@ export function mention(path: string): string {
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 const LOCAL_URL =
   /\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|[a-z0-9-]+\.localhost)(?::\d{2,5})?(?:\/[^\s"'<>`)\]]*)?/gi;
+/** Tauri's own webview hosts: never a page to preview, even when a config file or log mentions them. */
+const INTERNAL_HOST = /^https?:\/\/(?:ipc|tauri|asset)\.localhost(?:[:/]|$)/i;
 
 /** The local addresses in `text`, in order and without repeats. */
 export function previewUrlsIn(text: string): string[] {
   const out: string[] = [];
   for (const match of text.replace(ANSI, "").matchAll(LOCAL_URL)) {
     let url = match[0].replace(/[.,;:!?]+$/, "").replace("://0.0.0.0", "://localhost");
+    if (INTERNAL_HOST.test(url)) continue;
     if (!/\/./.test(url.replace(/^https?:\/\//i, "")) && !url.endsWith("/")) url += "/";
     if (!out.includes(url)) out.push(url);
   }
   return out;
 }
 
-/** Local addresses in the session's tool output, oldest first. */
+/** A dev server announces its port ("Local: http://localhost:5173/"); a bare host in a file or log is not one. */
+function announcesPort(url: string): boolean {
+  return /^https?:\/\/[^/]*:\d{2,5}(?:\/|$)/i.test(url);
+}
+
+/** Local dev-server addresses in the session's tool output, oldest first. */
 export function previewUrls(entries: Entry[]): string[] {
   const out: string[] = [];
   for (const entry of entries) {
     if (entry.kind !== "tool") continue;
     const text = [entry.output?.text, entry.progress].filter(Boolean).join("\n");
-    for (const url of previewUrlsIn(text)) if (!out.includes(url)) out.push(url);
+    for (const url of previewUrlsIn(text)) if (announcesPort(url) && !out.includes(url)) out.push(url);
   }
   return out;
 }

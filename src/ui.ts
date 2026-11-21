@@ -2,7 +2,8 @@
 
 import { reactive } from "vue";
 
-export type InspectorTab = "plan" | "changes" | "activity" | "files" | "terminal" | "browser";
+export type InspectorTab = "plan" | "changes" | "activity" | "files" | "terminal" | "browser" | "app";
+export interface LineRange { start: number; end: number }
 
 /** Settings pages the desktop draws itself; `""` opens the usual first one. */
 export type SettingsTab =
@@ -32,6 +33,7 @@ export const ui = reactive({
   diffExpanded: false,
   /** The file open in the Files panel's viewer. */
   filePath: null as string | null,
+  fileLines: null as LineRange | null,
   /** Expanded tool calls and reasoning sections, by key. */
   expanded: new Set<string>(),
   /** The composer's model picker. */

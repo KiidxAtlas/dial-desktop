@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, watch } from "vue";
-import { engine, snapshot } from "./bridge";
+import { connect, connecting, engine, snapshot, startupError } from "./bridge";
 import { focusComposer, ui, type InspectorTab } from "./ui";
-import { goToSession, sessionOrder, stepSession } from "./sessionActions";
-import { followAgentBrowser, showPanel, trackPreviews } from "./workspace";
+import { copyText, goToSession, sessionOrder, stepSession } from "./sessionActions";
+import { followAgentApp, followAgentBrowser, showPanel, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -174,6 +174,7 @@ function onKey(event: KeyboardEvent) {
 }
 
 let stopFollowing: (() => void) | null = null;
+let stopFollowingApp: (() => void) | null = null;
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
   window.addEventListener("keyup", onKeyUp);
@@ -181,12 +182,14 @@ onMounted(async () => {
   restoreImage();
   startUpdateChecks();
   stopFollowing = await followAgentBrowser();
+  stopFollowingApp = await followAgentApp();
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", hideHints);
   stopFollowing?.();
+  stopFollowingApp?.();
 });
 </script>
 
@@ -213,6 +216,16 @@ onBeforeUnmount(() => {
     </Transition>
   </div>
   <Welcome v-else-if="snap" />
+  <div v-else-if="startupError" class="boot">
+    <section class="boot-error" aria-labelledby="boot-title">
+      <Logo :size="36" />
+      <h2 id="boot-title">Couldn’t connect to Dial</h2>
+      <p>Reconnect to load the current session. No prompt will be resent.</p>
+      <pre>{{ startupError }}</pre>
+      <button class="btn btn-primary" :disabled="connecting" @click="connect">{{ connecting ? 'Reconnecting…' : 'Reconnect' }}</button>
+      <button class="btn btn-secondary" @click="copyText(startupError, 'Error copied')">Copy error</button>
+    </section>
+  </div>
   <div v-else class="boot" data-tauri-drag-region>
     <Logo :size="40" />
   </div>
@@ -244,6 +257,11 @@ onBeforeUnmount(() => {
   height: 100%;
   display: grid;
   place-items: center;
+}
+.boot-error { max-width: min(38rem, 90vw); padding: 24px; }
+.boot-error pre { max-height: 30vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.boot-error button + button { margin-left: 8px; }
+.boot > :only-child:not(.boot-error) {
   animation: pulse 1.6s ease-in-out infinite;
 }
 .slide-enter-active,

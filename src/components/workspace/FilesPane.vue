@@ -4,7 +4,7 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { files as fileActions, showToast, workspaceFiles } from "../../bridge";
 import { openMenu, ui, type MenuItem } from "../../ui";
-import { addToPrompt, mention } from "../../workspace";
+import { addToPrompt, mention, showFile } from "../../workspace";
 import type { DirEntry, FileView, OpenSnapshot } from "../../types";
 import CodeBlock from "../CodeBlock.vue";
 import Icon from "../Icon.vue";
@@ -14,7 +14,8 @@ const props = defineProps<{ snap: OpenSnapshot }>();
 /** Loaded folders' entries, by relative path (`""` is the root). */
 const children = reactive(new Map<string, DirEntry[]>());
 const expanded = reactive(new Set<string>());
-const loading = reactive(new Set<string>());
+const loading = reactive(new Map<string, number>());
+let request = 0, fileRequest = 0;
 const filter = ref("");
 const file = ref<FileView | null>(null);
 const fileError = ref<string | null>(null);
@@ -32,13 +33,16 @@ function lang(path: string): string {
 }
 
 async function load(path: string) {
-  loading.add(path);
+  const root = props.snap.workspace.root, id = ++request;
+  loading.set(path, id);
+  const current = () => props.snap.workspace.root === root && loading.get(path) === id;
   try {
-    children.set(path, await workspaceFiles.list(path));
+    const entries = await workspaceFiles.list(path, root);
+    if (current()) children.set(path, entries);
   } catch (error) {
-    showToast(String(error));
+    if (current()) showToast(String(error));
   } finally {
-    loading.delete(path);
+    if (current()) loading.delete(path);
   }
 }
 
@@ -50,13 +54,15 @@ function toggle(entry: DirEntry) {
 
 async function openFile(path: string) {
   const root = props.snap.workspace.root;
-  ui.filePath = path;
+  const id = ++fileRequest;
+  const current = () => id === fileRequest && ui.filePath === path && props.snap.workspace.root === root;
+  if (file.value?.path !== path) file.value = null;
   fileError.value = null;
   try {
-    const result = await workspaceFiles.read(path);
-    if (ui.filePath === path && props.snap.workspace.root === root) file.value = result;
+    const result = await workspaceFiles.read(path, root);
+    if (current()) file.value = result;
   } catch (error) {
-    if (ui.filePath !== path || props.snap.workspace.root !== root) return;
+    if (!current()) return;
     file.value = null;
     fileError.value = String(error);
   }
@@ -66,8 +72,8 @@ async function openFile(path: string) {
 async function refresh() {
   const open = ["", ...expanded];
   children.clear();
-  await Promise.all(open.map(load));
-  if (ui.filePath) await openFile(ui.filePath);
+  loading.clear();
+  await Promise.all([...open.map(load), ui.filePath && openFile(ui.filePath)]);
 }
 
 /** The visible rows: open folders' entries, depth-first. */
@@ -113,6 +119,10 @@ watch(
   () => props.snap.workspace.root,
   () => {
     children.clear();
+    loading.clear();
+    fileRequest++;
+    fileError.value = null;
+    ui.fileLines = null;
     expanded.clear();
     file.value = null;
     ui.filePath = null;
@@ -120,11 +130,22 @@ watch(
   },
 );
 
-// Refresh what is shown after Dial changes files.
-watch(
-  () => props.snap.changes.length,
-  () => void refresh(),
-);
+// Each settled tool result advances its paths' revisions, including repeat edits.
+watch(() => props.snap.changes, (changes, previous) => {
+  const old = new Map(previous.map(c => [c.path, c]));
+  const affected = [...changes.filter(c => old.get(c.path)?.revision !== c.revision),
+    ...previous.filter(c => !changes.some(next => next.path === c.path))];
+  const folders = new Set<string>();
+  for (const c of affected) {
+    const path = (c.dir + c.name).replaceAll('\\', '/');
+    if (path === ui.filePath) void openFile(path);
+    // Refresh the nearest visible parent, including when a new subtree was created.
+    let dir = path.split('/').slice(0, -1).join('/');
+    while (dir && !expanded.has(dir)) dir = dir.split('/').slice(0, -1).join('/');
+    folders.add(dir);
+  }
+  for (const dir of folders) void load(dir);
+});
 watch(() => ui.filePath, path => { if (path) void openFile(path); });
 
 onMounted(() => {
@@ -132,12 +153,11 @@ onMounted(() => {
   if (ui.filePath) void openFile(ui.filePath);
 });
 
-defineExpose({ openFile });
 </script>
 
 <template>
   <div class="files">
-    <div class="tree">
+    <div v-if="!ui.fileLines" class="tree">
       <div class="tree-head">
         <input v-model="filter" class="filter" placeholder="Filter open folders" spellcheck="false" />
         <button class="icon-btn" title="Refresh" @click="refresh">
@@ -153,7 +173,7 @@ defineExpose({ openFile });
           :class="{ on: !entry.dir && entry.path === ui.filePath }"
           :style="{ paddingLeft: `${6 + depth * 12}px` }"
           :title="entry.path"
-          @click="entry.dir ? toggle(entry) : (ui.filePath = entry.path)"
+          @click="entry.dir ? toggle(entry) : showFile(entry.path)"
           @contextmenu="menu($event, entry)"
         >
           <Icon
@@ -169,9 +189,14 @@ defineExpose({ openFile });
       </div>
     </div>
 
-    <div class="viewer">
+    <div class="viewer" :class="{ reader: ui.fileLines }">
+      <div v-if="ui.fileLines" class="reader-head">
+        <button class="btn btn-secondary" @click="ui.fileLines = null">Browse files</button>
+        <span class="mono truncate" :title="ui.filePath ?? ''">{{ ui.filePath }}</span>
+        <span class="faint">{{ ui.fileLines.end === ui.fileLines.start ? `line ${ui.fileLines.start}` : `lines ${ui.fileLines.start}–${ui.fileLines.end}` }}</span>
+      </div>
       <template v-if="file">
-        <div class="viewer-head">
+        <div v-if="!ui.fileLines" class="viewer-head">
           <span class="mono truncate" :title="file.path">{{ file.path }}</span>
           <span class="faint">{{ size(file.size) }}</span>
           <button class="icon-btn" title="Mention in prompt" @click="addToPrompt(mention(file.path))">
@@ -186,7 +211,7 @@ defineExpose({ openFile });
           <span>It cannot be shown as text.</span>
         </div>
         <div v-else class="code">
-          <CodeBlock :caption="lang(file.path) || 'text'" :text="file.text" :lang="lang(file.path)" :max-height="100000" />
+          <CodeBlock :caption="lang(file.path) || 'text'" :text="file.text" :lang="lang(file.path)" :max-height="100000" :lines="ui.fileLines" />
           <div v-if="file.truncated" class="faint pad">Only the first 512 KB are shown.</div>
         </div>
       </template>
@@ -209,6 +234,8 @@ defineExpose({ openFile });
   min-height: 0;
   gap: 10px;
 }
+.viewer.reader { padding: 0; border: 0; }
+.reader-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; font-size: var(--text-sm); }
 .tree {
   width: 42%;
   max-width: 260px;

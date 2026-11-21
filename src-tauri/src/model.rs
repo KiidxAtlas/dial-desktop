@@ -137,7 +137,7 @@ pub struct ModelOption {
     pub label: String,
     pub context_window: Option<u64>,
     pub reasoning: bool,
-    pub vision: bool,
+    pub vision: Option<bool>,
     /// Configured by the user: the main model, a favorite, a profile or a role.
     pub configured: bool,
     /// Discovered in a downloaded local model store.
@@ -165,7 +165,7 @@ impl ModelOption {
                 .to_owned(),
             context_window: value["context_window"].as_u64(),
             reasoning: value["reasoning"].as_bool().unwrap_or_default(),
-            vision: value["vision"].as_bool().unwrap_or_default(),
+            vision: value["vision"].as_bool(),
             configured,
             local: sources.iter().any(|source| source == "local"),
         })
@@ -470,16 +470,18 @@ impl Model {
             .unwrap_or_else(|| "New session".to_owned())
     }
 
-    /// Paths changed by settled tool calls, first change first, without duplicates.
-    pub fn changed_paths(&self) -> Vec<String> {
-        let mut paths: Vec<String> = Vec::new();
+    /// Paths changed by settled tool calls, first change first, with a per-file revision.
+    pub fn changed_paths(&self) -> Vec<(String, usize)> {
+        let mut paths: Vec<(String, usize)> = Vec::new();
         for entry in self.conversation.entries() {
             if let Entry::Tool(tool) = entry
                 && let Some(result) = &tool.result
             {
                 for path in &result.changed_paths {
-                    if !paths.contains(path) {
-                        paths.push(path.clone());
+                    if let Some((_, revision)) = paths.iter_mut().find(|(name, _)| name == path) {
+                        *revision += 1;
+                    } else {
+                        paths.push((path.clone(), 1));
                     }
                 }
             }

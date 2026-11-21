@@ -789,20 +789,23 @@ dependencies = [
 
 [[package]]
 name = "dial-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "block2",
  "dial-client",
+ "libc",
  "mac-usernotifications",
  "notify-rust",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-web-kit",
+ "png",
  "portable-pty",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -810,6 +813,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tauri-winrt-notification",
+ "tempfile",
  "tokio",
 ]
 

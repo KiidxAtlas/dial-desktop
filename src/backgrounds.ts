@@ -4,6 +4,7 @@
 
 import { computed, reactive, ref, watch } from "vue";
 import { hexSwarm, stackRain, traceRoute } from "./asciiBackgrounds";
+import { crabBeach } from "./crabBeach";
 import { koiPond } from "./koiPond";
 import { files, showToast } from "./bridge";
 
@@ -37,7 +38,7 @@ export interface BackgroundPrefs {
 }
 
 export const MAX_DIM = 0.9;
-export const DEFAULT_PREFS: BackgroundPrefs = { id: "warp", path: null, dim: 0.62, placement: "always", motion: true };
+export const DEFAULT_PREFS: BackgroundPrefs = { id: "warp", path: null, dim: 0.62, placement: "empty", motion: true };
 const STORAGE_KEY = "dial.background";
 
 // ---------------------------------------------------------------------------------------------
@@ -560,6 +561,7 @@ export const PRESETS: Preset[] = [
   { id: "hex-swarm", name: "Hex Swarm", paint: hexSwarm, moving: true },
   { id: "stack-rain", name: "Stack Rain", paint: stackRain, moving: true },
   { id: "koi-pond", name: "Koi Pond", paint: koiPond, moving: true },
+  { id: "crab-beach", name: "Crab Beach", paint: crabBeach, moving: true },
 ];
 
 // ---------------------------------------------------------------------------------------------

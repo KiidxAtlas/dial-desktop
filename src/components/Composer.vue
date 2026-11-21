@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
 import { engine, files, showToast, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
-import { ui } from "../ui";
+import { openMenu, ui } from "../ui";
 import { draftFor } from "../drafts";
 import { canCompact, promptHistory } from "../sessionActions";
 import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
@@ -20,11 +20,14 @@ import ApprovalMenu from "./ApprovalMenu.vue";
 import QuestionCard from "./QuestionCard.vue";
 import ContextMeter from "./ContextMeter.vue";
 import VoicePanel from "./VoicePanel.vue";
-import ModesMenu from "./ModesMenu.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
 const draft = computed(() => draftFor(props.snap));
+const visibleText = computed({
+  get: () => draft.value.submitting ? "" : draft.value.text,
+  set: (text: string) => { if (!draft.value.submitting) draft.value.text = text; },
+});
 const approvalMenu = ref<InstanceType<typeof ApprovalMenu> | null>(null);
 const queue = computed(() => queueFor(props.snap));
 const selected = ref(0);
@@ -62,10 +65,10 @@ function pickPath(path: string) {
 }
 
 /** Slash commands: the terminal's, run the desktop way (see `slashCommands.ts`), plus task recipes. */
-const modesMenu = ref<InstanceType<typeof ModesMenu> | null>(null);
+const modelPicker = ref<InstanceType<typeof ModelPicker> | null>(null);
 const allCommands = computed<SlashCommand[]>(() => [
   ...slashCommands(
-    { snap: props.snap, showApprovals: () => approvalMenu.value?.show(), showModes: () => modesMenu.value?.show() },
+    { snap: props.snap, showApprovals: () => approvalMenu.value?.show(), showModes: () => modelPicker.value?.showModes() },
     engineCommands.value,
   ),
   ...(canUseTaskRecipes(props.snap)
@@ -187,6 +190,7 @@ async function send() {
   }
   const images = [...target.attachments];
   target.sending = true;
+  target.submitting = true;
   try {
     const scope = { workspaceRoot: props.snap.workspace.root, sessionId: props.snap.sessionId };
     const accepted = steering.value ? await engine.steer(text, scope) : await engine.send(text, images, scope);
@@ -195,6 +199,7 @@ async function send() {
     const sentKeys = new Set(images.map((a) => a.key));
     target.attachments = target.attachments.filter((a) => !sentKeys.has(a.key));
   } finally {
+    target.submitting = false;
     target.sending = false;
     if (target === draft.value) focus();
   }
@@ -210,9 +215,19 @@ async function chooseImages() {
   if (target === draft.value) focus();
 }
 
+function attachmentMenu(event: MouseEvent) {
+  if (props.snap.platform !== 'macos') return void chooseImages();
+  openMenu(event, [
+    { label: 'Choose image files…', run: chooseImages },
+    { label: 'Paste image from clipboard', run: () => attachments.addNativeClipboardImage(draft.value) },
+  ], event.currentTarget as HTMLElement);
+}
+
 /** Attach clipboard images without interfering with normal text paste. */
 function onPaste(event: ClipboardEvent) {
-  if (!imagesAllowed.value) return;
+  const el = event.target;
+  const inTranscript = el instanceof HTMLElement && !!el.closest('.main .scroller') && !el.closest('input, textarea, [contenteditable=true]');
+  if (el !== input.value && !inTranscript || ui.settingsOpen || ui.paletteOpen || ui.shortcutsOpen || draft.value.sending) return;
   const clipboard = event.clipboardData;
   const images = Array.from(clipboard?.files ?? []).filter((f) => f.type.startsWith("image/"));
   if (!images.length) {
@@ -223,11 +238,18 @@ function onPaste(event: ClipboardEvent) {
     }
   }
   const target = draft.value;
-  if (images.length) {
+  if (images.length && !imagesAllowed.value) {
+    event.preventDefault();
+    return showToast(`${props.snap.model?.label ?? 'This model'} does not take images. Choose a vision model to attach a screenshot.`);
+  }
+  const native = event.isTrusted && props.snap.platform === 'macos' && imagesAllowed.value;
+  if (native && images.length && images.every(f => /^image\/(?:x-)?tiff?$/i.test(f.type))) {
+    event.preventDefault();
+    void attachments.addNativeClipboardImage(target);
+  } else if (images.length) {
     event.preventDefault();
     void attachments.addBlobs(target, images);
-  } else if (event.isTrusted && !clipboard?.getData("text/plain")) {
-    // WKWebView can omit native clipboard images from both DOM lists.
+  } else if (native && !clipboard?.getData('text/plain')) {
     void attachments.addNativeClipboardImage(target);
   }
 }
@@ -236,6 +258,7 @@ function onPaste(event: ClipboardEvent) {
 let unlistenDrop: (() => void) | null = null;
 let unmounted = false;
 onMounted(async () => {
+  document.addEventListener('paste', onPaste);
   const unlisten = await getCurrentWebview()
     .onDragDropEvent(({ payload }) => {
       dropping.value = imagesAllowed.value && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
@@ -251,6 +274,7 @@ onMounted(async () => {
   else unlistenDrop = unlisten;
 });
 onUnmounted(() => {
+  document.removeEventListener('paste', onPaste);
   unmounted = true;
   unlistenDrop?.();
 });
@@ -321,7 +345,7 @@ function decide(decision: Decision) {
   engine.approve(approval.value.approvalId, oneTime.value && decision !== "deny" ? "allow" : decision);
 }
 
-watch(() => draft.value.text, () => { selected.value = 0; nextTick(resize); });
+watch(visibleText, () => { selected.value = 0; nextTick(resize); });
 watch(() => ui.focusComposer, focus);
 onMounted(focus);
 </script>
@@ -392,7 +416,7 @@ onMounted(focus);
           </button>
           <div class="slash-foot"><kbd>↑</kbd><kbd>↓</kbd> choose <kbd>Tab</kbd> insert <kbd>Esc</kbd> dismiss</div>
         </div>
-        <div v-if="draft.attachments.length" class="thumbs" @click.stop>
+        <div v-if="!draft.submitting && draft.attachments.length" class="thumbs" @click.stop>
           <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
             <img :src="a.url" :alt="a.name" />
             <button class="remove" :aria-label="`Remove ${a.name}`" :title="`Remove ${a.name}`" @click="draft.attachments = draft.attachments.filter((image) => image.key !== a.key)">
@@ -402,15 +426,14 @@ onMounted(focus);
         </div>
         <textarea
           ref="input"
-          v-model="draft.text"
+          v-model="visibleText"
           aria-label="Prompt"
           rows="2"
           spellcheck="true"
-          :placeholder="snap.turnRunning ? 'Add a note for Dial while it works…' : 'How can I help you today?'"
+          :placeholder="draft.submitting ? 'Sending…' : snap.turnRunning ? 'Add a note for Dial while it works…' : snap.entries.length ? 'Message Dial…' : 'What would you like to do in this project?'"
           :readonly="draft.sending"
           @keydown="onKey"
           @input="trackCaret" @click="trackCaret" @select="trackCaret" @keyup.left="trackCaret" @keyup.right="trackCaret"
-          @paste="onPaste"
         />
         <div class="bar" @click.stop>
           <button
@@ -418,16 +441,15 @@ onMounted(focus);
             :disabled="!imagesAllowed"
             aria-label="Attach images"
             :title="imagesAllowed ? 'Attach images (or paste / drop them)' : `${snap.model?.label ?? 'This model'} does not take images`"
-            @click="chooseImages"
+            @click="attachmentMenu"
           >
             <Icon name="image" :size="15" />
           </button>
-          <ModelPicker :snap="snap" />
+          <ModelPicker ref="modelPicker" :snap="snap" />
           <ApprovalMenu ref="approvalMenu" :snap="snap" />
-          <ModesMenu ref="modesMenu" :snap="snap" />
           <span class="grow" />
           <span v-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
-          <span v-else-if="hasContent && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> {{ snap.turnRunning ? 'note' : 'send' }} <kbd>⇧ Enter</kbd> new line</span>
+          <span v-else-if="!draft.sending && !snap.turnRunning && hasContent && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> send <kbd>⇧ Enter</kbd> new line</span>
           <ContextMeter
             v-if="snap.context"
             :context="snap.context"
@@ -444,19 +466,20 @@ onMounted(focus);
           >
             <Icon name="mic" :size="16" />
           </button>
-          <button v-if="snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" title="Queue for the next turn (⌘/Ctrl+Enter)" @click="queueDraft">Queue</button>
+          <button v-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" title="Queue for the next turn (⌘/Ctrl+Enter)" @click="queueDraft">Queue for next turn</button>
           <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="markTurnAborted(snap); engine.abort()">
             <Icon name="stop" :size="14" />
           </button>
           <button
             v-if="!snap.turnRunning || steering"
             class="send"
+            :class="{ labeled: steering }"
             :disabled="!canSend"
             :title="snap.turnRunning ? 'Send note (Enter)' : 'Send (Enter)'"
-            :aria-label="snap.turnRunning ? 'Send note' : 'Send'"
+            :aria-label="snap.turnRunning ? 'Send note now' : 'Send'"
             @click.stop="send"
           >
-            <Icon name="arrowUp" :size="16" />
+            <span v-if="steering">Send note now</span><Icon v-else name="arrowUp" :size="16" />
           </button>
         </div>
       </div>
@@ -755,6 +778,7 @@ textarea::placeholder {
 }
 .bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   margin: 8px 0 0 -10px;
@@ -773,6 +797,7 @@ textarea::placeholder {
     opacity 120ms var(--ease),
     transform 90ms var(--ease);
 }
+.send.labeled { width: auto; padding: 0 10px; font-size: var(--text-sm); }
 .send:active:not(:disabled) {
   transform: scale(0.92);
 }

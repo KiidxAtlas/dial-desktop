@@ -80,8 +80,9 @@ export function highlight(code: string, lang: string): string | null {
 
 /** A code block with a header (`label`, default the language, and a copy button). `plain` skips
  * highlighting, for a block that is still being written. */
-export function codeBlock(code: string, lang: string, label = lang.trim() || "text", plain = false): string {
-  const body = (plain ? null : highlight(code, lang)) ?? `<pre class="plain"><code>${escape(code)}</code></pre>`;
+export function codeBlock(code: string, lang: string, label = lang.trim() || "text", plain = false, lineAnchors = false): string {
+  const body = (plain ? null : highlight(code, lang)) ?? `<pre class="plain"><code>${lineAnchors
+    ? code.split("\n").map(line => `<span class="line">${escape(line)}</span>`).join("\n") : escape(code)}</code></pre>`;
   return `<div class="code-block"><div class="code-head"><span>${escape(label)}</span><button type="button" class="copy" data-copy>Copy</button></div>${body}</div>`;
 }
 

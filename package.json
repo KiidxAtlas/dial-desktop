@@ -1,15 +1,15 @@
 {
   "name": "dial-desktop",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev:web": "vite",
     "build:web": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
-    "tauri": "tauri",
+    "tauri": "node packaging/macos-guest/tauri.mjs",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "node packaging/macos-guest/tauri.mjs build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

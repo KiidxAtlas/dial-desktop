@@ -40,7 +40,7 @@ preview-question: node_modules ## Design preview waiting on a question
 	npm run dev -- -- -- --preview=question $(or $(DIR),$(CURDIR))
 
 app: node_modules ## Build the debug app (no bundle)
-	npx tauri build --debug --no-bundle
+	node packaging/macos-guest/tauri.mjs build --debug --no-bundle
 
 open: ## Launch the built debug app: make open DIR=~/code/app
 	@test -x $(DEBUG_BIN) || { echo "No build yet; run 'make app' first"; exit 1; }

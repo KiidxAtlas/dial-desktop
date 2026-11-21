@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/macos-guest/dial-mac-guest": "macos-guest/dial-mac-guest",
+      "resources/macos-guest/dial-mac-prepare": "macos-guest/dial-mac-prepare",
+      "resources/macos-guest/dial-tools.iso": "macos-guest/dial-tools.iso"
+    }
+  }
+}

@@ -3,8 +3,7 @@
 import { computed, ref, watch } from "vue";
 import { diffHunks, type DiffHunk } from "../../diff";
 import { showToast, workspaceFiles } from "../../bridge";
-import { ui } from "../../ui";
-import { addToPrompt, mention, showPanel } from "../../workspace";
+import { addToPrompt, mention, showFile } from "../../workspace";
 import type { DiffView } from "../../types";
 import Icon from "../Icon.vue";
 
@@ -47,8 +46,7 @@ const baseLabel = computed(() => {
 const relative = computed(() => view.value?.path ?? props.path.replace(`${props.root}/`, ""));
 
 function openInFiles() {
-  ui.filePath = relative.value;
-  showPanel("files");
+  showFile(relative.value);
 }
 
 watch(() => [props.root, props.path], () => {

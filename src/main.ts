@@ -3,16 +3,15 @@ import App from "./App.vue";
 import { connect, openExternal, showToast, snapshot } from "./bridge";
 import { loadHighlighter } from "./markdown";
 import { startAppearance } from "./appearance";
-import { openInBrowser, previewUrlsIn, showPanel } from "./workspace";
+import { openInBrowser, previewUrlsIn, showFile } from "./workspace";
 import { IMAGE_EXT, viewImage } from "./imageViewer";
-import { ui } from "./ui";
 import { startNotifications } from "./notifications";
 import "./styles.css";
 
 startAppearance();
 createApp(App).mount("#app");
 
-connect().catch((error) => showToast(`Could not reach the app: ${error}`));
+void connect();
 startNotifications().catch((error) => showToast(`Could not initialize notifications: ${error}`));
 loadHighlighter().catch((error) => console.warn("syntax highlighting unavailable", error));
 
@@ -59,8 +58,9 @@ function openProjectFile(href: string) {
   if (path.startsWith(`${root}/`)) path = path.slice(root.length + 1);
   path = path.replace(/^\.\//, "");
   if (!path) return;
-  ui.filePath = path;
-  showPanel("files");
+  const match = /#L([1-9]\d*)(?:-L([1-9]\d*))?$/.exec(href);
+  const start = Number(match?.[1]), end = Number(match?.[2] ?? start);
+  showFile(path, Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start ? { start, end } : null);
 }
 
 // Copy buttons in rendered code blocks.

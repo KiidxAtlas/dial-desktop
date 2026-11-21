@@ -1,24 +1,32 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, watch } from "vue";
 import type { OpenSnapshot, ToolEntry } from "../types";
-import { ui, type InspectorTab } from "../ui";
-import { addToPrompt, inspectorWidth, mention, setInspectorWidth } from "../workspace";
+import { openMenu, ui, type InspectorTab } from "../ui";
+import { addToPrompt, inspectorWidth, mention, setInspectorWidth, showPanel } from "../workspace";
 import Icon from "./Icon.vue";
 import BrowserPane from "./workspace/BrowserPane.vue";
 import DiffPane from "./workspace/DiffPane.vue";
 import FilesPane from "./workspace/FilesPane.vue";
 import TerminalPane from "./workspace/TerminalPane.vue";
+import AppPane from "./workspace/AppPane.vue";
 
 const props = defineProps<{ snap: OpenSnapshot; open: boolean }>();
 
-const TABS: { id: InspectorTab; label: string; icon: "list" | "diff" | "activity" | "files" | "terminal" | "globe" }[] = [
+const TABS: { id: InspectorTab; label: string; icon: "list" | "diff" | "activity" | "files" | "terminal" | "globe" | "monitor" }[] = [
   { id: "plan", label: "Plan", icon: "list" },
   { id: "changes", label: "Changes", icon: "diff" },
   { id: "activity", label: "Activity", icon: "activity" },
   { id: "files", label: "Files", icon: "files" },
   { id: "terminal", label: "Terminal", icon: "terminal" },
   { id: "browser", label: "Browser", icon: "globe" },
+  { id: "app", label: "App", icon: "monitor" },
 ];
+const auxiliary = TABS.slice(2);
+const modifier = navigator.platform.includes("Mac") ? "⌘" : "Ctrl+";
+const hints: Partial<Record<InspectorTab, string>> = { files: `${modifier}⇧E`, terminal: 'Ctrl+`', browser: `${modifier}⇧B` };
+function panelMenu(event: MouseEvent) {
+  openMenu(event, auxiliary.map(tab => ({ label: tab.label, icon: tab.icon, hint: hints[tab.id], run: () => showPanel(tab.id) })), event.currentTarget as HTMLElement);
+}
 
 /** Heavy panels mount on first visit and stay mounted, so a shell or a page survives tab switches. */
 const visited = reactive(new Set<InspectorTab>());
@@ -90,25 +98,25 @@ function startResize(event: PointerEvent) {
   <aside class="inspector" :class="{ 'wide-review': expanded }" :style="{ '--inspector-width': `${width}px` }">
     <div v-if="!expanded" class="resize" title="Drag to resize" @pointerdown="startResize" />
     <div class="drag" data-tauri-drag-region />
-    <div class="tabs" role="tablist">
+    <div class="tabs" role="group" aria-label="Workspace panels">
       <button
-        v-for="tab in TABS"
+        v-for="tab in TABS.slice(0, 2)"
         :key="tab.id"
-        role="tab"
         :title="tab.label"
         :aria-label="tab.label"
-        :aria-selected="ui.inspectorTab === tab.id"
+        :aria-pressed="ui.inspectorTab === tab.id"
         :class="{ active: ui.inspectorTab === tab.id }"
         @click="ui.inspectorTab = tab.id"
       >
-        <Icon :name="tab.icon" :size="14" />
-        <span v-if="ui.inspectorTab === tab.id">{{ tab.label }}</span>
-        <span v-else-if="tab.id === 'changes' && snap.changes.length" class="badge">{{ snap.changes.length }}</span>
-        <span v-else-if="tab.id === 'activity' && snap.stats.running" class="live" />
+        {{ tab.label }}
+        <span v-if="tab.id === 'changes' && snap.changes.length" class="badge">{{ snap.changes.length }}</span>
+      </button>
+      <button aria-haspopup="menu" :class="{ active: auxiliary.some(t => t.id === ui.inspectorTab) }" @click="panelMenu">
+        {{ auxiliary.find(t => t.id === ui.inspectorTab)?.label ?? 'Panels' }} <Icon name="chevronDown" :size="12" />
       </button>
     </div>
 
-    <div v-show="['files', 'terminal', 'browser'].includes(ui.inspectorTab)" class="panel">
+    <div v-show="['files', 'terminal', 'browser', 'app'].includes(ui.inspectorTab)" class="panel">
       <FilesPane v-if="visited.has('files')" v-show="ui.inspectorTab === 'files'" :snap="snap" />
       <TerminalPane
         v-if="visited.has('terminal')"
@@ -117,6 +125,7 @@ function startResize(event: PointerEvent) {
         :active="shown('terminal')"
       />
       <BrowserPane v-if="visited.has('browser')" v-show="ui.inspectorTab === 'browser'" :active="shown('browser')" />
+      <AppPane v-if="visited.has('app')" v-show="ui.inspectorTab === 'app'" :root="snap.workspace.root" :active="shown('app')" />
     </div>
 
     <div v-if="ui.inspectorTab === 'changes' && ui.diffPath" class="panel">

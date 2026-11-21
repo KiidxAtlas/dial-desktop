@@ -20,6 +20,17 @@ import { runSummary, toolRuns, type ToolRun } from "../toolFolds";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const reviews = computed(() => turnReviews(props.snap.entries, props.snap.turnRunning));
+function forkAt(index: number, prompt: string) {
+  const snap = props.snap;
+  if (!snap.sessionId) return;
+  let occurrence = 0, matches = 0;
+  for (const [i, entry] of snap.entries.entries()) {
+    if (entry.kind !== 'user' || entry.text !== prompt) continue;
+    matches++;
+    if (i === index) occurrence = matches;
+  }
+  void engine.forkBefore(snap.workspace.root, snap.sessionId, prompt, occurrence, matches);
+}
 function evidence(index: number, key: string) {
   pinned.value = false;
   ui.expanded.add(key);
@@ -370,7 +381,7 @@ function failedIn(run: ToolRun) {
               <button class="act" title="Copy" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
               </button>
-              <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" @click="engine.forkBefore(snap.workspace.root, snap.sessionId, entry.text)"><Icon name="duplicate" :size="14" /></button>
+              <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" @click="forkAt(index, entry.text)"><Icon name="duplicate" :size="14" /></button>
               <template v-if="index === lastUser && undoable">
                 <button class="act" title="Edit: undo this turn and put the prompt back in the box" @click="editLastPrompt(snap)">
                   <Icon name="pencil" :size="14" />
@@ -439,15 +450,20 @@ function failedIn(run: ToolRun) {
           <summary>
             <Icon class="review-chevron" name="chevronRight" :size="12" />
             <span>Turn review</span>
-            <span class="pill">{{ review.files.length === 1 ? "1 file" : `${review.files.length} files` }}</span>
-            <span class="pill" :class="{ warn: !review.checks.length }">{{ review.checks.length === 1 ? "1 check" : review.checks.length ? `${review.checks.length} checks` : "unverified" }}</span>
+            <span class="review-counts">{{ review.files.length }} {{ review.files.length === 1 ? 'file' : 'files' }} · {{ review.checks.length ? `${review.checks.length} ${review.checks.length === 1 ? 'check' : 'checks'}` : 'No checks' }}</span>
           </summary>
-          <p v-if="!review.checks.length">No explicit verification recorded.</p>
-          <div v-for="call in review.checks" :key="call.tool.key">
-            <button class="btn btn-secondary" @click="evidence(call.index, call.tool.key)">{{ call.tool.target || call.tool.label }} · {{ call.tool.state === 'running' ? 'unknown' : call.tool.state }} → output</button>
-          </div>
+          <section class="review-section">
+            <h4>Checks</h4>
+            <p v-if="!review.checks.length">No verification recorded.</p>
+            <button v-for="call in review.checks" :key="call.tool.key" class="check-row" title="Show recorded output" @click="evidence(call.index, call.tool.key)">
+              <span class="check-target">{{ call.tool.target || call.tool.label }}</span>
+              <span class="check-state" :class="call.tool.state">{{ call.tool.state === 'running' ? 'unknown' : call.tool.state }}</span>
+              <Icon name="chevronRight" :size="12" />
+            </button>
+          </section>
+          <section v-if="review.files.length" class="review-section"><h4>Files</h4>
           <details v-for="file in review.files" :key="file.path">
-            <summary>{{ file.path }}</summary>
+            <summary :title="file.path"><Icon class="review-chevron" name="chevronRight" :size="12" />{{ file.path.startsWith(snap.workspace.root + '/') ? file.path.slice(snap.workspace.root.length + 1) : file.path }}</summary>
             <div v-for="call in file.calls" :key="call.tool.key">
               <CodeBlock v-if="call.tool.output?.caption === 'diff' && call.tool.changedPaths.length === 1" caption="Recorded change · this turn" :text="call.tool.output.text" lang="diff" :max-height="280" />
               <p v-else>No separate recorded patch for this file.</p>
@@ -455,6 +471,7 @@ function failedIn(run: ToolRun) {
             </div>
             <button class="btn btn-secondary" @click="workingTree(file.path)">Compare current working tree</button>
           </details>
+          </section>
         </details>
       </template>
 
@@ -490,8 +507,13 @@ function failedIn(run: ToolRun) {
   color: var(--text-muted);
   font-size: var(--text-sm);
 }
-.turn-review[open] { padding-bottom: 8px; }
-.turn-review > :not(summary) { margin-left: 12px; margin-right: 12px; }
+.review-section { padding: 8px 12px; border-top: 1px solid var(--border); min-width: 0; }
+.review-section h4 { margin: 0 0 4px; font-size: inherit; font-weight: 600; }
+.review-section p { margin: 4px 0; }
+.review-counts { margin-left: auto; color: var(--text-muted); }
+.check-row { display: flex; width: 100%; align-items: baseline; gap: 8px; text-align: left; padding: 5px 0; }
+.check-target { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: var(--font-mono); }
+.check-state.succeeded { color: var(--success); } .check-state.failed { color: var(--danger); }
 .turn-review summary {
   display: flex;
   align-items: center;
@@ -504,12 +526,12 @@ function failedIn(run: ToolRun) {
 }
 .turn-review summary::-webkit-details-marker { display: none; }
 .turn-review summary:hover { background: var(--hover); color: var(--text); }
-.review-chevron { color: var(--text-faint); transition: transform 140ms var(--ease); }
-.turn-review[open] > summary .review-chevron { transform: rotate(90deg); }
-.turn-review .pill.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, transparent); }
-.turn-review details summary { padding: 4px 0; font-family: var(--font-mono); }
-.turn-review details, .turn-review button { margin: 4px 0; }
-.turn-review button { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+.review-chevron { flex: none; color: var(--text-faint); transition: transform 140ms var(--ease); }
+details[open] > summary > .review-chevron { transform: rotate(90deg); }
+.review-section summary { padding: 6px 0; font-family: var(--font-mono); }
+.review-section .btn { margin: 4px 0; max-width: 100%; height: auto; min-height: 28px; white-space: normal; }
+.check-row:hover { background: var(--hover); }
+.review-section details > div { padding-inline-start: 14px; }
 .search-preview {
   display: flex;
   align-items: center;

@@ -5,7 +5,7 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
@@ -13,7 +13,17 @@ fn tool_list_is_well_formed() {
     }
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), 12, "tool names are unique");
+    assert_eq!(names.len(), tools.len(), "tool names are unique");
+    let guest = tools.iter().find(|t| t["name"] == "app_desktop").unwrap();
+    assert_eq!(guest["annotations"]["readOnlyHint"], false);
+    assert_eq!(
+        guest["inputSchema"]["properties"]["action"]["enum"],
+        json!(["state", "start", "frame", "input"])
+    );
+    assert_eq!(
+        guest["inputSchema"]["properties"]["guestTarget"]["enum"],
+        json!(["default", "linux", "windows", "macos", "vm"])
+    );
     let type_tool = tools.iter().find(|t| t["name"] == "browser_type").unwrap();
     assert_eq!(type_tool["inputSchema"]["required"], json!(["text"]));
     assert!(type_tool["inputSchema"]["properties"]["ref"].is_object());
@@ -109,7 +119,7 @@ fn requests_need_the_token() {
         &line("wrong", "browser_read"),
         "secret",
         |_| true,
-        |_, _| {
+        |_| {
             ran = true;
             Ok(Reply::text("x"))
         },
@@ -117,7 +127,7 @@ fn requests_need_the_token() {
     assert_eq!(denied, Reply::error("Not authorized"));
     assert!(!ran);
     assert_eq!(
-        handle("{", "secret", |_| true, |_, _| unreachable!()),
+        handle("{", "secret", |_| true, |_| unreachable!()),
         Reply::error("Bad request")
     );
     assert_eq!(
@@ -125,7 +135,7 @@ fn requests_need_the_token() {
             &line("secret", PING),
             "secret",
             |_| true,
-            |_, _| unreachable!()
+            |_| unreachable!()
         ),
         Reply::text("pong")
     );
@@ -134,7 +144,7 @@ fn requests_need_the_token() {
             &line("secret", "browser_click"),
             "secret",
             |root| root == "b",
-            |_, _| unreachable!()
+            |_| unreachable!()
         )
         .ok
     );
@@ -142,7 +152,7 @@ fn requests_need_the_token() {
         &line("secret", "browser_read"),
         "secret",
         |_| true,
-        |tool, _| Err(format!("{tool} failed")),
+        |request| Err(format!("{} failed", request.tool)),
     );
     assert_eq!(failed, Reply::error("browser_read failed"));
 }
