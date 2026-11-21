@@ -154,8 +154,8 @@ continues. Local builds without the release config do not contact Azure.
   Credentials are never shown and cannot be edited here.
 - **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (read straight from disk, honoring `HF_HUB_CACHE` and `HF_HOME`; no CLI needed). **Search Hugging Face** finds any MLX or GGUF model on the Hub, most downloaded first; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. A few suggested models follow, pinned to tested revisions. Every download is confirmed with its size first and uses the official Hugging Face CLI (`hf` on PATH, also used for search) and its normal cache. You can leave Settings while downloading, return to see the outcome, or cancel. Downloading does not select a model or install an inference runtime.
 - **Backgrounds** (Settings → Background): artwork behind your sessions, drawn by the app at the
-  window's resolution, with no image files. There are still ones (Warp, Dune, Aurora, Nebula,
-  Terrain), animated ones (Hyperspace, Drift, Flow, Fireflies, and the ASCII presets Trace Route,
+  window's resolution, with no image files. There are still ones (Warp, Dune, Terrain),
+  animated ones (Hyperspace, Flow, Fireflies, Cloudprint, and the ASCII presets Trace Route,
   Hex Swarm, Stack Rain, Koi Pond and Crab Beach) and your own image. Over a
   background the composer and cards turn to frosted glass. Choose whether it shows behind every
   session or only a new one (the default), how much a conversation dims it, and whether animated ones move.

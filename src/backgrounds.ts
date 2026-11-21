@@ -5,6 +5,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import { hexSwarm, stackRain, traceRoute } from "./asciiBackgrounds";
 import { crabBeach } from "./crabBeach";
+import { cloudprint } from "./cloudprint";
 import { koiPond } from "./koiPond";
 import { files, showToast } from "./bridge";
 
@@ -208,87 +209,6 @@ const dune: Painter = (ctx, w, h) => {
   });
 };
 
-/** Northern lights over dark hills. */
-const aurora: Painter = (ctx, w, h) => {
-  const rand = rng(23);
-  const u = unitOf(w, h);
-  ctx.fillStyle = vertical(ctx, h, [
-    [0, "#02040a"],
-    [0.7, "#06121f"],
-    [1, "#0a1a26"],
-  ]);
-  ctx.fillRect(0, 0, w, h);
-  stars(ctx, w, h, rand, 520, h * 0.85);
-  ctx.globalCompositeOperation = "lighter";
-  const ribbons: [string, string, number][] = [
-    ["70 255 170", "60 200 230", 0.42],
-    ["60 220 200", "120 120 255", 0.3],
-    ["160 110 255", "230 90 200", 0.22],
-  ];
-  const step = Math.max(1, 1.6 * u);
-  for (const [low, high, at] of ribbons) {
-    const p = [rand() * TAU, rand() * TAU, rand() * TAU, rand() * TAU];
-    for (let x = 0; x < w; x += step) {
-      const f = x / w;
-      const base = h * (at + Math.sin(f * TAU * 1.2 + p[0]) * 0.08 + Math.sin(f * TAU * 3.3 + p[1]) * 0.025);
-      const height = h * (0.1 + 0.2 * (0.5 + 0.5 * Math.sin(f * TAU * 2.1 + p[2])));
-      const strength = 0.02 + 0.07 * Math.pow(0.5 + 0.5 * Math.sin(f * TAU * 9 + p[3]), 3) + rand() * 0.015;
-      const g = ctx.createLinearGradient(0, base, 0, base - height);
-      g.addColorStop(0, `rgb(${low} / ${strength * 1.6})`);
-      g.addColorStop(0.25, `rgb(${low} / ${strength})`);
-      g.addColorStop(1, `rgb(${high} / 0)`);
-      ctx.fillStyle = g;
-      ctx.fillRect(x, base - height, step, height + 3 * u);
-    }
-  }
-  ctx.globalCompositeOperation = "source-over";
-  ridge(ctx, w, h, h * 0.84, h * 0.07, [
-    [1.3, 1.1, 0.55],
-    [3.7, 0.4, 0.3],
-    [11, 2.0, 0.15],
-  ], "#050b12");
-  ridge(ctx, w, h, h * 0.92, h * 0.05, [
-    [0.9, 2.6, 0.6],
-    [5.1, 1.7, 0.3],
-    [17, 0.3, 0.1],
-  ], "#020507");
-};
-
-/** Clouds of coloured gas across deep space. */
-const nebula: Painter = (ctx, w, h) => {
-  const rand = rng(41);
-  const u = unitOf(w, h);
-  ctx.fillStyle = "#05040a";
-  ctx.fillRect(0, 0, w, h);
-  const gauss = () => (rand() + rand() + rand() - 1.5) / 1.5;
-  const palette = ["217 119 87", "200 70 150", "120 80 225", "60 110 230", "60 180 200"];
-  ctx.globalCompositeOperation = "lighter";
-  for (let i = 0; i < 90; i++) {
-    const t = rand();
-    const x = t * w * 1.1 - w * 0.05;
-    const y = h * (0.78 - 0.55 * t) + gauss() * h * 0.16;
-    const color = palette[Math.min(palette.length - 1, Math.floor((t + gauss() * 0.15) * palette.length + 0.5) % palette.length)];
-    glow(ctx, x, y, (0.06 + rand() * 0.28) * w, color, 0.04 + rand() * 0.08);
-  }
-  ctx.globalCompositeOperation = "source-over";
-  // Dark dust lanes.
-  for (let i = 0; i < 40; i++) {
-    const t = rand();
-    glow(ctx, t * w, h * (0.8 - 0.55 * t) + gauss() * h * 0.12, (0.08 + rand() * 0.14) * w, "5 4 10", 0.16);
-  }
-  stars(ctx, w, h, rand, 650);
-  ctx.globalCompositeOperation = "lighter";
-  for (let i = 0; i < 14; i++) {
-    const x = rand() * w;
-    const y = rand() * h;
-    glow(ctx, x, y, (6 + rand() * 14) * u, "220 230 255", 0.5);
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(x - 9 * u, y - 0.35 * u, 18 * u, 0.7 * u);
-    ctx.fillRect(x - 0.35 * u, y - 9 * u, 0.7 * u, 18 * u);
-  }
-  ctx.globalCompositeOperation = "source-over";
-};
-
 /** Contour lines of an imaginary landscape, like a topographic map. */
 const terrain: Painter = (ctx, w, h) => {
   const rand = rng(5);
@@ -448,29 +368,6 @@ const hyperspace: Painter = (ctx, w, h, time) => {
   ctx.globalCompositeOperation = "source-over";
 };
 
-/** Large soft clouds of colour drifting past each other. */
-const drift: Painter = (ctx, w, h, time) => {
-  const rand = rng(29);
-  ctx.fillStyle = "#0b0a10";
-  ctx.fillRect(0, 0, w, h);
-  const colors = ["217 119 87", "140 90 230", "60 100 220", "200 70 150", "50 170 180", "230 160 80"];
-  ctx.globalCompositeOperation = "lighter";
-  for (const color of colors) {
-    const [s1, s2, s3] = [0.04 + rand() * 0.06, 0.03 + rand() * 0.06, 0.05 + rand() * 0.08];
-    const [p1, p2, p3] = [rand() * TAU, rand() * TAU, rand() * TAU];
-    const x = w * (0.5 + 0.4 * Math.sin(time * s1 + p1));
-    const y = h * (0.5 + 0.38 * Math.sin(time * s2 + p2));
-    glow(ctx, x, y, w * (0.32 + 0.08 * Math.sin(time * s3 + p3)), color, 0.3);
-  }
-  ctx.globalCompositeOperation = "source-over";
-  // Darker edges keep the middle glowing.
-  const shade = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.3, w / 2, h / 2, Math.max(w, h) * 0.75);
-  shade.addColorStop(0, "rgb(5 4 10 / 0)");
-  shade.addColorStop(1, "rgb(5 4 10 / 0.7)");
-  ctx.fillStyle = shade;
-  ctx.fillRect(0, 0, w, h);
-};
-
 /** Bands of fine lines rippling like silk, clay through violet. */
 const flow: Painter = (ctx, w, h, time) => {
   const u = unitOf(w, h);
@@ -550,11 +447,8 @@ const fireflies: Painter = (ctx, w, h, time) => {
 export const PRESETS: Preset[] = [
   { id: "warp", name: "Warp", paint: warp },
   { id: "dune", name: "Dune", paint: dune },
-  { id: "aurora", name: "Aurora", paint: aurora },
-  { id: "nebula", name: "Nebula", paint: nebula },
   { id: "terrain", name: "Terrain", paint: terrain },
   { id: "hyperspace", name: "Hyperspace", paint: hyperspace, moving: true },
-  { id: "drift", name: "Drift", paint: drift, moving: true },
   { id: "flow", name: "Flow", paint: flow, moving: true },
   { id: "fireflies", name: "Fireflies", paint: fireflies, moving: true },
   { id: "trace-route", name: "Trace Route", paint: traceRoute, moving: true },
@@ -562,6 +456,7 @@ export const PRESETS: Preset[] = [
   { id: "stack-rain", name: "Stack Rain", paint: stackRain, moving: true },
   { id: "koi-pond", name: "Koi Pond", paint: koiPond, moving: true },
   { id: "crab-beach", name: "Crab Beach", paint: crabBeach, moving: true },
+  { id: "cloudprint", name: "Cloudprint", paint: cloudprint, moving: true },
 ];
 
 // ---------------------------------------------------------------------------------------------

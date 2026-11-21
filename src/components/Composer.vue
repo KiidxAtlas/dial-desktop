@@ -215,11 +215,19 @@ async function chooseImages() {
   if (target === draft.value) focus();
 }
 
+async function pasteImage(images?: File[]) {
+  const target = draft.value;
+  const before = target.attachments.length;
+  if (images) await attachments.addBlobs(target, images);
+  else await attachments.addNativeClipboardImage(target);
+  if (!unmounted && target === draft.value && target.attachments.length > before) focus();
+}
+
 function attachmentMenu(event: MouseEvent) {
   if (props.snap.platform !== 'macos') return void chooseImages();
   openMenu(event, [
     { label: 'Choose image files…', run: chooseImages },
-    { label: 'Paste image from clipboard', run: () => attachments.addNativeClipboardImage(draft.value) },
+    { label: 'Paste image from clipboard', run: () => pasteImage() },
   ], event.currentTarget as HTMLElement);
 }
 
@@ -237,7 +245,6 @@ function onPaste(event: ClipboardEvent) {
       if (file?.type.startsWith("image/")) images.push(file);
     }
   }
-  const target = draft.value;
   if (images.length && !imagesAllowed.value) {
     event.preventDefault();
     return showToast(`${props.snap.model?.label ?? 'This model'} does not take images. Choose a vision model to attach a screenshot.`);
@@ -245,12 +252,12 @@ function onPaste(event: ClipboardEvent) {
   const native = event.isTrusted && props.snap.platform === 'macos' && imagesAllowed.value;
   if (native && images.length && images.every(f => /^image\/(?:x-)?tiff?$/i.test(f.type))) {
     event.preventDefault();
-    void attachments.addNativeClipboardImage(target);
+    void pasteImage();
   } else if (images.length) {
     event.preventDefault();
-    void attachments.addBlobs(target, images);
+    void pasteImage(images);
   } else if (native && !clipboard?.getData('text/plain')) {
-    void attachments.addNativeClipboardImage(target);
+    void pasteImage();
   }
 }
 
@@ -298,7 +305,8 @@ function onKey(event: KeyboardEvent) {
   }
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
-    send();
+    if (props.snap.turnRunning && draft.value.attachments.length) queueDraft();
+    else send();
   } else if (event.key === "Tab" && !event.shiftKey && slash.value.length) {
     event.preventDefault();
     const pick = slash.value[selected.value] ?? slash.value[0];
@@ -466,7 +474,7 @@ onMounted(focus);
           >
             <Icon name="mic" :size="16" />
           </button>
-          <button v-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" title="Queue for the next turn (⌘/Ctrl+Enter)" @click="queueDraft">Queue for next turn</button>
+          <button v-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" :title="draft.attachments.length ? 'Queue for the next turn (Enter)' : 'Queue for the next turn (⌘/Ctrl+Enter)'" @click="queueDraft">Queue for next turn</button>
           <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="markTurnAborted(snap); engine.abort()">
             <Icon name="stop" :size="14" />
           </button>
