@@ -5,16 +5,19 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
 import { engine, models } from "../bridge";
 import { focusComposer, ui } from "../ui";
+import { buildPickerGroups, pickerProviders, usableModels, type PickerFilter } from "../modelPicker";
+import { normalizeArrowKey } from "../macKeys";
 import Icon from "./Icon.vue";
 import ModesMenu from "./ModesMenu.vue";
-
 const props = defineProps<{ snap: OpenSnapshot }>();
 
 const root = ref<HTMLElement | null>(null);
 const search = ref<HTMLInputElement | null>(null);
 const query = ref("");
 const active = ref(0);
-const downloadedOnly = ref(false);
+const filter = ref<PickerFilter>("all");
+const expandedProviders = ref<Set<string>>(new Set());
+const downloadedOnly = computed(() => filter.value === "downloaded");
 const details = ref<{ row: ModelOption; plan?: LocalModelRemoval; error?: string } | null>(null);
 const managing = ref(false);
 const modesPage = ref(false);
@@ -57,41 +60,37 @@ function cannotRemove(row: ModelOption) {
   return "";
 }
 
-watch([() => props.snap.workspace.root, () => props.snap.sessionId, downloadedOnly, () => ui.modelPickerOpen], () => { details.value = null; });
+watch([() => props.snap.workspace.root, () => props.snap.sessionId, filter, () => ui.modelPickerOpen], () => { details.value = null; });
 
 const current = computed(() => props.snap.model);
 const usable = computed(() => props.snap.connection.state === "live" || props.snap.connection.state === "preview");
 const isCurrent = (m: ModelOption) =>
   !!current.value && m.modelId === current.value.modelId && (!current.value.provider || m.provider === current.value.provider);
 
-interface Group {
-  title: string;
-  rows: ModelOption[];
+const cleanedModels = computed(() => usableModels(models.value, isCurrent));
+const providers = computed(() => pickerProviders(cleanedModels.value));
+
+watch(providers, (list) => {
+  if (filter.value !== "all" && filter.value !== "downloaded" && !list.some((p) => p.provider === filter.value)) {
+    filter.value = "all";
+  }
+});
+
+function expandProvider(provider: string) {
+  const next = new Set(expandedProviders.value);
+  next.add(provider);
+  expandedProviders.value = next;
 }
 
-const groups = computed<Group[]>(() => {
-  const words = query.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const match = (m: ModelOption) => {
-    const text = `${m.label} ${m.modelId} ${m.provider}`.toLowerCase();
-    return words.every((w) => text.includes(w));
-  };
-  const rows = models.value.filter(match);
-  const local = rows.filter((m) => m.local);
-  if (downloadedOnly.value) return local.length ? [{ title: "Downloaded models", rows: local }] : [];
-  const mine = rows.filter((m) => !m.local && (m.configured || isCurrent(m)));
-  const byProvider = new Map<string, ModelOption[]>();
-  for (const m of rows) {
-    if (m.local || mine.includes(m)) continue;
-    byProvider.set(m.provider, [...(byProvider.get(m.provider) ?? []), m]);
-  }
-  const out: Group[] = [];
-  if (mine.length) out.push({ title: "Your models", rows: mine });
-  if (local.length) out.push({ title: "Downloaded models", rows: local });
-  for (const [provider, list] of byProvider) out.push({ title: provider, rows: list });
-  return out;
-});
+const groups = computed(() =>
+  buildPickerGroups(cleanedModels.value, {
+    query: query.value,
+    filter: filter.value,
+    expandedProviders: expandedProviders.value,
+    isCurrent,
+  }),
+);
 const flat = computed(() => groups.value.flatMap((g) => g.rows));
-
 const levels = computed(() => (current.value?.thinkingSettable ? current.value.levels : []));
 const thinkingLabel = computed(() => {
   const m = current.value;
@@ -113,6 +112,7 @@ function open() {
 function close(refocus = true) {
   ui.modelPickerOpen = false;
   query.value = "";
+  expandedProviders.value = new Set();
   if (refocus) focusComposer();
 }
 
@@ -126,20 +126,21 @@ function think(level: string) {
 }
 
 function onKey(event: KeyboardEvent) {
+  const key = normalizeArrowKey(event.key);
   const n = flat.value.length;
-  if (event.key === "ArrowDown" && n) {
+  if (key === "ArrowDown" && n) {
     event.preventDefault();
     active.value = (active.value + 1) % n;
     scrollActive();
-  } else if (event.key === "ArrowUp" && n) {
+  } else if (key === "ArrowUp" && n) {
     event.preventDefault();
     active.value = (active.value - 1 + n) % n;
     scrollActive();
-  } else if (event.key === "Enter" && n) {
+  } else if (key === "Enter" && n) {
     event.preventDefault();
     const pick = flat.value[active.value];
     if (pick) choose(pick);
-  } else if (event.key === "Escape") {
+  } else if (key === "Escape") {
     event.preventDefault();
     event.stopPropagation();
     close();
@@ -172,7 +173,7 @@ watch(
     }
   },
 );
-watch([query, downloadedOnly], () => (active.value = 0));
+watch([query, filter], () => (active.value = 0));
 onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 </script>
 
@@ -206,20 +207,37 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
           </button>
         </label>
         <div class="filters" role="group" aria-label="Model source">
-          <button :aria-pressed="!downloadedOnly" @click="downloadedOnly = false">All models</button>
-          <button :aria-pressed="downloadedOnly" @click="downloadedOnly = true">Downloaded</button>
+          <button :aria-pressed="filter === 'all'" @click="filter = 'all'">All</button>
+          <button :aria-pressed="filter === 'downloaded'" @click="filter = 'downloaded'">Downloaded</button>
           <button @click="close(false); ui.settingsTab = 'library'; ui.settingsOpen = true">Get models…</button>
           <button title="Helper models for background work, and saved model sets" @click="close(false); ui.settingsTab = 'roles'; ui.settingsOpen = true">Roles &amp; presets…</button>
         </div>
+        <div v-if="providers.length > 1" class="providers" role="group" aria-label="Filter by provider">
+          <button
+            v-for="p in providers"
+            :key="p.provider"
+            :aria-pressed="filter === p.provider"
+            @click="filter = filter === p.provider ? 'all' : p.provider"
+          >
+            {{ p.provider }} <span class="count">{{ p.count }}</span>
+          </button>
+        </div>
 
         <div class="list">
-          <p v-if="downloadedOnly && models.length && !models.some((m) => m.local)" class="empty">
+          <p v-if="downloadedOnly && cleanedModels.length && !cleanedModels.some((m) => m.local)" class="empty">
             No downloaded models found by Dial. After adding a local model, reload this list.
           </p>
-          <p v-else-if="!models.length" class="empty">No models listed yet. Use reload to check again.</p>
-          <p v-else-if="!flat.length" class="empty">No model matches “{{ query }}”.</p>
+          <p v-else-if="!cleanedModels.length" class="empty">No models listed yet. Use reload to check again.</p>
+          <p v-else-if="!groups.length" class="empty">No model matches “{{ query }}”.</p>
           <template v-for="group in groups" :key="group.title">
             <div class="group">{{ group.title }}</div>
+            <button
+              v-if="group.hiddenCount && group.provider"
+              class="expand-row"
+              @click="expandProvider(group.provider)"
+            >
+              Show all {{ group.hiddenCount }} {{ group.title }} models…
+            </button>
             <div v-for="m in group.rows" :key="`${m.provider}/${m.modelId}`" class="model-line">
               <button
                 class="row"
@@ -318,15 +336,14 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 }
 .menu {
   position: absolute;
-  left: -6px;
-  bottom: calc(100% + 10px);
+  left: 0;
+  bottom: calc(100% + var(--pop-gap));
   z-index: 30;
   width: 420px;
   display: flex;
   flex-direction: column;
   border-radius: var(--radius-lg);
   background: var(--raised);
-  border: 1px solid var(--border-strong);
   box-shadow: var(--shadow-pop);
   overflow: hidden;
 }
@@ -375,6 +392,47 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .filters button[aria-pressed="true"] {
   color: var(--text);
   background: var(--hover);
+}
+.providers {
+  display: flex;
+  gap: 4px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.providers::-webkit-scrollbar { display: none; }
+.providers button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.providers button:hover,
+.providers button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--border-strong);
+}
+.providers .count { color: var(--text-faint); }
+.expand-row {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.expand-row:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 .model-line { display: flex; align-items: center; gap: 4px; }
 .model-line .row { flex: 1; min-width: 0; }

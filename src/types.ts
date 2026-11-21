@@ -66,7 +66,7 @@ export interface ToolEntry {
   input: Block | null;
   output: Block | null;
   changedPaths: string[];
-  /** Absolute paths of images an `image_gen` call wrote; always shown in the row. */
+  /** Absolute paths of images the call wrote or viewed (an `image_gen`, a written image, a `read`); shown in the row. */
   images: string[];
   facts: string[];
 }
@@ -157,6 +157,10 @@ export interface ModelOption {
   /** The main model, a favorite, a profile or a role in the user's Dial config. */
   configured: boolean;
   local: boolean;
+  /** Present in the provider's live `/models` or account listing. */
+  listed?: boolean;
+  /** Only from a static bundled catalog (not configured, local, or live-listed). */
+  catalogOnly?: boolean;
 }
 
 export interface TranscriptHit {
@@ -203,6 +207,7 @@ export interface Snapshot {
   model: ModelInfo | null;
   approval: ApprovalMode | null;
   sessionId: string | null;
+  historyLoading: boolean;
   turnRunning: boolean;
   canSend: boolean;
   sessions: Session[];

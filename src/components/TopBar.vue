@@ -4,12 +4,15 @@ import type { OpenSnapshot } from "../types";
 import { openMenu, ui } from "../ui";
 import { finishRename, openSession, sessionItems } from "../sessionActions";
 import { conversationFindOpen } from "../commands";
+import { closeType, types } from "../savedTypes";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
 /** The session on screen, once it has a row in the list (a fresh one gets it with its first prompt). */
 const session = computed(() => openSession(props.snap));
+/** The type open in place of the transcript, if any. */
+const type = computed(() => (ui.typeOpen ? types.list.find((t) => t.id === ui.typeOpen) ?? null : null));
 const editing = computed(() => !!session.value && ui.renaming?.id === session.value.id && ui.renaming.place === "title");
 
 const input = ref<HTMLInputElement | null>(null);
@@ -49,8 +52,9 @@ function more(event: MouseEvent) {
     >
       <Icon name="panelLeft" :size="16" />
     </button>
+    <h1 v-if="type" class="truncate type-name" data-tauri-drag-region><span class="type-icon">{{ type.icon }}</span>{{ type.name }}</h1>
     <input
-      v-if="editing && session"
+      v-else-if="editing && session"
       ref="input"
       class="rename"
       :value="session.title"
@@ -66,9 +70,17 @@ function more(event: MouseEvent) {
     <h1 v-else class="truncate" data-tauri-drag-region>{{ snap.title }}</h1>
     <span v-if="snap.connection.state === 'preview'" class="pill" data-tauri-drag-region>Preview</span>
     <span v-if="snap.turnRunning" class="pill working" role="status" data-tauri-drag-region><span class="live-dot" />Working</span>
+    <div v-if="type" class="switch" role="tablist" aria-label="Type or its conversation">
+      <button role="tab" :aria-selected="ui.typeMode === 'type'" :class="{ on: ui.typeMode === 'type' }" @click="ui.typeMode = 'type'">
+        <span class="switch-icon">{{ type.icon }}</span> {{ type.name }}
+      </button>
+      <button role="tab" :aria-selected="ui.typeMode === 'chat'" :class="{ on: ui.typeMode === 'chat' }" @click="ui.typeMode = 'chat'">
+        <Icon name="chat" :size="13" /> Chat
+      </button>
+    </div>
     <div class="spacer" data-tauri-drag-region />
     <button
-      v-if="snap.entries.length"
+      v-if="snap.entries.length && (!type || ui.typeMode === 'chat')"
       class="icon-btn"
       title="Find in conversation (⌘F)"
       aria-label="Find in conversation"
@@ -86,11 +98,15 @@ function more(event: MouseEvent) {
     >
       <Icon name="sidebar" :size="16" />
     </button>
+    <button v-if="type" class="icon-btn" title="Close the type" aria-label="Close the type" @click="closeType()">
+      <Icon name="cross" :size="15" />
+    </button>
   </header>
 </template>
 
 <style scoped>
 .topbar {
+  position: relative;
   height: var(--topbar);
   flex: none;
   display: flex;
@@ -107,7 +123,7 @@ h1,
   color: var(--text-muted);
 }
 h1 {
-  padding: 0 6px;
+  padding: 0 8px;
 }
 .title {
   display: flex;
@@ -149,26 +165,10 @@ h1 {
   flex: 1;
   align-self: stretch;
 }
+/* Title-bar buttons match the 30px title; the shared look is `.icon-btn` in styles.css. */
 .icon-btn {
-  display: grid;
-  place-items: center;
   width: 30px;
   height: 30px;
-  flex: none;
-  border-radius: var(--radius-sm);
-  color: var(--text-faint);
-  transition:
-    background 120ms var(--ease),
-    color 120ms var(--ease),
-    transform 90ms var(--ease);
-}
-.icon-btn:hover,
-.icon-btn.on {
-  background: var(--hover);
-  color: var(--text);
-}
-.icon-btn:active {
-  transform: scale(0.94);
 }
 .working {
   gap: 6px;
@@ -181,5 +181,53 @@ h1 {
   border-radius: 50%;
   background: currentColor;
   animation: pulse 1.2s ease-in-out infinite;
+}
+.type-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+.type-icon {
+  font-size: 16px;
+}
+/* Centered on the bar, whatever sits left and right of it. */
+.switch {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.switch button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  height: 26px;
+  padding: 0 14px;
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+.switch button:hover {
+  color: var(--text);
+}
+.switch button.on {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.14);
+}
+.switch-icon {
+  font-size: 13px;
 }
 </style>

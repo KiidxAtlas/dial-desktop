@@ -365,7 +365,7 @@ fn a_screendump_becomes_an_rgba_frame_and_bad_images_are_refused() {
         "truncated pixels"
     );
     assert!(frame_from_ppm(b"P6\n4294967295 4294967295\n255\n").is_err());
-    assert!(Frame::from_bgrx(2, 1, &[1, 2, 3, 0, 4, 5, 6, 0]).is_ok_and(|f| &*f.rgba == [3, 2, 1, 255, 6, 5, 4, 255]));
+    assert!(Frame::from_bgrx(2, 1, &[1, 2, 3, 0, 4, 5, 6, 0]).is_ok_and(|f| *f.rgba == [3, 2, 1, 255, 6, 5, 4, 255]));
     assert!(Frame::from_bgrx(2, 1, &[0; 7]).is_err());
 }
 

@@ -23,7 +23,7 @@ use crate::tabs::{Route, Tab, Tabs};
 use crate::terminal::{self, Terminals};
 use crate::time;
 use crate::updates;
-use crate::view::{ModelOptionView, Published, Snapshot, SnapshotAt, Workspace};
+use crate::view::{EntryViews, ModelOptionView, Published, Snapshot, SnapshotAt, Workspace};
 use dial_client::{Diagnostics, Launch};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,8 @@ struct Inner {
     /// `None` until a folder is chosen.
     workspace: Option<Workspace>,
     recents: Recents,
+    /// The on-screen tab's transcript rows, reused by the next snapshot where unchanged.
+    entry_views: EntryViews,
 }
 
 /// State shared by the pump thread and the commands.
@@ -72,6 +74,9 @@ struct Shared {
     installed: Mutex<Option<PathBuf>>,
     /// The snapshot the UI has, so each `snapshot` event carries only what changed.
     published: Mutex<Published>,
+    /// The Appearance switches for what answers may draw; each new engine is told (`answer_style`).
+    answer_style: Mutex<crate::answer_style::AnswerStyle>,
+    answer_support: crate::answer_style::Support,
 }
 
 impl Shared {
@@ -181,9 +186,21 @@ impl Shared {
         let Source::Engine { args, .. } = &self.source else {
             return None;
         };
+        let program = self.program()?;
+        let style = *self
+            .answer_style
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Engines that predate the flag would refuse to start with it, so they go without.
+        let guidance = style
+            .guidance()
+            .filter(|_| self.answer_support.accepts(&program));
+        let mut launch = Launch::new(program).args(args.iter().cloned());
+        if let Some(text) = guidance {
+            launch = launch.arg(crate::answer_style::FLAG).arg(text);
+        }
         Some(
-            Launch::new(self.program()?)
-                .args(args.iter().cloned())
+            launch
                 .current_dir(path)
                 .diagnostics(Diagnostics::Inherit)
                 .interactive(true),
@@ -267,12 +284,14 @@ fn retire(tabs: Vec<Tab>) {
 }
 
 /// The tab on screen, with what the other tabs are doing marked in its sidebar.
-fn snapshot_of(inner: &Inner) -> Snapshot {
-    let mut snapshot = Snapshot::new(
+fn snapshot_of(inner: &mut Inner) -> Snapshot {
+    let mut snapshot = Snapshot::reusing(
         &inner.tabs.active().model,
         inner.workspace.as_ref(),
         time::now(),
+        &mut inner.entry_views,
     );
+    snapshot.history_loading |= inner.tabs.active().opening_session();
     snapshot.show_activity(&inner.tabs.activity());
     snapshot
 }
@@ -307,7 +326,7 @@ fn publish(app: &AppHandle) {
             .then(|| settings_of(&active.model))
             .flatten();
         (
-            snapshot_of(&inner),
+            snapshot_of(&mut inner),
             models,
             settings,
             messages,
@@ -364,7 +383,7 @@ fn snapshot(shared: State<'_, Shared>) -> SnapshotAt {
         .published
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .current(|| snapshot_of(&shared.lock()))
+        .current(|| snapshot_of(&mut shared.lock()))
 }
 
 #[tauri::command]
@@ -430,12 +449,10 @@ fn reset_setting(
 /// made through `engine_call` (roles, presets) so the session rebuilds once.
 #[tauri::command]
 fn apply_saved_settings(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
-    let inner = shared.lock();
-    dispatch(
-        &app,
-        inner.tabs.active().engine.as_ref(),
-        vec![Command::GetSettings, Command::ApplySettings],
-    );
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let commands = tab.saved_settings();
+    dispatch(&app, tab.engine.as_ref(), commands);
     Ok(())
 }
 
@@ -499,6 +516,35 @@ fn open_workspace(
 #[tauri::command]
 fn reconnect(shared: State<'_, Shared>) -> Result<(), String> {
     shared.reconnect()
+}
+
+/// The Appearance switches changed (or the window reports them at startup). Engines started from
+/// now on get the matching guidance; an idle session restarts into itself so it applies at once.
+#[tauri::command]
+fn set_answer_style(shared: State<'_, Shared>, cards: bool, diagrams: bool) -> Result<(), String> {
+    let style = crate::answer_style::AnswerStyle { cards, diagrams };
+    {
+        let mut current = shared
+            .answer_style
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *current == style {
+            return Ok(());
+        }
+        *current = style;
+    }
+    if let Some(file) = crate::answer_style::file(shared.home.as_deref().map(Path::new)) {
+        crate::answer_style::save(&file, style)?;
+    }
+    let has_engine = {
+        let mut inner = shared.lock();
+        inner.workspace.is_some() && inner.tabs.active_mut().engine.is_some()
+    };
+    if has_engine {
+        // A running turn keeps its engine; the next one started picks the switches up.
+        let _ = shared.reconnect();
+    }
+    Ok(())
 }
 
 /// The engine binary, or why there is none (the design preview).
@@ -641,7 +687,7 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("set_setting", 20),
     ("reset_setting", 20),
     ("extension_action", 180),
-    ("list_models", 30),
+    ("list_models", 60),
     ("image_settings", 20),
     // Slash commands typed with their arguments (see `src/commandRunner.ts`).
     ("state", 20),
@@ -788,6 +834,54 @@ async fn send_prompt(
         })?
     };
     rpc_reply(reply, None).await.map(|_| ())
+}
+
+/// Send `text` to session `session_id` without showing it: to the tab that has it open, or to a
+/// new engine behind the one on screen. Saving to a type adds the item in the type's own
+/// conversation this way, while the user stays where they are.
+#[tauri::command]
+fn send_background(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: String,
+    text: String,
+) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("The prompt is empty".into());
+    }
+    let send = Command::Send {
+        text: text.to_owned(),
+        images: Vec::new(),
+        inline_images: Vec::new(),
+    };
+    let mut inner = shared.lock();
+    if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+        return Err("The project changed".into());
+    }
+    match inner.tabs.route_resume(&session_id) {
+        Route::Switch(index) => {
+            let tab = inner.tabs.get_mut(index).ok_or("That session closed")?;
+            if tab.protects_work() || !tab.model.can_send() {
+                return Err("Dial is still working on the last one; try again when it finishes".into());
+            }
+            tab.enqueue(send)?;
+        }
+        Route::Closing => return Err("Dial is just finishing up; try again in a moment".into()),
+        Route::Elsewhere => return Err(OPEN_ELSEWHERE.into()),
+        Route::Here | Route::Spawn => {
+            let engine = shared
+                .spawn(Path::new(&workspace_root))
+                .ok_or(PREVIEW_NOTICE)?;
+            let mut tab = Tab::new(Model::starting(), Some(engine));
+            tab.enqueue(Command::Resume(session_id))?;
+            tab.enqueue(send)?;
+            inner.tabs.add_background(tab);
+        }
+    }
+    drop(inner);
+    shared.poke();
+    Ok(())
 }
 
 /// Check an image chosen or dropped by the user and return its preview. Async, so reading a
@@ -1410,9 +1504,29 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         // checked only when `app_updates_enabled`.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // A custom type layout's own page (`types::custom_page`), shown in a sandboxed frame.
+        .register_uri_scheme_protocol(crate::types::CUSTOM_SCHEME, |ctx, request| {
+            use tauri::Manager as _;
+            let store = ctx.app_handle().state::<crate::types::Store>();
+            crate::types::custom_page(&store, request.uri().path())
+        })
         .invoke_handler(tauri::generate_handler![
             notifications::set_notifications,
+            notifications::type_reminders_allow,
+            notifications::type_reminder,
+            crate::types::types_list,
+            crate::types::types_get,
+            crate::types::types_create,
+            crate::types::types_update,
+            crate::types::types_delete,
+            crate::types::types_add_item,
+            crate::types::types_update_item,
+            crate::types::types_remove_item,
+            crate::types::types_move_item,
+            crate::types::types_import_image,
+            crate::types::types_import_image_data,
             snapshot,
+            set_answer_style,
             models,
             settings,
             save_setting,
@@ -1428,6 +1542,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             engine_install,
             app_updates_enabled,
             send_prompt,
+            send_background,
             read_image,
             read_clipboard_image,
             read_transcript_image,
@@ -1505,12 +1620,21 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
             app.manage(Notifications::default());
+            // `DIAL_TYPES_DIR` keeps a separate set of types (design previews, tests).
+            app.manage(match std::env::var_os("DIAL_TYPES_DIR") {
+                Some(dir) => crate::types::Store::new(Some(PathBuf::from(dir))),
+                None => crate::types::Store::for_home(home.as_deref().map(Path::new)),
+            });
             app.manage(crate::model_library::Downloads::default());
+            let answer_style = crate::answer_style::load(
+                crate::answer_style::file(home.as_deref().map(Path::new)).as_deref(),
+            );
             app.manage(Shared {
                 inner: Mutex::new(Inner {
                     tabs: Tabs::new(Tab::new(Model::default(), None)),
                     workspace: None,
                     recents,
+                    entry_views: EntryViews::default(),
                 }),
                 source,
                 home,
@@ -1518,6 +1642,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 terminals: Mutex::new(Terminals::default()),
                 installed: Mutex::new(None),
                 published: Mutex::new(Published::default()),
+                answer_style: Mutex::new(answer_style),
+                answer_support: crate::answer_style::Support::default(),
             });
             app.manage(Browser::default());
             app.manage(crate::app_runner::AppRunner::new(

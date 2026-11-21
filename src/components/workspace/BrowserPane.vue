@@ -317,10 +317,6 @@ onBeforeUnmount(() => {
   flex: none;
   padding-bottom: 8px;
 }
-.icon-btn:disabled {
-  opacity: 0.35;
-  pointer-events: none;
-}
 .address {
   position: relative;
   flex: 1;

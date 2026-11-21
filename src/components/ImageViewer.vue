@@ -1,24 +1,27 @@
 <script setup lang="ts">
 // A generated or mentioned image, shown large, with Open / Show in Finder / Copy path.
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { files, type ImageFile } from "../bridge";
 import { viewedImage } from "../imageViewer";
 import { copyText } from "../sessionActions";
 import Icon from "./Icon.vue";
 import { vFocus } from "./Shortcuts.vue";
 
-const image = ref<ImageFile | null>(null);
+const file = computed(() => viewedImage.value && 'path' in viewedImage.value ? viewedImage.value : null);
+const loadedImage = ref<ImageFile | null>(null);
+const image = computed(() => viewedImage.value && 'attachment' in viewedImage.value ? viewedImage.value.attachment : loadedImage.value);
+const title = computed(() => file.value?.path ?? image.value?.name);
 const error = ref<string | null>(null);
 
 watch(
-  viewedImage,
+  file,
   async (viewed) => {
-    image.value = null;
+    loadedImage.value = null;
     error.value = null;
     if (!viewed) return;
     try {
       const loaded = await files.readTranscriptImage(viewed.root, viewed.path);
-      if (viewedImage.value === viewed) image.value = loaded;
+      if (viewedImage.value === viewed) loadedImage.value = loaded;
     } catch (failure) {
       if (viewedImage.value === viewed) error.value = String(failure);
     }
@@ -31,17 +34,17 @@ function close() {
 }
 
 function open() {
-  const v = viewedImage.value;
+  const v = file.value;
   if (v) void files.openTranscriptImage(v.root, v.path);
 }
 
 function reveal() {
-  const v = viewedImage.value;
+  const v = file.value;
   if (v) void files.reveal(v.absolute);
 }
 
 function copyPath() {
-  const v = viewedImage.value;
+  const v = file.value;
   if (v) void copyText(v.absolute, "Path copied");
 }
 
@@ -50,7 +53,8 @@ function onKey(event: KeyboardEvent) {
     event.preventDefault();
     event.stopPropagation();
     close();
-  } else if (event.key === "Enter" || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o")) {
+  } else if (!file.value) return;
+  else if (event.key === "Enter" || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o")) {
     event.preventDefault();
     open();
   } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c" && !getSelection()?.toString()) {
@@ -64,16 +68,16 @@ function onKey(event: KeyboardEvent) {
   <Teleport to="body">
     <Transition name="fade">
       <div v-if="viewedImage" class="overlay" @mousedown.self="close">
-        <div v-focus class="viewer" role="dialog" :aria-label="viewedImage.path" tabindex="-1" @keydown="onKey">
+        <div v-focus class="viewer" role="dialog" :aria-label="title" tabindex="-1" @keydown="onKey">
           <header>
-            <span class="name mono truncate" :title="viewedImage.absolute">{{ viewedImage.path }}</span>
-            <button class="btn btn-secondary" title="Open in the default viewer (Enter)" @click="open">
+            <span class="name mono truncate" :title="file?.absolute ?? title">{{ title }}</span>
+            <button v-if="file" class="btn btn-secondary" title="Open in the default viewer (Enter)" @click="open">
               <Icon name="external" :size="13" /> Open
             </button>
-            <button class="btn btn-secondary" title="Show in Finder" @click="reveal">
+            <button v-if="file" class="btn btn-secondary" title="Show in Finder" @click="reveal">
               <Icon name="folder" :size="13" /> Show in Finder
             </button>
-            <button class="icon-btn" title="Copy path (⌘C)" aria-label="Copy path" @click="copyPath">
+            <button v-if="file" class="icon-btn" title="Copy path (⌘C)" aria-label="Copy path" @click="copyPath">
               <Icon name="copy" :size="14" />
             </button>
             <button class="icon-btn" title="Close (Esc)" aria-label="Close" @click="close">

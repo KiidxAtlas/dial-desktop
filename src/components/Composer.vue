@@ -4,9 +4,11 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
 import { engine, files, showToast, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
+import { viewAttachment } from "../imageViewer";
 import { openMenu, ui } from "../ui";
-import { draftFor } from "../drafts";
+import { beginSend, draftFor } from "../drafts";
 import { canCompact, promptHistory } from "../sessionActions";
+import { sendInType, typedPrompt, typeSessionOnScreen, types } from "../savedTypes";
 import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
 import { engineCommands, loadEngineCommands } from "../engineTools";
 import { matchSlash, slashCommands, type SlashCommand } from "../slashCommands";
@@ -14,6 +16,7 @@ import { runTyped, typedCommand } from "../commandRunner";
 import CommandPanel from "./CommandPanel.vue";
 import { editQueued, enqueuePrompt, markTurnAborted, queueFor, removeQueued, sendQueuedNext } from "../queue";
 import { mention } from "../workspace";
+import { isLegacyFunctionKey, normalizeArrowKey, sanitizeEditable } from "../macKeys";
 import Icon from "./Icon.vue";
 import ModelPicker from "./ModelPicker.vue";
 import ApprovalMenu from "./ApprovalMenu.vue";
@@ -24,10 +27,6 @@ import VoicePanel from "./VoicePanel.vue";
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
 const draft = computed(() => draftFor(props.snap));
-const visibleText = computed({
-  get: () => draft.value.submitting ? "" : draft.value.text,
-  set: (text: string) => { if (!draft.value.submitting) draft.value.text = text; },
-});
 const approvalMenu = ref<InstanceType<typeof ApprovalMenu> | null>(null);
 const queue = computed(() => queueFor(props.snap));
 const selected = ref(0);
@@ -35,6 +34,7 @@ const caret = ref(-1);
 const paths = ref<string[]>([]);
 function trackCaret() {
   const el = input.value;
+  if (el && sanitizeEditable(el)) draft.value.text = el.value;
   caret.value = el && el.selectionStart === el.selectionEnd ? el.selectionStart : -1;
 }
 const token = computed(() => {
@@ -72,7 +72,7 @@ const allCommands = computed<SlashCommand[]>(() => [
     engineCommands.value,
   ),
   ...(canUseTaskRecipes(props.snap)
-    ? taskRecipes.map((r) => ({ name: `/${r.id}`, detail: r.title, kind: "desktop" as const, run: () => { draft.value.text = r.prompt; } }))
+    ? taskRecipes().map((r) => ({ name: `/${r.id}`, detail: r.title, kind: "desktop" as const, run: () => { draft.value.text = r.prompt; } }))
     : []),
 ]);
 watch(() => [props.snap.workspace.root, props.snap.connection.state] as const, () => void loadEngineCommands(), { immediate: true });
@@ -105,15 +105,13 @@ async function queueDraft() {
   const target = draft.value;
   const text = target.text;
   const images = [...target.attachments];
-  target.sending = true;
+  const finish = beginSend(target);
+  focus();
+  let queued = false;
   try {
-    if (!(await enqueuePrompt(props.snap, text, images))) return;
-    if (target.text === text) target.text = "";
-    const keys = new Set(images.map((image) => image.key));
-    target.attachments = target.attachments.filter((image) => !keys.has(image.key));
+    queued = await enqueuePrompt(props.snap, text, images);
   } finally {
-    target.sending = false;
-    if (target === draft.value) focus();
+    finish(queued);
   }
 }
 /** While a turn runs, typed text goes to it as guidance (images cannot). */
@@ -189,19 +187,20 @@ async function send() {
     return;
   }
   const images = [...target.attachments];
-  target.sending = true;
-  target.submitting = true;
+  const steer = steering.value;
+  const finish = beginSend(target);
+  focus();
+  let accepted = false;
   try {
     const scope = { workspaceRoot: props.snap.workspace.root, sessionId: props.snap.sessionId };
-    const accepted = steering.value ? await engine.steer(text, scope) : await engine.send(text, images, scope);
-    if (!accepted) return;
-    if (target.text === original) target.text = "";
-    const sentKeys = new Set(images.map((a) => a.key));
-    target.attachments = target.attachments.filter((a) => !sentKeys.has(a.key));
+    // In an open type, a prompt goes to the type's own conversation, started on the first one.
+    accepted = steer
+      ? await engine.steer(text, scope)
+      : ui.typeOpen && !typeSessionOnScreen()
+        ? await sendInType(ui.typeOpen, text, images)
+        : await engine.send(typedPrompt(text, scope.sessionId), images, scope);
   } finally {
-    target.submitting = false;
-    target.sending = false;
-    if (target === draft.value) focus();
+    finish(accepted);
   }
 }
 
@@ -288,32 +287,47 @@ onUnmounted(() => {
 
 function onKey(event: KeyboardEvent) {
   if (event.isComposing) return;
+  const key = normalizeArrowKey(event.key);
+  const legacy = isLegacyFunctionKey(event.key);
   const count = paths.value.length || slash.value.length;
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && props.snap.turnRunning) {
+  if (key === "Enter" && (event.metaKey || event.ctrlKey) && props.snap.turnRunning) {
     event.preventDefault(); queueDraft(); return;
   }
-  if (count && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
-    event.preventDefault(); selected.value = (selected.value + (event.key === "ArrowDown" ? 1 : -1) + count) % count;
+  if (count && (key === "ArrowDown" || key === "ArrowUp")) {
+    event.preventDefault(); selected.value = (selected.value + (key === "ArrowDown" ? 1 : -1) + count) % count;
     nextTick(() => input.value?.parentElement?.querySelector('.slash-row.active')?.scrollIntoView({ block: 'nearest' }));
     return;
   }
-  if (paths.value.length && !event.shiftKey && (event.key === "Tab" || event.key === "Enter")) {
+  if (paths.value.length && !event.shiftKey && (key === "Tab" || key === "Enter")) {
     event.preventDefault(); pickPath(paths.value[selected.value] ?? paths.value[0]); return;
   }
-  if (token.value !== null && event.key === "Escape") {
+  if (token.value !== null && key === "Escape") {
     event.stopPropagation(); event.preventDefault(); caret.value = -1; return;
   }
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+  if (key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     if (props.snap.turnRunning && draft.value.attachments.length) queueDraft();
     else send();
-  } else if (event.key === "Tab" && !event.shiftKey && slash.value.length) {
+  } else if (key === "Tab" && !event.shiftKey && slash.value.length) {
     event.preventDefault();
     const pick = slash.value[selected.value] ?? slash.value[0];
     draft.value.text = `${pick.name}${pick.insert ? " " : ""}`;
-  } else if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.altKey && !event.metaKey && !draft.value.attachments.length && browsable()) {
+  } else if ((key === "ArrowUp" || key === "ArrowDown") && !event.altKey && !event.metaKey && !draft.value.attachments.length && browsable()) {
     // Like a shell: ↑ in an empty box walks back through this session's prompts, ↓ forward.
-    recall(event.key === "ArrowUp" ? 1 : -1, event);
+    recall(key === "ArrowUp" ? 1 : -1, event);
+    if (!event.defaultPrevented && !draft.value.text) event.preventDefault();
+  } else if (
+    !draft.value.text &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    (key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown")
+  ) {
+    // In an empty composer an arrow key has nowhere to move; preventing default stops macOS
+    // WKWebView from advancing the caret or painting/inserting a placeholder box.
+    event.preventDefault();
+  } else if (legacy) {
+    event.preventDefault();
   }
 }
 
@@ -353,7 +367,7 @@ function decide(decision: Decision) {
   engine.approve(approval.value.approvalId, oneTime.value && decision !== "deny" ? "allow" : decision);
 }
 
-watch(visibleText, () => { selected.value = 0; nextTick(resize); });
+watch(() => draft.value.text, () => { selected.value = 0; nextTick(resize); });
 watch(() => ui.focusComposer, focus);
 onMounted(focus);
 </script>
@@ -424,9 +438,11 @@ onMounted(focus);
           </button>
           <div class="slash-foot"><kbd>↑</kbd><kbd>↓</kbd> choose <kbd>Tab</kbd> insert <kbd>Esc</kbd> dismiss</div>
         </div>
-        <div v-if="!draft.submitting && draft.attachments.length" class="thumbs" @click.stop>
+        <div v-if="draft.attachments.length" class="thumbs" @click.stop>
           <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
-            <img :src="a.url" :alt="a.name" />
+            <button class="preview-thumb" :aria-label="`Preview ${a.name}`" :title="`Preview ${a.name}`" @click="viewAttachment(a)">
+              <img :src="a.url" alt="" />
+            </button>
             <button class="remove" :aria-label="`Remove ${a.name}`" :title="`Remove ${a.name}`" @click="draft.attachments = draft.attachments.filter((image) => image.key !== a.key)">
               <Icon name="cross" :size="11" />
             </button>
@@ -434,12 +450,12 @@ onMounted(focus);
         </div>
         <textarea
           ref="input"
-          v-model="visibleText"
+          v-model="draft.text"
           aria-label="Prompt"
           rows="2"
           spellcheck="true"
-          :placeholder="draft.submitting ? 'Sending…' : snap.turnRunning ? 'Add a note for Dial while it works…' : snap.entries.length ? 'Message Dial…' : 'What would you like to do in this project?'"
-          :readonly="draft.sending"
+          :placeholder="draft.pending ? 'Write your next message…' : snap.turnRunning ? 'Add a note for Dial while it works…' : ui.typeOpen ? `Ask Dial to change ${types.list.find((t) => t.id === ui.typeOpen)?.name ?? 'this type'}…` : snap.entries.length ? 'Message Dial…' : 'What would you like to do in this project?'"
+          :readonly="draft.sending && !draft.pending"
           @keydown="onKey"
           @input="trackCaret" @click="trackCaret" @select="trackCaret" @keyup.left="trackCaret" @keyup.right="trackCaret"
         />
@@ -617,6 +633,7 @@ onMounted(focus);
   border: 1px solid var(--border);
   background: var(--bg);
 }
+.preview-thumb { display: block; width: 100%; height: 100%; padding: 0; border-radius: inherit; cursor: zoom-in; }
 .thumb img {
   width: 100%;
   height: 100%;
@@ -673,7 +690,7 @@ onMounted(focus);
   position: absolute;
   left: 8px;
   right: 8px;
-  bottom: calc(100% + 8px);
+  bottom: calc(100% + var(--pop-gap));
   z-index: 20;
   padding: 6px;
   border-radius: var(--radius-md);
@@ -789,7 +806,8 @@ textarea::placeholder {
   flex-wrap: wrap;
   align-items: center;
   gap: 2px;
-  margin: 8px 0 0 -10px;
+  /* Pulls the first 28px button out so its icon, not its hover box, lines up with the text. */
+  margin: 8px 0 0 -6px;
   cursor: default;
 }
 .send {

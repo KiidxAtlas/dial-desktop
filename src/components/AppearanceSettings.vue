@@ -6,6 +6,7 @@ import Icon from "./Icon.vue";
 import BackgroundSettings from "./BackgroundSettings.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
+import SSwitch from "./settings/SSwitch.vue";
 
 const THEMES: { id: Theme; name: string }[] = [
   { id: "system", name: "Match system" },
@@ -48,6 +49,14 @@ const THEMES: { id: Theme; name: string }[] = [
           <Icon name="plus" :size="12" />
         </button>
       </div>
+    </SRow>
+  </SGroup>
+  <SGroup title="In answers">
+    <SRow label="Interactive cards" description="Calculators, guides, comparisons and more, added when they help. Off stops asking for them and shows their JSON.">
+      <SSwitch v-model="appearance.cards" label="Interactive cards" />
+    </SRow>
+    <SRow label="Diagrams and charts" description="Mermaid diagrams and charts, added when they help. Off stops asking for them and shows their source.">
+      <SSwitch v-model="appearance.diagrams" label="Diagrams and charts" />
     </SRow>
   </SGroup>
   <BackgroundSettings />

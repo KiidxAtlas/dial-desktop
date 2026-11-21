@@ -6,6 +6,7 @@ import { DRAFTS, QUEUES, readLocal, writeLocal } from "./localPrompts";
 import { canRetry } from "./sessionActions";
 import type { Attachment, OpenSnapshot } from "./types";
 import { focusComposer } from "./ui";
+import { typedPrompt } from "./savedTypes";
 
 export interface QueuedPrompt {
   id: number;
@@ -153,7 +154,7 @@ export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
   // Keep the restart warning on a rejected or unconfirmed send.
   try {
     const scope = { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId };
-    const accepted = await engine.send(item.text, item.attachments, scope);
+    const accepted = await engine.send(typedPrompt(item.text, snap.sessionId), item.attachments, scope);
     if (!accepted) {
       // No acceptance: leave the persisted copy intact and require manual review before retry.
       queue.paused = true;

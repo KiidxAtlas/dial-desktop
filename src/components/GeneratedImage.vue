@@ -121,7 +121,7 @@ figcaption {
   flex: none;
   place-items: center;
   width: 24px;
-  height: 22px;
+  height: 24px;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
 }

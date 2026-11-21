@@ -6,6 +6,7 @@
 //! renders, and [`app`] wires them into Tauri.
 
 pub mod agent_browser;
+pub mod answer_style;
 pub mod app;
 mod app_disk;
 pub mod app_runner;
@@ -24,6 +25,7 @@ pub mod settings;
 pub mod tabs;
 pub mod terminal;
 pub mod time;
+pub mod types;
 pub mod updates;
 pub mod view;
 pub mod voice;

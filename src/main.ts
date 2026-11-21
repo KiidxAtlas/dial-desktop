@@ -6,13 +6,17 @@ import { startAppearance } from "./appearance";
 import { openInBrowser, previewUrlsIn, showFile } from "./workspace";
 import { IMAGE_EXT, viewImage } from "./imageViewer";
 import { startNotifications } from "./notifications";
+import { startTypes } from "./savedTypes";
+import { installLegacyKeyGuard } from "./macKeys";
 import "./styles.css";
 
+installLegacyKeyGuard();
 startAppearance();
 createApp(App).mount("#app");
 
 void connect();
 startNotifications().catch((error) => showToast(`Could not initialize notifications: ${error}`));
+startTypes().catch((error) => showToast(`Could not load your types: ${error}`));
 loadHighlighter().catch((error) => console.warn("syntax highlighting unavailable", error));
 
 // Web links open in the browser: this computer's (a dev server) in the Browser panel, others in

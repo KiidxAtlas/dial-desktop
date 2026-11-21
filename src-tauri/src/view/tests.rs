@@ -114,9 +114,55 @@ fn generated_images_show_inline_from_changed_paths_else_the_output_argument() {
         );
         assert!(ToolView::new(0, &call, &w).images.is_empty(), "{output}");
     }
+    // Any tool shows the image files it wrote; only `image_gen` falls back to its output argument.
     let mut write = live.clone();
     write.name = "write".into();
-    assert!(ToolView::new(0, &write, &w).images.is_empty());
+    assert_eq!(
+        ToolView::new(0, &write, &w).images,
+        [
+            "/home/ada/work/app/art/kite.png",
+            "/home/ada/work/app/art/kite-2.png"
+        ]
+    );
+    let mut resumed_write = resumed.clone();
+    resumed_write.name = "write".into();
+    assert!(ToolView::new(0, &resumed_write, &w).images.is_empty());
+}
+
+#[test]
+fn a_read_shows_the_images_it_viewed() {
+    let w = workspace();
+    let read = |ok: Option<bool>, text: &str| ToolEntry {
+        call_id: "r1".into(),
+        name: "read".into(),
+        arguments: r#"{"paths":["shots/a.png","shots/b (1).jpg"]}"#.into(),
+        result: Some(dial_client::ToolOutcome {
+            text: text.into(),
+            ..outcome(ok, &[])
+        }),
+        ..ToolEntry::default()
+    };
+    let receipt = "Image: shots/a.png (1298289 bytes; attached to the next model request when vision is available)\n\
+         Image: shots/b (1).jpg (52 bytes; attached to the next model request when vision is available)\n\
+         Image: shots/a.png (1298289 bytes; attached to the next model request when vision is available)\n\
+         Image: /elsewhere/c.png (9 bytes; attached to the next model request when vision is available)\n\
+         Image: art/logo.svg rasterized from SVG; attached to the next model request when vision is available\n\
+         Image: notes.png (not a receipt)";
+    // Each viewed image inside the workspace, once, in order; converted sources and prose are not.
+    assert_eq!(
+        ToolView::new(0, &read(Some(true), receipt), &w).images,
+        ["/home/ada/work/app/shots/a.png", "/home/ada/work/app/shots/b (1).jpg"]
+    );
+    assert!(ToolView::new(0, &read(Some(false), receipt), &w).images.is_empty());
+    // Text from other tools that looks like a receipt shows nothing.
+    let mut bash = read(Some(true), receipt);
+    bash.name = "bash".into();
+    assert!(ToolView::new(0, &bash, &w).images.is_empty());
+    // Many images: the row keeps the first few.
+    let many: String = (0..20)
+        .map(|i| format!("Image: shots/{i}.png (1 bytes; attached)\n"))
+        .collect();
+    assert_eq!(ToolView::new(0, &read(Some(true), &many), &w).images.len(), 8);
 }
 
 #[test]
@@ -226,12 +272,12 @@ fn published_snapshots_send_only_what_changed() {
     let mut next = first.clone();
     next.title = "Renamed".into();
     let last = next.entries.len() - 1;
-    next.entries[last] = EntryView::Assistant {
+    next.entries[last] = Arc::new(EntryView::Assistant {
         text: "still streaming".into(),
         reasoning: String::new(),
         streaming: true,
         abandoned: false,
-    };
+    });
     let event = published.advance(next.clone()).unwrap();
     assert_eq!((event.seq, event.base), (2, 1));
     let patch = event.patch.unwrap();
@@ -281,7 +327,7 @@ fn the_session_preview_snapshot_covers_every_row_kind() {
         snap.stats,
         StatsView {
             running: 1,
-            succeeded: 6,
+            succeeded: 7,
             failed: 1
         }
     );
@@ -305,7 +351,7 @@ fn the_session_preview_snapshot_covers_every_row_kind() {
     let tools: Vec<&ToolView> = snap
         .entries
         .iter()
-        .filter_map(|e| match e {
+        .filter_map(|e| match &**e {
             EntryView::Tool(t) => Some(&**t),
             _ => None,
         })
@@ -445,6 +491,8 @@ fn the_model_view_prefers_state_and_labels_from_the_list() {
         vision: Some(true),
         configured: true,
         local: false,
+        listed: false,
+        catalog_only: false,
     }];
     model.approval = Some("ask".into());
     let value = serde_json::to_value(Snapshot::new(&model, None, 0)).unwrap();
@@ -496,4 +544,88 @@ fn the_empty_preview_has_no_selected_session() {
     assert!(snap.entries.is_empty());
     assert!(!snap.sessions.is_empty());
     assert!(snap.sessions.iter().all(|s| !s.selected));
+}
+
+fn feed(model: &mut Model, body: Value) {
+    let kind = body["event"].as_str().unwrap_or_default().to_owned();
+    model.conversation.apply_event(&dial_client::Event { kind, body });
+}
+
+/// A session with `turns` turns, each an answer and three settled `read` calls.
+fn long_session(w: &Workspace, turns: usize, output: &str) -> Model {
+    let mut model = preview::model(Preview::Empty, &w.root);
+    feed(&mut model, json!({"event": "ready", "session_id": "long"}));
+    for turn in 0..turns {
+        model.conversation.push_user(&format!("prompt {turn}"), 0);
+        feed(&mut model, json!({"event": "text", "delta": "word ".repeat(400)}));
+        for call in 0..3 {
+            let id = format!("c{turn}-{call}");
+            feed(&mut model, json!({"event": "tool_call", "call_id": id, "name": "read", "summary": "src/lib.rs"}));
+            feed(&mut model, json!({"event": "tool_result", "call_id": id, "name": "read", "text": output, "is_error": false, "status": "ok", "changed_paths": []}));
+        }
+    }
+    model
+}
+
+#[test]
+fn reused_rows_match_a_fresh_build_and_only_changed_rows_are_rebuilt() {
+    let w = workspace();
+    let mut model = long_session(&w, 2, "output");
+    feed(&mut model, json!({"event": "tool_call", "call_id": "run", "name": "bash", "summary": "cargo test"}));
+    let mut views = EntryViews::default();
+    let first = Snapshot::reusing(&model, Some(&w), 0, &mut views);
+    assert_eq!(first, Snapshot::new(&model, Some(&w), 0));
+    let running = first.entries.len() - 1;
+
+    // The running call settles and an answer starts: earlier rows are shared, the rest rebuilt.
+    feed(&mut model, json!({"event": "tool_result", "call_id": "run", "name": "bash", "text": "ok", "is_error": false, "status": "ok", "changed_paths": []}));
+    feed(&mut model, json!({"event": "text", "delta": "All tests pass."}));
+    let next = Snapshot::reusing(&model, Some(&w), 0, &mut views);
+    assert_eq!(next, Snapshot::new(&model, Some(&w), 0));
+    assert_eq!(next.entries.len(), running + 2);
+    assert!((0..running).all(|i| Arc::ptr_eq(&first.entries[i], &next.entries[i])));
+    assert!(!Arc::ptr_eq(&first.entries[running], &next.entries[running]));
+
+    // A shorter transcript (an undone turn) drops the rows past its end.
+    model.conversation.load_history(Some("long"), &[json!({"role": "user", "content": "only this"})]);
+    let shorter = Snapshot::reusing(&model, Some(&w), 0, &mut views);
+    assert_eq!(shorter, Snapshot::new(&model, Some(&w), 0));
+    assert_eq!(shorter.entries.len(), 1);
+
+    // Rows show paths relative to the workspace, so a different workspace rebuilds every row.
+    let mut model = long_session(&w, 1, "Image: /home/ada/work/app/shot.png (10 bytes; image/png)");
+    let mut views = EntryViews::default();
+    let here = Snapshot::reusing(&model, Some(&w), 0, &mut views);
+    let other = Workspace::new("/home/ada/elsewhere", Some("/home/ada"));
+    feed(&mut model, json!({"event": "text", "delta": "."}));
+    let there = Snapshot::reusing(&model, Some(&other), 0, &mut views);
+    assert_eq!(there, Snapshot::new(&model, Some(&other), 0));
+    assert!(here.entries.iter().zip(&there.entries).all(|(a, b)| !Arc::ptr_eq(a, b)));
+    assert_ne!(here.entries[2], there.entries[2], "the image is outside the other workspace");
+}
+
+#[test]
+#[ignore = "timing benchmark: cargo test --release snapshot_cost -- --ignored --nocapture"]
+fn snapshot_cost_on_a_long_session() {
+    let w = workspace();
+    let mut model = long_session(&w, 300, &"line of tool output\n".repeat(300));
+    model.conversation.push_user("last prompt", 0);
+    let frames = 60;
+    let mut views = EntryViews::default();
+    for (name, reuse) in [("rebuild every row", false), ("reuse unchanged rows", true)] {
+        let mut published = Published::default();
+        published.advance(Snapshot::reusing(&model, Some(&w), 0, &mut views));
+        let start = std::time::Instant::now();
+        for i in 0..frames {
+            feed(&mut model, json!({"event": "text", "delta": format!("token{i} ")}));
+            let snap = if reuse {
+                Snapshot::reusing(&model, Some(&w), 0, &mut views)
+            } else {
+                Snapshot::new(&model, Some(&w), 0)
+            };
+            assert!(published.advance(snap).is_some());
+        }
+        let per_frame = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+        println!("{} entries, {name}: {per_frame:.2} ms per frame", model.conversation.entries().len());
+    }
 }

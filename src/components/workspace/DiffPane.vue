@@ -161,9 +161,6 @@ function copy() {
 .del {
   color: var(--danger);
 }
-.icon-btn:disabled {
-  opacity: 0.35;
-}
 .lines {
   flex: 1;
   overflow: auto;

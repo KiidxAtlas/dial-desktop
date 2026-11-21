@@ -57,7 +57,9 @@ export const vFocus = { mounted: (el: HTMLElement) => el.focus() };
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgb(0 0 0 / 28%);
+  background: var(--scrim);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
 }
 .sheet {
   width: min(720px, 100%);
@@ -110,16 +112,13 @@ h3 {
   justify-content: space-between;
   gap: 12px;
   min-height: 30px;
+  padding: 5px 0;
+  line-height: 1.5;
   font-size: 13px;
   color: var(--text-muted);
 }
 kbd {
   flex: none;
-  padding: 2px 6px;
-  border-radius: 5px;
-  background: var(--hover);
-  font-family: var(--font-ui);
-  font-size: var(--text-xs);
   color: var(--text);
   white-space: pre;
 }

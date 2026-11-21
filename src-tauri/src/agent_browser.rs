@@ -113,7 +113,10 @@ the user need not name the App panel. Check state first. When app_desktop state 
 VM, run shell commands and read files in that VM with the ssh tool (host ssh.host) instead of \
 typing into its screen; keep frame and input for graphical apps. If setup or project files are \
 missing, explain what is needed. Never download a guest or launch the app on the host as a \
-fallback. Ordinary non-GUI build and test commands are unchanged.";
+fallback. Ordinary non-GUI build and test commands are unchanged. The types_* tools keep the \
+user's Types: saved collections (a cookbook, a routine, a moodboard, a decider) that Dial Desktop \
+opens as their own small apps. When the user wants to keep something the conversation produced, \
+check types_list, save it with types_add_item, and offer types_create for a fitting new Type.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -139,7 +142,7 @@ pub fn tools() -> Value {
         })
     };
     let none = json!({"type": "object", "properties": {}});
-    json!([
+    let mut list = json!([
         tool(
             "browser_open",
             "Open a page",
@@ -260,7 +263,11 @@ pub fn tools() -> Value {
                 "actions":{"type":"array", "minItems":1, "maxItems":64, "description":"Input steps run in order on that frame; required for input", "items": app_desktop_action_items()}
             }}),
         ),
-    ])
+    ]);
+    if let Value::Array(items) = &mut list {
+        items.extend(crate::types::tools());
+    }
+    list
 }
 
 /// The `actions` items of `app_desktop` (see `app_runner::actions::Action`). Built apart from the
@@ -794,6 +801,10 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
             let args = &request.arguments;
             if tool == "app_desktop" {
                 return crate::app_runner::agent_call(app, &request.workspace, args);
+            }
+            if tool.starts_with("types_") {
+                let store = app.state::<crate::types::Store>();
+                return crate::types::agent_call(app, &store, tool, args).map(Reply::text);
             }
             let _ = app.emit(
                 "agent-browser",

@@ -78,6 +78,19 @@ fn a_busy_tab_keeps_working_while_another_session_opens() {
 }
 
 #[test]
+fn saved_settings_wait_for_their_own_turn_not_another_session() {
+    let mut tabs = Tabs::new(tab("first", true));
+    assert_eq!(tabs.active_mut().saved_settings(), vec![Command::GetSettings]);
+    tabs.open(tab("second", false));
+    assert_eq!(tabs.active_mut().saved_settings(), vec![Command::GetSettings, Command::ApplySettings]);
+    let first = tabs.get_mut(0).unwrap();
+    let follow = first.apply(Update::Message(Message::Response {
+        id: request_id(1), method: "send".into(), result: Ok(json!({"outcome":"completed"})),
+    }));
+    assert_eq!(follow, vec![Command::ListSessions, Command::ApplySettings]);
+}
+
+#[test]
 fn a_background_tab_reports_when_done_and_then_closes() {
     let mut tabs = Tabs::new(tab("s1", true));
     tabs.open(tab("s2", false));

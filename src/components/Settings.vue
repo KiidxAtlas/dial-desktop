@@ -56,7 +56,7 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
   {
     title: "App",
     pages: [
-      { id: "appearance", label: "Appearance", icon: "sun", about: "Theme, zoom and the background behind sessions, on this computer.", words: "theme dark light zoom background image wallpaper dim" },
+      { id: "appearance", label: "Appearance", icon: "sun", about: "Theme, zoom, what answers draw, and the background behind sessions, on this computer.", words: "theme dark light zoom background image wallpaper dim interactive cards diagrams charts mermaid calculator" },
       { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify" },
       { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, and installing new ones.", words: "version upgrade install" },
     ],

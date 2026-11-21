@@ -4,6 +4,8 @@ import MarkdownIt from "markdown-it";
 import { ref } from "vue";
 import { createHighlighterCore, type HighlighterCore } from "shiki/core";
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import { diagramName } from "./diagram";
+import { appearance } from "./appearance";
 
 /** Code colours for each theme; the page picks one through the `--shiki-light`/`--shiki-dark` variables. */
 export const THEMES = { dark: "vesper", light: "github-light" } as const;
@@ -103,11 +105,18 @@ md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
   const label = escape(`Image: ${alt}`);
   return src && /^https?:/i.test(src) ? `<a href="${escape(src)}">${label}</a>` : `<span class="image-ref">${label}</span>`;
 };
-md.renderer.rules.fence = (tokens, idx, _options, env: { streaming?: boolean } | undefined) => {
+md.renderer.rules.fence = (tokens, idx, _options, env: RenderEnv | undefined) => {
   const token = tokens[idx];
   const lang = token.info.trim().split(/\s+/)[0] ?? "";
   // While an answer streams, its last block may still be growing: highlight it once it is done.
   const growing = !!env?.streaming && idx === tokens.length - 1;
+  if (lang.toLowerCase() === 'dial-app' && env?.cards && !env.streaming && token.content.length <= 24000) {
+    return `<div class="reply-app"><details open><summary>Interactive example source</summary>${codeBlock(token.content.trimEnd(), 'json')}</details></div>`;
+  }
+  if (lang.toLowerCase() === 'mermaid' && env?.diagrams && !env.streaming && token.content.length <= 12000) {
+    const name = diagramName(token.content);
+    return `<figure class="reply-diagram"><figcaption>${name}</figcaption><details open><summary>${name} source</summary>${codeBlock(token.content.trimEnd(), 'mermaid')}</details></figure>`;
+  }
   return codeBlock(token.content.replace(/\n$/, ""), lang, undefined, growing);
 };
 
@@ -148,7 +157,11 @@ md.renderer.rules.text = (tokens, idx) => {
   return out + escape(text.slice(last));
 };
 
-/** `streaming`: the text is still arriving (see the `fence` rule). */
+interface RenderEnv { streaming: boolean; cards: boolean; diagrams: boolean }
+
+/** `streaming`: the text is still arriving (see the `fence` rule). Cards and diagrams follow the
+ * Appearance settings; a caller computing from this re-renders when they change. */
 export function renderMarkdown(text: string, streaming = false): string {
-  return md.render(text, { streaming });
+  const env: RenderEnv = { streaming, cards: appearance.cards, diagrams: appearance.diagrams };
+  return md.render(text, env);
 }

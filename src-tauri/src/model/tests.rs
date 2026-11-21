@@ -531,6 +531,24 @@ fn switching_model_rereads_state_and_failures_toast() {
 }
 
 #[test]
+fn resumed_history_is_loading_until_recovery_finishes() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let loading = |m: &Model| {
+        let view = crate::view::Snapshot::new(m, None, 0);
+        serde_json::to_value(view).unwrap()["historyLoading"] == true
+    };
+    assert!(!loading(&model));
+    let (id, _) = requested(&mut model, Command::Resume("s2".into()), 1);
+    respond(&mut model, id, "resume", json!({"session_id":"s2"}));
+    assert!(loading(&model), "an opened session is not empty before recovery arrives");
+    let (id, _) = requested(&mut model, Command::Recover, 2);
+    assert!(loading(&model));
+    respond(&mut model, id, "recovery_snapshot", json!({"session_id":"s2", "seq":2, "messages":[], "busy":false, "pending_approvals":[], "question":null, "todo":[]}));
+    assert!(!loading(&model));
+}
+
+#[test]
 fn opened_and_forked_sessions_load_their_history() {
     // `dial rpc` replays nothing on a switch; the transcript comes from `recovery_snapshot`.
     let mut model = Model::starting();

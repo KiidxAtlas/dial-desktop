@@ -154,18 +154,46 @@ continues. Local builds without the release config do not contact Azure.
   Credentials are never shown and cannot be edited here.
 - **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (read straight from disk, honoring `HF_HUB_CACHE` and `HF_HOME`; no CLI needed). **Search Hugging Face** finds any MLX or GGUF model on the Hub, most downloaded first; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. A few suggested models follow, pinned to tested revisions. Every download is confirmed with its size first and uses the official Hugging Face CLI (`hf` on PATH, also used for search) and its normal cache. You can leave Settings while downloading, return to see the outcome, or cancel. Downloading does not select a model or install an inference runtime.
 - **Backgrounds** (Settings → Background): artwork behind your sessions, drawn by the app at the
-  window's resolution, with no image files. There are still ones (Warp, Dune, Terrain),
-  animated ones (Hyperspace, Flow, Fireflies, Cloudprint, and the ASCII presets Trace Route,
-  Hex Swarm, Stack Rain, Koi Pond and Crab Beach) and your own image. Over a
+  window's resolution. Choose still artwork (Warp or Dune), animated artwork
+  (Fireflies, Trace Route, Koi Pond, Crab Beach, Cloudprint, or Orbital Earth), or your own image. Over a
   background the composer and cards turn to frosted glass. Choose whether it shows behind every
   session or only a new one (the default), how much a conversation dims it, and whether animated ones move.
   They hold still when the system asks to reduce motion. Saved on this computer, for every project.
+  Orbital Earth labels real spacecraft using representative orbital heights and inclinations from the
+  [ILRS mission catalog](https://ilrs.gsfc.nasa.gov/missions/satellite_missions/index.html); positions are illustrative, not live.
 - **Conversation**: prompts, streamed answers with Markdown and syntax-highlighted code blocks
   (with copy buttons), collapsible reasoning, and compact tool-call rows. Expand a row to see its
   arguments, live output, result and changed files. Images an `image_gen` call writes always show
   inline under its row, including in resumed sessions; click one to show it in its folder. Text is
   selectable; links open in the browser, and links to project files open in the Files panel.
   Images an answer cannot load (remote addresses, unsupported formats) show as a link or label.
+  Replies can mix headings, bullet lists, comparison tables, images, and diagrams. Choose **Explain
+  with a diagram** in a new chat and add a topic, or ask for a flowchart in a `mermaid` code block.
+  When the reply finishes, click the diagram to enlarge it or expand **Diagram source** to copy the text.
+  Mermaid `xychart-beta` blocks render as bar and line charts in the same colours.
+  Choose **Make it interactive** for an inline card. A `dial-app` code block holds JSON with a
+  `title`, an optional `kind`, and optional `followUps` (`[{"label":"Go deeper","ask":"…"}]`).
+  Text fields are Markdown, so cards can include code, tables, and diagrams. Kinds:
+  - `screens` (the default): branching screens, each with a unique `id`, `text`, and `choices` that
+    open another screen (`{"label":"Try again","to":"start"}`) or offer a prompt (`{"label":"…","ask":"…"}`).
+  - `guide`: `steps` with a `title`, `text`, and optional `checklist`; ticks are remembered on this computer.
+  - `compare`: two to eight `tabs`, each with a `label` and `text`.
+  - `calculator`: `inputs` (`slider`, `number`, `select`, or `toggle`, each with an `id`) and `outputs`
+    with a `formula` such as `round(params * bits / 8, 1)`. Formulas are plain arithmetic with
+    comparisons, `a ? b : c`, and functions like `min`, `max`, `round`, and `sqrt`; an output with an
+    `id` can be used by later outputs.
+  - `explore`: a Mermaid `diagram` plus `nodes` keyed by node id, each with `text` and an optional
+    `ask`; click a node to read about it. Flowchart and state diagram nodes and flowchart subgraphs
+    are clickable; give each one an entry.
+
+  Cards are declarative: nothing in them runs as code, and a prompt button only adds text to the
+  prompt box. It never sends. You don't have to ask for them: each engine the app starts is told
+  (with `--append-system-prompt`) to add a diagram or card when one explains better than prose.
+  That guidance is about 450 tokens per request (about 150 with diagrams alone), cached by providers with the rest of the
+  system prompt. Settings → Appearance → In answers turns either kind off: the model is no longer
+  asked for them, existing blocks show as plain code, and their starter prompts are hidden. The
+  change restarts an idle session into itself; a running turn finishes first. Engines older than
+  the flag start without the guidance, so cards and diagrams then appear only when asked for.
   Hover a message to copy it (the last answer keeps its copy button in view); the last prompt also
   offers undo, and edit (undo, then put the prompt back in the box). A failed turn offers Retry.
   Scrolling up stops following new output, and a button jumps back to the latest.
@@ -223,9 +251,9 @@ continues. Local builds without the release config do not contact Azure.
     or console errors to the prompt. Pages get no access to the app's commands (the capability
     covers only the `main` web view) and cannot open windows. Local links in the conversation open
     here; ⌘-click opens them in the system browser.
-  - **Live previews**: when a tool call's output announces a local server (`http://localhost:5173`
-    and the like), the browser opens it, or a toast offers it if you turned that off (Browser
-    panel or palette). Previews from a session's history are listed but not opened.
+  - **Live previews**: local server announcements such as `Local: http://localhost:5173/` offer a
+    preview in the Browser panel without switching panels. To open new previews automatically,
+    opt in from the Browser panel or command palette. Session history never opens previews.
   - **The agent's browser**: Dial can drive the Browser panel itself through MCP tools
     (`mcp__dial_desktop__browser_open`, `_snapshot`, `_click`, `_type`, `_read`, `_screenshot`
     and more): open your dev server, click through it, read console errors and look at it. The

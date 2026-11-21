@@ -68,7 +68,7 @@ fn tools_are_listed_only_while_the_app_runs() {
             .as_array()
             .map(Vec::len)
     };
-    assert_eq!(list(true), Some(13));
+    assert_eq!(list(true), Some(19));
     assert_eq!(list(false), Some(0));
 }
 

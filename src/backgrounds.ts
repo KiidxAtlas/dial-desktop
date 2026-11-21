@@ -3,9 +3,10 @@
 // preference of this computer, kept in local storage.
 
 import { computed, reactive, ref, watch } from "vue";
-import { hexSwarm, stackRain, traceRoute } from "./asciiBackgrounds";
+import { lighthouse, traceRoute } from "./asciiBackgrounds";
 import { crabBeach } from "./crabBeach";
 import { cloudprint } from "./cloudprint";
+import { orbitalEarth } from "./orbitalEarth";
 import { koiPond } from "./koiPond";
 import { files, showToast } from "./bridge";
 
@@ -19,6 +20,7 @@ export interface Preset {
   id: string;
   name: string;
   paint: Painter;
+  prepare?: () => Promise<void>;
   /** Animated; still ones ignore the time. */
   moving?: boolean;
 }
@@ -209,199 +211,8 @@ const dune: Painter = (ctx, w, h) => {
   });
 };
 
-/** Contour lines of an imaginary landscape, like a topographic map. */
-const terrain: Painter = (ctx, w, h) => {
-  const rand = rng(5);
-  const u = unitOf(w, h);
-  ctx.fillStyle = vertical(ctx, h, [
-    [0, "#1c1b19"],
-    [1, "#262421"],
-  ]);
-  ctx.fillRect(0, 0, w, h);
-  const bumps = Array.from({ length: 9 }, () => ({
-    x: rand() * 1.6,
-    y: rand(),
-    s: 0.08 + rand() * 0.22,
-    a: (rand() < 0.75 ? 1 : -0.6) * (0.4 + rand() * 0.8),
-  }));
-  const aspect = w / h;
-  const field = (x: number, y: number) => {
-    const fx = (x / w) * aspect;
-    const fy = y / h;
-    let v = 0.15 * Math.sin(fx * 5.1 + fy * 2.3) + 0.1 * Math.sin(fy * 7.7 - fx * 1.9);
-    for (const b of bumps) v += b.a * Math.exp(-((fx - b.x) ** 2 + (fy - b.y) ** 2) / (2 * b.s * b.s));
-    return v;
-  };
-  const cell = Math.max(2, 6 * u);
-  const cols = Math.ceil(w / cell) + 1;
-  const rows = Math.ceil(h / cell) + 1;
-  const v = new Float32Array(cols * rows);
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (let j = 0; j < rows; j++)
-    for (let i = 0; i < cols; i++) {
-      const value = field(i * cell, j * cell);
-      v[j * cols + i] = value;
-      lo = Math.min(lo, value);
-      hi = Math.max(hi, value);
-    }
-  const levels = 26;
-  for (let k = 1; k < levels; k++) {
-    const level = lo + ((hi - lo) * k) / levels;
-    const major = k % 5 === 0;
-    ctx.strokeStyle = major ? "rgb(217 119 87 / 0.42)" : "rgb(222 220 209 / 0.13)";
-    ctx.lineWidth = (major ? 1.4 : 0.9) * u;
-    ctx.beginPath();
-    contour(ctx, v, cols, rows, cell, level);
-    ctx.stroke();
-  }
-  ctx.globalCompositeOperation = "lighter";
-  glow(ctx, w * 0.3, h * 0.25, w * 0.5, "217 119 87", 0.07);
-  ctx.globalCompositeOperation = "source-over";
-};
-
-/**
- * Marching squares: add the iso-line of `level` through the grid `v` (`cols` × `rows` samples,
- * `cell` apart) to the current path, as separate segments.
- */
-export function contour(
-  ctx: Pick<CanvasRenderingContext2D, "moveTo" | "lineTo">,
-  v: ArrayLike<number>,
-  cols: number,
-  rows: number,
-  cell: number,
-  level: number,
-) {
-  for (let j = 0; j < rows - 1; j++) {
-    for (let i = 0; i < cols - 1; i++) {
-      const a = v[j * cols + i]; // top left
-      const b = v[j * cols + i + 1]; // top right
-      const c = v[(j + 1) * cols + i + 1]; // bottom right
-      const d = v[(j + 1) * cols + i]; // bottom left
-      const index = (a > level ? 8 : 0) | (b > level ? 4 : 0) | (c > level ? 2 : 0) | (d > level ? 1 : 0);
-      if (index === 0 || index === 15) continue;
-      const x = i * cell;
-      const y = j * cell;
-      const top = (): [number, number] => [x + (cell * (level - a)) / (b - a), y];
-      const right = (): [number, number] => [x + cell, y + (cell * (level - b)) / (c - b)];
-      const bottom = (): [number, number] => [x + (cell * (level - d)) / (c - d), y + cell];
-      const left = (): [number, number] => [x, y + (cell * (level - a)) / (d - a)];
-      const line = (p: [number, number], q: [number, number]) => {
-        ctx.moveTo(p[0], p[1]);
-        ctx.lineTo(q[0], q[1]);
-      };
-      switch (index) {
-        case 1:
-        case 14:
-          line(left(), bottom());
-          break;
-        case 2:
-        case 13:
-          line(bottom(), right());
-          break;
-        case 3:
-        case 12:
-          line(left(), right());
-          break;
-        case 4:
-        case 11:
-          line(top(), right());
-          break;
-        case 5:
-          line(top(), left());
-          line(bottom(), right());
-          break;
-        case 6:
-        case 9:
-          line(top(), bottom());
-          break;
-        case 7:
-        case 8:
-          line(top(), left());
-          break;
-        case 10:
-          line(top(), right());
-          line(left(), bottom());
-          break;
-      }
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Animated presets
-
-/** Stars streaking past, as if flying through them. */
-const hyperspace: Painter = (ctx, w, h, time) => {
-  const rand = rng(17);
-  const u = unitOf(w, h);
-  ctx.fillStyle = "#020208";
-  ctx.fillRect(0, 0, w, h);
-  const cx = w * 0.5;
-  const cy = h * 0.45;
-  const depth = Math.max(w, h) * 0.6;
-  ctx.globalCompositeOperation = "lighter";
-  glow(ctx, cx, cy, w * 0.35, "90 110 255", 0.09);
-  ctx.lineCap = "round";
-  const radius = (spread: number, z: number) => (spread * depth) / (z * 4 + 0.15);
-  for (let i = 0; i < 700; i++) {
-    const angle = rand() * TAU;
-    const spread = 0.03 + rand();
-    const speed = 0.04 + rand() * 0.1;
-    const phase = rand();
-    const pick = rand();
-    const color = pick < 0.8 ? "200 215 255" : pick < 0.92 ? "255 120 110" : "217 119 87";
-    // z runs from 1 (far) to 0 (passing the viewer), then the star starts again.
-    const z = 1 - ((phase + time * speed) % 1);
-    const near = 1 - z;
-    const head = radius(spread, z);
-    const tail = radius(spread, Math.min(1, z + 0.03 + speed * 0.3));
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    ctx.strokeStyle = `rgb(${color} / ${Math.min(1, near * near * 1.3)})`;
-    ctx.lineWidth = (0.5 + near * 2.2) * u;
-    ctx.beginPath();
-    ctx.moveTo(cx + cos * tail, cy + sin * tail);
-    ctx.lineTo(cx + cos * head, cy + sin * head);
-    ctx.stroke();
-  }
-  ctx.globalCompositeOperation = "source-over";
-};
-
-/** Bands of fine lines rippling like silk, clay through violet. */
-const flow: Painter = (ctx, w, h, time) => {
-  const u = unitOf(w, h);
-  ctx.fillStyle = vertical(ctx, h, [
-    [0, "#07080d"],
-    [1, "#0e0b13"],
-  ]);
-  ctx.fillRect(0, 0, w, h);
-  ctx.globalCompositeOperation = "lighter";
-  const lines = 40;
-  const step = Math.max(2, 8 * u);
-  ctx.lineWidth = 1.4 * u;
-  for (let k = 0; k < lines; k++) {
-    const f = k / (lines - 1);
-    const r = Math.round(217 + (140 - 217) * f);
-    const g = Math.round(119 + (110 - 119) * f);
-    const b = Math.round(87 + (230 - 87) * f);
-    ctx.strokeStyle = `rgb(${r} ${g} ${b} / ${0.14 + 0.5 * Math.sin(f * Math.PI)})`;
-    const y0 = h * (0.3 + 0.45 * f);
-    ctx.beginPath();
-    for (let x = -step; x <= w + step; x += step) {
-      const fx = x / w;
-      const y =
-        y0 +
-        h * 0.09 * Math.sin(fx * TAU * 1.1 + time * 0.22 + f * 1.6) +
-        h * 0.04 * Math.sin(fx * TAU * 2.6 - time * 0.17 + f * 0.7) +
-        h * 0.02 * Math.sin(fx * TAU * 0.4 + time * 0.08);
-      if (x === -step) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  }
-  ctx.globalCompositeOperation = "source-over";
-};
 
 /** Warm lights drifting and blinking over dark hills at night. */
 const fireflies: Painter = (ctx, w, h, time) => {
@@ -447,16 +258,13 @@ const fireflies: Painter = (ctx, w, h, time) => {
 export const PRESETS: Preset[] = [
   { id: "warp", name: "Warp", paint: warp },
   { id: "dune", name: "Dune", paint: dune },
-  { id: "terrain", name: "Terrain", paint: terrain },
-  { id: "hyperspace", name: "Hyperspace", paint: hyperspace, moving: true },
-  { id: "flow", name: "Flow", paint: flow, moving: true },
   { id: "fireflies", name: "Fireflies", paint: fireflies, moving: true },
   { id: "trace-route", name: "Trace Route", paint: traceRoute, moving: true },
-  { id: "hex-swarm", name: "Hex Swarm", paint: hexSwarm, moving: true },
-  { id: "stack-rain", name: "Stack Rain", paint: stackRain, moving: true },
+  { id: "lighthouse", name: "Lighthouse", paint: lighthouse, moving: true },
   { id: "koi-pond", name: "Koi Pond", paint: koiPond, moving: true },
   { id: "crab-beach", name: "Crab Beach", paint: crabBeach, moving: true },
   { id: "cloudprint", name: "Cloudprint", paint: cloudprint, moving: true },
+  { id: "orbital-earth", name: "Orbital Earth", paint: orbitalEarth, moving: true },
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -472,6 +280,7 @@ export function parsePrefs(text: string | null): BackgroundPrefs {
     // A damaged value falls back to the defaults.
   }
   const path = typeof raw.path === "string" && raw.path ? raw.path : null;
+  if (raw.id === "newsprint") raw.id = "orbital-earth";
   const known = typeof raw.id === "string" && (raw.id === "none" || PRESETS.some((p) => p.id === raw.id));
   const id = raw.id === "custom" && path ? "custom" : known ? (raw.id as string) : DEFAULT_PREFS.id;
   const dim = typeof raw.dim === "number" && Number.isFinite(raw.dim) ? Math.min(MAX_DIM, Math.max(0, raw.dim)) : DEFAULT_PREFS.dim;
@@ -564,6 +373,7 @@ export function paintCanvas(canvas: HTMLCanvasElement, p: Preset, time = STILL_T
  * allowed, else painted once and again after resizing. Returns the function that stops it.
  */
 export function show(canvas: HTMLCanvasElement, p: Preset): () => void {
+  const ready = p.prepare?.().catch(() => { /* Keep the printed layout if an asset cannot load. */ });
   if (p.moving && motionAllowed()) {
     const start = performance.now() - STILL_TIME * 1000;
     let last = -Infinity;
@@ -586,7 +396,10 @@ export function show(canvas: HTMLCanvasElement, p: Preset): () => void {
   });
   observer.observe(canvas);
   repaint();
+  let active = true;
+  ready?.then(() => { if (active) repaint(); });
   return () => {
+    active = false;
     observer.disconnect();
     clearTimeout(timer);
   };

@@ -5,7 +5,7 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 19);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
@@ -27,6 +27,11 @@ fn tool_list_is_well_formed() {
     let type_tool = tools.iter().find(|t| t["name"] == "browser_type").unwrap();
     assert_eq!(type_tool["inputSchema"]["required"], json!(["text"]));
     assert!(type_tool["inputSchema"]["properties"]["ref"].is_object());
+    let saved: Vec<&str> = names.iter().copied().filter(|n| n.starts_with("types_")).collect();
+    assert_eq!(
+        saved,
+        ["types_add_item", "types_create", "types_items", "types_list", "types_update", "types_update_item"]
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@ import type { OpenSnapshot } from "../types";
 import { engine, showToast } from "../bridge";
 import { applySaved, engineCall, readable } from "../engineTools";
 import { assignRole, unassignRole } from "../roles";
+import { imageChoices, imageModelLabel, matchesImageRoute, type ImageModelsChecked, type RoleModel } from "../imageModels";
 import { ui } from "../ui";
 import Icon from "./Icon.vue";
 import SPage from "./settings/SPage.vue";
@@ -31,44 +32,62 @@ interface Page {
   role: { provider: string; model: string; base_url?: string | null } | null;
   options: { sizes: string[]; qualities: string[]; backgrounds: string[]; moderations: string[]; max_steps: number; lora_scale_limit: number; loras: string[] };
 }
-interface Listed { provider: string; provider_label?: string; model_id: string; label: string; base_url?: string | null; image_api?: unknown }
 
 const live = computed(() => props.snap.connection.state === "live");
 const page = ref<Page | null>(null);
-const models = ref<Listed[]>([]);
+const models = ref<RoleModel[]>([]);
 const loading = ref(false);
+const checking = ref(false);
 const busy = ref(false);
 const error = ref("");
+const checkedSummary = ref<ImageModelsChecked | null>(null);
+let autoChecked = false;
 
-async function load() {
+async function load(refresh = false) {
   if (!live.value) return;
   loading.value = true;
+  if (refresh) checking.value = true;
   error.value = "";
   try {
-    const [p, m] = await Promise.all([
+    let image: { models: RoleModel[]; checked?: ImageModelsChecked };
+    if (refresh) {
+      // Probe all configured providers first so the engine updates its persistent caches.
+      image = await engineCall<{ models: RoleModel[]; checked?: ImageModelsChecked }>("list_models", {
+        purpose: "image",
+        refresh: true,
+      }).catch(() => engineCall<{ models: RoleModel[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] })));
+      if (image.checked) checkedSummary.value = image.checked;
+    } else {
+      image = await engineCall<{ models: RoleModel[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] }));
+    }
+    const [p, catalog] = await Promise.all([
       engineCall<Page>("image_settings"),
-      engineCall<{ models: Listed[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] as Listed[] })),
+      engineCall<{ models: RoleModel[] }>("list_models").catch(() => ({ models: [] })),
     ]);
     page.value = p;
-    // An engine without image listings answers with chat rows, which have no `image_api`.
-    models.value = (m.models ?? []).filter((r) => "image_api" in r);
+    models.value = imageChoices(image.models ?? [], catalog.models ?? [], p);
+    if (!refresh && !autoChecked && models.value.length === 0) {
+      autoChecked = true;
+      await load(true);
+      return;
+    }
   } catch (e) {
     error.value = /does not call|unknown method|method_not_found/i.test(readable(e))
       ? "This Dial engine is too old for image settings. Update the engine, then reopen this page."
       : readable(e);
   } finally {
     loading.value = false;
+    if (refresh) checking.value = false;
   }
 }
-onMounted(load);
-
+onMounted(() => load(false));
 const has = (field: string) => !!page.value?.settings?.includes(field);
 const entry = computed<Entry>(() => page.value?.entry ?? { model: page.value?.model ?? "" });
 
 // ── Model ──
 const key = (provider: string, model: string) => `${provider}\u0000${model}`;
 const groups = computed(() => {
-  const by = new Map<string, Listed[]>();
+  const by = new Map<string, RoleModel[]>();
   for (const m of models.value) {
     const name = m.provider_label ?? m.provider;
     by.set(name, [...(by.get(name) ?? []), m]);
@@ -81,7 +100,21 @@ const shortModel = (id: string) => (id.startsWith("/") ? id.split("/").filter(Bo
 /** The listing's name for the route's model, else the tail of its id. */
 const routeName = computed(() => {
   const id = page.value?.model ?? "";
-  return models.value.find((m) => m.model_id === id)?.label || shortModel(id);
+  return models.value.find((m) => matchesImageRoute(m, page.value ?? undefined))?.label || shortModel(id);
+});
+const cacheHint = computed(() => {
+  if (checking.value) return "Checking configured providers and caching capable image models…";
+  if (!models.value.length) return "No image generators cached yet. Click Check models to probe configured providers.";
+  const verified = models.value.filter((m) => m.image_capability_source === "verified").length;
+  const candidates = models.value.filter((m) => m.image_capability === "candidate").length;
+  const capable = models.value.length - candidates;
+  const parts = [`${capable} capable`];
+  if (verified) parts.push(`${verified} verified`);
+  if (candidates) parts.push(`${candidates} unverified`);
+  const base = `Cached across ${groups.value.length} provider${groups.value.length === 1 ? "" : "s"} (${parts.join(", ")}). Unassigned follows the conversation model when it can generate images.`;
+  return checkedSummary.value
+    ? `${base} Last checked ${checkedSummary.value.providers} providers.`
+    : base;
 });
 
 async function pickModel(value: string) {
@@ -151,7 +184,7 @@ async function test() {
 <template>
   <SPage title="Image generation" description="Which model makes images when Dial is asked for one, and how it renders them.">
     <template #actions>
-      <button v-if="live" class="btn btn-secondary" :disabled="loading || busy" @click="load">Refresh</button>
+      <button v-if="live" class="btn btn-secondary" :disabled="loading || busy" @click="load(true)">{{ checking ? "Checking…" : "Check models" }}</button>
     </template>
 
     <div v-if="!live" class="empty">Connect to the Dial engine to change image settings.</div>
@@ -170,16 +203,15 @@ async function test() {
             Generate a test image
           </button>
         </div>
-        <SRow label="Image model" description="The model Dial uses for images. Downloaded models run on this Mac; Dial starts and stops them itself. Unassigned uses the conversation model when it can make images.">
+        <SRow label="Image model" :description="cacheHint">
           <select class="s-select" :value="chosen" :disabled="busy || loading" aria-label="Image model" @change="pickModel(($event.target as HTMLSelectElement).value)">
             <option value="">Unassigned</option>
-            <option v-if="offList && page.role" :value="chosen">{{ shortModel(page.role.model) }} · {{ page.role.provider }}</option>
+            <option v-if="offList && page.role" disabled :value="chosen">{{ shortModel(page.role.model) }} · {{ page.role.provider }} (not listed)</option>
             <optgroup v-for="[p, list] in groups" :key="p" :label="p">
-              <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ m.label || shortModel(m.model_id) }}</option>
+              <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ imageModelLabel(m, shortModel(m.model_id)) }}</option>
             </optgroup>
           </select>
         </SRow>
-        <p v-if="!models.length" class="note">No image models found. Download one in Model library, or refresh a provider's model list.</p>
       </SGroup>
 
       <SGroup v-if="page.ok && page.settings?.length" title="Generation" :description="`Saved for this model only. ${page.api} uses the settings shown; others are kept for other models.`">

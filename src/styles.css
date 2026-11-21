@@ -96,6 +96,11 @@
 
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 
+  /* Dimmed backdrop behind centred sheets (palette, shortcuts, command output). */
+  --scrim: rgb(0 0 0 / 32%);
+  /* Space between a popover and the control it opens from. */
+  --pop-gap: 8px;
+
   /* Floating cards (composer, approvals, questions). Over a background they turn to glass. */
   --glass: var(--surface);
   --glass-soft: transparent;
@@ -113,8 +118,9 @@
   color: var(--text);
 }
 
-/* With the sidebar hidden, the macOS window buttons sit over the title bar (TopBar.vue). */
-.mac.no-sidebar .topbar {
+/* With the sidebar hidden, the macOS window buttons sit over the title bar (TopBar.vue).
+   Full screen has no window buttons, so nothing is reserved there (App.vue). */
+.mac.no-sidebar:not(.fullscreen) .topbar {
   padding-left: 84px;
 }
 
@@ -261,6 +267,33 @@ kbd {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 .btn:disabled {
+  opacity: 0.4;
+}
+
+/* Square icon-only buttons: pane toolbars, sheet headers, list rows. */
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  transition:
+    background 120ms var(--ease),
+    color 120ms var(--ease),
+    opacity 120ms var(--ease),
+    transform 90ms var(--ease);
+}
+.icon-btn:hover:not(:disabled),
+.icon-btn.on {
+  background: var(--hover);
+  color: var(--text);
+}
+.icon-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+.icon-btn:disabled {
   opacity: 0.4;
 }
 
@@ -425,10 +458,137 @@ kbd {
   background: color-mix(in srgb, var(--warning) 28%, transparent);
   color: inherit;
 }
+/* Answer images sit in a thin glass mat, like the other answer cards. */
 .prose img {
   max-width: 100%;
-  border-radius: var(--radius-md);
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--glass-soft);
 }
+/* Source toggles under diagrams and interactive cards: mono, like tool rows. */
+.reply-app > details > summary,
+.reply-diagram summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  cursor: pointer;
+  list-style: none;
+  font: var(--text-xs) / 1.4 var(--font-mono);
+  text-transform: lowercase;
+  color: var(--text-faint);
+}
+.reply-app > details > summary::-webkit-details-marker,
+.reply-diagram summary::-webkit-details-marker { display: none; }
+.reply-app > details > summary::before,
+.reply-diagram summary::before {
+  content: "›";
+  font-size: 13px;
+  line-height: 1;
+  transition: transform 0.15s var(--ease);
+}
+.reply-app > details[open] > summary::before,
+.reply-diagram details[open] summary::before { transform: rotate(90deg); }
+.reply-app > details > summary:hover,
+.reply-diagram summary:hover { color: var(--accent); }
+.reply-app { margin-bottom: 1em; }
+.reply-app > details > summary { padding: 2px 6px; }
+.reply-app > details[open] > summary { margin-bottom: 6px; }
+/* A card's source link stays out of the way until the card is hovered or the link focused. */
+.reply-app > details:not([open]) > summary { opacity: 0; transition: opacity 0.15s var(--ease); }
+.reply-app:hover > details > summary,
+.reply-app > details > summary:focus-visible { opacity: 1; }
+/* Diagrams: a glass frame with a mono header; the diagram itself is transparent, on a faint dot grid. */
+.reply-diagram {
+  margin: 0.4em 0 1.1em;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--glass-soft);
+}
+.reply-diagram figcaption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font: 500 var(--text-xs) / 1.4 var(--font-mono);
+  text-transform: lowercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+.reply-diagram figcaption + details { border-top: 0; }
+.reply-diagram figcaption::before {
+  content: "●";
+  font-size: 8px;
+  color: var(--accent);
+}
+.reply-diagram:has(> button) figcaption::after {
+  content: "click to expand";
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+.reply-diagram.wide:has(> button) figcaption::after { content: "scroll sideways · click to expand"; }
+/* Diagrams keep a readable size (see `MIN_SCALE` in diagram.ts); wider ones scroll sideways. */
+.reply-diagram > button {
+  display: block;
+  width: 100%;
+  padding: 14px 12px;
+  background: radial-gradient(circle, var(--border-strong) 1px, transparent 1.4px) center / 18px 18px;
+  cursor: zoom-in;
+}
+.reply-diagram > button:focus-visible { outline-offset: -3px; }
+/* A scroller fades out at any edge with more beyond it (`trackOverflow`, scrollFade.ts). A mask
+ * rather than an overlay, so it works over glass; keep borders off the scroller itself. Sideways
+ * and vertical fades are separate layers, intersected. */
+.scroll-x {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  --fade: 56px;
+  --fade-x: linear-gradient(#000, #000);
+  --fade-y: linear-gradient(#000, #000);
+}
+.scroll-x.more-end { --fade-x: linear-gradient(to right, #000 calc(100% - var(--fade)), transparent); }
+.scroll-x.more-start { --fade-x: linear-gradient(to left, #000 calc(100% - var(--fade)), transparent); }
+.scroll-x.more-start.more-end {
+  --fade-x: linear-gradient(to right, transparent, #000 var(--fade), #000 calc(100% - var(--fade)), transparent);
+}
+.scroll-x.more-bottom { --fade-y: linear-gradient(to bottom, #000 calc(100% - var(--fade)), transparent); }
+.scroll-x.more-top { --fade-y: linear-gradient(to top, #000 calc(100% - var(--fade)), transparent); }
+.scroll-x.more-top.more-bottom {
+  --fade-y: linear-gradient(to bottom, transparent, #000 var(--fade), #000 calc(100% - var(--fade)), transparent);
+}
+.scroll-x:is(.more-start, .more-end, .more-top, .more-bottom) {
+  mask-image: var(--fade-x), var(--fade-y);
+  mask-composite: intersect;
+}
+.reply-diagram img {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  animation: diagram-in 0.45s var(--ease) both;
+}
+@keyframes diagram-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reply-diagram img { animation: none; }
+}
+/* One diagram rendering per palette, picked the same way as highlighted code. */
+.reply-diagram img.diagram-light { display: none; }
+:root[data-theme="light"] .reply-diagram img.diagram-light { display: block; }
+:root[data-theme="light"] .reply-diagram img.diagram-dark { display: none; }
+:root[data-theme="light"] .has-backdrop .reply-diagram img.diagram-light { display: none; }
+:root[data-theme="light"] .has-backdrop .reply-diagram img.diagram-dark { display: block; }
+.reply-diagram details { border-top: 1px solid var(--border); }
+.reply-diagram summary { padding: 7px 12px; }
+.reply-diagram .code-block { margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
 .prose h1,
 .prose h2 {
   letter-spacing: -0.01em;
@@ -451,11 +611,12 @@ kbd {
   max-width: 100%;
   width: max-content;
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
+  background: var(--glass-soft);
 }
 .prose th,
 .prose td {
-  padding: 7px 12px;
+  padding: 8px 14px;
   text-align: left;
   border-bottom: 1px solid var(--border);
 }
@@ -466,19 +627,25 @@ kbd {
 .prose tr:last-child td {
   border-bottom: none;
 }
+/* Column headings read like the mono labels on tool rows and cards. */
 .prose th {
   background: var(--hover);
-  font-weight: 600;
+  font: 500 var(--text-xs) / 1.4 var(--font-mono);
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
 }
 .prose tbody tr:hover td {
   background: var(--hover);
+}
+.prose tbody td:first-child {
+  font-weight: 500;
 }
 
 /* Code blocks: answers and tool details. */
 .code-block {
   margin: 0 0 0.9em;
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bubble);
   overflow: hidden;
 }
@@ -486,24 +653,31 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 30px;
+  height: 32px;
   padding: 0 6px 0 12px;
   border-bottom: 1px solid var(--border);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  font-family: var(--font-ui);
+  background: var(--hover);
+  font: 500 var(--text-xs) / 1 var(--font-mono);
+  color: var(--text-muted);
   user-select: none;
   -webkit-user-select: none;
 }
+.code-head > span::before {
+  content: "●";
+  margin-right: 8px;
+  font-size: 8px;
+  vertical-align: 1px;
+  color: var(--accent);
+}
 .code-head .copy {
-  font-family: var(--font-ui);
-  font-size: var(--text-xs);
+  font: var(--text-xs) / 1 var(--font-mono);
+  text-transform: lowercase;
   color: var(--text-faint);
-  padding: 3px 8px;
+  padding: 5px 8px;
   border-radius: var(--radius-sm);
 }
 .code-head .copy:hover {
-  color: var(--text);
+  color: var(--accent);
   background: var(--hover);
 }
 .code-head .copy.copied {

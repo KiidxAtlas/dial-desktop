@@ -11,6 +11,7 @@ import Markdown from "./Markdown.vue";
 import ToolRow from "./ToolRow.vue";
 import EmptyState from "./EmptyState.vue";
 import Icon from "./Icon.vue";
+import { pendingSave, saveMenu, withoutTypeTag } from "../savedTypes";
 import WorkingIndicator from "./WorkingIndicator.vue";
 import { turnReviews } from "../turnReview";
 import CodeBlock from "./CodeBlock.vue";
@@ -329,7 +330,8 @@ function failedIn(run: ToolRun) {
 </script>
 
 <template>
-  <EmptyState v-if="empty" :snap="snap" />
+  <p v-if="empty && snap.historyLoading" class="history-loading" role="status">Loading conversation…</p>
+  <EmptyState v-else-if="empty" :snap="snap" />
   <div v-if="conversationFindOpen && !empty" class="find-bar" @keydown.esc.stop.prevent="closeFind">
     <Icon name="search" :size="15" />
     <input
@@ -368,7 +370,7 @@ function failedIn(run: ToolRun) {
         <div v-if="!hidden.has(index)" class="row" :class="[`k-${entry.kind}`, gap(index), { 'current-match': index === transcriptMatch || (matches.length && index === activeMatch) }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
             <div class="bubble">
-              <div class="user-text" :class="{ clamped: isLongPrompt(entry.text) && !ui.expanded.has(`prompt:${index}`) }">{{ entry.text }}</div>
+              <div class="user-text" :class="{ clamped: isLongPrompt(entry.text) && !ui.expanded.has(`prompt:${index}`) }">{{ withoutTypeTag(entry.text) }}</div>
               <button v-if="isLongPrompt(entry.text)" class="more" @click="toggle(`prompt:${index}`)">
                 {{ ui.expanded.has(`prompt:${index}`) ? "Show less" : `Show all ${entry.text.split("\n").length} lines` }}
               </button>
@@ -378,7 +380,7 @@ function failedIn(run: ToolRun) {
               </div>
             </div>
             <div class="actions">
-              <button class="act" title="Copy" @click="copyText(entry.text)">
+              <button class="act" title="Copy" @click="copyText(withoutTypeTag(entry.text))">
                 <Icon name="copy" :size="14" />
               </button>
               <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" @click="forkAt(index, entry.text)"><Icon name="duplicate" :size="14" /></button>
@@ -418,6 +420,13 @@ function failedIn(run: ToolRun) {
               </button>
               <button class="act" title="Copy answer as Markdown" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
+              </button>
+              <button
+                class="act"
+                title="Save to a type…"
+                @click="saveMenu($event, pendingSave(entry.text, [], snap.workspace.root, snap.sessionId), $event.currentTarget as HTMLElement)"
+              >
+                <Icon name="bookmark" :size="14" />
               </button>
               <button
                 v-if="snap.connection.state === 'live'"
@@ -499,6 +508,11 @@ function failedIn(run: ToolRun) {
 </template>
 
 <style scoped>
+.history-loading {
+  margin: auto;
+  color: var(--text-muted);
+  font-size: 13px;
+}
 .turn-review {
   margin: 12px 0 4px;
   border: 1px solid var(--border);
@@ -568,7 +582,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   font: inherit;
 }
 .match-count { font-size: 12px; white-space: nowrap; }
-.find-bar button { display: grid; place-items: center; width: 25px; height: 25px; border-radius: var(--radius-sm); }
+.find-bar button { display: grid; place-items: center; width: 28px; height: 28px; border-radius: var(--radius-sm); }
 .find-bar button:hover:not(:disabled) { background: var(--hover); }
 .find-bar button:disabled { opacity: 0.4; }
 .row.current-match {
@@ -734,7 +748,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   translate: -50% calc(-100% - 8px);
   border-radius: 999px;
   background: var(--raised);
-  box-shadow: var(--shadow-pop), inset 0 0 0 1px var(--border-strong);
+  box-shadow: var(--shadow-pop);
   color: var(--text);
   font-size: var(--text-sm);
   animation: rise 120ms var(--ease) both;

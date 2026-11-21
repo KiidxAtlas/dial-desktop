@@ -5,10 +5,11 @@ import { engine, folders } from "../bridge";
 import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
-import { finishRename, sessionGroups, sessionItems, startRename } from "../sessionActions";
+import { finishRename, goToSession, sessionGroups, sessionItems, startRename } from "../sessionActions";
 import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
+import SidebarTypes from "./types/SidebarTypes.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -130,21 +131,15 @@ function newSession() {
 // Picking several sessions (see `picking.ts`); a plain click opens the session.
 const anchor = ref<string | null>(null);
 
-function click(event: MouseEvent, id: string, selected: boolean) {
+function click(event: MouseEvent, session: Session) {
   const kind = clickKind(event);
   const ids = sessions.value.map((s) => s.id);
   const current = props.snap.sessions.find((s) => s.selected)?.id ?? null;
-  const next = pickAfter({ picked: ui.picked, anchor: anchor.value }, ids, id, kind, current);
+  const next = pickAfter({ picked: ui.picked, anchor: anchor.value }, ids, session.id, kind, current);
   ui.picked.clear();
   for (const pickedId of next.picked) ui.picked.add(pickedId);
   anchor.value = next.anchor;
-  if (kind === "open") open(id, selected);
-}
-
-function open(id: string, selected: boolean) {
-  ui.transcriptJump = null;
-  ui.settingsOpen = false;
-  if (!selected) engine.resume(id);
+  if (kind === "open") goToSession(session);
 }
 
 const pickedSessions = computed(() => props.snap.sessions.filter((s) => ui.picked.has(s.id)));
@@ -238,7 +233,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         New session
       </button>
       <form class="item search" @submit.prevent="searchTranscripts">
-        <Icon name="search" :size="15" />
+        <Icon name="search" :size="16" />
         <input ref="searchInput" v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search titles'" :aria-label="searchMessages ? 'Search messages' : 'Search titles'" spellcheck="false" @keydown="onSearchKey" />
         <button
           type="button" class="scope" :aria-pressed="searchMessages"
@@ -247,6 +242,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         >{{ searchMessages ? 'Messages' : 'Titles' }}</button>
       </form>
     </nav>
+
+    <SidebarTypes />
 
     <nav v-if="searchMessages" class="list" aria-label="Transcript search results">
       <button class="item" :disabled="!live || searching || !ui.sessionFilter.trim()" @click="searchTranscripts">Search messages</button>
@@ -272,7 +269,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           :key="s.id"
           class="session"
           :class="{
-            selected: s.selected && !ui.settingsOpen,
+            selected: s.selected && !ui.settingsOpen && !ui.typeOpen,
             picked: ui.picked.has(s.id),
             editing: renamingHere(s.id),
           }"
@@ -280,10 +277,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           tabindex="0"
           :aria-pressed="ui.picked.has(s.id)"
           :title="`${s.title}\n${s.waiting ? 'Waiting for you' : s.running ? 'Working' : s.meta}`"
-          @click="renamingHere(s.id) || click($event, s.id, s.selected)"
+          @click="renamingHere(s.id) || click($event, s)"
           @dblclick="startRename(s.id, 'sidebar')"
           @contextmenu="menuFor($event, s)"
-          @keydown.self.enter="open(s.id, s.selected)"
+          @keydown.self.enter="goToSession(s)"
           @keydown.self.f2.prevent="startRename(s.id, 'sidebar')"
           @keydown.self.space.prevent="ui.picked.has(s.id) ? ui.picked.delete(s.id) : ui.picked.add(s.id)"
         >
@@ -334,7 +331,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       title="Settings (⌘,)"
       @click="ui.settingsOpen = !ui.settingsOpen"
     >
-      <Icon name="gear" :size="15" />
+      <Icon name="gear" :size="16" />
       Settings
     </button>
 
@@ -419,8 +416,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   height: 36px;
   padding: 0 10px;
 }
-.mac .brand {
-  /* Room for the window buttons, which sit over the content. */
+.mac:not(.fullscreen) .brand {
+  /* Room for the window buttons, which sit over the content; full screen has none. */
   margin-top: 26px;
 }
 .collapse {
@@ -481,7 +478,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   place-items: center;
   width: 20px;
   height: 20px;
-  margin-left: -2px;
+  /* Optically centred on the 16px row icons, so every label starts on one line. */
+  margin: 0 -2px;
   border-radius: 50%;
   background: var(--accent);
   color: var(--on-accent);
@@ -686,7 +684,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   width: 22px;
   height: 22px;
   flex: none;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-faint);
 }
 .row-btn:last-child {
@@ -783,9 +781,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   position: absolute;
   left: 0;
   right: 0;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + var(--pop-gap));
   z-index: 30;
-  padding: 5px;
+  padding: 6px;
   border-radius: var(--radius-md);
   background: var(--raised);
   box-shadow: var(--shadow-pop);

@@ -83,6 +83,10 @@ impl Tab {
         Ok(())
     }
 
+    pub fn saved_settings(&mut self) -> Vec<Command> {
+        self.model.saved_settings(self.turn_queued)
+    }
+
     pub fn submit_prompt(&mut self, command: Command) -> Result<crate::engine::RpcReply, String> {
         let reply = self
             .engine
@@ -154,6 +158,10 @@ impl Tab {
                 .opening
                 .as_ref()
                 .is_some_and(|(wanted, _)| wanted == id)
+    }
+
+    pub fn opening_session(&self) -> bool {
+        self.opening.is_some()
     }
 
     pub fn transitioning(&self) -> bool {
@@ -336,6 +344,18 @@ impl Tabs {
         }
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Add `tab` behind the one on screen: it works in the background and closes when done.
+    pub fn add_background(&mut self, mut tab: Tab) {
+        if tab.model.sessions.is_empty() {
+            tab.model.sessions = self.active().model.sessions.clone();
+        }
+        self.tabs.push(tab);
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Tab> {
+        self.tabs.get_mut(index)
     }
 
     /// Close background tabs with nothing left to do and return them for shutdown.

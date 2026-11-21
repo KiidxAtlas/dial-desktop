@@ -42,6 +42,12 @@ export const ui = reactive({
   settingsOpen: false,
   /** The Desktop tab to open settings on (`updates`), or `""` for the usual first tab. */
   settingsTab: "" as SettingsTab,
+  /** The saved type (`savedTypes`) shown in place of the transcript while open, by id. */
+  typeOpen: null as string | null,
+  /** With a type open: the type itself, or its own conversation. */
+  typeMode: "type" as "type" | "chat",
+  /** The sidebar's Types shows its name field for a new type. */
+  typeNaming: false,
   /** Sessions picked in the sidebar with ⌘/Ctrl- or Shift-click, by id. */
   picked: new Set<string>(),
   /** The session whose name is being edited, and where: the sidebar row or the title bar. */

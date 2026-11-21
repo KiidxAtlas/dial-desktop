@@ -24,13 +24,14 @@ interface Prefs {
 }
 
 function load(): Prefs {
-  const defaults: Prefs = { narrowWidth: 300, wideWidth: 620, autoOpenPreviews: true };
+  const defaults: Prefs = { narrowWidth: 300, wideWidth: 620, autoOpenPreviews: false };
   try {
     const value = JSON.parse(localStorage.getItem(KEY) ?? "{}");
     return {
       narrowWidth: Number.isFinite(value?.narrowWidth) ? value.narrowWidth : defaults.narrowWidth,
       wideWidth: Number.isFinite(value?.wideWidth) ? value.wideWidth : defaults.wideWidth,
-      autoOpenPreviews: typeof value?.autoOpenPreviews === "boolean" ? value.autoOpenPreviews : defaults.autoOpenPreviews,
+      // The old autoOpenPreviews value was also persisted on resize, so true wasn't an opt-in.
+      autoOpenPreviews: value?.previewAutoOpenOptIn === true,
     };
   } catch {
     return defaults;
@@ -52,7 +53,7 @@ watch(
   () => {
     try {
       const { narrowWidth, wideWidth, autoOpenPreviews } = workspace;
-      localStorage.setItem(KEY, JSON.stringify({ narrowWidth, wideWidth, autoOpenPreviews }));
+      localStorage.setItem(KEY, JSON.stringify({ narrowWidth, wideWidth, previewAutoOpenOptIn: autoOpenPreviews }));
     } catch {
       // Storage may be unavailable; the choice still holds for this run.
     }
@@ -180,10 +181,8 @@ export function previewUrlsIn(text: string): string[] {
   return out;
 }
 
-/** A dev server announces its port ("Local: http://localhost:5173/"); a bare host in a file or log is not one. */
-function announcesPort(url: string): boolean {
-  return /^https?:\/\/[^/]*:\d{2,5}(?:\/|$)/i.test(url);
-}
+// Only consume a URL immediately following a server startup label, not links in source or errors.
+const SERVER_ANNOUNCEMENT = /^\s*(?:[➜-]\s*)?(?:Local:|(?:Server )?(?:running|listening) (?:on|at):?|Starting development server at)\s+(https?:\/\/\S+)/i;
 
 /** Local dev-server addresses in the session's tool output, oldest first. */
 export function previewUrls(entries: Entry[]): string[] {
@@ -191,7 +190,12 @@ export function previewUrls(entries: Entry[]): string[] {
   for (const entry of entries) {
     if (entry.kind !== "tool") continue;
     const text = [entry.output?.text, entry.progress].filter(Boolean).join("\n");
-    for (const url of previewUrlsIn(text)) if (announcesPort(url) && !out.includes(url)) out.push(url);
+    for (const line of text.replace(ANSI, "").split("\n")) {
+      const address = SERVER_ANNOUNCEMENT.exec(line)?.[1];
+      if (!address) continue;
+      const [url] = previewUrlsIn(address);
+      if (url && /^https?:\/\/[^/]*:\d{2,5}(?:\/|$)/i.test(url) && !out.includes(url)) out.push(url);
+    }
   }
   return out;
 }

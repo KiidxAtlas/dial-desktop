@@ -264,12 +264,10 @@ function startResize(event: PointerEvent) {
 .panel > * {
   height: 100%;
 }
+/* Centres the 32px tab row on the title bar's line (--topbar is 48px). */
 .drag {
-  height: 10px;
+  height: 8px;
   flex: none;
-}
-.mac .drag {
-  height: 14px;
 }
 .tabs {
   display: flex;

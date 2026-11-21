@@ -84,7 +84,9 @@ function copy() {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgb(0 0 0 / 28%);
+  background: var(--scrim);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
 }
 .sheet {
   display: flex;

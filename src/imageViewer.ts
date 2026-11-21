@@ -3,6 +3,7 @@
 
 import { shallowRef } from "vue";
 import { snapshot } from "./bridge";
+import type { Attachment } from "./types";
 
 export interface ViewedImage {
   /** The path as the conversation named it (relative to the project, or absolute). */
@@ -13,7 +14,12 @@ export interface ViewedImage {
   root: string;
 }
 
-export const viewedImage = shallowRef<ViewedImage | null>(null);
+type AttachmentPreview = Pick<Attachment, "name" | "url">;
+export const viewedImage = shallowRef<ViewedImage | { attachment: AttachmentPreview } | null>(null);
+
+export function viewAttachment({ name, url }: AttachmentPreview) {
+  viewedImage.value = { attachment: { name, url } };
+}
 
 /** Raster image file names the app can preview (the backend checks the real file too). */
 export const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;

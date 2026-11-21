@@ -158,6 +158,20 @@ fn conversation_turn(feed: &mut impl FnMut(Value), path: &impl Fn(&str) -> Strin
             vec![path("src-tauri/icons/128x128@2x.png")],
         )),
     );
+    // So does an image the model viewed with `read`, named in the engine's receipt.
+    tool(
+        feed,
+        "c6v",
+        "read",
+        "Read",
+        "src-tauri/icons/Square142x142Logo.png",
+        "tools",
+        Some((
+            true,
+            "Image: src-tauri/icons/Square142x142Logo.png (8214 bytes; attached to the next model request when vision is available)",
+            vec![],
+        )),
+    );
     feed(
         json!({"event": "text", "delta": "The limiter is in place and the crate builds. Requests over the limit now get `429 Too Many Requests` with a `Retry-After` header."}),
     );
@@ -304,6 +318,8 @@ fn models() -> Vec<ModelOption> {
         vision: Some(true),
         configured,
         local: provider == "mlx",
+        listed: !configured && provider != "mlx",
+        catalog_only: false,
     };
     vec![
         row(

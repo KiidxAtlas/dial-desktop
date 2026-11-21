@@ -54,6 +54,35 @@ struct Destination {
     session_id: String,
 }
 
+/// What a click on a notification opens.
+#[derive(Clone)]
+enum Target {
+    Session(Destination),
+    /// A saved type (`types`), by id.
+    Type(String),
+}
+
+/// Whether the OS lets Dial show alerts; asks the user when it has not decided yet. Type
+/// reminders need this without turning on session alerts.
+#[tauri::command]
+pub async fn type_reminders_allow() -> Result<(), String> {
+    authorize(true).await
+}
+
+/// A reminder the user set on an item of a type. The text is what they saved and chose to be
+/// reminded of, unlike session alerts.
+#[tauri::command]
+pub async fn type_reminder(
+    app: AppHandle,
+    type_id: String,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    let title: String = title.chars().take(80).collect();
+    let body: String = body.chars().take(240).collect();
+    deliver(&app, &title, &body, Target::Type(type_id)).await
+}
+
 pub fn publish(app: &AppHandle, workspace_root: &str, notices: Vec<SessionNotice>) {
     if notices.is_empty() || !app.state::<Notifications>().0.load(Ordering::Relaxed) {
         return;
@@ -73,13 +102,13 @@ pub fn publish(app: &AppHandle, workspace_root: &str, notices: Vec<SessionNotice
                 NoticeKind::Question => "A session has a question for you.",
                 NoticeKind::Finished => "A session's turn ended.",
             };
-            let destination = Destination {
+            let destination = Target::Session(Destination {
                 workspace_root: root.clone(),
                 session_id: notice.session_id,
-            };
+            });
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = deliver(&app, body, destination).await {
+                if let Err(error) = deliver(&app, "Dial", body, destination).await {
                     eprintln!("dial-desktop: could not deliver a notification: {error}");
                 }
             });
@@ -87,22 +116,30 @@ pub fn publish(app: &AppHandle, workspace_root: &str, notices: Vec<SessionNotice
     });
 }
 
-fn activate(app: &AppHandle, destination: Destination) {
+fn activate(app: &AppHandle, target: Target) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
-            let _ = window.emit("notification-open", destination);
+            let _ = match target {
+                Target::Session(destination) => window.emit("notification-open", destination),
+                Target::Type(id) => window.emit("type-open", id),
+            };
         }
     });
 }
 
 #[cfg(target_os = "macos")]
-async fn deliver(app: &AppHandle, body: &str, destination: Destination) -> Result<(), String> {
+async fn deliver(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    destination: Target,
+) -> Result<(), String> {
     let notification = mac_usernotifications::Notification::new()
-        .title("Dial")
+        .title(title)
         .message(body)
         .timeout(LIFETIME);
     let response = mac_usernotifications::send_with_actions(notification)
@@ -115,11 +152,16 @@ async fn deliver(app: &AppHandle, body: &str, destination: Destination) -> Resul
 }
 
 #[cfg(target_os = "windows")]
-async fn deliver(app: &AppHandle, body: &str, destination: Destination) -> Result<(), String> {
+async fn deliver(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    destination: Target,
+) -> Result<(), String> {
     let app = app.clone();
     let app_id = app.config().identifier.clone();
     tauri_winrt_notification::Toast::new(&app_id)
-        .title("Dial")
+        .title(title)
         .text1(body)
         .on_activated(move |_| {
             activate(&app, destination.clone());
@@ -130,11 +172,16 @@ async fn deliver(app: &AppHandle, body: &str, destination: Destination) -> Resul
 }
 
 #[cfg(target_os = "linux")]
-async fn deliver(app: &AppHandle, body: &str, destination: Destination) -> Result<(), String> {
+async fn deliver(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    destination: Target,
+) -> Result<(), String> {
     use notify_rust::{Notification, NotificationResponse, Timeout};
     let handle = Notification::new()
         .appname("Dial")
-        .summary("Dial")
+        .summary(title)
         .body(body)
         .action("default", "Open session")
         .action("open", "Open session")

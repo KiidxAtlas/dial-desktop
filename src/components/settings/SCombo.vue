@@ -168,10 +168,10 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", outside, true));
 .pop {
   position: absolute;
   z-index: 30;
-  top: calc(100% + 6px);
+  top: calc(100% + var(--pop-gap));
   right: 0;
   width: 340px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: var(--raised);
   box-shadow: var(--shadow-pop);
   overflow: hidden;

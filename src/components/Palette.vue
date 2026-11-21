@@ -115,7 +115,7 @@ function onKey(event: KeyboardEvent) {
             aria-expanded="true"
             @keydown="onKey"
           />
-          <kbd>esc</kbd>
+          <kbd>Esc</kbd>
         </label>
         <div ref="list" class="results" role="listbox">
           <p v-if="!results.length" class="none">{{ ui.filePalette ? status : `Nothing matches “${query}”.` }}</p>
@@ -151,7 +151,7 @@ function onKey(event: KeyboardEvent) {
   justify-content: center;
   align-items: flex-start;
   padding-top: 12vh;
-  background: rgb(0 0 0 / 32%);
+  background: var(--scrim);
   -webkit-backdrop-filter: blur(2px);
   backdrop-filter: blur(2px);
 }

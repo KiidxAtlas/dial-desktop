@@ -142,6 +142,10 @@ pub struct ModelOption {
     pub configured: bool,
     /// Discovered in a downloaded local model store.
     pub local: bool,
+    /// Present in the provider's live `/models` or account listing.
+    pub listed: bool,
+    /// Only from the static bundled catalog (not configured, local, or live-listed).
+    pub catalog_only: bool,
 }
 
 impl ModelOption {
@@ -155,6 +159,8 @@ impl ModelOption {
                 || source.starts_with("profile:")
                 || source.starts_with("role:")
         });
+        let listed = sources.iter().any(|source| source == "listing");
+        let catalog_only = !sources.is_empty() && sources.iter().all(|source| source == "catalog");
         Some(Self {
             provider: provider.to_owned(),
             model_id: model_id.to_owned(),
@@ -168,6 +174,8 @@ impl ModelOption {
             vision: value["vision"].as_bool(),
             configured,
             local: sources.iter().any(|source| source == "local"),
+            listed,
+            catalog_only,
         })
     }
 }
@@ -237,7 +245,7 @@ pub struct Model {
     /// when the engine predates that listing.
     pub image_models: Option<Vec<Value>>,
     pending: HashMap<RequestId, Purpose>,
-    recovering: bool,
+    pub(crate) recovering: bool,
     /// The open question already acknowledged as presented; the engine refuses a second ack.
     presented: Option<String>,
     /// Sessions to delete once the engine has moved off them (it refuses the active one).
@@ -619,10 +627,15 @@ impl Model {
                 if matches!(command, Command::Recover) {
                     self.recovering = false;
                 }
+                if matches!(command, Command::Send { .. } | Command::Retry) && !self.conversation.turn_running() {
+                    self.apply_after_turn(&mut follow);
+                }
                 self.toast = Some(format!("Could not {}: {error}", describe(&command)));
             }
             Update::Message(message) => self.message(&message, &mut follow),
         }
+        // A frame may be published before the worker acknowledges the follow-up request.
+        self.recovering |= follow.contains(&Command::Recover);
         if self.conversation.needs_reload()
             && !self.recovering
             && !self.conversation.turn_running()
@@ -850,12 +863,7 @@ impl Model {
                     }
                     // Saved settings take effect once applied; the engine refuses that mid-turn.
                     (Purpose::SetSetting | Purpose::ResetSetting, Ok(_)) => {
-                        follow.push(Command::GetSettings);
-                        if self.conversation.turn_running() {
-                            self.apply_pending = true;
-                        } else {
-                            follow.push(Command::ApplySettings);
-                        }
+                        follow.extend(self.saved_settings(false));
                     }
                     // Applying can change the model and the approval mode.
                     (Purpose::ApplySettings, Ok(_)) => follow.push(Command::State),
@@ -875,6 +883,9 @@ impl Model {
                     (Purpose::Turn, Err(_)) => {
                         follow.push(Command::ListSessions);
                         self.apply_after_turn(follow);
+                    }
+                    (Purpose::ApplySettings, Err(error)) if error.code.as_deref() == Some("busy") && self.conversation.turn_running() => {
+                        self.apply_pending = true;
                     }
                     (purpose, Err(error)) => {
                         if purpose == Purpose::Recover {
@@ -937,6 +948,16 @@ impl Model {
                 _ => {}
             },
             Message::ProtocolError(_) => {}
+        }
+    }
+
+    /// Refresh saved values immediately; rebuild this engine only between turns.
+    pub fn saved_settings(&mut self, turn_queued: bool) -> Vec<Command> {
+        if turn_queued || self.conversation.turn_running() {
+            self.apply_pending = true;
+            vec![Command::GetSettings]
+        } else {
+            vec![Command::GetSettings, Command::ApplySettings]
         }
     }
 

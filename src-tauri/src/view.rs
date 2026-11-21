@@ -11,6 +11,7 @@ use dial_client::{Entry, ToolEntry};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
@@ -197,7 +198,7 @@ pub struct ToolView {
     pub output: Option<Block>,
     /// Changed files, relative to the workspace.
     pub changed_paths: Vec<String>,
-    /// Absolute paths of the images an `image_gen` call wrote, shown inline in the row.
+    /// Absolute paths of images the call produced or viewed, shown inline in the row.
     pub images: Vec<String>,
     /// Warnings about the outcome ("status: timeout", "side effects unknown").
     pub facts: Vec<String>,
@@ -283,7 +284,7 @@ impl ToolView {
             progress: tool.progress.clone().filter(|_| tool.result.is_none()),
             input,
             output,
-            images: generated_images(tool, workspace),
+            images: shown_images(tool, workspace),
             changed_paths,
             facts,
         }
@@ -315,14 +316,17 @@ fn change_preview(text: &str) -> Option<String> {
         .then(|| hunks.join("\n"))
 }
 
-/// The tool that generates images; its written files are previewed in the conversation.
+/// The tool that generates images; its requested output names the image when history does not.
 const IMAGE_GEN: &str = "image_gen";
+/// Inline pictures per row, so a command that writes many images stays readable.
+const MAX_ROW_IMAGES: usize = 8;
 
-/// Images a settled `image_gen` call wrote inside the workspace, in order. Live results name them
-/// in `changed_paths`; history may not, so the requested `output` argument is the fallback, as in
-/// the engine's own preview. A known failure shows none.
-fn generated_images(tool: &ToolEntry, workspace: &Workspace) -> Vec<String> {
-    let Some(result) = tool.result.as_ref().filter(|_| tool.name == IMAGE_GEN) else {
+/// Images a settled, successful call shows inline, in order, inside the workspace only: the
+/// image files it wrote (`changed_paths`), the images a `read` viewed (its `Image: <path> (N
+/// bytes; …)` lines), and for `image_gen` in history without changed paths, the requested
+/// `output`. A known failure shows none.
+fn shown_images(tool: &ToolEntry, workspace: &Workspace) -> Vec<String> {
+    let Some(result) = tool.result.as_ref() else {
         return Vec::new();
     };
     if result.succeeded() == Some(false) || workspace.root.is_empty() {
@@ -343,19 +347,34 @@ fn generated_images(tool: &ToolEntry, workspace: &Workspace) -> Vec<String> {
         (contained && crate::attachments::image_mime(&absolute).is_some())
             .then(|| absolute.to_string_lossy().into_owned())
     };
-    let written: Vec<String> = result
-        .changed_paths
-        .iter()
-        .filter_map(|p| inside(p))
-        .collect();
-    if !written.is_empty() {
-        return written;
-    }
-    serde_json::from_str::<Value>(&tool.arguments)
-        .ok()
-        .and_then(|args| args["output"].as_str().and_then(inside))
+    let viewed = (tool.name == "read")
+        .then(|| result.text.lines().filter_map(viewed_image))
         .into_iter()
-        .collect()
+        .flatten();
+    let mut images: Vec<String> = Vec::new();
+    for path in result.changed_paths.iter().map(String::as_str).chain(viewed) {
+        if let Some(path) = inside(path).filter(|p| !images.contains(p)) {
+            images.push(path);
+        }
+    }
+    if images.is_empty() && tool.name == IMAGE_GEN {
+        images.extend(
+            serde_json::from_str::<Value>(&tool.arguments)
+                .ok()
+                .and_then(|args| args["output"].as_str().and_then(inside)),
+        );
+    }
+    images.truncate(MAX_ROW_IMAGES);
+    images
+}
+
+/// The path in a `read` receipt for an image file: `Image: <path> (<N> bytes; …)`. Converted
+/// sources (SVG, HEIC, PDF pages) have other wording and are not shown.
+fn viewed_image(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("Image: ")?;
+    let (path, detail) = rest.rsplit_once(" (")?;
+    let (count, _) = detail.split_once(" bytes;")?;
+    count.chars().all(|c| c.is_ascii_digit()).then_some(path)
 }
 
 /// A pending approval.
@@ -508,6 +527,8 @@ pub struct ModelOptionView {
     pub vision: bool,
     pub configured: bool,
     pub local: bool,
+    pub listed: bool,
+    pub catalog_only: bool,
 }
 
 impl From<&ModelOption> for ModelOptionView {
@@ -521,6 +542,8 @@ impl From<&ModelOption> for ModelOptionView {
             vision: m.vision == Some(true),
             configured: m.configured,
             local: m.local,
+            listed: m.listed,
+            catalog_only: m.catalog_only,
         }
     }
 }
@@ -539,10 +562,12 @@ pub struct Snapshot {
     /// Approval mode in force: `readonly`, `ask`, `write` or `auto`.
     pub approval: Option<String>,
     pub session_id: Option<String>,
+    pub history_loading: bool,
     pub turn_running: bool,
     pub can_send: bool,
     pub sessions: Vec<SessionView>,
-    pub entries: Vec<EntryView>,
+    /// Shared with the previous snapshot where unchanged (see [`EntryViews`]).
+    pub entries: Vec<Arc<EntryView>>,
     pub approvals: Vec<ApprovalView>,
     /// The open question, if the agent is waiting for an answer.
     pub question: Option<QuestionView>,
@@ -583,6 +608,16 @@ pub struct ContextView {
 impl Snapshot {
     /// The view of `model` at time `now` (Unix seconds, for relative session times).
     pub fn new(model: &Model, workspace: Option<&Workspace>, now: i64) -> Self {
+        Self::reusing(model, workspace, now, &mut EntryViews::default())
+    }
+
+    /// [`Snapshot::new`], reusing the rows in `views` whose entries did not change.
+    pub fn reusing(
+        model: &Model,
+        workspace: Option<&Workspace>,
+        now: i64,
+        views: &mut EntryViews,
+    ) -> Self {
         let no_workspace = Workspace::new("", None);
         let shown = workspace.unwrap_or(&no_workspace);
         let conversation = &model.conversation;
@@ -619,32 +654,7 @@ impl Snapshot {
                 }
             })
             .collect();
-        let entries = conversation
-            .entries()
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| match entry {
-                Entry::User(user) => EntryView::User {
-                    text: user.text.clone(),
-                    images: user.images,
-                },
-                Entry::Assistant(answer) => EntryView::Assistant {
-                    text: answer.text.clone(),
-                    reasoning: answer.reasoning.trim().to_owned(),
-                    streaming: answer.streaming,
-                    abandoned: answer.abandoned,
-                },
-                Entry::Tool(tool) => EntryView::Tool(Box::new(ToolView::new(index, tool, shown))),
-                Entry::Notice(notice) => EntryView::Notice {
-                    message: notice.message.clone(),
-                    lane: notice.lane.clone(),
-                    notice_kind: notice.kind.clone(),
-                },
-                Entry::Error(message) => EntryView::Error {
-                    message: message.clone(),
-                },
-            })
-            .collect();
+        let entries = views.build(conversation.entries(), shown);
         let approvals = conversation
             .pending_approvals()
             .iter()
@@ -692,6 +702,7 @@ impl Snapshot {
             approval: model.approval.clone(),
             title: model.title(),
             session_id,
+            history_loading: model.recovering,
             turn_running: conversation.turn_running(),
             can_send: model.can_send(),
             sessions,
@@ -828,6 +839,62 @@ impl Published {
     }
 }
 
+/// The rows of the last snapshot with the entries they were made from.
+///
+/// A row depends only on its entry, its position and the workspace, so a row whose entry is
+/// unchanged is shared instead of rebuilt. That keeps a streaming frame's cost to comparing the
+/// transcript rather than rebuilding every tool row (and copying its output) on each publish.
+#[derive(Default)]
+pub struct EntryViews {
+    workspace: Option<Workspace>,
+    rows: Vec<(Entry, Arc<EntryView>)>,
+}
+
+impl EntryViews {
+    /// The rows for `entries`, rebuilding only the ones that changed.
+    pub fn build(&mut self, entries: &[Entry], workspace: &Workspace) -> Vec<Arc<EntryView>> {
+        if self.workspace.as_ref() != Some(workspace) {
+            self.workspace = Some(workspace.clone());
+            self.rows.clear();
+        }
+        self.rows.truncate(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            match self.rows.get_mut(index) {
+                Some((cached, _)) if cached == entry => {}
+                Some(row) => *row = (entry.clone(), Arc::new(entry_view(index, entry, workspace))),
+                None => self
+                    .rows
+                    .push((entry.clone(), Arc::new(entry_view(index, entry, workspace)))),
+            }
+        }
+        self.rows.iter().map(|(_, view)| Arc::clone(view)).collect()
+    }
+}
+
+fn entry_view(index: usize, entry: &Entry, workspace: &Workspace) -> EntryView {
+    match entry {
+        Entry::User(user) => EntryView::User {
+            text: user.text.clone(),
+            images: user.images,
+        },
+        Entry::Assistant(answer) => EntryView::Assistant {
+            text: answer.text.clone(),
+            reasoning: answer.reasoning.trim().to_owned(),
+            streaming: answer.streaming,
+            abandoned: answer.abandoned,
+        },
+        Entry::Tool(tool) => EntryView::Tool(Box::new(ToolView::new(index, tool, workspace))),
+        Entry::Notice(notice) => EntryView::Notice {
+            message: notice.message.clone(),
+            lane: notice.lane.clone(),
+            notice_kind: notice.kind.clone(),
+        },
+        Entry::Error(message) => EntryView::Error {
+            message: message.clone(),
+        },
+    }
+}
+
 /// The fields of `next` that differ from `prev` (see [`SnapshotEvent::patch`]).
 pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
@@ -843,6 +910,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
         model,
         approval,
         session_id,
+        history_loading,
         turn_running,
         can_send,
         sessions,
@@ -869,6 +937,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
     field!(model, "model");
     field!(approval, "approval");
     field!(session_id, "sessionId");
+    field!(history_loading, "historyLoading");
     field!(turn_running, "turnRunning");
     field!(can_send, "canSend");
     field!(sessions, "sessions");

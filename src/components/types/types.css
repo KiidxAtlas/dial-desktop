@@ -1,0 +1,282 @@
+/* Shared look of a type's views. A type's theme arrives as custom properties on `.ty-canvas`
+   (see TypeView.vue); every layout draws with them, so one blueprint restyles every view.
+   Prefixed `ty-` because it is global. */
+
+.ty-canvas {
+  --ty-muted: color-mix(in srgb, var(--ty-ink) 62%, var(--ty-paper));
+  --ty-faint: color-mix(in srgb, var(--ty-ink) 40%, var(--ty-paper));
+  --ty-line: color-mix(in srgb, var(--ty-ink) 13%, transparent);
+  --ty-soft: color-mix(in srgb, var(--ty-accent) 14%, var(--ty-paper));
+  --ty-raised: color-mix(in srgb, var(--ty-paper) 92%, white);
+  --ty-on-accent: #fff;
+  color: var(--ty-ink);
+  font-family: var(--ty-font);
+}
+
+.ty-texture-paper {
+  background-image:
+    radial-gradient(circle at 20% 15%, rgb(255 255 255 / 9%), transparent 45%),
+    radial-gradient(circle at 80% 85%, rgb(120 80 30 / 8%), transparent 50%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .45 0 0 0 0 .35 0 0 0 0 .2 0 0 0 .09 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.ty-texture-linen {
+  background-image:
+    repeating-linear-gradient(0deg, rgb(0 0 0 / 3.5%) 0 1px, transparent 1px 4px),
+    repeating-linear-gradient(90deg, rgb(0 0 0 / 3%) 0 1px, transparent 1px 5px);
+}
+.ty-texture-grid {
+  background-image:
+    linear-gradient(var(--ty-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ty-line) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.ty-texture-dots {
+  background-image: radial-gradient(var(--ty-line) 1.2px, transparent 1.4px);
+  background-size: 18px 18px;
+}
+.ty-texture-noise {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.75' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 .12 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Text inside a type follows its ink, not the app's. */
+.ty-canvas .prose {
+  color: inherit;
+  font-size: 14px;
+  cursor: auto;
+}
+.ty-canvas .prose li::marker {
+  color: var(--ty-accent);
+}
+.ty-canvas .prose a {
+  color: var(--ty-accent);
+}
+
+.ty-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: var(--ty-soft);
+  color: color-mix(in srgb, var(--ty-accent) 70%, var(--ty-ink));
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ty-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 999px;
+  background: var(--ty-accent);
+  color: var(--ty-on-accent);
+  font: 600 13.5px var(--font-ui);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--ty-accent) 35%, transparent);
+  transition: transform 100ms var(--ease), filter 120ms var(--ease);
+}
+.ty-button:hover:not(:disabled) {
+  filter: brightness(1.07);
+}
+.ty-button:active:not(:disabled) {
+  transform: scale(0.96);
+}
+.ty-button:disabled {
+  opacity: 0.45;
+  box-shadow: none;
+}
+.ty-ghost {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  color: var(--ty-faint);
+  transition: background 120ms var(--ease), color 120ms var(--ease);
+}
+.ty-ghost:hover {
+  background: var(--ty-line);
+  color: var(--ty-ink);
+}
+
+.ty-input {
+  width: 100%;
+  height: 38px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ty-ink) 6%, transparent);
+  box-shadow: inset 0 0 0 1px var(--ty-line);
+  color: var(--ty-ink);
+  font: 13.5px var(--font-ui);
+  outline: none;
+}
+.ty-input::placeholder {
+  color: var(--ty-faint);
+}
+.ty-input:focus {
+  box-shadow: inset 0 0 0 1.5px var(--ty-accent);
+}
+
+.ty-empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  max-width: 380px;
+  margin: 12vh auto 0;
+  text-align: center;
+  color: var(--ty-muted);
+  font-family: var(--font-ui);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+.ty-empty .glyph {
+  font-size: 44px;
+  line-height: 1;
+}
+.ty-empty strong {
+  color: var(--ty-ink);
+  font-size: 16px;
+}
+
+/* Dialogs over a type: the item editor, the design sheet, the new-type sheet. */
+.ty-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgb(0 0 0 / 45%);
+  backdrop-filter: blur(3px);
+}
+.ty-sheet {
+  display: flex;
+  flex-direction: column;
+  width: min(620px, 100%);
+  max-height: min(820px, 100%);
+  border-radius: var(--radius-lg);
+  background: var(--raised);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-family: var(--font-ui);
+  outline: none;
+  animation: rise 160ms var(--ease) both;
+}
+.ty-sheet > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 18px 12px;
+}
+.ty-sheet > header h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.ty-sheet > .body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 18px 16px;
+}
+.ty-sheet > footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--border);
+}
+.ty-sheet > footer .spacer {
+  flex: 1;
+}
+.ty-sheet label.row {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.ty-sheet label.row > span,
+.ty-sheet .row-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.ty-sheet input[type="text"],
+.ty-sheet input[type="time"],
+.ty-sheet input[type="date"],
+.ty-sheet input[type="datetime-local"],
+.ty-sheet input[type="number"],
+.ty-sheet input[type="url"],
+.ty-sheet select,
+.ty-sheet textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
+  color: var(--text);
+  font: 13px var(--font-ui);
+  outline: none;
+}
+.ty-sheet textarea {
+  min-height: 84px;
+  resize: vertical;
+  line-height: 1.5;
+}
+.ty-sheet textarea.code {
+  min-height: 220px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.ty-sheet input:focus,
+.ty-sheet select:focus,
+.ty-sheet textarea:focus {
+  box-shadow: inset 0 0 0 1px var(--focus-border);
+}
+.ty-sheet .hint {
+  margin: -6px 0 14px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.ty-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.ty-tile {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
+  text-align: left;
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+.ty-tile:hover {
+  background: var(--active);
+}
+.ty-tile.on {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.ty-tile .glyph {
+  font-size: 18px;
+}
+.ty-tile strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.ty-tile small {
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.35;
+}

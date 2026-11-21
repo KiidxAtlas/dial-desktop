@@ -89,7 +89,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .menu {
   position: absolute;
   left: 0;
-  bottom: calc(100% + 10px);
+  bottom: calc(100% + var(--pop-gap));
   z-index: 30;
   width: 300px;
   padding: 6px;

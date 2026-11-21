@@ -8,8 +8,8 @@ interface Draft {
   text: string;
   attachments: Attachment[];
   sending: boolean;
-  /** Hide the submitted draft until the engine confirms it; keep its persisted copy intact. */
-  submitting: boolean;
+  /** Unacknowledged input stays recoverable alongside the editable next draft. */
+  pending?: { text: string; attachments: Attachment[] };
   loading: boolean;
 }
 
@@ -26,14 +26,38 @@ export function draftRecord(text: string, attachments: readonly Attachment[]) {
   return text || attachments.length ? { text, attachments: attachments.map((a) => ({ ...a })) } : undefined;
 }
 
+function recoverable(draft: Draft) {
+  const p = draft.pending;
+  if (!p) return draftRecord(draft.text, draft.attachments);
+  const keys = new Set(p.attachments.map(a => a.key));
+  return draftRecord([p.text, draft.text].filter(Boolean).join("\n\n"), [...p.attachments, ...draft.attachments.filter(a => !keys.has(a.key))]);
+}
+
+export function beginSend(draft: Draft) {
+  const pending = { text: draft.text, attachments: draft.attachments };
+  draft.sending = true;
+  draft.text = "";
+  draft.attachments = [];
+  draft.pending = pending;
+  return (accepted: boolean) => {
+    const restored = !accepted && recoverable(draft);
+    draft.pending = undefined;
+    if (restored) {
+      draft.text = restored.text;
+      draft.attachments = restored.attachments;
+    }
+    draft.sending = false;
+  };
+}
+
 async function attachPersistence(key: string, draft: Draft) {
   // Install the watcher before loading so an edit during startup wins over stored data.
   let edited = false;
   let restoring = false;
-  watch(() => [draft.text, [...draft.attachments]] as const, ([text, attachments]) => {
+  watch(() => recoverable(draft), (record) => {
     if (restoring) return;
     edited = true;
-    void writeLocal(key, { [DRAFTS]: draftRecord(text, attachments) }).catch(storageError);
+    void writeLocal(key, { [DRAFTS]: record }).catch(storageError);
   }, { flush: "sync" });
   const stored = await readLocal(DRAFTS, key) as { text?: unknown; attachments?: Attachment[] } | undefined;
   if (edited || typeof stored?.text !== "string" || !Array.isArray(stored.attachments)) return;
@@ -47,7 +71,7 @@ export function draftFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): D
   const key = JSON.stringify([snap.workspace.root, snap.sessionId]);
   let draft = drafts.get(key);
   if (!draft) {
-    const created = reactive<Draft>({ text: "", attachments: [], sending: false, submitting: false, loading: true });
+    const created = reactive<Draft>({ text: "", attachments: [], sending: false, loading: true });
     drafts.set(key, created);
     void attachPersistence(key, created).catch(storageError).finally(() => { created.loading = false; });
     draft = created;

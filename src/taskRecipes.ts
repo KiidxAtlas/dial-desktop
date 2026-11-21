@@ -4,8 +4,25 @@ import { draftFor } from "./drafts";
 import type { Snapshot } from "./types";
 import { ui } from "./ui";
 import { addToPrompt } from "./workspace";
+import { appearance } from "./appearance";
 
-export const taskRecipes = [
+interface TaskRecipe { id: string; title: string; detail: string; prompt: string; needs?: "cards" | "diagrams" }
+
+const ALL: TaskRecipe[] = [
+  {
+    id: "explain-visually",
+    title: "Explain with a diagram",
+    detail: "Turn a topic into a visual explanation",
+    prompt: "Explain the topic below in plain language. Show how the pieces fit together in a small Mermaid flowchart in a fenced mermaid block. Follow it with the key takeaways.\n\nTopic: ",
+    needs: "diagrams",
+  },
+  {
+    id: "make-interactive",
+    title: "Make it interactive",
+    detail: "Build a guide, calculator, comparison, explorable diagram, or decision helper",
+    prompt: 'Make an interactive card about the topic below. Return one fenced dial-app block of JSON with a "title", a "kind", and up to four "followUps" like {"label":"Go deeper","ask":"Explain … in more detail"}. Pick the kind that fits best:\n- "guide": {"steps":[{"title":"Install","text":"Markdown","checklist":["Node 20 installed"]}]}\n- "calculator": {"inputs":[{"id":"users","label":"Users","type":"slider","min":0,"max":1000,"step":10,"value":100,"unit":"k"}],"outputs":[{"id":"cost","label":"Monthly cost","formula":"users * 0.4","unit":"$","decimals":0}]}. Input types are slider, number, select (with "options":[{"label":"…","value":1}]) and toggle. Formulas use + - * / % ^, comparisons, a ? b : c, and min max abs round floor ceil sqrt pow clamp log ln exp; they may use input ids and earlier output ids.\n- "compare": {"tabs":[{"label":"Option A","text":"Markdown"}]} with 2-8 tabs.\n- "explore": {"diagram":"flowchart LR\\n  A[Client] --> B[Server]","intro":"Markdown","nodes":{"A":{"text":"Markdown","ask":"optional prompt"},"B":{"text":"Markdown"}}}, keyed by Mermaid node id. Use a flowchart or stateDiagram-v2 (other diagram types have no clickable nodes) and give every node and subgraph an entry, so none is left unexplained.\n- "screens": branching steps {"screens":[{"id":"start","text":"Markdown","choices":[{"label":"Next","to":"end"}]},{"id":"end","text":"Done"}]}; a choice may instead be {"label":"…","ask":"prompt"}.\nText fields are Markdown and may include code, tables, and mermaid blocks. Keep labels short. JSON only: no scripts or HTML.\n\nTopic: ',
+    needs: "cards",
+  },
   {
     id: "map-codebase",
     title: "Map this codebase",
@@ -31,6 +48,11 @@ export const taskRecipes = [
     prompt: "Find an important untested behavior in this project and add focused tests using the existing test conventions. Cover a representative case and a meaningful edge case. Run the tests and report the result.",
   },
 ];
+
+/** The recipes in effect: one whose answer the Appearance settings would not draw is left out. */
+export function taskRecipes(): TaskRecipe[] {
+  return ALL.filter((r) => !r.needs || appearance[r.needs]);
+}
 
 export function canUseTaskRecipes(snap: Snapshot) {
   return !snap.turnRunning && (snap.canSend || snap.connection.state === "preview");

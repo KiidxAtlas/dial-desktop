@@ -5,15 +5,14 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import type { OpenSnapshot } from "../types";
 import { ui } from "../ui";
 import { engineCall, readable } from "../engineTools";
+import { imageChoices, imageModelLabel, type ImageRoute, type RoleModel } from "../imageModels";
 import {
   ROLES, applyPreset, assignRole, deletePreset, presetsIn, readSettings, renamePreset, rolesIn, savePreset, unassignRole, validPresetName,
   type Preset, type Selection,
 } from "../roles";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
-interface Listed { provider: string; model_id: string; label: string; thinking_levels: string[]; sources: string[] }
-/** A `list_models` row for a non-chat role (`purpose: "embedding" | "image"`). */
-interface ForRole { provider: string; provider_label?: string; model_id: string; label: string; base_url?: string | null; image_api?: unknown }
+interface Listed extends RoleModel { thinking_levels: string[]; sources: string[] }
 
 const live = computed(() => props.snap.connection.state === "live");
 const loading = ref(false);
@@ -21,28 +20,30 @@ const error = ref("");
 const roles = ref<Record<string, Selection>>({});
 const presets = ref<Preset[]>([]);
 const listed = ref<Listed[]>([]);
-/** Models each non-chat role can take, from the engine's metadata; empty on an engine without
- *  these listings (older engines answer `purpose` with the chat list, recognised and dropped). */
-const forRole = ref<Record<string, ForRole[]>>({});
+const forRole = ref<Record<string, RoleModel[]>>({});
 const busy = ref("");
 
-async function load() {
+async function load(refresh = false) {
   if (!live.value) return;
   loading.value = true;
   error.value = "";
   try {
-    const [flat, models, embedding, image] = await Promise.all([
+    const image = refresh
+      ? await engineCall<{ models: RoleModel[] }>("list_models", { purpose: "image", refresh: true })
+          .catch(() => engineCall<{ models: RoleModel[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] })))
+      : await engineCall<{ models: RoleModel[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] }));
+    const [flat, models, embedding, route] = await Promise.all([
       readSettings(),
       engineCall<{ models: Listed[] }>("list_models"),
-      engineCall<{ models: ForRole[] }>("list_models", { purpose: "embedding" }).catch(() => ({ models: [] })),
-      engineCall<{ models: ForRole[] }>("list_models", { purpose: "image" }).catch(() => ({ models: [] })),
+      engineCall<{ models: RoleModel[] }>("list_models", { purpose: "embedding" }).catch(() => ({ models: [] })),
+      engineCall<ImageRoute>("image_settings").catch(() => undefined),
     ]);
     roles.value = rolesIn(flat);
     presets.value = presetsIn(flat);
     listed.value = models.models ?? [];
     forRole.value = {
       embedding: (embedding.models ?? []).filter((m) => "provider_label" in m),
-      image: (image.models ?? []).filter((m) => "image_api" in m),
+      image: imageChoices(image.models ?? [], listed.value, route),
     };
   } catch (e) {
     error.value = readable(e);
@@ -50,7 +51,7 @@ async function load() {
     loading.value = false;
   }
 }
-onMounted(load);
+onMounted(() => load(false));
 
 const key = (provider: string, model: string) => `${provider}\u0000${model}`;
 const providers = computed(() => {
@@ -63,7 +64,7 @@ const levels = (s?: Selection | null) => find(s)?.thinking_levels ?? [];
 const shortName = (s?: Selection | null) => (s ? find(s)?.label ?? findFor(s)?.label ?? s.model : "");
 /** A non-chat role's choices grouped by provider. */
 function groupsFor(role: string) {
-  const by = new Map<string, ForRole[]>();
+  const by = new Map<string, RoleModel[]>();
   for (const m of forRole.value[role] ?? []) by.set(m.provider_label ?? m.provider, [...(by.get(m.provider_label ?? m.provider) ?? []), m]);
   return [...by.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
@@ -167,7 +168,7 @@ function inUse(p: Preset) {
         <h2>Roles &amp; presets</h2>
         <p class="note">Dial hands background work to helper models. Pick one per role, then save the whole set as a preset to switch in one click.</p>
       </div>
-      <button v-if="live" class="btn btn-secondary" :disabled="loading" @click="load">Refresh</button>
+      <button v-if="live" class="btn btn-secondary" :disabled="loading" @click="load(true)">{{ loading ? "Checking…" : "Check & refresh" }}</button>
     </div>
 
     <div v-if="!live" class="empty">Connect to the Dial engine to change roles.</div>
@@ -222,9 +223,9 @@ function inUse(p: Preset) {
                 @change="pickFor(r.id, ($event.target as HTMLSelectElement).value)"
               >
                 <option value="">{{ r.id === "image" ? "Unassigned (main model, when it makes images)" : "Unassigned (keyword recall only)" }}</option>
-                <option v-if="offList(r.id)" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} · {{ roles[r.id].provider }}</option>
+                <option v-if="offList(r.id)" :disabled="r.id === 'image'" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} · {{ roles[r.id].provider }}{{ r.id === 'image' ? ' (not listed)' : '' }}</option>
                 <optgroup v-for="[p, list] in groupsFor(r.id)" :key="p" :label="p">
-                  <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ m.label || m.model_id }}</option>
+                  <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ r.id === "image" ? imageModelLabel(m) : (m.label || m.model_id) }}</option>
                 </optgroup>
               </select>
             </template>

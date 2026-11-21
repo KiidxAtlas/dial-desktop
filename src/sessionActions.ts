@@ -4,6 +4,7 @@ import { engine, showToast, snapshot } from "./bridge";
 import { draftFor } from "./drafts";
 import type { OpenSnapshot, Session } from "./types";
 import { focusComposer, ui, type MenuItem } from "./ui";
+import { dismissType, isTypeSession } from "./savedTypes";
 
 /** Start editing the name of session `id` in `place`. */
 export function startRename(id: string, place: "sidebar" | "title") {
@@ -24,10 +25,13 @@ export function openSession(snap: OpenSnapshot): Session | null {
   return snap.sessions.find((s) => s.selected) ?? null;
 }
 
-/** Sessions as the sidebar groups them (Active, Pinned, Recents), keeping those whose title matches `filter`. */
+/**
+ * Sessions as the sidebar groups them (Active, Pinned, Recents), keeping those whose title matches
+ * `filter`. A type's own conversations are not listed: they open with their type.
+ */
 export function sessionGroups(sessions: Session[], filter = ""): { name: string; sessions: Session[] }[] {
   const f = filter.trim().toLowerCase();
-  const matching = sessions.filter((s) => !f || s.title.toLowerCase().includes(f));
+  const matching = sessions.filter((s) => !isTypeSession(s.id) && (!f || s.title.toLowerCase().includes(f)));
   return [
     { name: "Active", sessions: matching.filter((s) => s.running || s.waiting) },
     { name: "Pinned", sessions: matching.filter((s) => s.pinned && !s.running && !s.waiting) },
@@ -44,6 +48,7 @@ export function sessionOrder(snap: OpenSnapshot): Session[] {
 export function goToSession(session: Session) {
   ui.transcriptJump = null;
   ui.settingsOpen = false;
+  dismissType();
   if (!session.selected) engine.resume(session.id);
 }
 

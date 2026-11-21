@@ -18,7 +18,7 @@ const enabled = computed(() => canUseTaskRecipes(props.snap));
     </div>
     <div class="chips">
       <button
-        v-for="(s, i) in taskRecipes.slice(0, 3)"
+        v-for="(s, i) in taskRecipes().slice(0, 3)"
         :key="s.id"
         class="chip"
         :style="{ animationDelay: `${80 + i * 35}ms` }"
