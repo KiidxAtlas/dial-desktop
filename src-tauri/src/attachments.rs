@@ -116,6 +116,50 @@ pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Save image bytes (base64) to `path`, a place the user picked in the save dialog. Writes a
+/// temporary file beside it first, so a failed save never leaves half an image behind.
+pub fn save_image(path: &Path, data: &str) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    image_mime(path).ok_or_else(|| format!("{name} needs a .png, .jpg, .gif or .webp name"))?;
+    let data = data.trim();
+    if data.len() > (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4 {
+        return Err(format!(
+            "Images can be at most {} MiB",
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| "The image could not be read".to_owned())?;
+    let kind = sniff_extension(&bytes).ok_or("The image could not be read")?;
+    let wanted = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let wanted = if wanted == "jpeg" { "jpg" } else { wanted.as_str() };
+    if wanted != kind {
+        return Err(format!(
+            "This image is a {} file; save it with a .{kind} name",
+            kind.to_ascii_uppercase()
+        ));
+    }
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".dial-save-")
+        .tempfile_in(dir)
+        .map_err(|e| format!("Could not save {name}: {e}"))?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|e| format!("Could not save {name}: {e}"))?;
+    file.persist(path)
+        .map_err(|e| format!("Could not save {name}: {}", e.error))?;
+    Ok(())
+}
+
 /// Turn pasted images (base64, already [`check`]ed) into private files in `dir` and return their
 /// paths, so the prompt sends them by path like chosen files.
 ///

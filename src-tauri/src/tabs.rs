@@ -28,6 +28,9 @@ pub struct Tab {
     opening: Option<(String, Option<RequestId>)>,
     restore_target: Option<String>,
     turn_queued: bool,
+    /// Edits belong to this tab's journal, including while its turn runs in the background.
+    edits: Vec<Command>,
+    editing: Option<Command>,
     // Stand-in lifetime for tabs without a worker (preview and routing tests).
     lifetime: Arc<AtomicBool>,
 }
@@ -43,6 +46,8 @@ impl Tab {
             opening: None,
             restore_target: None,
             turn_queued: false,
+            edits: Vec::new(),
+            editing: None,
             lifetime: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -87,6 +92,47 @@ impl Tab {
         self.model.saved_settings(self.turn_queued)
     }
 
+    pub fn select_model_setting(&mut self, command: Command) -> Result<Option<Command>, String> {
+        if self.opening_session() || self.model.recovering {
+            return Err("Wait for the conversation to open".into());
+        }
+        // A different model resets effort. Repeated effort picks replace the previous one.
+        match &command {
+            Command::SetModel { .. } => self.edits.clear(),
+            Command::SetThinking { .. } => self
+                .edits
+                .retain(|c| !matches!(c, Command::SetThinking { .. })),
+            _ => return Err("Not a model setting".into()),
+        }
+        self.edits.push(command);
+        Ok(self.next_edit())
+    }
+
+    fn next_edit(&mut self) -> Option<Command> {
+        if self.busy() || self.editing.is_some() || self.edits.is_empty() {
+            return None;
+        }
+        let next = self.edits.remove(0);
+        self.editing = Some(next.clone());
+        Some(next)
+    }
+
+    fn settle_edit(&mut self, method: &str, ok: bool) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|c| c.request().1 == method)
+        {
+            self.editing = None;
+            if !ok
+                && method == "set_model"
+                && matches!(self.edits.first(), Some(Command::SetThinking { .. }))
+            {
+                self.edits.clear(); // Don't apply the new model's effort to the old model.
+            }
+        }
+    }
+
     pub fn submit_prompt(&mut self, command: Command) -> Result<crate::engine::RpcReply, String> {
         let reply = self
             .engine
@@ -98,6 +144,17 @@ impl Tab {
     }
 
     pub fn apply(&mut self, update: Update) -> Vec<Command> {
+        match &update {
+            Update::Message(Message::Response { method, result, .. }) => {
+                self.settle_edit(method, result.is_ok())
+            }
+            Update::RequestFailed { command, .. } => self.settle_edit(command.request().1, false),
+            Update::ConnectFailed(_) | Update::Message(Message::Disconnected { .. }) => {
+                self.edits.clear();
+                self.editing = None;
+            }
+            _ => {}
+        }
         match &update {
             Update::Requested {
                 command: Command::Resume(target),
@@ -147,7 +204,8 @@ impl Tab {
             _ => {}
         }
         let was_running = self.model.conversation.turn_running();
-        let follow = self.model.apply(update);
+        let mut follow = self.model.apply(update);
+        follow.extend(self.next_edit());
         self.turn_ended |= was_running && !self.model.conversation.turn_running();
         follow
     }
@@ -165,7 +223,10 @@ impl Tab {
     }
 
     pub fn transitioning(&self) -> bool {
-        self.opening.is_some() || self.turn_queued
+        self.opening.is_some()
+            || self.turn_queued
+            || self.editing.is_some()
+            || !self.edits.is_empty()
     }
 
     fn busy(&self) -> bool {
@@ -306,7 +367,7 @@ impl Tabs {
 
     /// Where starting a fresh session goes.
     pub fn route_new(&self) -> Route {
-        if self.active().busy() || self.active().opening.is_some() {
+        if self.active().busy() || self.active().transitioning() {
             Route::Spawn
         } else {
             Route::Here
@@ -325,6 +386,25 @@ impl Tabs {
                     tab.model.title()
                 )
             })
+    }
+
+    /// Each engine caches its own sidebar and may still be receiving an older page.
+    pub fn sync_deletions(&mut self) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let deleted: HashSet<_> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.model.deleted.iter().cloned())
+            .collect();
+        if deleted.is_empty() {
+            return;
+        }
+        for tab in &mut self.tabs {
+            tab.model.sessions.retain(|s| !deleted.contains(&s.id));
+            tab.model.deleted.extend(deleted.iter().cloned());
+        }
     }
 
     /// Show tab `index`.

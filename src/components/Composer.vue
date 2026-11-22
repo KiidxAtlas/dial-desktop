@@ -23,6 +23,7 @@ import ApprovalMenu from "./ApprovalMenu.vue";
 import QuestionCard from "./QuestionCard.vue";
 import ContextMeter from "./ContextMeter.vue";
 import VoicePanel from "./VoicePanel.vue";
+import { imageBoardAt } from "./types/BoardView.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
@@ -193,9 +194,9 @@ async function send() {
   let accepted = false;
   try {
     const scope = { workspaceRoot: props.snap.workspace.root, sessionId: props.snap.sessionId };
-    // In an open type, a prompt goes to the type's own conversation, started on the first one.
+    // In an open type, a prompt or steer goes to the type's own conversation with its tag.
     accepted = steer
-      ? await engine.steer(text, scope)
+      ? await engine.steer(typedPrompt(text, scope.sessionId), scope)
       : ui.typeOpen && !typeSessionOnScreen()
         ? await sendInType(ui.typeOpen, text, images)
         : await engine.send(typedPrompt(text, scope.sessionId), images, scope);
@@ -267,8 +268,9 @@ onMounted(async () => {
   document.addEventListener('paste', onPaste);
   const unlisten = await getCurrentWebview()
     .onDragDropEvent(({ payload }) => {
-      dropping.value = imagesAllowed.value && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
-      if (payload.type === "drop" && payload.paths.length && imagesAllowed.value && !ui.settingsOpen) {
+      const overBoard = payload.type !== "leave" && imageBoardAt(payload.position);
+      dropping.value = !overBoard && imagesAllowed.value && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
+      if (!overBoard && payload.type === "drop" && payload.paths.length && imagesAllowed.value && !ui.settingsOpen) {
         const target = draft.value;
         void attachments.addPaths(target, payload.paths).then(() => {
           if (target === draft.value) focus();

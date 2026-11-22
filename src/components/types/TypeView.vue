@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { focusComposer } from "../../ui";
-import { typeApi, types, type Full, type Item } from "../../savedTypes";
+import { typeApi, typeState, types, type Full, type Item } from "../../savedTypes";
 import type { OpenSnapshot } from "../../types";
 import BookView from "./BookView.vue";
+import DesignProgress from './DesignProgress.vue';
 import ChecklistView from "./ChecklistView.vue";
 import BoardView from "./BoardView.vue";
 import WheelView from "./WheelView.vue";
@@ -25,16 +26,21 @@ const full = ref<Full | null>(null);
 const error = ref("");
 const editing = ref<{ item: Item | null } | null>(null);
 const board = ref<InstanceType<typeof BoardView> | null>(null);
+// A newly built book opens on the saved item. Opening an existing book still shows its cover.
+const progress = computed(() => typeState.firstSaves.get(props.id));
+const openFirstItem = ref(!!progress.value);
+watch(progress, saving => { if (saving) openFirstItem.value = true; });
 
-async function load() {
+watch(() => [props.id, types.revision[props.id]], async (_, __, cleanup) => {
+  let current = true;
+  cleanup(() => { current = false; });
   try {
-    full.value = await typeApi.get(props.id);
-    error.value = "";
+    const next = await typeApi.get(props.id);
+    if (current) { full.value = next; error.value = ''; }
   } catch (failure) {
-    error.value = String(failure);
+    if (current) error.value = String(failure);
   }
-}
-watch(() => [props.id, types.revision[props.id]], load, { immediate: true });
+}, { immediate: true });
 
 const def = computed(() => full.value?.def ?? null);
 
@@ -55,7 +61,7 @@ const canvasStyle = computed(() => {
     "--ty-paper": t.paper || "var(--surface)",
     "--ty-ink": t.ink || "var(--text)",
     "--ty-font": FONTS[t.font] ?? FONTS.sans,
-    "--ty-radius": `${t.radius || 14}px`,
+    "--ty-radius": `${t.radius ?? 14}px`,
   };
 });
 const texture = computed(() => (def.value && def.value.theme.texture !== "none" ? `ty-texture-${def.value.theme.texture}` : ""));
@@ -82,15 +88,16 @@ const countLabel = computed(() => `${count.value} ${count.value === 1 ? "item" :
     <div v-if="error" class="failed">
       <p>{{ error }}</p>
     </div>
+    <DesignProgress v-else-if="def && !count && progress" :name="def.name" :choices="progress" :running="snap.turnRunning && def.sessions[snap.workspace.root] === snap.sessionId" />
     <div v-else-if="fresh && def" class="fresh">
       <span class="glyph">{{ def.icon }}</span>
       <h2>{{ def.name }}</h2>
       <p>Tell Dial below what {{ def.name }} should be, and it builds it here. Or save an answer to it with the bookmark under any reply, and Dial designs it around what you save.</p>
       <button class="btn btn-secondary" @click="focusComposer()"><Icon name="sparkle" :size="13" /> Describe it to Dial</button>
     </div>
-    <div v-else-if="full && def" class="ty-canvas canvas" :class="[desk ? 'desk' : texture, `layout-${layout}`]" :style="canvasStyle">
+    <div v-else-if="full && def" class="ty-canvas canvas" :class="[desk ? 'desk' : texture, `layout-${layout}`]" :data-type-capture="id" :data-image-board="layout === 'board' && def.view.imageField ? '' : undefined" :style="canvasStyle">
       <button v-if="layout === 'book'" class="add btn btn-secondary" :title="addLabel" @click="add"><Icon name="plus" :size="13" /> {{ addLabel }}</button>
-      <BookView v-if="layout === 'book'" :full="full" :texture="texture" @edit="edit" />
+      <BookView v-if="layout === 'book'" :full="full" :texture="texture" :open-first-item="openFirstItem" @edit="edit" />
       <CustomView v-else-if="layout === 'custom'" :full="full" :platform="snap.platform" />
       <div v-else class="scroll">
         <header v-if="headed" class="head">
@@ -172,6 +179,16 @@ const countLabel = computed(() => `${count.value} ${count.value === 1 ? "item" :
   padding: 30px 28px 0;
   color: var(--ty-ink);
 }
+.layout-board .head {
+  padding-inline: clamp(14px, 2.2cqi, 28px);
+}
+
+.layout-board .head-add {
+  background: var(--ty-raised);
+  color: var(--ty-ink);
+  box-shadow: inset 0 0 0 1px var(--ty-line);
+}
+.layout-board .head-add svg { color: var(--ty-accent); }
 .titles {
   min-width: 0;
 }

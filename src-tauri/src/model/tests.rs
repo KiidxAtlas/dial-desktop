@@ -240,6 +240,16 @@ fn deleting_other_sessions_asks_directly_and_refreshes_once() {
 }
 
 #[test]
+fn stale_history_cannot_restore_a_deleted_session() {
+    let mut model = Model::starting();
+    let (list, _) = requested(&mut model, Command::ListSessions, 1);
+    let (del, _) = requested(&mut model, Command::DeleteSession("gone".into()), 2);
+    respond(&mut model, del, "delete_session", json!({"session_id":"gone"}));
+    respond(&mut model, list, "list_sessions", json!({"sessions":[{"session_id":"gone"}]}));
+    assert!(model.sessions.is_empty());
+}
+
+#[test]
 fn deleting_the_open_session_moves_off_it_first() {
     let mut model = Model::starting();
     model.apply(Update::Connected(Box::new(ready("s1"))));
@@ -497,10 +507,39 @@ fn state_and_models_load_the_model_controls() {
 }
 
 #[test]
+fn discovering_models_asks_for_a_refresh_and_replaces_the_list() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    assert_eq!(
+        Command::DiscoverModels.request().1,
+        "list_models",
+        "discovery uses the same RPC as the offline listing"
+    );
+    assert_eq!(
+        Command::DiscoverModels.request().2,
+        json!({"refresh": true})
+    );
+    let (id, _) = requested(&mut model, Command::DiscoverModels, 1);
+    respond(
+        &mut model,
+        id,
+        "list_models",
+        json!({"models": [
+            {"provider": "google-antigravity", "model_id": "gemini-a", "sources": ["listing"]},
+            {"provider": "google-antigravity", "model_id": "gemini-b", "sources": ["listing"]}
+        ], "checked": {"providers": 1}}),
+    );
+    assert!(model.models_changed);
+    assert_eq!(model.models.len(), 2);
+    assert!(model.models.iter().all(|m| m.listed && !m.catalog_only));
+}
+
+#[test]
 fn switching_model_rereads_state_and_failures_toast() {
     let mut model = Model::starting();
     model.apply(Update::Connected(Box::new(ready("s1"))));
     let switch = Command::SetModel {
+        session_id: "s1".into(),
         provider: "openai".into(),
         model_id: "gpt".into(),
     };
@@ -508,7 +547,7 @@ fn switching_model_rereads_state_and_failures_toast() {
     let follow = respond(&mut model, id, "set_model", json!({"model": "gpt"}));
     assert_eq!(follow, vec![Command::State]);
 
-    let (id, _) = requested(&mut model, Command::SetThinking("max".into()), 2);
+    let (id, _) = requested(&mut model, Command::SetThinking { session_id: "s1".into(), level: "max".into() }, 2);
     model.apply(Update::Message(Message::Response {
         id,
         method: "set_thinking".into(),

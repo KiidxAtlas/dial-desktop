@@ -30,15 +30,23 @@ export async function readSettings(): Promise<Flat> {
 }
 
 /** The keys under `prefix.` as a nested object (`a.b.c` → `{a: {b: {c}}}`). */
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 export function nest(flat: Flat, prefix: string): Record<string, any> {
-  const out: Record<string, any> = {};
+  const out: Record<string, any> = Object.create(null);
   const head = `${prefix}.`;
   for (const [key, value] of flat) {
     if (!key.startsWith(head)) continue;
     const path = key.slice(head.length).split(".");
-    let at = out;
-    for (const part of path.slice(0, -1)) at = at[part] ??= {};
-    at[path[path.length - 1]] = value;
+    if (path.some((part) => !part || UNSAFE_KEYS.has(part))) continue;
+    let at: Record<string, any> = out;
+    let ok = true;
+    for (const part of path.slice(0, -1)) {
+      const cur = at[part];
+      if (cur === undefined) at = at[part] = Object.create(null);
+      else if (cur && typeof cur === "object" && !Array.isArray(cur)) at = cur;
+      else { ok = false; break; }
+    }
+    if (ok) at[path[path.length - 1]] = value;
   }
   return out;
 }

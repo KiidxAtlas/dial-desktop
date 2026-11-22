@@ -3,6 +3,8 @@
 import { computed, ref, watch } from "vue";
 import { files, type ImageFile } from "../bridge";
 import { viewedImage } from "../imageViewer";
+import { typeApi } from "../savedTypes";
+import { openImageMenu } from "../imageActions";
 import { copyText } from "../sessionActions";
 import Icon from "./Icon.vue";
 import { vFocus } from "./Shortcuts.vue";
@@ -20,7 +22,9 @@ watch(
     error.value = null;
     if (!viewed) return;
     try {
-      const loaded = await files.readTranscriptImage(viewed.root, viewed.path);
+      const loaded = viewed.asset
+        ? await files.readImage(viewed.absolute)
+        : await files.readTranscriptImage(viewed.root!, viewed.path);
       if (viewedImage.value === viewed) loadedImage.value = loaded;
     } catch (failure) {
       if (viewedImage.value === viewed) error.value = String(failure);
@@ -35,9 +39,10 @@ function close() {
 
 function open() {
   const v = file.value;
-  if (v) void files.openTranscriptImage(v.root, v.path);
+  if (!v) return;
+  if (v.asset) void typeApi.openAsset(v.absolute);
+  else if (v.root) void files.openTranscriptImage(v.root, v.path);
 }
-
 function reveal() {
   const v = file.value;
   if (v) void files.reveal(v.absolute);
@@ -46,6 +51,18 @@ function reveal() {
 function copyPath() {
   const v = file.value;
   if (v) void copyText(v.absolute, "Path copied");
+}
+
+function menu(event: MouseEvent) {
+  const shown = image.value;
+  if (!shown) return;
+  const v = file.value;
+  openImageMenu(event, {
+    name: shown.name,
+    url: shown.url,
+    absolute: v?.absolute,
+    open: v ? { label: "Open", run: open } : undefined,
+  });
 }
 
 function onKey(event: KeyboardEvent) {
@@ -85,7 +102,7 @@ function onKey(event: KeyboardEvent) {
             </button>
           </header>
           <div class="stage" @dblclick="open">
-            <img v-if="image" :src="image.url" :alt="image.name" draggable="false" />
+            <img v-if="image" :src="image.url" :alt="image.name" draggable="false" @contextmenu="menu" />
             <p v-else-if="error" class="error">Preview unavailable: {{ error }}</p>
             <div v-else class="loading" />
           </div>

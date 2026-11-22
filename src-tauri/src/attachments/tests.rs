@@ -32,6 +32,45 @@ fn reading_an_image_gives_a_data_url_preview() {
 }
 
 #[test]
+fn saving_an_image_writes_its_bytes_under_a_matching_name() {
+    let dir = std::env::temp_dir().join(format!("dial-desktop-save-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = b"\x89PNG\r\n\x1a\nrest";
+    let data = STANDARD.encode(png);
+
+    let target = dir.join("copy.png");
+    save_image(&target, &data).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), png);
+    // Saving again replaces the file (the dialog already asked).
+    save_image(&target, &data).unwrap();
+
+    let jpeg = STANDARD.encode(b"\xff\xd8\xffjpeg");
+    save_image(&dir.join("photo.JPEG"), &jpeg).unwrap();
+
+    assert!(
+        save_image(&dir.join("wrong.jpg"), &data)
+            .unwrap_err()
+            .contains(".png")
+    );
+    assert!(
+        save_image(&dir.join("notes.txt"), &data)
+            .unwrap_err()
+            .contains("needs a")
+    );
+    assert!(save_image(&dir.join("bad.png"), "not base64!").is_err());
+    assert!(save_image(&dir.join("text.png"), &STANDARD.encode(b"hello")).is_err());
+    assert!(!dir.join("wrong.jpg").exists() && !dir.join("bad.png").exists());
+    // No temporary files are left behind.
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".dial-save-"))
+        .count();
+    assert_eq!(leftovers, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn attachments_are_checked_before_sending() {
     assert!(check(&[], &[]).is_ok());
     assert!(check(&["/a/b.png".into()], &["iVBORw==".into()]).is_ok());

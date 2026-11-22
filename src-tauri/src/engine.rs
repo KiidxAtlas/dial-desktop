@@ -79,15 +79,19 @@ pub enum Command {
     State,
     /// Load the models `SetModel` accepts.
     ListModels,
+    /// Load the models after the engine re-queries signed-in and configured providers
+    /// (`list_models` with `refresh: true`), so account listings such as Antigravity's are current.
+    DiscoverModels,
     /// Load the models that generate images (`list_models` with `purpose: "image"`).
     ListImageModels,
     /// Switch this session's model.
     SetModel {
+        session_id: String,
         provider: String,
         model_id: String,
     },
     /// Set the reasoning level; `default` restores the model's default.
-    SetThinking(String),
+    SetThinking { session_id: String, level: String },
     /// Set the approval mode: `ask`, `write`, `auto` or `readonly`.
     SetApproval(String),
     /// Tell the engine the open question is on screen; its answer timeout starts now.
@@ -240,12 +244,12 @@ impl Command {
             Self::ListSessions => (
                 Purpose::Sessions,
                 "list_sessions",
-                json!({ "limit": SESSION_PAGE }),
+                json!({ "limit": SESSION_PAGE, "include_empty": true }),
             ),
             Self::ListSessionsPage { offset, .. } => (
                 Purpose::Sessions,
                 "list_sessions",
-                json!({ "limit": SESSION_PAGE, "offset": offset }),
+                json!({ "limit": SESSION_PAGE, "offset": offset, "include_empty": true }),
             ),
             Self::NewSession => (Purpose::NewSession, "new_session", json!({})),
             Self::Resume(id) => (Purpose::Resume, "resume", json!({ "session_id": id })),
@@ -270,20 +274,21 @@ impl Command {
             Self::Recover => (Purpose::Recover, "recovery_snapshot", json!({})),
             Self::State => (Purpose::State, "state", json!({})),
             Self::ListModels => (Purpose::Models, "list_models", json!({})),
+            Self::DiscoverModels => (Purpose::Models, "list_models", json!({ "refresh": true })),
             Self::ListImageModels => (
                 Purpose::ImageModels,
                 "list_models",
                 json!({ "purpose": "image" }),
             ),
-            Self::SetModel { provider, model_id } => (
+            Self::SetModel { session_id, provider, model_id } => (
                 Purpose::SetModel,
                 "set_model",
-                json!({ "provider": provider, "model_id": model_id }),
+                json!({ "session_id": session_id, "provider": provider, "model_id": model_id }),
             ),
-            Self::SetThinking(level) => (
+            Self::SetThinking { session_id, level } => (
                 Purpose::SetThinking,
                 "set_thinking",
-                json!({ "level": level }),
+                json!({ "session_id": session_id, "level": level }),
             ),
             Self::SetApproval(mode) => (
                 Purpose::SetApproval,

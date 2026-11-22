@@ -6,6 +6,7 @@ import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
 import { finishRename, goToSession, sessionGroups, sessionItems, startRename } from "../sessionActions";
+import { isTypeSession, types } from "../savedTypes";
 import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
@@ -17,6 +18,7 @@ const live = computed(() => props.snap.connection.state === "live");
 const searchMessages = ref(false);
 const results = ref<TranscriptResults | null>(null);
 const searching = ref(false);
+const visibleHits = computed(() => types.loaded ? results.value?.hits.filter(hit => !isTypeSession(hit.session_id)) ?? [] : []);
 const searchError = ref("");
 let searchVersion = 0;
 
@@ -53,7 +55,7 @@ async function openHit(hit: TranscriptHit) {
   }
 }
 /** Each session belongs to one group (Shift-click ranges follow the displayed order). */
-const groups = computed(() => sessionGroups(props.snap.sessions, ui.sessionFilter));
+const groups = computed(() => sessionGroups(props.snap, ui.sessionFilter));
 const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
 /** ⌘1–9 numbers for the first nine rows, shown while ⌘ is held. */
 const jumpNumber = computed(() => new Map(sessions.value.slice(0, 9).map((s, i) => [s.id, i + 1])));
@@ -249,9 +251,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       <button class="item" :disabled="!live || searching || !ui.sessionFilter.trim()" @click="searchTranscripts">Search messages</button>
       <p v-if="searching" class="empty" role="status">Searching messages…</p>
       <p v-else-if="searchError" class="empty" role="alert">{{ searchError }}</p>
-      <p v-else-if="results && !results.hits.length" class="empty">No matching messages.</p>
+      <p v-else-if="results && !visibleHits.length" class="empty">No matching messages.</p>
       <template v-else-if="results">
-        <button v-for="(hit, index) in results.hits" :key="`${hit.session_id}:${hit.entry_id}:${index}`" class="hit" @click="openHit(hit)">
+        <button v-for="(hit, index) in visibleHits" :key="`${hit.session_id}:${hit.entry_id}:${index}`" class="hit" @click="openHit(hit)">
           <strong class="truncate">{{ hit.title || 'Untitled session' }}</strong>
           <span>{{ hit.snippet }}</span>
         </button>

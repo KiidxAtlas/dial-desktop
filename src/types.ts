@@ -39,6 +39,7 @@ export interface Session {
   id: string;
   title: string;
   meta: string;
+  empty?: boolean;
   pinned: boolean;
   selected: boolean;
   /** A turn runs in it, on screen or in the background. */

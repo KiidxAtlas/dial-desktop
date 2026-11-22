@@ -12,6 +12,7 @@ import SettingRow from "./SettingRow.vue";
 import AppearanceSettings from "./AppearanceSettings.vue";
 import UpdatesSettings from "./UpdatesSettings.vue";
 import NotificationSettings from "./NotificationSettings.vue";
+import TypeSettings from "./TypeSettings.vue";
 import ModelLibrary from "./ModelLibrary.vue";
 import RolesPresets from "./RolesPresets.vue";
 import ImageSettings from "./ImageSettings.vue";
@@ -24,7 +25,7 @@ import SSegmented from "./settings/SSegmented.vue";
 import "./settings/settings.css";
 
 type IconName = keyof typeof PATHS;
-type DesktopPage = "overview" | "appearance" | "notifications" | "updates" | "library" | "roles" | "images" | ProjectTab;
+type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "library" | "roles" | "images" | ProjectTab;
 /** A desktop page, or `engine:<tab>` for one of the engine's tabs. */
 type PageId = DesktopPage | `engine:${string}`;
 
@@ -58,6 +59,7 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
     pages: [
       { id: "appearance", label: "Appearance", icon: "sun", about: "Theme, zoom, what answers draw, and the background behind sessions, on this computer.", words: "theme dark light zoom background image wallpaper dim interactive cards diagrams charts mermaid calculator" },
       { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify" },
+      { id: "types", label: "Types", icon: "folder", about: "Where new Types are saved: in the app for every project, or in this project.", words: "type collection save project folder global location storage" },
       { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, and installing new ones.", words: "version upgrade install" },
     ],
   },
@@ -371,6 +373,7 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
         <SPage v-else-if="desktopPage" :title="desktopPage.label" :description="desktopPage.about">
           <AppearanceSettings v-if="current === 'appearance'" />
           <NotificationSettings v-else-if="current === 'notifications'" />
+          <TypeSettings v-else-if="current === 'types'" />
           <UpdatesSettings v-else />
         </SPage>
 

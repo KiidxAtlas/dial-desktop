@@ -46,14 +46,12 @@ export const ui = reactive({
   typeOpen: null as string | null,
   /** With a type open: the type itself, or its own conversation. */
   typeMode: "type" as "type" | "chat",
-  /** The sidebar's Types shows its name field for a new type. */
-  typeNaming: false,
   /** Sessions picked in the sidebar with ⌘/Ctrl- or Shift-click, by id. */
   picked: new Set<string>(),
   /** The session whose name is being edited, and where: the sidebar row or the title bar. */
   renaming: null as { id: string; place: "sidebar" | "title" } | null,
   /** The open context menu, at a point in the window. */
-  menu: null as { x: number; y: number; items: MenuItem[] } | null,
+  menu: null as { x: number; y: number; items: MenuItem[]; title?: string; anchor?: HTMLElement | null } | null,
   /** The command palette (⌘K). */
   paletteOpen: false,
   filePalette: false,
@@ -67,26 +65,27 @@ export const ui = reactive({
 });
 
 export type MenuItem =
-  | {
+  | ({
       label: string;
       icon?: string;
       /** A key hint shown on the right, like `⌘⌫`. */
       hint?: string;
       danger?: boolean;
       disabled?: boolean;
-      run: () => void;
-    }
+    } & ({ run: () => void; prompt?: never } | {
+      prompt: { label: string; placeholder: string; maxLength: number; confirm: string; submit: (value: string) => void };
+    }))
   | { divider: true };
 
 /** Open a menu at the pointer (a right-click) or under `anchor` (a "…" button). */
-export function openMenu(event: MouseEvent, items: MenuItem[], anchor?: HTMLElement | null) {
+export function openMenu(event: MouseEvent, items: MenuItem[], anchor?: HTMLElement | null, title?: string) {
   event.preventDefault();
   event.stopPropagation();
   if (anchor) {
     const box = anchor.getBoundingClientRect();
-    ui.menu = { x: box.left, y: box.bottom + 4, items };
+    ui.menu = { x: box.left, y: box.bottom + 4, items, anchor, title };
   } else {
-    ui.menu = { x: event.clientX, y: event.clientY, items };
+    ui.menu = { x: event.clientX, y: event.clientY, items, title };
   }
 }
 

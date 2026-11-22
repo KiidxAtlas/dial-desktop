@@ -8,6 +8,28 @@ fn blueprint(value: Value) -> TypeDef {
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000rest-of-a-tiny-file";
 
 #[test]
+fn blueprint_descriptions_fit_engine_mcp_limit() {
+    for tool in tools() {
+        if matches!(tool["name"].as_str(), Some("types_create" | "types_update")) {
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.len() <= 2048, "{} exceeds the MCP cap", tool["name"]);
+            assert!(description.ends_with("illustration."));
+        }
+    }
+}
+
+#[test]
+fn design_progress_reports_only_committed_choices_including_explicit_defaults() {
+    let def = normalize(blueprint(json!({"name":"Cookbook", "view":{"layout":"book", "style":"cookbook"},
+        "fields":[{"key":"recipe", "label":"Recipe", "kind":"text"}], "theme":{"font":"serif"}})), 1).unwrap();
+    assert_eq!(design_change(&def, &json!({"icon":"✦"}))["choices"], json!({}));
+    assert_eq!(design_change(&def, &json!({"fields":[]}))["choices"], json!({"fields":["Recipe"]}));
+    assert_eq!(design_change(&def, &json!({"view":{"layout":"book"}, "theme":{"font":"serif"}})),
+        json!({"id":def.id, "choices":{"layout":{"kind":"book", "style":"cookbook"},
+            "look":{"font":"serif", "texture":def.theme.texture, "accent":def.theme.accent}}}));
+}
+
+#[test]
 fn normalize_fills_fields_and_view_from_the_layout() {
     let def = normalize(
         blueprint(json!({"name": "  Routine ", "view": {"layout": "checklist"}})),
@@ -280,6 +302,18 @@ fn a_named_type_is_undesigned_and_its_sessions_are_replaced_whole() {
 }
 
 #[test]
+fn claiming_a_type_chat_preserves_other_projects_and_refuses_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(Some(dir.path().to_path_buf()));
+    let id = store.create(blueprint(json!({"name":"Notes"}))).unwrap().id;
+    for (root, session) in [("/a", "one"), ("/b", "two")] {
+        store.claim_session(&id, root.into(), session.into()).unwrap();
+    }
+    assert!(store.claim_session(&id, "/a".into(), "other".into()).is_err());
+    assert_eq!(store.list().unwrap()[0].sessions, ["one", "two"]);
+}
+
+#[test]
 fn custom_pages_are_served_only_for_custom_layouts() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(Some(dir.path().to_path_buf()));
@@ -299,4 +333,180 @@ fn custom_pages_are_served_only_for_custom_layouts() {
     assert_eq!(page.headers()["Content-Security-Policy"], CUSTOM_CSP);
     assert_eq!(custom_page(&store, &format!("/{}", book.id)).status(), 404);
     assert_eq!(custom_page(&store, "/../x").status(), 404);
+}
+
+#[test]
+fn new_types_go_where_the_user_chose_and_both_places_are_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app").join("types");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let store = Store::new(Some(app.clone()));
+    store.set_project(Some(&project));
+
+    let shared = store.create(blueprint(json!({"name": "Recipes"}))).unwrap();
+    assert!(app.join(&shared.id).join("type.json").is_file(), "the app is the default");
+
+    store.set_save_in(Scope::Project).unwrap();
+    let local = store
+        .create(blueprint(json!({"name": "Moodboard", "view": {"layout": "board"}})))
+        .unwrap();
+    let local_dir = project.join(".dial").join("types").join(&local.id);
+    assert!(local_dir.join("type.json").is_file());
+    assert!(!app.join(&local.id).exists());
+
+    // Items and images of a project type stay in the project.
+    let fields = json!({"title": "Sketch"}).as_object().unwrap().clone();
+    store.add_item(&local.id, fields, None).unwrap();
+    assert!(local_dir.join("items.json").is_file());
+    let png = dir.path().join("pic.png");
+    std::fs::write(&png, PNG).unwrap();
+    let asset = store.import_image(&local.id, &png).unwrap();
+    assert!(local_dir.join("assets").join(asset).is_file());
+
+    // Both places are listed, each marked with where it is, whatever the setting is.
+    store.set_save_in(Scope::App).unwrap();
+    let list = store.list().unwrap();
+    let scope_of = |id: &str| list.iter().find(|s| s.id == id).unwrap().scope;
+    assert_eq!(list.len(), 2);
+    assert_eq!(scope_of(&shared.id), Scope::App);
+    assert_eq!(scope_of(&local.id), Scope::Project);
+    assert_eq!(store.get(&local.id).unwrap().items.len(), 1);
+
+    // Another project sees only the app's types; with no project open "project" means the app.
+    store.set_project(None);
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert!(store.get(&local.id).is_err());
+    store.set_save_in(Scope::Project).unwrap();
+    let fallback = store.create(blueprint(json!({"name": "Notes"}))).unwrap();
+    assert!(app.join(&fallback.id).join("type.json").is_file());
+
+    store.set_project(Some(&project));
+    store.delete(&local.id).unwrap();
+    assert!(!local_dir.exists());
+}
+
+#[test]
+fn the_choice_of_where_to_save_is_remembered() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::for_home(Some(dir.path()));
+    assert_eq!(store.location().save_in, Scope::App);
+    assert_eq!(store.location().project, None);
+    store.set_save_in(Scope::Project).unwrap();
+    store.set_project(Some(Path::new("/work/site")));
+    let again = Store::for_home(Some(dir.path()));
+    assert_eq!(again.location().save_in, Scope::Project);
+    assert_eq!(store.location().project.as_deref(), Some("/work/site/.dial/types"));
+}
+
+#[test]
+fn a_type_prompt_carries_what_the_type_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(Some(dir.path().to_path_buf()));
+    let def = store
+        .create(blueprint(json!({
+            "name": "Image board", "icon": "🖼", "description": "Pictures that set a mood",
+            "view": {"layout": "board"}
+        })))
+        .unwrap();
+    let sent = with_context(&store, &format!("[[type:{}]]\nmake it warmer", def.id));
+    assert!(sent.starts_with(&format!("[[type:{}]]\n{CONTEXT_OPEN}", def.id)));
+    assert!(sent.contains("Image board") && sent.contains("Pictures that set a mood"));
+    assert!(sent.contains("board layout") && sent.contains("not about the project's code"));
+    assert!(sent.ends_with("make it warmer"));
+    // Already briefed, plain, or about an unknown type: unchanged.
+    assert_eq!(with_context(&store, &sent), sent);
+    assert_eq!(with_context(&store, "fix the build"), "fix the build");
+    let unknown = "[[type:nope-1234]]\nhello";
+    assert_eq!(with_context(&store, unknown), unknown);
+}
+
+#[test]
+fn allow_import_false_never_reads_host_image_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(Some(dir.path().join("types")));
+    let def = store
+        .create(blueprint(json!({
+            "name": "Custom Board",
+            "fields": [{"key": "title"}, {"key": "photo", "kind": "image"}, {"key": "gallery", "kind": "images"}]
+        })))
+        .unwrap();
+    let secret = dir.path().join("secret.png");
+    std::fs::write(&secret, PNG).unwrap();
+
+    let (item, _) = store
+        .add_item_with(
+            &def.id,
+            json!({"title": "Card", "photo": secret.to_str().unwrap(), "gallery": [secret.to_str().unwrap()]})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!(item.fields.get("photo"), None);
+    assert_eq!(item.fields.get("gallery"), None);
+    assert!(
+        std::fs::read_dir(&store.get(&def.id).unwrap().assets)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true),
+        "no host image may be copied into assets when allow_import is false"
+    );
+    // Updating from a sandboxed view cannot smuggle a host path either, while existing asset names stay valid.
+    let legit = store.import_image(&def.id, &secret).unwrap();
+    let updated = store
+        .update_item_with(
+            &def.id,
+            &item.id,
+            ItemPatch {
+                fields: Some(
+                    json!({"photo": legit, "gallery": [secret.to_str().unwrap()]})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                ..ItemPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(updated.fields["photo"], legit);
+    assert_eq!(updated.fields.get("gallery"), None);
+}
+
+#[test]
+fn resolve_asset_allows_only_store_assets_and_refuses_outside_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app").join("types");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let store = Store::new(Some(app));
+    store.set_project(Some(&project));
+
+    let def = store.create(blueprint(json!({"name": "Board"}))).unwrap();
+    let src = dir.path().join("pic.png");
+    std::fs::write(&src, PNG).unwrap();
+    let asset = store.import_image(&def.id, &src).unwrap();
+    let full = store.get(&def.id).unwrap();
+    let asset_path = Path::new(&full.assets).join(&asset);
+
+    assert!(store.resolve_asset(&asset_path).is_ok());
+    assert!(store.resolve_asset(&src).is_err(), "files outside the store are rejected");
+    assert!(
+        store
+            .resolve_asset(&Path::new(&full.assets).parent().unwrap().join("type.json"))
+            .is_err(),
+        "non-asset files in the type folder are rejected"
+    );
+}
+
+#[test]
+fn two_windows_see_save_location_changes_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Store::for_home(Some(dir.path()));
+    let second = Store::for_home(Some(dir.path()));
+    assert_eq!(second.location().save_in, Scope::App);
+    first.set_save_in(Scope::Project).unwrap();
+    assert_eq!(second.location().save_in, Scope::Project);
 }

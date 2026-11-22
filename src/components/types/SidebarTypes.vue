@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from "vue";
+import { nextTick, ref } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { showToast } from "../../bridge";
 import { openMenu, ui } from "../../ui";
-import { closeType, createType, openType, refreshTypes, typeApi, typeState, types, type Summary } from "../../savedTypes";
+import { createType, deleteType, openType, refreshTypes, typeApi, types, type Summary } from "../../savedTypes";
 import Icon from "../Icon.vue";
 
 /** The sidebar's Types: each one opens as its own small app in place of the transcript. */
@@ -25,11 +25,6 @@ async function startNaming(id: string | null = null, before = "") {
   field.value?.focus();
   field.value?.select();
 }
-watch(() => ui.typeNaming, (now) => {
-  if (!now) return;
-  ui.typeNaming = false;
-  void startNaming();
-});
 
 async function finishNaming() {
   const target = naming.value;
@@ -53,7 +48,6 @@ async function finishNaming() {
 }
 function cancelNaming() {
   naming.value = null;
-  typeState.saveAfterCreate = null;
 }
 function onKey(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.isComposing) {
@@ -72,9 +66,7 @@ async function remove(t: Summary) {
   }).catch(() => false);
   if (!sure) return;
   try {
-    if (ui.typeOpen === t.id) closeType();
-    await typeApi.remove(t.id);
-    await refreshTypes();
+    await deleteType(t.id);
   } catch (error) {
     showToast(String(error));
   }

@@ -111,6 +111,7 @@ pub struct SessionView {
     pub title: String,
     /// "3h ago · 12 messages".
     pub meta: String,
+    pub empty: bool,
     pub pinned: bool,
     /// The session on screen.
     pub selected: bool,
@@ -352,6 +353,17 @@ fn shown_images(tool: &ToolEntry, workspace: &Workspace) -> Vec<String> {
         .into_iter()
         .flatten();
     let mut images: Vec<String> = Vec::new();
+    if let Some(data) = &result.data {
+        let uris = data["artifact"]["uri"].as_str().into_iter().chain(
+            data["dial_images"].as_array().into_iter().flatten().filter_map(|r| r["uri"].as_str())
+        );
+        for uri in uris {
+            if uri.strip_prefix("artifact://").is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())) && !images.iter().any(|i| i == uri) {
+                images.push(uri.to_owned());
+                if images.len() == MAX_ROW_IMAGES { return images; }
+            }
+        }
+    }
     for path in result.changed_paths.iter().map(String::as_str).chain(viewed) {
         if let Some(path) = inside(path).filter(|p| !images.contains(p)) {
             images.push(path);
@@ -647,6 +659,7 @@ impl Snapshot {
                     id: s.id.clone(),
                     title: s.title.clone(),
                     meta,
+                    empty: s.messages == 0,
                     pinned: s.pinned,
                     selected: session_id.as_deref() == Some(s.id.as_str()),
                     running: false,
@@ -762,6 +775,7 @@ impl Snapshot {
                     }
                     .into(),
                     pinned: false,
+                    empty: false,
                     selected: self.session_id.as_deref() == Some(id.as_str()),
                     running: a.running,
                     waiting: a.waiting,

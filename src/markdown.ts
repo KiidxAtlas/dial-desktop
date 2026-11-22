@@ -1,6 +1,7 @@
 // Markdown for answers, with code blocks highlighted by Shiki once its grammars load.
 
 import MarkdownIt from "markdown-it";
+import type Token from "markdown-it/lib/token.mjs";
 import { ref } from "vue";
 import { createHighlighterCore, type HighlighterCore } from "shiki/core";
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
@@ -105,15 +106,22 @@ md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
   const label = escape(`Image: ${alt}`);
   return src && /^https?:/i.test(src) ? `<a href="${escape(src)}">${label}</a>` : `<span class="image-ref">${label}</span>`;
 };
+// markdown-it accepts EOF as an implicit closing fence. Its source map includes both
+// delimiters only for an explicit close; token.content contains just the body lines.
+function closedFence(token: Token) {
+  if (!token.map) return false;
+  const bodyLines = token.content ? token.content.replace(/\n$/, '').split('\n').length : 0;
+  return token.map[1] - token.map[0] === bodyLines + 2;
+}
+
 md.renderer.rules.fence = (tokens, idx, _options, env: RenderEnv | undefined) => {
   const token = tokens[idx];
   const lang = token.info.trim().split(/\s+/)[0] ?? "";
-  // While an answer streams, its last block may still be growing: highlight it once it is done.
-  const growing = !!env?.streaming && idx === tokens.length - 1;
-  if (lang.toLowerCase() === 'dial-app' && env?.cards && !env.streaming && token.content.length <= 24000) {
+  const growing = !!env?.streaming && !closedFence(token);
+  if (lang.toLowerCase() === 'dial-app' && env?.cards && !growing && token.content.length <= 24000) {
     return `<div class="reply-app"><details open><summary>Interactive example source</summary>${codeBlock(token.content.trimEnd(), 'json')}</details></div>`;
   }
-  if (lang.toLowerCase() === 'mermaid' && env?.diagrams && !env.streaming && token.content.length <= 12000) {
+  if (lang.toLowerCase() === 'mermaid' && env?.diagrams && !growing && token.content.length <= 12000) {
     const name = diagramName(token.content);
     return `<figure class="reply-diagram"><figcaption>${name}</figcaption><details open><summary>${name} source</summary>${codeBlock(token.content.trimEnd(), 'mermaid')}</details></figure>`;
   }
@@ -159,9 +167,28 @@ md.renderer.rules.text = (tokens, idx) => {
 
 interface RenderEnv { streaming: boolean; cards: boolean; diagrams: boolean }
 
-/** `streaming`: the text is still arriving (see the `fence` rule). Cards and diagrams follow the
- * Appearance settings; a caller computing from this re-renders when they change. */
-export function renderMarkdown(text: string, streaming = false): string {
+/** Keep top-level rich fences in separate DOM fragments. Later streamed prose can then update
+ * without unmounting a card or cancelling a diagram's pending image decode. Parse the whole
+ * document first so Markdown references still resolve across fragments. */
+export function renderMarkdownParts(text: string, streaming = false): string[] {
   const env: RenderEnv = { streaming, cards: appearance.cards, diagrams: appearance.diagrams };
-  return md.render(text, env);
+  const tokens = md.parse(text, env);
+  const parts: string[] = [];
+  let from = 0;
+  const flush = (end: number) => {
+    if (end > from) parts.push(md.renderer.render(tokens.slice(from, end), md.options, env));
+    from = end;
+  };
+  for (const [i, token] of tokens.entries()) {
+    if (token.level === 0 && token.type === 'fence' && /^(mermaid|dial-app)(\s|$)/i.test(token.info.trim())) {
+      flush(i);
+      flush(i + 1);
+    }
+  }
+  flush(tokens.length);
+  return parts;
+}
+
+export function renderMarkdown(text: string, streaming = false): string {
+  return renderMarkdownParts(text, streaming).join('');
 }

@@ -2,6 +2,7 @@
 
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { downloadDir } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -241,7 +242,7 @@ export const engine = {
   approve: (approvalId: string, decision: Decision) => call("approve", { approvalId, decision }),
   abort: () => call("abort"),
   newSession: () => call("new_session"),
-  resume: (sessionId: string, workspaceRoot?: string) => call("resume", { sessionId, workspaceRoot }),
+  resume: (sessionId: string, workspaceRoot?: string, waitForClose = false) => call("resume", { sessionId, workspaceRoot, waitForClose }),
   searchTranscripts: (workspaceRoot: string, query: string) =>
     invoke<import("./types").TranscriptResults>("search_transcripts", { workspaceRoot, query }),
   localModelDetails: (workspaceRoot: string, model: string) =>
@@ -269,8 +270,7 @@ export const engine = {
         cancelLabel: "Cancel",
       },
     ).catch(() => false);
-    if (confirmed) await call("delete_sessions", { sessionIds: sessions.map((s) => s.id) });
-    return confirmed;
+    return confirmed && await call("delete_sessions", { sessionIds: sessions.map((s) => s.id) });
   },
   renameSession: (sessionId: string, title: string) => call("rename_session", { sessionId, title }),
   pinSession: (sessionId: string, pinned: boolean) => call("pin_session", { sessionId, pinned }),
@@ -328,9 +328,11 @@ export const engine = {
   readAloud: (text: string | null) => call("read_aloud", { text }),
   refreshSessions: () => call("refresh_sessions"),
   refreshModels: () => call("refresh_models"),
-  setModel: (provider: string, modelId: string) => call("set_model", { provider, modelId }),
+  /** Re-queries signed-in providers (for example Antigravity's account list); slower than `refreshModels`. */
+  discoverModels: () => call("discover_models"),
+  setModel: (snap: import("./types").OpenSnapshot, provider: string, modelId: string) => call("set_model", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, provider, modelId }),
   /** `default` restores the model's own level. */
-  setThinking: (level: string) => call("set_thinking", { level }),
+  setThinking: (snap: import("./types").OpenSnapshot, level: string) => call("set_thinking", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, level }),
   setApproval: (mode: ApprovalMode) => call("set_approval", { mode }),
   reconnect: () => call("reconnect"),
   /** The question is on screen; the engine starts its answer timeout. */
@@ -415,6 +417,22 @@ export const files = {
       filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
     });
     return typeof picked === "string" ? picked : null;
+  },
+  /** Ask where to save an image (Downloads by default) and write its base64 bytes there. */
+  async saveImage(fileName: string, extensions: string[], data: string) {
+    try {
+      const folder = await downloadDir().catch(() => "");
+      const path = await saveDialog({
+        title: "Save image",
+        defaultPath: folder ? `${folder.replace(/\/+$/, "")}/${fileName}` : fileName,
+        filters: [{ name: "Image", extensions }],
+      });
+      if (!path) return;
+      await invoke("save_image", { path, data });
+      showToast("Image saved");
+    } catch (error) {
+      showToast(`Could not save the image: ${error}`);
+    }
   },
 };
 

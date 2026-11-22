@@ -1,10 +1,10 @@
 // What can be done to a session, shared by its sidebar menu, the title bar menu and the palette.
 
 import { engine, showToast, snapshot } from "./bridge";
-import { draftFor } from "./drafts";
+import { draftFor, hasDraft } from "./drafts";
 import type { OpenSnapshot, Session } from "./types";
 import { focusComposer, ui, type MenuItem } from "./ui";
-import { dismissType, isTypeSession } from "./savedTypes";
+import { dismissType, isTypeSession, types, typeState } from "./savedTypes";
 
 /** Start editing the name of session `id` in `place`. */
 export function startRename(id: string, place: "sidebar" | "title") {
@@ -25,13 +25,19 @@ export function openSession(snap: OpenSnapshot): Session | null {
   return snap.sessions.find((s) => s.selected) ?? null;
 }
 
+export function listedSession(s: Session, snap: OpenSnapshot): boolean {
+  if (snap.connection.state === "live" && !types.loaded) return false;
+  if (isTypeSession(s.id) || (s.selected && typeState.pending)) return false;
+  return !s.empty || s.running || s.waiting || s.pinned || s.selected || hasDraft(snap.workspace.root, s.id);
+}
+
 /**
  * Sessions as the sidebar groups them (Active, Pinned, Recents), keeping those whose title matches
  * `filter`. A type's own conversations are not listed: they open with their type.
  */
-export function sessionGroups(sessions: Session[], filter = ""): { name: string; sessions: Session[] }[] {
+export function sessionGroups(snap: OpenSnapshot, filter = ""): { name: string; sessions: Session[] }[] {
   const f = filter.trim().toLowerCase();
-  const matching = sessions.filter((s) => !isTypeSession(s.id) && (!f || s.title.toLowerCase().includes(f)));
+  const matching = snap.sessions.filter((s) => listedSession(s, snap) && (!f || s.title.toLowerCase().includes(f)));
   return [
     { name: "Active", sessions: matching.filter((s) => s.running || s.waiting) },
     { name: "Pinned", sessions: matching.filter((s) => s.pinned && !s.running && !s.waiting) },
@@ -41,7 +47,7 @@ export function sessionGroups(sessions: Session[], filter = ""): { name: string;
 
 /** The sidebar's sessions top to bottom: what ⌘1–9 and next/previous session step through. */
 export function sessionOrder(snap: OpenSnapshot): Session[] {
-  return sessionGroups(snap.sessions, ui.sessionFilter).flatMap((g) => g.sessions);
+  return sessionGroups(snap, ui.sessionFilter).flatMap((g) => g.sessions);
 }
 
 /** Open `session` from the keyboard or a list. */

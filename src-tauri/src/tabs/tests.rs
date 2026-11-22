@@ -50,6 +50,38 @@ fn tab(session: &str, busy: bool) -> Tab {
 }
 
 #[test]
+fn busy_tab_keeps_latest_model_and_effort_until_both_settle() {
+    let mut tabs = Tabs::new(tab("one", true));
+    let model = Command::SetModel {
+        session_id: "one".into(),
+        provider: "p".into(),
+        model_id: "new".into(),
+    };
+    let thinking = |level: &str| Command::SetThinking {
+        session_id: "one".into(),
+        level: level.into(),
+    };
+    let high = thinking("high");
+    for edit in [model.clone(), thinking("low"), high.clone()] {
+        assert_eq!(tabs.active_mut().select_model_setting(edit).unwrap(), None);
+    }
+    tabs.open(tab("two", false));
+    let reply = |method: &str, n| {
+        Update::Message(Message::Response {
+            id: request_id(n),
+            method: method.into(),
+            result: Ok(json!({})),
+        })
+    };
+    assert!(tabs.tabs[0].apply(reply("send", 1)).contains(&model));
+    assert!(tabs.close_idle().is_empty());
+    assert_eq!(tabs.tabs[0].apply(reply("set_model", 2)), [high]);
+    assert!(tabs.active().edits.is_empty() && tabs.active().editing.is_none());
+    tabs.tabs[0].apply(reply("set_thinking", 3));
+    assert_eq!(tabs.close_idle().len(), 1);
+}
+
+#[test]
 fn an_idle_tab_opens_sessions_in_place() {
     let tabs = Tabs::new(tab("s1", false));
     assert_eq!(tabs.route_resume("s2"), Route::Here);
@@ -80,12 +112,20 @@ fn a_busy_tab_keeps_working_while_another_session_opens() {
 #[test]
 fn saved_settings_wait_for_their_own_turn_not_another_session() {
     let mut tabs = Tabs::new(tab("first", true));
-    assert_eq!(tabs.active_mut().saved_settings(), vec![Command::GetSettings]);
+    assert_eq!(
+        tabs.active_mut().saved_settings(),
+        vec![Command::GetSettings]
+    );
     tabs.open(tab("second", false));
-    assert_eq!(tabs.active_mut().saved_settings(), vec![Command::GetSettings, Command::ApplySettings]);
+    assert_eq!(
+        tabs.active_mut().saved_settings(),
+        vec![Command::GetSettings, Command::ApplySettings]
+    );
     let first = tabs.get_mut(0).unwrap();
     let follow = first.apply(Update::Message(Message::Response {
-        id: request_id(1), method: "send".into(), result: Ok(json!({"outcome":"completed"})),
+        id: request_id(1),
+        method: "send".into(),
+        result: Ok(json!({"outcome":"completed"})),
     }));
     assert_eq!(follow, vec![Command::ListSessions, Command::ApplySettings]);
 }

@@ -206,8 +206,16 @@ pub(crate) fn guest_command(pub_key: &str, ping: Option<Ipv4Addr>, report: Optio
         .map(|ip| format!("; ping -c 3 -W 1 {ip} >/dev/null 2>&1"))
         .unwrap_or_default();
     Ok(format!(
-        "sudo sh -c 'command -v sshd >/dev/null 2>&1 || (apt-get update && apt-get install -y openssh-server); \
-systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd' && mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+        "sudo sh -c 'command -v sshd >/dev/null 2>&1 || (\
+if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y openssh-server; \
+elif command -v dnf >/dev/null 2>&1; then dnf install -y openssh-server; \
+elif command -v yum >/dev/null 2>&1; then yum install -y openssh-server; \
+elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm openssh; \
+elif command -v zypper >/dev/null 2>&1; then zypper --non-interactive install openssh; \
+elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh; \
+else exit 1; fi); \
+systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || rc-service sshd start 2>/dev/null || service ssh start' && \
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
 (grep -qxF '{key}' ~/.ssh/authorized_keys 2>/dev/null || echo '{key}' >> ~/.ssh/authorized_keys) && \
 chmod 600 ~/.ssh/authorized_keys{report}{ping}; echo DIAL-SSH-READY\n"
     ))
@@ -394,6 +402,13 @@ fn free_port() -> Option<u16> {
     TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok().map(|a| a.port())
 }
 
+/// The public key path `ssh-keygen -f <key>` writes: `<key>.pub`, preserving dots in `<key>`.
+pub(crate) fn public_key_path(key: &Path) -> PathBuf {
+    let mut os = key.as_os_str().to_os_string();
+    os.push(".pub");
+    PathBuf::from(os)
+}
+
 /// The dedicated key pair, created on first use. Returns (private key path, public key line).
 fn ensure_key(ssh_dir: &Path, alias: &str) -> Result<(PathBuf, String), String> {
     fs::create_dir_all(ssh_dir).map_err(|_| "Dial could not create ~/.ssh.".to_owned())?;
@@ -403,7 +418,7 @@ fn ensure_key(ssh_dir: &Path, alias: &str) -> Result<(PathBuf, String), String> 
         let _ = fs::set_permissions(ssh_dir, fs::Permissions::from_mode(0o700));
     }
     let key = ssh_dir.join(format!("dial_{alias}"));
-    let public = key.with_extension("pub");
+    let public = public_key_path(&key);
     if !key.is_file() || !public.is_file() {
         let (ok, _) = run(
             &system_tool("ssh-keygen"),

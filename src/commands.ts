@@ -5,7 +5,6 @@ import { engine, files, folders } from "./bridge";
 import { recentProjects } from "./projects";
 import type { OpenSnapshot } from "./types";
 import { focusComposer, ui, type SettingsTab } from "./ui";
-import { isTypeSession } from "./savedTypes";
 import { appearance, zoomBy, type Theme } from "./appearance";
 import { showPanel, workspace } from "./workspace";
 import { checkApp, checkEngine } from "./updates";
@@ -19,6 +18,7 @@ import {
   copyText,
   editLastPrompt,
   openSession,
+  listedSession,
   sessionOrder,
   startRename,
   stepSession,
@@ -214,7 +214,7 @@ export function commands(snap: OpenSnapshot): Command[] {
 
   // Switching sessions, most recent first.
   for (const s of snap.sessions)
-    if (!s.selected && !isTypeSession(s.id))
+    if (!s.selected && listedSession(s, snap))
       list.push({
         id: `session-${s.id}`,
         group: "Go to session",

@@ -29,6 +29,16 @@ export async function readLocal(store: string, key: string): Promise<unknown> {
   });
 }
 
+/** Discover saved drafts without loading their text or image attachments. */
+export async function localKeys(store: string): Promise<IDBValidKey[]> {
+  const db = await open();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(store).objectStore(store).getAllKeys();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
 /** Resolve after commit, not just after put(), so the UI never clears unsaved text. */
 export async function writeLocal(key: string, records: Record<string, unknown>): Promise<void> {
   const db = await open();

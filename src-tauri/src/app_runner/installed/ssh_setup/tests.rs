@@ -127,3 +127,24 @@ fn an_alias_the_user_already_has_is_not_taken_over() {
     let managed = upsert_block("", "kali", &config_block("kali", "1.2.3.4", 22, "a", key));
     assert_eq!(free_alias(&managed, "kali"), "kali");
 }
+
+#[test]
+fn public_key_path_preserves_dots_in_vm_aliases() {
+    assert_eq!(
+        public_key_path(Path::new("/Users/me/.ssh/dial_ubuntu-24.04")),
+        PathBuf::from("/Users/me/.ssh/dial_ubuntu-24.04.pub")
+    );
+    assert_eq!(
+        public_key_path(Path::new("/Users/me/.ssh/dial_kali")),
+        PathBuf::from("/Users/me/.ssh/dial_kali.pub")
+    );
+}
+
+#[test]
+fn guest_command_supports_multiple_linux_package_managers() {
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample dial";
+    let cmd = guest_command(key, None, None).unwrap();
+    for mgr in ["apt-get", "dnf", "yum", "pacman", "zypper", "apk"] {
+        assert!(cmd.contains(mgr), "missing package manager {mgr}: {cmd}");
+    }
+}

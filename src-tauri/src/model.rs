@@ -223,6 +223,8 @@ pub struct Model {
     /// Ignore late pages from a history refresh superseded by a new one.
     session_page: Option<(RequestId, u64)>,
     session_pages: Vec<SessionSummary>,
+    /// Confirmed deletions: outstanding list pages (including other tabs') may predate them.
+    pub(crate) deleted: HashSet<String>,
     /// The model in force, once the engine reported it.
     pub current_model: Option<CurrentModel>,
     /// The approval mode in force (`ask`, `write`, `auto`, `readonly`).
@@ -632,7 +634,20 @@ impl Model {
                 }
                 self.toast = Some(format!("Could not {}: {error}", describe(&command)));
             }
-            Update::Message(message) => self.message(&message, &mut follow),
+            Update::Message(mut message) => {
+                // The wire client keeps structured tool data but not top-level journal attachment
+                // fields. Project retained references into the same channel as live results.
+                match &mut message {
+                    Message::Event(event) if event.kind == "replay_message" => replay_images(&mut event.body["message"]),
+                    Message::Response { result: Ok(body), .. } if body.get("messages").is_some() => {
+                        if let Some(messages) = body["messages"].as_array_mut() {
+                            for message in messages { replay_images(message); }
+                        }
+                    }
+                    _ => {}
+                }
+                self.message(&message, &mut follow);
+            }
         }
         // A frame may be published before the worker acknowledges the follow-up request.
         self.recovering |= follow.contains(&Command::Recover);
@@ -697,7 +712,7 @@ impl Model {
                                     let mut seen = HashSet::new();
                                     self.sessions = std::mem::take(&mut self.session_pages)
                                         .into_iter()
-                                        .filter(|s| seen.insert(s.id.clone()))
+                                        .filter(|s| !self.deleted.contains(&s.id) && seen.insert(s.id.clone()))
                                         .collect();
                                 }
                             }
@@ -735,6 +750,9 @@ impl Model {
                     // Ending voice mode after the engine's session is gone is not a problem.
                     (Purpose::LiveStop, Err(_)) => {}
                     (Purpose::State, Ok(state)) => {
+                        if state["session_id"].as_str().is_some_and(|id| Some(id) != self.conversation.session_id()) {
+                            return;
+                        }
                         if let Some(current) = CurrentModel::from_wire(&state["current_model"]) {
                             self.current_model = Some(current);
                         }
@@ -833,6 +851,7 @@ impl Model {
                     (Purpose::DeleteSession, Ok(result)) => {
                         if let Some(id) = result["session_id"].as_str() {
                             self.sessions.retain(|s| s.id != id);
+                            self.deleted.insert(id.to_owned());
                         }
                         // One refresh after the last of several deletes.
                         if !self.pending.values().any(|p| *p == Purpose::DeleteSession) {
@@ -920,7 +939,7 @@ impl Model {
                     });
                 }
                 // Another session's size is unknown until the engine reports it.
-                "active_session" => self.context = None,
+                "active_session" => { self.context = None; self.current_model = None; }
                 "live_transcript" => {
                     let text = event.body["text"].as_str().unwrap_or_default();
                     if let Some((id, repeated)) = self.voice.transcript(text) {
@@ -964,6 +983,15 @@ impl Model {
     fn apply_after_turn(&mut self, follow: &mut Vec<Command>) {
         if std::mem::take(&mut self.apply_pending) {
             follow.push(Command::ApplySettings);
+        }
+    }
+}
+
+fn replay_images(message: &mut Value) {
+    if message["role"] == "tool" && let Some(images) = message["dial_images"].as_array() {
+        let refs: Vec<_> = images.iter().filter_map(|r| r["uri"].as_str()).map(|uri| json!({"uri":uri})).collect();
+        if !refs.is_empty() && (message["data"].is_null() || message["data"].is_object()) {
+            message["data"]["dial_images"] = Value::Array(refs);
         }
     }
 }
@@ -1019,9 +1047,10 @@ fn describe(command: &Command) -> &'static str {
         Command::Recover => "reload the session",
         Command::State => "read the session settings",
         Command::ListModels => "load models",
+        Command::DiscoverModels => "refresh models",
         Command::ListImageModels => "load image models",
         Command::SetModel { .. } => "switch the model",
-        Command::SetThinking(_) => "set the reasoning level",
+        Command::SetThinking { .. } => "set the reasoning level",
         Command::SetApproval(_) => "set the approval mode",
         Command::QuestionPresented(_) => "show the question",
         Command::AnswerQuestion { .. } => "answer the question",

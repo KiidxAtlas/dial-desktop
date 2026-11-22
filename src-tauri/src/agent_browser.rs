@@ -489,8 +489,12 @@ BODY
   })();
   if (v && typeof v.then === 'function') {
     const id = 'p' + Math.random().toString(36).slice(2);
-    v.then((x) => (A.done[id] = { ok: true, value: x === undefined ? null : x }),
-      (e) => (A.done[id] = { ok: false, error: String((e && e.message) || e) }));
+    const settle = (entry) => {
+      A.done[id] = entry;
+      setTimeout(() => { delete A.done[id]; }, 30000);
+    };
+    v.then((x) => settle({ ok: true, value: x === undefined ? null : x }),
+      (e) => settle({ ok: false, error: String((e && e.message) || e) }));
     return { pending: id };
   }
   return v;
@@ -509,13 +513,29 @@ pub fn action(body: &str) -> String {
     format!("{HELPERS}\nwindow.__dialAgent.run({body});")
 }
 
-/// Fill a script template's `KEY` placeholders with JSON values.
+/// Fill a script template's `KEY` placeholders with JSON values in a single pass so substituted
+/// values are never re-scanned or corrupted by later placeholder names.
 fn fill(template: &str, values: &[(&str, Value)]) -> String {
-    values
-        .iter()
-        .fold(template.to_owned(), |script, (key, value)| {
-            script.replace(key, &value.to_string())
-        })
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        let next = values
+            .iter()
+            .filter_map(|(key, value)| rest.find(key).map(|pos| (pos, *key, value)))
+            .min_by_key(|(pos, key, _)| (*pos, std::cmp::Reverse(key.len())));
+        match next {
+            Some((pos, key, value)) => {
+                out.push_str(&rest[..pos]);
+                out.push_str(&value.to_string());
+                rest = &rest[pos + key.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Which element a call names: `{ref}`, `{selector}` or `{name}` as the page script wants it, or
@@ -801,6 +821,9 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
             let args = &request.arguments;
             if tool == "app_desktop" {
                 return crate::app_runner::agent_call(app, &request.workspace, args);
+            }
+            if tool == "types_screenshot" {
+                return capture_type(app, args);
             }
             if tool.starts_with("types_") {
                 let store = app.state::<crate::types::Store>();
@@ -1102,7 +1125,7 @@ fn capture(app: &AppHandle) -> Result<Reply, String> {
     let view = app
         .get_webview(browser::LABEL)
         .ok_or("The browser is not open")?;
-    let png = screenshot::capture(&view)?;
+    let png = screenshot::capture(&view, None)?;
     let state = app.state::<Browser>().current();
     Ok(Reply {
         ok: true,
@@ -1114,6 +1137,24 @@ fn capture(app: &AppHandle) -> Result<Reply, String> {
 #[cfg(not(target_os = "macos"))]
 fn capture(_app: &AppHandle) -> Result<Reply, String> {
     Err("Screenshots of the Browser panel are available on macOS only for now".into())
+}
+
+#[cfg(target_os = "macos")]
+fn capture_type(app: &AppHandle, args: &Value) -> Result<Reply, String> {
+    use base64::Engine;
+    let id = app.state::<crate::types::Store>().find(string_arg(args, "type")?)?;
+    let view = app.get_webview("main").ok_or("The Dial window is not open")?;
+    let png = screenshot::capture_type(&view, &id)?;
+    Ok(Reply {
+        ok: true,
+        text: format!("Screenshot of Type {id}"),
+        image: Some(base64::engine::general_purpose::STANDARD.encode(png)),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_type(_app: &AppHandle, _args: &Value) -> Result<Reply, String> {
+    Err("Type screenshots are currently supported on macOS only".into())
 }
 
 /// The `mcp.dial_desktop` entry that runs `exe` as the bridge, as a TOML inline table.

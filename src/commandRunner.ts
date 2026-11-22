@@ -371,18 +371,18 @@ async function joinRoom(link: string) {
 
 const HANDLERS: Record<string, Handler> = {
   // Models, modes and approval.
-  model: ({ args, rest }) => {
+  model: ({ args, rest, snap }) => {
     if (!args.length) return (ui.modelPickerOpen = true);
     if (["local", "backups"].includes(args[0])) return settingsAt("library");
     if (["settings", "defaults"].includes(args[0])) return settingsAt("roles");
     const [provider, ...id] = rest.trim().split("/");
     if (!id.length) return usage("model", "<provider>/<model>");
-    void engine.setModel(provider, id.join("/"));
+    void engine.setModel(snap, provider, id.join("/"));
   },
-  effort: ({ args }) => {
+  effort: ({ args, snap }) => {
     if (!args.length) return (ui.modelPickerOpen = true);
     if (args.length > 1) return settingsAt("roles");
-    void engine.setThinking(args[0] === "auto" ? "default" : args[0]);
+    void engine.setThinking(snap, args[0] === "auto" ? "default" : args[0]);
   },
   approval: ({ args }) => {
     const mode = args[0] as "ask" | "write" | "auto" | "readonly";

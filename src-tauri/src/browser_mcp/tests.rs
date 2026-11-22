@@ -66,10 +66,13 @@ fn tools_are_listed_only_while_the_app_runs() {
         )
         .unwrap()["result"]["tools"]
             .as_array()
-            .map(Vec::len)
+            .unwrap()
+            .clone()
     };
-    assert_eq!(list(true), Some(19));
-    assert_eq!(list(false), Some(0));
+    let tools = list(true);
+    assert_eq!(tools.len(), 20);
+    assert!(tools.iter().any(|tool| tool["name"] == "types_screenshot"));
+    assert!(list(false).is_empty());
 }
 
 #[test]

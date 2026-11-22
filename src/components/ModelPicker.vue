@@ -3,7 +3,7 @@
 // how hard the model thinks. The choice applies to this session.
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
-import { engine, models } from "../bridge";
+import { engine, models, showToast } from "../bridge";
 import { focusComposer, ui } from "../ui";
 import { buildPickerGroups, pickerProviders, usableModels, type PickerFilter } from "../modelPicker";
 import { normalizeArrowKey } from "../macKeys";
@@ -117,12 +117,20 @@ function close(refocus = true) {
 }
 
 function choose(m: ModelOption) {
-  if (!isCurrent(m)) engine.setModel(m.provider, m.modelId);
+  if (props.snap.turnRunning || !isCurrent(m)) {
+    const snap = props.snap;
+    void engine.setModel(snap, m.provider, m.modelId).then(ok => {
+      if (ok && snap.turnRunning) showToast(`Next turn in this session: ${m.label}`);
+    });
+  }
   close();
 }
 
 function think(level: string) {
-  engine.setThinking(level);
+  const snap = props.snap;
+  void engine.setThinking(snap, level).then(ok => {
+    if (ok && snap.turnRunning) showToast(`Next turn in this session: ${level} effort`);
+  });
 }
 
 function onKey(event: KeyboardEvent) {
@@ -155,11 +163,28 @@ function onOutside(event: MouseEvent) {
   if (root.value && !root.value.contains(event.target as Node)) close(false);
 }
 
+const DISCOVER_INTERVAL_MS = 60_000;
+let lastDiscovery = 0;
+
+/** Account listings need a network fetch; do it on open at most once a minute. */
+function discoverModelsThrottled() {
+  const now = Date.now();
+  if (now - lastDiscovery < DISCOVER_INTERVAL_MS) return;
+  lastDiscovery = now;
+  engine.discoverModels();
+}
+
+function reloadModels() {
+  lastDiscovery = Date.now();
+  engine.discoverModels();
+}
+
 watch(
   () => ui.modelPickerOpen,
   (isOpen) => {
     if (isOpen) {
       engine.refreshModels();
+      discoverModelsThrottled();
       const index = flat.value.findIndex(isCurrent);
       active.value = index < 0 ? 0 : index;
       nextTick(() => {
@@ -199,10 +224,11 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         </div>
         <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
         <template v-else>
+        <p v-if="snap.turnRunning" class="empty">Changes apply to this session after the running turn.</p>
         <label class="search">
           <Icon name="search" :size="14" />
           <input ref="search" v-model="query" placeholder="Search models" spellcheck="false" @keydown="onKey" />
-          <button class="refresh" title="Reload the model list" @click="engine.refreshModels()">
+          <button class="refresh" title="Reload the model list" @click="reloadModels()">
             <Icon name="refresh" :size="13" />
           </button>
         </label>

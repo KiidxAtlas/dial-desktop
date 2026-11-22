@@ -351,6 +351,15 @@ pub fn eval_raw<R: Runtime>(
     timeout: Duration,
 ) -> Result<String, String> {
     let view = webview(app)?;
+    eval_view_raw(&view, script, timeout)
+}
+
+/// Evaluate a fixed internal script in a caller-selected webview, off the main thread.
+pub(crate) fn eval_view_raw<R: Runtime>(
+    view: &Webview<R>,
+    script: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let (tx, rx) = mpsc::channel();
     view.eval_with_callback(script, move |raw| {
         let _ = tx.send(raw);

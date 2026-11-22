@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 
@@ -25,13 +25,13 @@ struct Shell {
     child: Box<dyn Child + Send + Sync>,
 }
 
-/// The open shells, by id.
+/// The open shells, by id. Shared with reader threads so naturally-exited shells are reaped and
+/// removed as soon as their output closes.
 #[derive(Default)]
 pub struct Terminals {
     next: u32,
-    shells: HashMap<u32, Shell>,
+    shells: Arc<Mutex<HashMap<u32, Shell>>>,
 }
-
 /// The user's login shell, run in `cwd`.
 pub fn login_shell(cwd: &Path) -> CommandBuilder {
     let program = std::env::var("SHELL")
@@ -55,8 +55,12 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
 }
 
 impl Terminals {
+    fn lock_shells(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Shell>> {
+        self.shells.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn has_shells(&self) -> bool {
-        !self.shells.is_empty()
+        !self.lock_shells().is_empty()
     }
     /// Start `command` in a terminal of `cols`×`rows`; its output goes to `sink` from a reader
     /// thread until it ends. Returns the shell's id.
@@ -86,7 +90,16 @@ impl Terminals {
             .map_err(|e| format!("Could not write to the terminal: {e}"))?;
         self.next += 1;
         let id = self.next;
-        thread::Builder::new()
+        self.lock_shells().insert(
+            id,
+            Shell {
+                master: pair.master,
+                writer,
+                child,
+            },
+        );
+        let shells = Arc::clone(&self.shells);
+        if let Err(e) = thread::Builder::new()
             .name(format!("dial-terminal-{id}"))
             .spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -107,23 +120,28 @@ impl Terminals {
                     let data = String::from_utf8_lossy(&pending).into_owned();
                     sink(TerminalEvent::Data { id, data });
                 }
+                // Reap and remove the finished shell before notifying the UI so FDs and
+                // `has_shells()` are already clean when `Exit` arrives.
+                let ended = shells
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                if let Some(mut shell) = ended {
+                    let _ = shell.child.wait();
+                }
                 sink(TerminalEvent::Exit { id });
             })
-            .map_err(|e| format!("Could not start the terminal reader: {e}"))?;
-        self.shells.insert(
-            id,
-            Shell {
-                master: pair.master,
-                writer,
-                child,
-            },
-        );
+        {
+            self.close(id);
+            return Err(format!("Could not start the terminal reader: {e}"));
+        }
         Ok(id)
     }
 
     /// Type `data` into shell `id`.
     pub fn write(&mut self, id: u32, data: &str) -> Result<(), String> {
-        let shell = self.shells.get_mut(&id).ok_or("That terminal is closed")?;
+        let mut shells = self.lock_shells();
+        let shell = shells.get_mut(&id).ok_or("That terminal is closed")?;
         shell
             .writer
             .write_all(data.as_bytes())
@@ -132,7 +150,8 @@ impl Terminals {
     }
 
     pub fn resize(&mut self, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-        let shell = self.shells.get(&id).ok_or("That terminal is closed")?;
+        let shells = self.lock_shells();
+        let shell = shells.get(&id).ok_or("That terminal is closed")?;
         shell
             .master
             .resize(size(cols, rows))
@@ -141,7 +160,8 @@ impl Terminals {
 
     /// End shell `id`; closing one that already ended is fine.
     pub fn close(&mut self, id: u32) {
-        if let Some(mut shell) = self.shells.remove(&id) {
+        let removed = self.lock_shells().remove(&id);
+        if let Some(mut shell) = removed {
             let _ = shell.child.kill();
             let _ = shell.child.wait();
         }
@@ -149,9 +169,13 @@ impl Terminals {
 
     /// End every shell (the workspace closed or the app quits).
     pub fn close_all(&mut self) {
-        let ids: Vec<u32> = self.shells.keys().copied().collect();
-        for id in ids {
-            self.close(id);
+        let removed: Vec<Shell> = {
+            let mut shells = self.lock_shells();
+            shells.drain().map(|(_, shell)| shell).collect()
+        };
+        for mut shell in removed {
+            let _ = shell.child.kill();
+            let _ = shell.child.wait();
         }
     }
 }

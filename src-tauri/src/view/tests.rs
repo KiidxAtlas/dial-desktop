@@ -166,6 +166,20 @@ fn a_read_shows_the_images_it_viewed() {
 }
 
 #[test]
+fn retained_tool_images_survive_live_and_replayed_results() {
+    let uri = format!("artifact://{}", "b".repeat(64));
+    let mut model = Model::starting();
+    for event in [
+        json!({"event":"tool_result", "call_id":"live", "name":"browser", "is_error":false, "data":{"artifact":{"uri":uri}}}),
+        json!({"event":"replay_message", "message":{"role":"tool", "tool_call_id":"replayed", "dial_images":[{"uri":uri}, {"uri":"artifact://../outside"}]}}),
+    ] {
+        model.apply(crate::engine::Update::Message(dial_client::Message::Event(dial_client::Event { kind:event["event"].as_str().unwrap().into(), body:event })));
+        let Some(Entry::Tool(tool)) = model.conversation.entries().last() else { panic!("missing tool row") };
+        assert_eq!(ToolView::new(0, tool, &workspace()).images.as_slice(), std::slice::from_ref(&uri));
+    }
+}
+
+#[test]
 fn workspace_abbreviates_home_and_relativizes_paths() {
     let w = workspace();
     assert_eq!(w.display, "~/work/app");

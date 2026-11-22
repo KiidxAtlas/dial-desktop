@@ -14,14 +14,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use tauri::{AppHandle, Emitter, State};
 
 #[cfg(test)]
 mod tests;
 
 pub const VERSION: u32 = 1;
-/// The event the UI reloads on, with the changed type's id (or `null` for the list).
+/// List invalidation (`null`), a changed id, or an agent design commit with its saved choices.
 pub const CHANGED: &str = "types-changed";
 const MAX_FIELDS: usize = 24;
 const MAX_ITEMS: usize = 5_000;
@@ -214,6 +215,8 @@ pub struct Summary {
     pub count: usize,
     pub updated: i64,
     pub designed: bool,
+    /// Where the type is kept.
+    pub scope: Scope,
     /// The ids of the type's own sessions (see [`TypeDef::sessions`]).
     pub sessions: Vec<String>,
 }
@@ -449,9 +452,8 @@ pub fn normalize(mut def: TypeDef, now: i64) -> Result<TypeDef, String> {
     def.theme.radius = def.theme.radius.min(28);
     def.sessions
         .retain(|root, id| !root.is_empty() && root.len() <= 4096 && !id.is_empty() && id.len() <= 200);
-    while def.sessions.len() > 64 {
-        let first = def.sessions.keys().next().cloned().unwrap_or_default();
-        def.sessions.remove(&first);
+    if def.sessions.len() > 64 {
+        return Err("This type already has conversations in 64 projects".into());
     }
 
     if def.custom_html.len() > MAX_CUSTOM {
@@ -600,9 +602,55 @@ fn random_suffix() -> String {
     crate::agent_browser::new_token()[..8].to_owned()
 }
 
-/// The saved types, owned by the app.
+fn write_def_in(dir: &Path, def: &TypeDef) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(def).map_err(|e| e.to_string())?;
+    write_atomic(&dir.join("type.json"), &bytes)
+}
+
+/// Where a type is kept: with the app (every project sees it) or in one project's folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    #[default]
+    App,
+    Project,
+}
+
+/// The setting for where new types are kept, and what it comes to right now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Location {
+    /// What the user chose in Settings.
+    pub save_in: Scope,
+    /// The open project's folder for types, when a project is open.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Prefs {
+    save_in: Scope,
+}
+
+#[derive(Debug, Default)]
+struct Place {
+    /// The open project's root.
+    project: Option<PathBuf>,
+    save_in: Scope,
+}
+
+/// Where a project keeps its types, so they travel with it.
+fn project_types(root: &Path) -> PathBuf {
+    root.join(".dial").join("types")
+}
+
+/// The saved types, owned by the app. Types live in the app's folder, shared by every project, or
+/// in the open project's `.dial/types`; the setting only decides where new ones go. Both places
+/// are always listed, so changing it never hides a type.
 pub struct Store {
     root: Option<PathBuf>,
+    prefs: Option<PathBuf>,
+    place: Mutex<Place>,
     lock: Mutex<()>,
 }
 
@@ -610,26 +658,118 @@ impl Store {
     pub fn new(root: Option<PathBuf>) -> Self {
         Self {
             root,
+            prefs: None,
+            place: Mutex::new(Place::default()),
             lock: Mutex::new(()),
         }
     }
 
-    /// The store in the app's per-user folder.
+    /// The store in the app's per-user folder, with the saved choice of where new types go.
     pub fn for_home(home: Option<&Path>) -> Self {
-        Self::new(crate::launcher::app_dir(home).map(|d| d.join("types")))
+        let app = crate::launcher::app_dir(home);
+        let prefs = app.as_ref().map(|d| d.join("types-location.json"));
+        let saved: Prefs = prefs
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            root: app.map(|d| d.join("types")),
+            prefs,
+            place: Mutex::new(Place {
+                project: None,
+                save_in: saved.save_in,
+            }),
+            lock: Mutex::new(()),
+        }
     }
 
-    fn root(&self) -> Result<&Path, String> {
-        self.root
-            .as_deref()
+    fn place(&self) -> MutexGuard<'_, Place> {
+        self.place.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The saved scope on disk when a prefs file exists, else the in-memory setting.
+    /// Re-reading keeps multiple open windows aligned when the user changes Settings → Types.
+    fn saved_scope(&self) -> Scope {
+        if let Some(path) = &self.prefs
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(saved) = serde_json::from_slice::<Prefs>(&bytes)
+        {
+            self.place().save_in = saved.save_in;
+            return saved.save_in;
+        }
+        self.place().save_in
+    }
+
+    /// The project the user has open (`None` for none): its types are listed with the app's.
+    pub fn set_project(&self, project: Option<&Path>) {
+        self.place().project = project.map(Path::to_path_buf);
+    }
+
+    pub fn location(&self) -> Location {
+        let save_in = self.saved_scope();
+        let place = self.place();
+        Location {
+            save_in,
+            project: place
+                .project
+                .as_deref()
+                .map(|p| project_types(p).to_string_lossy().into_owned()),
+        }
+    }
+
+    /// Choose where new types are kept, and remember it.
+    pub fn set_save_in(&self, scope: Scope) -> Result<(), String> {
+        if let Some(path) = &self.prefs {
+            let bytes = serde_json::to_vec_pretty(&Prefs { save_in: scope })
+                .map_err(|e| e.to_string())?;
+            write_atomic(path, &bytes)?;
+        }
+        self.place().save_in = scope;
+        Ok(())
+    }
+
+    /// The folders types are read from; the project's comes first and wins a clash of ids.
+    fn roots(&self) -> Vec<(Scope, PathBuf)> {
+        let mut out = Vec::new();
+        if let Some(project) = &self.place().project {
+            out.push((Scope::Project, project_types(project)));
+        }
+        if let Some(root) = &self.root {
+            out.push((Scope::App, root.clone()));
+        }
+        out
+    }
+
+    /// Where a new type goes: the chosen place, or the other when that one is not available (the
+    /// project's with no project open).
+    fn new_root(&self) -> Result<(Scope, PathBuf), String> {
+        let want = self.saved_scope();
+        let roots = self.roots();
+        roots
+            .iter()
+            .find(|(scope, _)| *scope == want)
+            .or_else(|| roots.first())
+            .cloned()
+            .ok_or_else(|| "No folder for saved types (no home folder)".into())
+    }
+
+    /// Where type `id` is: the place it exists in, else the app's folder.
+    fn locate(&self, id: &str) -> Result<(Scope, PathBuf), String> {
+        if !valid_id(id) {
+            return Err(format!("No type `{id}`"));
+        }
+        let roots = self.roots();
+        roots
+            .iter()
+            .map(|(scope, root)| (*scope, root.join(id)))
+            .find(|(_, dir)| dir.join("type.json").is_file())
+            .or_else(|| roots.last().map(|(scope, root)| (*scope, root.join(id))))
             .ok_or_else(|| "No folder for saved types (no home folder)".into())
     }
 
     fn dir(&self, id: &str) -> Result<PathBuf, String> {
-        if !valid_id(id) {
-            return Err(format!("No type `{id}`"));
-        }
-        Ok(self.root()?.join(id))
+        self.locate(id).map(|(_, dir)| dir)
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -645,8 +785,7 @@ impl Store {
     }
 
     fn write_def(&self, def: &TypeDef) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(def).map_err(|e| e.to_string())?;
-        write_atomic(&self.dir(&def.id)?.join("type.json"), &bytes)
+        write_def_in(&self.dir(&def.id)?, def)
     }
 
     fn read_items(&self, id: &str) -> Result<Vec<Item>, String> {
@@ -665,17 +804,29 @@ impl Store {
 
     pub fn list(&self) -> Result<Vec<Summary>, String> {
         let _guard = self.guard();
-        let Ok(entries) = std::fs::read_dir(self.root()?) else {
-            return Ok(Vec::new());
-        };
-        let mut out: Vec<Summary> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|id| valid_id(id))
-            .filter_map(|id| {
-                let def = self.read_def(&id).ok()?;
+        let roots = self.roots();
+        if roots.is_empty() {
+            return Err("No folder for saved types (no home folder)".into());
+        }
+        let mut seen = HashSet::new();
+        let mut out: Vec<Summary> = Vec::new();
+        for (scope, root) in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for id in entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|id| valid_id(id))
+            {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let Ok(def) = self.read_def(&id) else {
+                    continue;
+                };
                 let count = self.read_items(&id).map(|i| i.len()).unwrap_or(0);
-                Some(Summary {
+                out.push(Summary {
                     id: def.id,
                     name: def.name,
                     icon: def.icon,
@@ -685,10 +836,11 @@ impl Store {
                     count,
                     updated: def.updated,
                     designed: def.designed,
+                    scope,
                     sessions: def.sessions.into_values().collect(),
-                })
-            })
-            .collect();
+                });
+            }
+        }
         out.sort_by_key(|s| s.name.to_lowercase());
         Ok(out)
     }
@@ -725,8 +877,8 @@ impl Store {
         let mut def = normalize(def, now)?;
         def.created = now;
         let _guard = self.guard();
-        let root = self.root()?;
-        let count = std::fs::read_dir(root).map(|d| d.count()).unwrap_or(0);
+        let (_, root) = self.new_root()?;
+        let count = std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0);
         if count >= MAX_TYPES {
             return Err(format!("At most {MAX_TYPES} types"));
         }
@@ -736,7 +888,7 @@ impl Store {
         }
         base.truncate(40);
         def.id = format!("{}-{}", base.trim_end_matches('-'), random_suffix());
-        self.write_def(&def)?;
+        write_def_in(&root.join(&def.id), &def)?;
         self.write_items(&def.id, &[])?;
         Ok(def)
     }
@@ -777,6 +929,16 @@ impl Store {
         let def = normalize(def, crate::time::now())?;
         self.write_def(&def)?;
         Ok(def)
+    }
+
+    fn claim_session(&self, id: &str, root: String, session: String) -> Result<(), String> {
+        let _guard = self.guard();
+        let mut def = self.read_def(id)?;
+        if def.sessions.get(&root).is_some_and(|old| old != &session) {
+            return Err("This type already has a conversation here; reopen it".into());
+        }
+        def.sessions.insert(root, session);
+        self.write_def(&normalize(def, crate::time::now())?)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {
@@ -850,17 +1012,60 @@ impl Store {
         problems
     }
 
+    /// Resolve `path` only if it is an existing asset image file inside one of this store's
+    /// `<root>/<valid-id>/assets/<valid-asset>` folders (never following symlinks outside).
+    pub fn resolve_asset(&self, path: &Path) -> Result<PathBuf, String> {
+        let real = path
+            .canonicalize()
+            .map_err(|_| "That type image is no longer available".to_owned())?;
+        if !real.is_file() {
+            return Err("That type image is not a file".into());
+        }
+        for (_, root) in self.roots() {
+            let Ok(root_real) = root.canonicalize() else {
+                continue;
+            };
+            let Ok(rel) = real.strip_prefix(&root_real) else {
+                continue;
+            };
+            let parts: Vec<&str> = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if parts.len() == 3 && valid_id(parts[0]) && parts[1] == "assets" && valid_asset(parts[2]) {
+                return Ok(real);
+            }
+        }
+        Err("That path is not a saved type image".into())
+    }
+
     /// Save a new item; image fields may hold absolute paths, which are imported.
     /// Returns the item and anything that could not be kept.
     pub fn add_item(
         &self,
         id: &str,
+        fields: Map<String, Value>,
+        source: Option<Source>,
+    ) -> Result<(Item, Vec<String>), String> {
+        self.add_item_with(id, fields, source, true)
+    }
+
+    /// Save a new item; when `allow_import` is false (e.g. a sandboxed custom view), local image
+    /// paths are never read from disk and only existing asset names are kept.
+    pub fn add_item_with(
+        &self,
+        id: &str,
         mut fields: Map<String, Value>,
         source: Option<Source>,
+        allow_import: bool,
     ) -> Result<(Item, Vec<String>), String> {
         let _guard = self.guard();
         let def = self.read_def(id)?;
-        let problems = self.import_field_images(&def, &mut fields);
+        let problems = if allow_import {
+            self.import_field_images(&def, &mut fields)
+        } else {
+            Vec::new()
+        };
         let mut items = self.read_items(id)?;
         if items.len() >= MAX_ITEMS {
             return Err(format!("A type holds at most {MAX_ITEMS} items"));
@@ -895,6 +1100,16 @@ impl Store {
     }
 
     pub fn update_item(&self, id: &str, item_id: &str, patch: ItemPatch) -> Result<Item, String> {
+        self.update_item_with(id, item_id, patch, true)
+    }
+
+    pub fn update_item_with(
+        &self,
+        id: &str,
+        item_id: &str,
+        patch: ItemPatch,
+        allow_import: bool,
+    ) -> Result<Item, String> {
         let _guard = self.guard();
         let def = self.read_def(id)?;
         let mut items = self.read_items(id)?;
@@ -903,7 +1118,9 @@ impl Store {
             .find(|i| i.id == item_id)
             .ok_or_else(|| format!("No item `{item_id}`"))?;
         if let Some(mut more) = patch.fields {
-            self.import_field_images(&def, &mut more);
+            if allow_import {
+                self.import_field_images(&def, &mut more);
+            }
             let mut merged = item.fields.clone();
             for (key, value) in more {
                 if value.is_null() {
@@ -956,6 +1173,24 @@ fn changed(app: &AppHandle, id: Option<&str>) {
     let _ = app.emit(CHANGED, id);
 }
 
+/// Report only choices this patch actually committed, not defaults present since creation.
+/// A single atomic blueprint update can settle several checklist rows at once.
+fn design_change(def: &TypeDef, patch: &Value) -> Value {
+    use serde_json::json;
+
+    let mut choices = Map::new();
+    if patch.pointer("/view/layout").is_some() || patch.pointer("/view/style").is_some() {
+        choices.insert("layout".into(), json!({"kind": def.view.layout, "style": def.view.style}));
+    }
+    if patch.get("fields").is_some() {
+        choices.insert("fields".into(), json!(def.fields.iter().map(|f| &f.label).collect::<Vec<_>>()));
+    }
+    if patch.get("theme").and_then(Value::as_object).is_some_and(|t| !t.is_empty()) {
+        choices.insert("look".into(), json!({"font": def.theme.font, "texture": def.theme.texture, "accent": def.theme.accent}));
+    }
+    json!({"id": def.id, "choices": choices})
+}
+
 #[tauri::command]
 pub fn types_list(store: State<'_, Store>) -> Result<Vec<Summary>, String> {
     store.list()
@@ -964,6 +1199,25 @@ pub fn types_list(store: State<'_, Store>) -> Result<Vec<Summary>, String> {
 #[tauri::command]
 pub fn types_get(store: State<'_, Store>, id: String) -> Result<Full, String> {
     store.get(&id)
+}
+
+/// Where new types are kept, and the open project's folder for them.
+#[tauri::command]
+pub fn types_location(store: State<'_, Store>) -> Location {
+    store.location()
+}
+
+/// Choose where new types are kept: with the app, or in the open project.
+#[tauri::command]
+pub fn types_set_location(store: State<'_, Store>, save_in: Scope) -> Result<Location, String> {
+    store.set_save_in(save_in)?;
+    Ok(store.location())
+}
+
+/// The project the user opened: its types join the list, and new ones go there when chosen.
+pub fn follow_project(app: &AppHandle, store: &Store, project: &Path) {
+    store.set_project(Some(project));
+    changed(app, None);
 }
 
 #[tauri::command]
@@ -990,6 +1244,13 @@ pub fn types_update(
 }
 
 #[tauri::command]
+pub fn types_claim_session(app: AppHandle, store: State<'_, Store>, id: String, root: String, session: String) -> Result<(), String> {
+    store.claim_session(&id, root, session)?;
+    changed(&app, Some(&id));
+    Ok(())
+}
+
+#[tauri::command]
 pub fn types_delete(app: AppHandle, store: State<'_, Store>, id: String) -> Result<(), String> {
     store.delete(&id)?;
     changed(&app, None);
@@ -1003,8 +1264,9 @@ pub fn types_add_item(
     id: String,
     fields: Map<String, Value>,
     source: Option<Source>,
+    allow_import: Option<bool>,
 ) -> Result<Item, String> {
-    let (item, _) = store.add_item(&id, fields, source)?;
+    let (item, _) = store.add_item_with(&id, fields, source, allow_import.unwrap_or(true))?;
     changed(&app, Some(&id));
     Ok(item)
 }
@@ -1016,8 +1278,9 @@ pub fn types_update_item(
     id: String,
     item_id: String,
     patch: ItemPatch,
+    allow_import: Option<bool>,
 ) -> Result<Item, String> {
-    let item = store.update_item(&id, &item_id, patch)?;
+    let item = store.update_item_with(&id, &item_id, patch, allow_import.unwrap_or(true))?;
     changed(&app, Some(&id));
     Ok(item)
 }
@@ -1073,40 +1336,48 @@ pub fn types_import_image_data(
     store.store_image(&id, &bytes)
 }
 
+/// Open a saved type asset image in the system's default viewer.
+#[tauri::command]
+pub async fn types_open_asset(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    path: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Type images are only available in the app UI".into());
+    }
+    let resolved = store.resolve_asset(Path::new(&path))?;
+    if crate::attachments::image_mime(&resolved).is_none() {
+        return Err("That file is not an image".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        tauri_plugin_opener::open_path(&resolved, None::<&str>)
+            .map_err(|e| format!("Could not open image: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // The agent's side: the `types_*` MCP tools.
 
 /// How the blueprint format reads to the agent; shared by the tool descriptions.
-pub const BLUEPRINT_GUIDE: &str = "A Type is a saved collection the user opens as its own little app. \
-Blueprint: {name, description, icon (one emoji), fields: [{key, label, kind}], view: {layout, \
-titleField, subtitleField, imageField, timeField, reminders, leadMinutes, dailyReset, tagline}, \
-theme: {accent, paper, ink (#hex colours), font, texture, radius 0-28}, customHtml}. \
-Field kinds: text, longtext, markdown, list, steps, image, images, time (HH:MM), date (YYYY-MM-DD), \
-datetime (YYYY-MM-DD HH:MM), number, url, tags, rating (0-5), toggle. \
-Layouts: book (one item per page, flipped like a real book: recipes, journals, guides; \
-view.style picks its pages: cookbook for recipes, journal for dated entries, guide for \
-chapters), \
-checklist (tick off items with times; reminders:true adds a remind-me bell that notifies \
-leadMinutes before each time; dailyReset:true unticks every day: routines), board (a masonry \
-image wall: moodboards, inspiration), wheel (a spinner that picks one item at random: deciders), \
-calendar (a month grid with an agenda, items placed by their date or datetime timeField: \
-events, appointments, plans, deadlines; reminders:true adds the bell), \
-cards (a grid of cards), table (rows and columns), custom (your own page in customHtml). \
+pub const BLUEPRINT_GUIDE: &str = "Blueprint: {name, description, icon (one emoji), fields: [{key, label, kind}], \
+view: {layout, titleField, subtitleField, imageField, timeField, style, reminders, leadMinutes, dailyReset, tagline}, \
+theme: {accent, paper, ink (#hex), font, texture, radius (0–28)}, customHtml}. \
+Kinds: text, longtext, markdown, list, steps, image, images, time (HH:MM), date (YYYY-MM-DD), \
+datetime (YYYY-MM-DD HH:MM), number, url, tags, rating (0–5), toggle. \
+Layouts: book (one item per page; style cookbook, journal or guide), checklist (tasks/routines), \
+board (image gallery), wheel (random picker), calendar (month and agenda), cards, table, custom. \
+Calendar uses a date/datetime timeField; checklist uses a time. Reminders add an opt-in bell; \
+leadMinutes controls when it alerts. dailyReset clears checklist ticks each day. \
 Fonts: sans, serif, mono, hand, display, rounded. Textures: none, paper, linen, grid, dots, noise. \
-Pick the layout, fields and look that make the collection feel like the real thing. \
-customHtml is a full HTML document with inline CSS and JS only (no network, no external files); \
-it receives window message {type:'dial-type', def, items, images} where images maps asset names to \
-data URLs, and may post {type:'dial-type-update', itemId, fields|done} back to change an item. \
-Prefer a built-in layout unless none fits. \
-A user message that starts with a line `[[type:ID]]` was written inside that Type's own view: the \
-user is looking at the Type, the conversation is its own, and \"it\" or \"this\" means the Type. \
-Make the change they ask for with types_update (layout, fields, look) and the item tools, check \
-with types_items, and keep replies to a short sentence. When the Type is not designed yet, design \
-it from its name and what is being saved: pick a layout, fields, icon and theme that make it feel \
-like the real thing. To save something into it, fill the Type's fields from the content (split a \
-list into several items when the layout is a checklist or wheel) with types_add_item. When the \
-Type has an image field and the item has no picture of its own, make one for it with your image \
-generation tool when you have one (the dish itself for a recipe, never a generic stand-in) and \
-pass its absolute path; otherwise leave the field empty and the Type draws its own illustration.";
+Prefer built-in layouts. customHtml is a self-contained HTML document (no network or external files); \
+it receives {type:'dial-type', def, items, images} (asset name to data URL) and can post \
+{type:'dial-type-update', itemId, fields|done}. \
+[[type:ID]] marks a conversation inside that Type; 'this' means the Type. Use types_update for \
+design, types_add_item for saves, and types_items to confirm data. Populate each board item with \
+its own image, title and optional note. Reuse any attached file's absolute path; never substitute a \
+different image. If no image is available, leave it empty unless the user wants an illustration.";
 
 fn args_object(args: &Value) -> Result<&Map<String, Value>, String> {
     args.as_object()
@@ -1150,6 +1421,63 @@ fn describe(def: &TypeDef, count: usize) -> String {
         def.name,
         def.id,
         fields.join(", ")
+    )
+}
+
+/// Marks the Type's own briefing in a prompt, so the UI can leave it out of the transcript.
+pub const CONTEXT_OPEN: &str = "<type-context>";
+const CONTEXT_CLOSE: &str = "</type-context>";
+
+/// What the agent is told about the Type a conversation belongs to.
+fn context(def: &TypeDef, count: usize, scope: Scope) -> String {
+    let purpose = if def.description.trim().is_empty() {
+        "not described yet; infer it from the name and the items".to_owned()
+    } else {
+        def.description.trim().to_owned()
+    };
+    let kept = match scope {
+        Scope::App => "in the app, shared by every project",
+        Scope::Project => "in this project's .dial/types folder",
+    };
+    format!(
+        "{CONTEXT_OPEN}\n\
+         The user is inside their Type “{} {}” (id {}), opened as its own little app in Dial Desktop. \
+         This conversation is about that Type, not about the project's code. Purpose: {purpose}.\n\
+         Now: {}\n\
+         Kept {kept}; the types_* tools own its files, so never edit them directly. Do what the user \
+         asks with the tools: types_update to change the layout, fields or look, types_add_item and \
+         types_update_item for items, and types_items to check saved data. On macOS, use \
+         types_screenshot to inspect the visible design after a visual change. Do not read, search \
+         or edit the project's files or run project commands for this, unless the user names a project file. Keep replies \
+         to a sentence or two.\n\
+         {CONTEXT_CLOSE}",
+        def.icon,
+        def.name,
+        def.id,
+        describe(def, count)
+    )
+}
+
+/// A prompt as the agent should get it. One that starts with a `[[type:ID]]` line (written inside
+/// that Type's own view) gets the Type's briefing after the line; any other is returned as it is.
+pub fn with_context(store: &Store, text: &str) -> String {
+    let Some((id, rest)) = text
+        .strip_prefix("[[type:")
+        .and_then(|tail| tail.split_once("]]"))
+    else {
+        return text.to_owned();
+    };
+    let body = rest.strip_prefix('\n').unwrap_or(rest);
+    if body.starts_with(CONTEXT_OPEN) {
+        return text.to_owned();
+    }
+    let Ok(full) = store.get(id) else {
+        return text.to_owned();
+    };
+    let scope = store.locate(id).map(|(scope, _)| scope).unwrap_or_default();
+    format!(
+        "[[type:{id}]]\n{}\n{body}",
+        context(&full.def, full.items.len(), scope)
     )
 }
 
@@ -1205,7 +1533,7 @@ pub fn agent_call(
                 members.insert("designed".into(), Value::Bool(true));
             }
             let def = store.update(&id, &patch)?;
-            changed(app, Some(&id));
+            let _ = app.emit(CHANGED, design_change(&def, &patch));
             let count = store.get(&id)?.items.len();
             Ok(format!("Updated {}", describe(&def, count)))
         }
@@ -1297,6 +1625,14 @@ pub fn tools() -> Vec<Value> {
     let which = json!({"type": "string", "description": "The type's name or id"});
     vec![
         tool(
+            "types_screenshot",
+            "Inspect the open Type",
+            false,
+            "Take a PNG of the requested Type's visible canvas on macOS. The user must have that Type open. This does not open or change the Type. Use it to check the rendered design, not to list items."
+                .into(),
+            json!({"type":"object", "properties":{"type":which}, "required":["type"]}),
+        ),
+        tool(
             "types_list",
             "List the user's Types",
             true,
@@ -1331,8 +1667,8 @@ pub fn tools() -> Vec<Value> {
             false,
             "Save one item (`fields`) or several (`items`) to a Type, filling its fields by key \
              from what the user wants to keep: lists as arrays of strings, steps in order, \
-             images as absolute local file paths (generated or downloaded images). `source` is \
-             the original text, kept with the item."
+             images as absolute local paths (use the path supplied with a file attachment, or a saved \
+             generated/downloaded image). `source` holds the original text."
                 .into(),
             json!({"type": "object", "properties": {
                 "type": which,

@@ -12,14 +12,18 @@ import { bookOf, bookStyle, folioOf, type Page } from "./bookPages";
  * leaf, its front the page being turned and its back the one it lands on, while the book
  * underneath already shows what lies beyond.
  */
-const props = defineProps<{ full: Full; texture: string }>();
+const props = defineProps<{ full: Full; texture: string; openFirstItem?: boolean }>();
 const emit = defineEmits<{ edit: [item: Item] }>();
 
 const FLIP_MS = 760;
 const style = computed(() => bookStyle(props.full.def));
 const book = computed(() => bookOf(props.full.def, props.full.items, style.value));
 /** The spread open: 0 is the closed cover. */
-const at = ref(0);
+const at = ref(props.openFirstItem ? book.value.starts[0] ?? 0 : 0);
+// The turn can finish before the last item-change event reaches this view.
+if (props.openFirstItem && !at.value) {
+  watch(() => book.value.starts[0], first => { if (first !== undefined) at.value = first; }, { once: true });
+}
 const flipping = ref<{ from: number; to: number; dir: "fwd" | "back" } | null>(null);
 let timer = 0;
 

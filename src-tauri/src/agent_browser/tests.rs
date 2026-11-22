@@ -5,7 +5,7 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 20);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
@@ -30,8 +30,17 @@ fn tool_list_is_well_formed() {
     let saved: Vec<&str> = names.iter().copied().filter(|n| n.starts_with("types_")).collect();
     assert_eq!(
         saved,
-        ["types_add_item", "types_create", "types_items", "types_list", "types_update", "types_update_item"]
+        [
+            "types_add_item", "types_create", "types_items", "types_list", "types_screenshot",
+            "types_update", "types_update_item",
+        ]
     );
+    let screenshot = tools.iter().find(|t| t["name"] == "types_screenshot").unwrap();
+    assert_eq!(
+        screenshot["annotations"]["readOnlyHint"], false,
+        "capture of a private Type requires approval"
+    );
+    assert_eq!(screenshot["inputSchema"]["required"], json!(["type"]));
 }
 
 #[test]
@@ -72,6 +81,31 @@ fn arguments_are_embedded_as_json_literals() {
     let full = action(&script);
     assert!(full.starts_with(HELPERS));
     assert!(full.ends_with("});"));
+}
+
+#[test]
+fn fill_does_not_corrupt_values_containing_other_placeholder_names() {
+    let script = fill(
+        TYPE,
+        &[
+            ("QUERY", json!({"name": "TEXT CLEAR SUBMIT"})),
+            ("TEXT", json!("CLEAR and SUBMIT and QUERY")),
+            ("CLEAR", json!(true)),
+            ("SUBMIT", json!(false)),
+        ],
+    );
+    assert!(
+        script.contains(r#"A.find({"name":"TEXT CLEAR SUBMIT"})"#),
+        "QUERY was corrupted: {script}"
+    );
+    assert!(
+        script.contains(r#"const text = "CLEAR and SUBMIT and QUERY";"#),
+        "TEXT was corrupted: {script}"
+    );
+    assert!(script.contains("if (true) document.execCommand('selectAll');"));
+    assert!(script.contains("(true ? '' : el.value)"));
+    assert!(script.contains("return false ?"));
+    assert!(EVAL.contains("setTimeout(() => { delete A.done[id]; }"));
 }
 
 #[test]

@@ -56,6 +56,7 @@ fn commands_map_to_documented_wire_requests() {
     assert_eq!(params, json!({"session_id": "s4"}));
 
     assert_eq!(Command::ListSessions.request().1, "list_sessions");
+    assert_eq!(Command::ListSessions.request().2["include_empty"], true);
     assert_eq!(Command::NewSession.request().1, "new_session");
     assert_eq!(Command::Abort.request().1, "abort");
     assert_eq!(Command::Recover.request().1, "recovery_snapshot");

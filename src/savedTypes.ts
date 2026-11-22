@@ -6,6 +6,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { engine, showToast, snapshot } from "./bridge";
 import { focusComposer, openMenu, ui, type MenuItem } from "./ui";
+import type { OpenSnapshot } from "./types";
 import {
   isDone, occurrence, today, markdownImages,
   type Field, type Fields, type Layout, type TypeView,
@@ -14,7 +15,11 @@ import {
 export type { Field, FieldKind, Fields, Layout, TypeView } from "./typeExtract";
 
 export type Font = "sans" | "serif" | "mono" | "hand" | "display" | "rounded";
+
 export type Texture = "none" | "paper" | "linen" | "grid" | "dots" | "noise";
+
+export type TypeScope = "app" | "project";
+export interface TypeLocation { saveIn: TypeScope; project: string | null }
 
 export interface Theme {
   accent: string;
@@ -66,6 +71,8 @@ export interface Summary {
   count: number;
   updated: number;
   designed: boolean;
+  /** Kept with the app (every project sees it) or in the open project. */
+  scope: TypeScope;
   sessions: string[];
 }
 
@@ -79,15 +86,18 @@ export const typeApi = {
   create: (def: Partial<TypeDef>) => invoke<TypeDef>("types_create", { def }),
   update: (id: string, patch: Record<string, unknown>) => invoke<TypeDef>("types_update", { id, patch }),
   remove: (id: string) => invoke<void>("types_delete", { id }),
-  addItem: (id: string, fields: Fields, source: Source | null = null) =>
-    invoke<Item>("types_add_item", { id, fields, source }),
-  updateItem: (id: string, itemId: string, patch: ItemPatch) =>
-    invoke<Item>("types_update_item", { id, itemId, patch }),
+  addItem: (id: string, fields: Fields, source: Source | null = null, allowImport = true) =>
+    invoke<Item>("types_add_item", { id, fields, source, allowImport }),
+  updateItem: (id: string, itemId: string, patch: ItemPatch, allowImport = true) =>
+    invoke<Item>("types_update_item", { id, itemId, patch, allowImport }),
   removeItem: (id: string, itemId: string) => invoke<void>("types_remove_item", { id, itemId }),
   moveItem: (id: string, itemId: string, to: number) => invoke<void>("types_move_item", { id, itemId, to }),
   importImage: (id: string, path: string) => invoke<string>("types_import_image", { id, path }),
   importImageData: (id: string, data: string) => invoke<string>("types_import_image_data", { id, data }),
+  openAsset: (path: string) => invoke<void>("types_open_asset", { path }).catch((error) => showToast(String(error))),
   allowReminders: () => invoke<void>("type_reminders_allow"),
+  location: () => invoke<TypeLocation>("types_location"),
+  setLocation: (saveIn: TypeScope) => invoke<TypeLocation>("types_set_location", { saveIn }),
   remind: (typeId: string, title: string, body: string) => invoke<void>("type_reminder", { typeId, title, body }),
 };
 
@@ -98,13 +108,30 @@ export const types = reactive({
   revision: {} as Record<string, number>,
 });
 
+/** Where new types are saved (Settings → Types), and the open project's folder for them. */
+export const typeLocation = reactive<TypeLocation>({ saveIn: "app", project: null });
+
+let listVersion = 0;
 export async function refreshTypes() {
   if (!isTauri()) return;
+  const version = ++listVersion;
   try {
-    types.list = await typeApi.list();
+    const list = await typeApi.list();
+    if (version !== listVersion) return;
+    types.list = list;
     types.loaded = true;
+    Object.assign(typeLocation, await typeApi.location());
   } catch (error) {
     showToast(`Could not load your types: ${error}`);
+  }
+}
+
+/** Choose where new types are saved. */
+export async function setTypeLocation(saveIn: TypeScope) {
+  try {
+    Object.assign(typeLocation, await typeApi.setLocation(saveIn));
+  } catch (error) {
+    showToast(`Could not change where types are saved: ${error}`);
   }
 }
 
@@ -117,15 +144,23 @@ export async function refreshTypes() {
 // types in a row never races several new sessions. The session is claimed as the type's before
 // the first prompt goes out, so it never shows in the list as an ordinary one.
 
+/** Values reported by a successful agent types_update, after native normalization. */
+export interface DesignChoices {
+  layout?: { kind: Layout; style: string };
+  fields?: string[];
+  look?: Pick<Theme, 'font' | 'texture' | 'accent'>;
+}
+export type TypeChange = string | null | { id: string; choices: DesignChoices };
+
 export const typeState = reactive({
   returnTo: null as string | null,
   /** The type whose new conversation is starting: the next session on screen is its own. */
   pending: null as string | null,
-  /** An answer to save into the next type made in the sidebar. */
-  saveAfterCreate: null as PendingSave | null,
+  /** First saves currently being handed to Dial, including the new type's session startup. */
+  firstSaves: new Map<string, DesignChoices>(),
 });
 
-const TAG = /^\[\[type:([a-z0-9-]+)\]\]\n?/;
+const TAG = /^\[\[type:([a-z0-9-]+)\]\]\n?(?:<type-context>[\s\S]*?<\/type-context>\n?)?/;
 
 /** `text` without the type line it was sent with, for the transcript. */
 export function withoutTypeTag(text: string): string {
@@ -149,6 +184,31 @@ export function typedPrompt(text: string, sessionId: string | null = snapshot.va
   return open && sessionId && open.sessions.includes(sessionId) ? `[[type:${open.id}]]\n${text}` : text;
 }
 
+/**
+ * What the transcript, top bar and composer show while type `ui.typeOpen` is open. A type is its
+ * own conversation: until that session is on screen (nothing has been sent in it yet, or it is
+ * still opening), the session that happens to be on screen belongs to another chat, so its
+ * turn, queue, title and transcript must not leak into the type. They are replaced by an empty
+ * conversation of the type's own. A pending approval or question of that other session still
+ * shows through, since the turn is blocked on the user.
+ */
+export function typeScopedSnapshot(snap: OpenSnapshot): OpenSnapshot {
+  const open = types.list.find((t) => t.id === ui.typeOpen);
+  if (!open || typeSessionOnScreen() || snap.approvals.length || snap.question) return snap;
+  return {
+    ...snap,
+    sessionId: `type:${open.id}`,
+    title: `${open.icon} ${open.name}`.trim(),
+    historyLoading: false,
+    turnRunning: false,
+    canSend: snap.connection.state === "live",
+    entries: [],
+    plan: [],
+    changes: [],
+    context: null,
+  };
+}
+
 /** Open type `id` in place of the transcript, with its own conversation behind it if it has one. */
 export async function openType(id: string) {
   ui.settingsOpen = false;
@@ -166,9 +226,9 @@ export async function openType(id: string) {
   }
   // No conversation yet: the first prompt starts one (`sendInType`).
   if (ui.typeOpen !== id || !session || snapshot.value?.sessionId === session) return;
-  // Opening runs in the engine; a session that is gone leaves the old one on screen.
-  if ((await engine.resume(session, root)) && (await until(() => snapshot.value?.sessionId === session, 8000))) return;
-  if (ui.typeOpen === id) await forgetSession(id, root);
+  // Busy, closing and disconnected engines do not mean the journal is gone. Never unlink
+  // the type or substitute a fresh conversation just because opening this one failed.
+  if (await engine.resume(session, root, true)) await until(() => snapshot.value?.sessionId === session, 8000);
 }
 
 async function until(test: () => boolean, timeout: number): Promise<boolean> {
@@ -196,17 +256,12 @@ export function closeType() {
   else if (!back && onType) void engine.newSession();
 }
 
-async function setSession(id: string, root: string, session: string | null) {
-  const { def } = await typeApi.get(id);
-  const sessions = { ...def.sessions };
-  if (session) sessions[root] = session;
-  else delete sessions[root];
-  await typeApi.update(id, { sessions });
+async function setSession(id: string, root: string, session: string) {
+  await invoke("types_claim_session", { id, root, session });
+  // Keep ownership visible even if a concurrent list refresh supersedes this one.
+  const owner = types.list.find(t => t.id === id);
+  if (owner && !owner.sessions.includes(session)) owner.sessions.push(session);
   await refreshTypes();
-}
-
-function forgetSession(id: string, root: string) {
-  return setSession(id, root, null).catch((error) => showToast(String(error)));
 }
 
 /** The session on screen can take a prompt. */
@@ -216,30 +271,22 @@ function ready(): boolean {
 }
 
 /**
- * Start type `id`'s conversation in this project and claim it as the type's. An untouched new
- * session on screen that belongs to nobody is used as it is; otherwise a new one is started.
+ * Start a dedicated session: even an apparently empty regular session may have a local draft.
  */
 async function startTypeSession(id: string, root: string): Promise<string | null> {
-  const now = snapshot.value;
-  let session: string | null = null;
-  if (now?.sessionId && !now.entries.length && !now.turnRunning && !isTypeSession(now.sessionId)) {
-    session = now.sessionId;
-    if (typeState.returnTo === session) typeState.returnTo = null;
-  } else {
-    const before = now?.sessionId ?? null;
-    typeState.pending = id;
-    try {
-      await engine.newSession();
-      const started = await until(() => snapshot.value?.sessionId !== before && !snapshot.value?.entries.length && ready(), 10000);
-      if (!started || ui.typeOpen !== id) return null;
-      session = snapshot.value!.sessionId;
-    } finally {
-      typeState.pending = null;
-    }
+  const before = snapshot.value?.sessionId;
+  if (typeState.pending || ui.typeOpen !== id) return null;
+  typeState.pending = id;
+  try {
+    if (!await engine.newSession()) return null;
+    const started = await until(() => snapshot.value?.sessionId !== before && !snapshot.value?.entries.length && ready(), 10000);
+    const session = snapshot.value?.sessionId;
+    if (!started || !session || ui.typeOpen !== id || snapshot.value?.workspace?.root !== root) return null;
+    await setSession(id, root, session);
+    return session;
+  } finally {
+    if (typeState.pending === id) typeState.pending = null;
   }
-  if (!session) return null;
-  await setSession(id, root, session);
-  return session;
 }
 
 /**
@@ -253,7 +300,7 @@ export async function sendInType(id: string, text: string, images: Parameters<ty
     let session: string | null = (await typeApi.get(id)).def.sessions[root] ?? null;
     if (session && snapshot.value?.sessionId !== session) {
       await openType(id);
-      if (snapshot.value?.sessionId !== session) session = null;
+      if (snapshot.value?.sessionId !== session) return false;
     }
     const first = !session;
     if (!session) session = await startTypeSession(id, root);
@@ -282,6 +329,10 @@ export async function sendInType(id: string, text: string, images: Parameters<ty
  * closes the type.
  */
 export function followTypeSession(root: string | undefined, id: string | null, previousRoot: string | undefined, previousId: string | null) {
+  if (root !== previousRoot && isTauri()) {
+    types.loaded = false;
+    void refreshTypes();
+  }
   const open = ui.typeOpen;
   if (!open) return;
   if (root !== previousRoot) {
@@ -293,13 +344,14 @@ export function followTypeSession(root: string | undefined, id: string | null, p
   if (typeState.pending === open) return;
   ui.typeOpen = null;
 }
-/** Make a type from just a name, open it, and save the answer waiting for it, if any. */
-export async function createType(name: string): Promise<boolean> {
+/** Make a type from its name. A first save supplies the design brief; no second prompt is needed. */
+export async function createType(name: string, save?: PendingSave): Promise<boolean> {
   try {
+    if (save && (save.workspace !== snapshot.value?.workspace?.root || save.sessionId !== snapshot.value?.sessionId)) {
+      throw new Error('The conversation changed. Open Save on the answer again.');
+    }
     const def = await typeApi.create({ name });
     await refreshTypes();
-    const save = typeState.saveAfterCreate;
-    typeState.saveAfterCreate = null;
     if (save) return saveTo(def.id, save);
     await openType(def.id);
     focusComposer();
@@ -310,6 +362,22 @@ export async function createType(name: string): Promise<boolean> {
   }
 }
 
+/** Delete type `id` and remove its hidden session in the open workspace so it does not resurface. */
+export async function deleteType(id: string): Promise<void> {
+  const root = snapshot.value?.workspace?.root ?? null;
+  const sessionId = root
+    ? await typeApi.get(id).then((f) => f.def.sessions[root] ?? null).catch(() => null)
+    : null;
+  if (ui.typeOpen === id) closeType();
+  if (sessionId && snapshot.value?.sessionId === sessionId) {
+    await until(() => snapshot.value?.sessionId !== sessionId, 3000);
+  }
+  await typeApi.remove(id);
+  await refreshTypes();
+  if (sessionId && snapshot.value?.sessionId !== sessionId) {
+    await invoke("delete_sessions", { sessionIds: [sessionId] }).catch(() => {});
+  }
+}
 /** The absolute path of asset `name` of a type. */
 export function assetPath(full: Full, name: unknown): string | null {
   return typeof name === "string" && name ? `${full.assets.replace(/[\\/]+$/, "")}/${name}` : null;
@@ -357,7 +425,7 @@ export function pendingSave(text: string, images: string[], workspace: string | 
 function savePrompt(def: TypeDef, save: PendingSave): string {
   const lines = [
     `[[type:${def.id}]]`,
-    `Save this to “${def.name}”.${def.designed ? "" : " It has no design yet: design it to suit this first."}`,
+    `Save this to “${def.name}”.${def.designed ? '' : ' Design it from this answer: choose the layout, fields and look. Apply choices with types_update as they are ready, then save the first item with types_add_item.'}`,
     "",
     save.text.trim(),
   ];
@@ -372,7 +440,10 @@ function savePrompt(def: TypeDef, save: PendingSave): string {
  */
 export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
   const snap = snapshot.value;
-  if (!snap?.workspace) return false;
+  if (!snap?.workspace || save.workspace !== snap.workspace.root) {
+    showToast('The project changed. Open Save on the answer again.');
+    return false;
+  }
   const root = snap.workspace.root;
   try {
     const { def } = await typeApi.get(id);
@@ -386,10 +457,20 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
       showToast(`Dial is adding it to ${def.icon} ${def.name}`);
       return true;
     }
-    await openType(id);
-    if (ui.typeOpen !== id) return false;
-    // The prompt carries its own type line, so it is sent as it is.
-    return await sendInType(id, prompt.replace(TAG, ""));
+    if (!def.designed) typeState.firstSaves.set(id, {});
+    try {
+      await openType(id);
+      if (ui.typeOpen !== id) return false;
+      // The prompt carries its own type line, so it is sent as it is.
+      const sent = await sendInType(id, prompt.replace(TAG, ''));
+      if (sent && !def.designed && !(await typeApi.get(id)).items.length) {
+        showToast(`No item was saved to ${def.name}. Open its Chat to see what happened.`);
+        return false;
+      }
+      return sent;
+    } finally {
+      typeState.firstSaves.delete(id);
+    }
   } catch (error) {
     showToast(`Could not save: ${error instanceof Error ? error.message : error}`);
     return false;
@@ -400,16 +481,16 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
 export function saveMenu(event: MouseEvent, save: PendingSave, anchor?: HTMLElement | null) {
   const items: MenuItem[] = types.list.map((t) => ({ label: `${t.icon} ${t.name}`, run: () => void saveTo(t.id, save) }));
   if (items.length) items.push({ divider: true });
+  else if (types.loaded) items.push({ label: 'No types yet', disabled: true, run: () => {} });
   items.push({
     label: "New type…",
     icon: "plus",
-    run: () => {
-      typeState.saveAfterCreate = save;
-      ui.sidebarOpen = true;
-      ui.typeNaming = true;
+    prompt: {
+      label: 'Type name', placeholder: 'e.g. Cookbook', maxLength: 60, confirm: 'Create & open',
+      submit: (name) => void createType(name, save),
     },
   });
-  openMenu(event, items, anchor);
+  openMenu(event, items, anchor, 'Save to a type');
 }
 
 // Reminders: while the app runs, items whose type has reminders on notify ahead of their time.
@@ -468,14 +549,23 @@ async function remindDue() {
   if (changed) localStorage.setItem(FIRED_KEY, JSON.stringify({ day: today(now), keys: [...fired] }));
 }
 
+/** Keep first-save decisions across navigation, but never create progress for another type. */
+export function applyTypeChange(change: TypeChange) {
+  const id = typeof change === 'object' && change !== null ? change.id : change;
+  if (!id) return;
+  const progress = typeState.firstSaves.get(id);
+  if (progress && typeof change === 'object' && change) Object.assign(progress, change.choices);
+  types.revision[id] = (types.revision[id] ?? 0) + 1;
+}
+
 let started = false;
 
 /** Load the list, follow changes from the agent and the views, and run reminders. */
 export async function startTypes() {
   if (started || !isTauri()) return;
   started = true;
-  await listen<string | null>("types-changed", async ({ payload }) => {
-    if (payload) types.revision[payload] = (types.revision[payload] ?? 0) + 1;
+  await listen<TypeChange>('types-changed', async ({ payload }) => {
+    applyTypeChange(payload);
     await refreshTypes();
     await loadReminderTypes();
   });

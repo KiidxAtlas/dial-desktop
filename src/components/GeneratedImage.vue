@@ -8,53 +8,72 @@ const cache = new Map<string, Promise<ImageFile>>();
 
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { files } from "../bridge";
-import { viewImage } from "../imageViewer";
+import { files, snapshot } from "../bridge";
+import { openImageMenu } from "../imageActions";
+import { viewAttachment, viewImage } from "../imageViewer";
 import Icon from "./Icon.vue";
 
-/** One image a tool wrote, shown in the conversation. Click opens it larger in the viewer. */
+/** One image a tool wrote, shown in the conversation. Click opens it larger in the viewer;
+ * right-click copies or saves it. */
 const props = defineProps<{ path: string }>();
 
 const image = ref<ImageFile | null>(null);
 const error = ref<string | null>(null);
 
 watch(
-  () => props.path,
-  async (path) => {
+  [() => props.path, () => snapshot.value?.workspace?.root],
+  async ([path, root], _, onCleanup) => {
+    let current = true;
+    onCleanup(() => { current = false; });
     image.value = null;
     error.value = null;
-    let load = cache.get(path);
+    if (!root) return;
+    const key = JSON.stringify([root, path]);
+    let load = cache.get(key);
     if (!load) {
-      load = files.readImage(path);
-      cache.set(path, load);
+      load = files.readTranscriptImage(root, path);
+      if (cache.size >= 16) cache.delete(cache.keys().next().value!);
+      cache.set(key, load);
       // A failed read (the file is not there yet, or was removed) may succeed next time.
-      load.catch(() => cache.delete(path));
+      load.catch(() => { if (cache.get(key) === load) cache.delete(key); });
     }
     try {
       const loaded = await load;
-      if (props.path === path) image.value = loaded;
+      if (current) image.value = loaded;
     } catch (failure) {
-      if (props.path === path) error.value = String(failure);
+      if (current) error.value = String(failure);
     }
   },
   { immediate: true },
 );
 
 function openInViewer() {
-  viewImage(props.path);
+  if (props.path.startsWith("artifact://") && image.value) viewAttachment(image.value);
+  else viewImage(props.path);
+}
+
+function menu(event: MouseEvent) {
+  const shown = image.value;
+  if (!shown) return;
+  openImageMenu(event, {
+    name: shown.name,
+    url: shown.url,
+    absolute: props.path.startsWith("artifact://") ? undefined : shown.path,
+    open: { label: "View larger", run: openInViewer },
+  });
 }
 </script>
 
 <template>
   <figure class="generated">
-    <button v-if="image" class="frame" :title="`View ${image.name}`" @click.stop="openInViewer">
+    <button v-if="image" class="frame" :title="`View ${image.name}`" @click.stop="openInViewer" @contextmenu="menu">
       <img :src="image.url" :alt="image.name" draggable="false" />
     </button>
     <div v-else-if="error" class="missing">Preview unavailable: {{ error }}</div>
     <div v-else class="loading" />
     <figcaption v-if="image">
       <button class="name mono truncate" :title="path" @click.stop="openInViewer">{{ image.name }}</button>
-      <button class="act" title="Show in Finder" aria-label="Show in Finder" @click.stop="files.reveal(path)">
+      <button v-if="!path.startsWith('artifact://')" class="act" title="Show in Finder" aria-label="Show in Finder" @click.stop="files.reveal(path)">
         <Icon name="folder" :size="13" />
       </button>
     </figcaption>

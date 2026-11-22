@@ -44,6 +44,11 @@ fn a_shell_streams_output_and_reports_its_exit() {
     }
     assert!(output.contains("dial-42"), "{output:?}");
     assert!(exited);
-    terminals.close(id);
+    assert!(
+        !terminals.has_shells(),
+        "exited shell must be removed before Exit is reported"
+    );
     assert!(terminals.write(id, "x").is_err());
+    // Closing an already-exited shell remains a safe no-op.
+    terminals.close(id);
 }

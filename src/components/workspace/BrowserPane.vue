@@ -7,6 +7,7 @@ import { browserApi, openExternal, showToast } from "../../bridge";
 import { appearance } from "../../appearance";
 import { openMenu, ui, type MenuItem } from "../../ui";
 import { addToPrompt, workspace } from "../../workspace";
+import { viewedImage } from "../../imageViewer";
 import type { Bounds, BrowserState, PageInfo } from "../../types";
 import Icon from "../Icon.vue";
 
@@ -24,7 +25,7 @@ const busy = ref(false);
 const blank = computed(() => !state.value.url || state.value.url === "about:blank");
 /** Overlays that would be hidden under the native view. */
 const covered = computed(
-  () => ui.settingsOpen || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen || !!ui.menu,
+  () => ui.settingsOpen || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen || !!ui.menu || !!viewedImage.value,
 );
 const visible = computed(() => props.active && !covered.value && created.value && !blank.value);
 

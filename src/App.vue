@@ -29,7 +29,7 @@ import UpdateBanner from "./components/UpdateBanner.vue";
 import { startUpdateChecks } from "./updates";
 import TypeView from "./components/types/TypeView.vue";
 import Icon from "./components/Icon.vue";
-import { followTypeSession } from "./savedTypes";
+import { followTypeSession, typeScopedSnapshot } from "./savedTypes";
 
 /** A type stays open while its own conversation is on screen; another session closes it. */
 watch(
@@ -51,13 +51,18 @@ function openTypeComposer() {
   void nextTick(focusComposer);
 }
 watch(() => [ui.typeOpen, ui.typeMode], () => (typeComposerOpen.value = false));
-watch(() => snapshot.value?.turnRunning, (running) => {
-  if (running && showingType.value) typeComposerOpen.value = false;
-});
 
 const snap = computed(() => snapshot.value);
 /** The snapshot once a folder is open; until then the welcome screen shows. */
 const opened = computed(() => (snap.value?.workspace ? (snap.value as OpenSnapshot) : null));
+/**
+ * What the conversation panes show: the open type's own conversation, never another chat's that
+ * happens to be on screen until the type has one.
+ */
+const viewed = computed(() => (opened.value ? typeScopedSnapshot(opened.value) : null));
+watch(() => viewed.value?.turnRunning, (running) => {
+  if (running && showingType.value) typeComposerOpen.value = false;
+});
 const reviewing = computed(() => ui.inspectorOpen && ui.inspectorTab === "changes" && !!ui.diffPath && ui.diffExpanded && !ui.settingsOpen);
 watch(() => [opened.value?.workspace.root, opened.value?.sessionId] as const, ([root, id], [previousRoot, previousId]) => {
   if (root !== previousRoot || id !== previousId) {
@@ -255,7 +260,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    v-if="opened"
+    v-if="opened && viewed"
     class="shell"
     :class="{ mac: opened.platform === 'macos', 'no-sidebar': !ui.sidebarOpen, fullscreen }"
   >
@@ -265,21 +270,21 @@ onBeforeUnmount(() => {
     <!-- Kept mounted under the settings page, so the conversation keeps its scroll and draft. -->
     <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }">
       <Backdrop v-if="showBackdrop" :dimmed="!empty" />
-      <TopBar :snap="opened" />
+      <TopBar :snap="viewed" />
       <UpdateBanner />
       <!-- Kept mounted behind an open type, so the transcript keeps its scroll. Timeline has several
            root nodes, so it is hidden through this wrapper. -->
       <div v-show="!showingType" class="transcript">
-        <Timeline :snap="opened" />
+        <Timeline :snap="viewed" />
       </div>
-      <TypeView v-if="showingType && ui.typeOpen" :id="ui.typeOpen" :key="ui.typeOpen" :snap="opened" />
-      <Composer v-if="composerShown" :snap="opened" />
+      <TypeView v-if="showingType && ui.typeOpen" :id="ui.typeOpen" :key="ui.typeOpen" :snap="viewed" />
+      <Composer v-if="composerShown" :snap="viewed" />
       <div v-else class="type-compose">
         <button
           class="compose-orb"
-          :class="{ working: opened.turnRunning }"
-          :title="opened.turnRunning ? 'Dial is working on it' : 'Ask Dial to change this'"
-          :aria-label="opened.turnRunning ? 'Dial is working on it' : 'Ask Dial to change this'"
+          :class="{ working: viewed.turnRunning }"
+          :title="viewed.turnRunning ? 'Dial is working on it' : 'Ask Dial to change this'"
+          :aria-label="viewed.turnRunning ? 'Dial is working on it' : 'Ask Dial to change this'"
           @click="openTypeComposer"
         >
           <Icon name="arrowUp" :size="19" />

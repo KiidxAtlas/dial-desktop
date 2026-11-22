@@ -128,6 +128,10 @@ continues. Local builds without the release config do not contact Azure.
   can’t be identified uniquely, Desktop shows the saved snippet instead.
   Switching projects asks before stopping running work or closing terminals. **Reconnect**
   resumes the foreground conversation without restarting other session engines or terminals.
+- **Save an answer as a Type**: click **Save** under a reply, choose an existing type or name a
+  **New type**, then **Create & open**. On its first save, the design checklist shows the layout,
+  fields and look as Dial commits them. Choices saved together appear together. The finished
+  item replaces the checklist; a new book opens directly to its first entry.
 - **Session actions**: right-click a session, use its `…` button, or click the title in the top
   bar to rename (also double-click or <kbd>F2</kbd>), pin to the top, duplicate (a forked copy),
   copy the conversation as Markdown, export it to a Markdown file in the project, undo the last
@@ -259,6 +263,9 @@ continues. Local builds without the release config do not contact Azure.
     and more): open your dev server, click through it, read console errors and look at it. The
     app registers the `mcp.dial_desktop` setting at start (this binary with `--browser-mcp`); set
     its `enabled = false` to turn it off. See `docs/browser-agent.md`.
+- **Type boards**: drop PNG, JPEG, GIF or WebP images onto the open board, or use **Add images**.
+  Each file becomes a separate item. On macOS, the agent can ask to capture the visible Type
+  canvas with `types_screenshot`; the user must open the requested Type first.
 - **Reliability**: lost events trigger one `recovery_snapshot` reload once the turn is idle. A
   dropped engine is shown as stopped, and tool calls it left running are marked as having
   unknown outcomes, never as succeeded.
@@ -336,7 +343,7 @@ checkout instead, add this to `src-tauri/Cargo.toml` (and do not commit it):
 
 ```toml
 [patch."https://github.com/KiidxAtlas/dial.git"]
-dial-client = { path = "../../dial/crates/dial-client" }
+dial-client = { path = "../../dial-engine/crates/dial-client" }
 ```
 
 When the desktop app needs a capability the protocol lacks, add the RPC method in Dial first.

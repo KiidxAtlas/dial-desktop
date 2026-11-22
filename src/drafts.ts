@@ -2,7 +2,7 @@
 import { reactive, watch } from "vue";
 import type { Attachment, OpenSnapshot } from "./types";
 import { showToast } from "./bridge";
-import { DRAFTS, readLocal, writeLocal } from "./localPrompts";
+import { DRAFTS, localKeys, readLocal, writeLocal } from "./localPrompts";
 
 interface Draft {
   text: string;
@@ -15,6 +15,17 @@ interface Draft {
 
 const drafts = new Map<string, Draft>();
 let warned = false;
+const storedKeys = reactive(new Set<string>());
+let indexLoaded: Promise<void> | undefined;
+
+export function hasDraft(root: string, id: string): boolean {
+  const key = JSON.stringify([root, id]);
+  indexLoaded ??= localKeys(DRAFTS).then(keys => {
+    for (const k of keys) if (typeof k === "string") storedKeys.add(k);
+  }).catch(storageError);
+  const draft = drafts.get(key);
+  return draft && !draft.loading ? !!(draft.text || draft.attachments.length || draft.pending) : storedKeys.has(key);
+}
 
 function storageError() {
   if (warned) return;
@@ -57,6 +68,7 @@ async function attachPersistence(key: string, draft: Draft) {
   watch(() => recoverable(draft), (record) => {
     if (restoring) return;
     edited = true;
+    if (record) storedKeys.add(key); else storedKeys.delete(key);
     void writeLocal(key, { [DRAFTS]: record }).catch(storageError);
   }, { flush: "sync" });
   const stored = await readLocal(DRAFTS, key) as { text?: unknown; attachments?: Attachment[] } | undefined;

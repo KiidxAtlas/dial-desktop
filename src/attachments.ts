@@ -5,7 +5,7 @@ import type { Draft } from "./drafts";
 
 /** Matches `MAX_IMAGES` in `src-tauri/src/attachments.rs`. */
 export const MAX_IMAGES = 10;
-const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+export const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
 const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/i;
 /** Matches `MAX_IMAGE_BYTES` in the desktop backend. */
 const MAX_IMAGE_BYTES = 64 * 1024 * 1024;

@@ -12,6 +12,22 @@ type Action = Exclude<MenuItem, { divider: true }>;
 const isAction = (item: MenuItem): item is Action => !("divider" in item);
 const items = computed(() => ui.menu?.items ?? []);
 const icon = (name?: string) => (name && name in PATHS ? (name as keyof typeof PATHS) : null);
+const prompt = ref<NonNullable<Action['prompt']> | null>(null);
+const value = ref('');
+
+function cancel() {
+  const anchor = ui.menu?.anchor;
+  close();
+  anchor?.focus({ preventScroll: true });
+}
+
+function submit() {
+  const field = prompt.value;
+  const name = value.value.trim();
+  if (!ui.menu || !field || !name) return;
+  cancel();
+  field.submit(name);
+}
 
 function close() {
   ui.menu = null;
@@ -19,6 +35,11 @@ function close() {
 
 function choose(item: Action) {
   if (item.disabled) return;
+  if (item.prompt) {
+    prompt.value = item.prompt;
+    void place();
+    return;
+  }
   close();
   item.run();
 }
@@ -34,15 +55,15 @@ async function place() {
     left: Math.max(8, Math.min(menu.x, window.innerWidth - width - 8)),
     top: menu.y + height > window.innerHeight - 8 ? Math.max(8, menu.y - height) : menu.y,
   };
-  el.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
+  el.querySelector<HTMLElement>(prompt.value ? 'input' : 'button:not(:disabled)')?.focus({ preventScroll: true });
 }
 
 function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopPropagation();
-    close();
-  } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    if (!event.isComposing) cancel();
+  } else if (!prompt.value && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
     event.preventDefault();
     const buttons = [...(root.value?.querySelectorAll<HTMLElement>("button:not(:disabled)") ?? [])];
     const at = buttons.indexOf(document.activeElement as HTMLElement);
@@ -74,6 +95,8 @@ function listen(on: boolean) {
 watch(
   () => ui.menu,
   (menu, before) => {
+    prompt.value = null;
+    value.value = '';
     if (menu && !before) listen(true);
     if (!menu && before) listen(false);
     if (menu) place();
@@ -88,11 +111,20 @@ onBeforeUnmount(() => listen(false));
       v-if="ui.menu"
       ref="root"
       class="context-menu"
-      role="menu"
+      :role="prompt ? 'dialog' : 'menu'"
+      :aria-label="ui.menu.title"
       :style="{ left: `${position.left}px`, top: `${position.top}px` }"
       @contextmenu.prevent
     >
-      <template v-for="(item, index) in items" :key="index">
+      <div v-if="ui.menu.title" class="menu-title">{{ ui.menu.title }}</div>
+      <form v-if="prompt" class="menu-form" @submit.prevent="submit">
+        <label>{{ prompt.label }}<input v-model="value" :maxlength="prompt.maxLength" :placeholder="prompt.placeholder" required /></label>
+        <div class="form-actions">
+          <button class="btn btn-secondary" type="button" @click="cancel">Cancel</button>
+          <button class="btn btn-primary" type="submit" :disabled="!value.trim()">{{ prompt.confirm }}</button>
+        </div>
+      </form>
+      <template v-for="(item, index) in prompt ? [] : items" :key="index">
         <div v-if="!isAction(item)" class="rule" role="separator" />
         <button
           v-else
@@ -113,14 +145,20 @@ onBeforeUnmount(() => listen(false));
 <style scoped>
 .context-menu {
   position: fixed;
-  z-index: 60;
+  /* Above every panel and the image viewer (75), below toasts (80). */
+  z-index: 78;
   min-width: 200px;
   padding: 4px;
   border-radius: var(--radius-md);
   background: var(--raised);
   box-shadow: var(--shadow-pop);
 }
-button {
+.menu-title { padding: 7px 10px; font-size: var(--text-xs); color: var(--text-muted); font-weight: 600; }
+.menu-form { display: grid; gap: 12px; padding: 4px 8px 8px; }
+.menu-form label { display: grid; gap: 4px; font-size: var(--text-sm); color: var(--text-muted); }
+.menu-form input { padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
+.form-actions { display: flex; justify-content: flex-end; gap: 6px; }
+button[role="menuitem"] {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -135,8 +173,8 @@ button {
 button svg {
   color: var(--text-faint);
 }
-button:hover:not(:disabled),
-button:focus-visible {
+button[role="menuitem"]:hover:not(:disabled),
+button[role="menuitem"]:focus-visible {
   background: var(--hover);
   outline: none;
 }

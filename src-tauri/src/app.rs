@@ -292,6 +292,7 @@ fn snapshot_of(inner: &mut Inner) -> Snapshot {
         &mut inner.entry_views,
     );
     snapshot.history_loading |= inner.tabs.active().opening_session();
+    snapshot.can_send &= !inner.tabs.active().transitioning();
     snapshot.show_activity(&inner.tabs.activity());
     snapshot
 }
@@ -312,6 +313,7 @@ fn publish(app: &AppHandle) {
             }
             messages.extend(tab.model.toast.take());
         }
+        tabs.sync_deletions();
         messages.extend(tabs.background_news(&before));
         let notices = tabs.session_notices();
         let closed = tabs.close_idle();
@@ -500,8 +502,10 @@ fn forget_workspace(shared: State<'_, Shared>, path: String) -> bool {
 
 #[tauri::command]
 fn open_workspace(
+    app: AppHandle,
     shared: State<'_, Shared>,
     runner: State<'_, crate::app_runner::AppRunner>,
+    store: State<'_, crate::types::Store>,
     path: String,
     confirmed_from: Option<String>,
 ) -> Result<Option<String>, String> {
@@ -510,7 +514,12 @@ fn open_workspace(
     if !path.is_dir() {
         return Err(format!("{} is not a folder", path.display()));
     }
-    shared.open(&path, confirmed_from.as_deref(), &runner)
+    let confirm = shared.open(&path, confirmed_from.as_deref(), &runner)?;
+    if confirm.is_none() {
+        // The project's own types join the list.
+        crate::types::follow_project(&app, &store, &path);
+    }
+    Ok(confirm)
 }
 
 #[tauri::command]
@@ -797,6 +806,7 @@ async fn local_model_removal(
 #[tauri::command]
 async fn send_prompt(
     shared: State<'_, Shared>,
+    store: State<'_, crate::types::Store>,
     workspace_root: String,
     session_id: Option<String>,
     text: String,
@@ -808,6 +818,7 @@ async fn send_prompt(
         return Err("The prompt is empty".into());
     }
     attachments::check(&images, &inline_images)?;
+    let text = crate::types::with_context(&store, text);
     // Pasted images go by path like chosen files: inline base64 pushed the request past the
     // engine's 1 MiB RPC limit.
     let mut images = images;
@@ -828,7 +839,7 @@ async fn send_prompt(
             return Err("Dial is not ready to accept a prompt".into());
         }
         tab.submit_prompt(Command::Send {
-            text: text.to_owned(),
+            text,
             images,
             inline_images: Vec::new(),
         })?
@@ -842,6 +853,7 @@ async fn send_prompt(
 #[tauri::command]
 fn send_background(
     shared: State<'_, Shared>,
+    store: State<'_, crate::types::Store>,
     workspace_root: String,
     session_id: String,
     text: String,
@@ -851,7 +863,7 @@ fn send_background(
         return Err("The prompt is empty".into());
     }
     let send = Command::Send {
-        text: text.to_owned(),
+        text: crate::types::with_context(&store, text),
         images: Vec::new(),
         inline_images: Vec::new(),
     };
@@ -887,8 +899,13 @@ fn send_background(
 /// Check an image chosen or dropped by the user and return its preview. Async, so reading a
 /// large file runs off the main thread.
 #[tauri::command]
-async fn read_image(path: String) -> Result<ImageFile, String> {
-    attachments::read_image(Path::new(&path))
+async fn read_image(webview: tauri::Webview, path: String) -> Result<ImageFile, String> {
+    if webview.label() != "main" {
+        return Err("Images are only available in the app UI".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || attachments::read_image(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Read the native clipboard only for the app UI, never for the integrated browser.
@@ -903,6 +920,18 @@ fn read_clipboard_image(webview: tauri::Webview) -> Result<Option<String>, Strin
     Ok(None)
 }
 
+/// Save an image shown in the app to a path the user picked in the save dialog. Only the app UI
+/// may call it; the integrated browser's pages never can.
+#[tauri::command]
+async fn save_image(webview: tauri::Webview, path: String, data: String) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Saving images is only available in the app UI".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || attachments::save_image(Path::new(&path), &data))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Load a relative transcript image from the conversation's project, not the web app bundle.
 #[tauri::command]
 async fn read_transcript_image(
@@ -914,14 +943,26 @@ async fn read_transcript_image(
     if webview.label() != "main" {
         return Err("Transcript images are only available in the app UI".into());
     }
+    if path.starts_with("artifact://") {
+        let reply = workspace_rpc(&shared, &workspace_root, "read_image_artifact", serde_json::json!({"uri":path}))?;
+        let result = rpc_reply(reply, Some(Duration::from_secs(20))).await?;
+        let mime = result["media_type"].as_str().ok_or("Missing image type")?;
+        let extension = match mime { "image/png" => "png", "image/jpeg" => "jpg", "image/webp" => "webp", "image/gif" => "gif", _ => return Err("Unsupported image type".into()) };
+        let data = result["data"].as_str().ok_or("Missing image bytes")?;
+        return Ok(ImageFile { name: format!("Tool image.{extension}"), url: format!("data:{mime};base64,{data}"), path });
+    }
     {
         let inner = shared.lock();
         if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
             return Err("The project changed".into());
         }
     }
-    let resolved = files::resolve(Path::new(&workspace_root), &path)?;
-    attachments::read_image(&resolved)
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved = files::resolve(Path::new(&workspace_root), &path)?;
+        attachments::read_image(&resolved)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open an image from the conversation's project in the system's default viewer (Preview on a
@@ -942,12 +983,16 @@ async fn open_transcript_image(
             return Err("The project changed".into());
         }
     }
-    let resolved = files::resolve(Path::new(&workspace_root), &path)?;
-    if attachments::image_mime(&resolved).is_none() || !resolved.is_file() {
-        return Err(format!("{path} is not an image file"));
-    }
-    tauri_plugin_opener::open_path(&resolved, None::<&str>)
-        .map_err(|e| format!("Could not open {path}: {e}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved = files::resolve(Path::new(&workspace_root), &path)?;
+        if attachments::image_mime(&resolved).is_none() || !resolved.is_file() {
+            return Err(format!("{path} is not an image file"));
+        }
+        tauri_plugin_opener::open_path(&resolved, None::<&str>)
+            .map_err(|e| format!("Could not open {path}: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1246,10 +1291,12 @@ fn undo_turn(
 #[tauri::command]
 async fn steer(
     shared: State<'_, Shared>,
+    store: State<'_, crate::types::Store>,
     workspace_root: String,
     session_id: Option<String>,
     text: String,
 ) -> Result<(), String> {
+    let text = crate::types::with_context(&store, text.trim());
     let reply = {
         let inner = shared.lock();
         check_session(&inner, &workspace_root, session_id.as_deref())?;
@@ -1360,13 +1407,31 @@ fn refresh_models(app: AppHandle, shared: State<'_, Shared>) {
 }
 
 #[tauri::command]
-fn set_model(app: AppHandle, shared: State<'_, Shared>, provider: String, model_id: String) {
-    request(&app, &shared, Command::SetModel { provider, model_id });
+fn discover_models(app: AppHandle, shared: State<'_, Shared>) {
+    request(&app, &shared, Command::DiscoverModels);
 }
 
 #[tauri::command]
-fn set_thinking(app: AppHandle, shared: State<'_, Shared>, level: String) {
-    request(&app, &shared, Command::SetThinking(level));
+fn set_model(app: AppHandle, shared: State<'_, Shared>, workspace_root: String, session_id: String, provider: String, model_id: String) -> Result<(), String> {
+    select_model_setting(&app, &shared, &workspace_root, &session_id, Command::SetModel { session_id: session_id.clone(), provider, model_id })
+}
+
+#[tauri::command]
+fn set_thinking(app: AppHandle, shared: State<'_, Shared>, workspace_root: String, session_id: String, level: String) -> Result<(), String> {
+    select_model_setting(&app, &shared, &workspace_root, &session_id, Command::SetThinking { session_id: session_id.clone(), level })
+}
+
+fn select_model_setting(app: &AppHandle, shared: &Shared, root: &str, session: &str, command: Command) -> Result<(), String> {
+    let mut inner = shared.lock();
+    check_session(&inner, root, Some(session))?;
+    let tab = inner.tabs.active_mut();
+    if tab.engine.is_none() { return Err("Dial is not connected".into()); }
+    if let Some(command) = tab.select_model_setting(command)? {
+        dispatch(app, tab.engine.as_ref(), vec![command]);
+    }
+    drop(inner);
+    shared.poke();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1412,7 +1477,10 @@ async fn list_dir(
     path: String,
     workspace_root: String,
 ) -> Result<Vec<DirEntryView>, String> {
-    files::list(&panel_root(&shared, &workspace_root)?, &path)
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::list(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// File `path` in the workspace, for the viewer.
@@ -1422,7 +1490,10 @@ async fn read_file(
     path: String,
     workspace_root: String,
 ) -> Result<FileView, String> {
-    files::read(&panel_root(&shared, &workspace_root)?, &path)
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::read(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// The uncommitted changes of file `path` in the workspace.
@@ -1432,7 +1503,10 @@ async fn file_diff(
     path: String,
     workspace_root: String,
 ) -> Result<DiffView, String> {
-    files::diff(&panel_root(&shared, &workspace_root)?, &path)
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::diff(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn panel_root(shared: &Shared, expected: &str) -> Result<PathBuf, String> {
@@ -1516,8 +1590,11 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             notifications::type_reminder,
             crate::types::types_list,
             crate::types::types_get,
+            crate::types::types_location,
+            crate::types::types_set_location,
             crate::types::types_create,
             crate::types::types_update,
+            crate::types::types_claim_session,
             crate::types::types_delete,
             crate::types::types_add_item,
             crate::types::types_update_item,
@@ -1525,6 +1602,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::types::types_move_item,
             crate::types::types_import_image,
             crate::types::types_import_image_data,
+            crate::types::types_open_asset,
             snapshot,
             set_answer_style,
             models,
@@ -1545,6 +1623,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             send_background,
             read_image,
             read_clipboard_image,
+            save_image,
             read_transcript_image,
             open_transcript_image,
             approve,
@@ -1580,6 +1659,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::model_library::model_hub_search,
             crate::model_library::model_hub_files,
             refresh_models,
+            discover_models,
             set_model,
             set_thinking,
             set_approval,
@@ -1659,11 +1739,13 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 eprintln!("dial-desktop: the agent's browser tools are off: {error}");
             }
             if let Some(path) = workspace {
+                let path_root = path.clone();
                 app.state::<Shared>().open(
                     &path,
                     None,
                     &app.state::<crate::app_runner::AppRunner>(),
                 )?;
+                app.state::<crate::types::Store>().set_project(Some(&path_root));
             }
             let handle = app.handle().clone();
             thread::Builder::new()

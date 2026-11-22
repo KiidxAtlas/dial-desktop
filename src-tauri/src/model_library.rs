@@ -2,10 +2,14 @@
 //! Face owns caching, authentication, integrity checks and retries.
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::State;
 
+const HF_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+const HF_MAX_OUTPUT: u64 = 4 << 20;
 #[derive(Deserialize)]
 struct Model {
     repo: String,
@@ -96,11 +100,73 @@ fn download_command(repo: &str, file: Option<&str>) -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// Run `cmd` with a deadline and bounded stdout/stderr; kills the child on timeout.
+fn run_bounded(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(hf_missing)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let read_pipe = |pipe: Option<std::process::ChildStdout>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = pipe {
+                let _ = p.take(HF_MAX_OUTPUT).read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let read_err = |pipe: Option<std::process::ChildStderr>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = pipe {
+                let _ = p.take(HF_MAX_OUTPUT).read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_handle = read_pipe(stdout);
+    let err_handle = read_err(stderr);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(format!(
+                    "Hugging Face request timed out after {} s",
+                    timeout.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not check `hf`: {e}"));
+            }
+        }
+    };
+    let out = out_handle.join().unwrap_or_default();
+    let err = err_handle.join().unwrap_or_default();
+    Ok((status, out, err))
+}
+
 /// Run `hf` with `args` and parse its JSON output.
 fn hf_json<T: DeserializeOwned>(args: &[String]) -> Result<T, String> {
-    let out = hf().args(args).output().map_err(hf_missing)?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let mut cmd = hf();
+    cmd.args(args);
+    let (status, stdout, stderr) = run_bounded(cmd, HF_QUERY_TIMEOUT)?;
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr);
         let line = err
             .lines()
             .rev()
@@ -108,7 +174,7 @@ fn hf_json<T: DeserializeOwned>(args: &[String]) -> Result<T, String> {
             .unwrap_or("no details");
         return Err(format!("Hugging Face search failed: {}", line.trim()));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("Unexpected Hugging Face output: {e}"))
+    serde_json::from_slice(&stdout).map_err(|e| format!("Unexpected Hugging Face output: {e}"))
 }
 
 /// `hf models list` arguments: the most downloaded `format` (MLX or GGUF) models matching `query`.
@@ -301,19 +367,28 @@ pub struct CachedModel {
     bytes: u64,
 }
 
-/// The hub cache `hf` uses: `HF_HUB_CACHE`, else `HF_HOME/hub`, else `~/.cache/huggingface/hub`.
-fn hub_cache() -> Option<std::path::PathBuf> {
-    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-    if let Some(dir) = var("HF_HUB_CACHE") {
+/// The hub cache `hf` uses: `HF_HUB_CACHE`, else `HF_HOME/hub`, else `$XDG_CACHE_HOME` /
+/// `$HOME/.cache` / `%USERPROFILE%\.cache` + `huggingface/hub`.
+fn hub_cache_from(mut var: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let mut get = |k: &str| var(k).filter(|v| !v.is_empty());
+    if let Some(dir) = get("HF_HUB_CACHE") {
         return Some(dir.into());
     }
-    if let Some(home) = var("HF_HOME") {
+    if let Some(home) = get("HF_HOME") {
         return Some(std::path::PathBuf::from(home).join("hub"));
     }
-    var("XDG_CACHE_HOME")
+    get("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| var("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .or_else(|| {
+            get("HOME")
+                .or_else(|| get("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+        })
         .map(|c| c.join("huggingface").join("hub"))
+}
+
+fn hub_cache() -> Option<std::path::PathBuf> {
+    hub_cache_from(|k| std::env::var_os(k))
 }
 
 /// Model repos in `cache` (`models--owner--name` folders), largest first. Sizes count the
@@ -546,6 +621,37 @@ mod tests {
         assert_eq!(left, ["org/Other"]);
     }
 
+    #[test]
+    fn hub_cache_falls_back_to_windows_userprofile() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("USERPROFILE", std::ffi::OsString::from("C:\\Users\\alice"));
+        let path = hub_cache_from(|k| env.get(k).cloned()).unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("C:\\Users\\alice")
+                .join(".cache")
+                .join("huggingface")
+                .join("hub")
+        );
+        env.insert("HOME", std::ffi::OsString::from("/home/alice"));
+        let path = hub_cache_from(|k| env.get(k).cloned()).unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/alice")
+                .join(".cache")
+                .join("huggingface")
+                .join("hub")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_kills_a_hanging_command_on_timeout() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("10");
+        let err = run_bounded(cmd, Duration::from_millis(120)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
     /// Lists the real cache: `cargo test -- --ignored real_hub_cache_has_models --nocapture`.
     #[test]
     #[ignore]
