@@ -1,6 +1,5 @@
-// Backgrounds behind the conversation: built-in artwork, painted on a canvas at the pane's own
-// resolution (no image files, sharp at any size), or the user's own image. The choice is a
-// preference of this computer, kept in local storage.
+// Artwork behind the conversation: built-in canvas presets or the user's own image.
+// The choice is a preference of this computer, kept in local storage.
 
 import { computed, reactive, ref, watch } from "vue";
 import { lighthouse, traceRoute } from "./asciiBackgrounds";
@@ -8,6 +7,7 @@ import { crabBeach } from "./crabBeach";
 import { cloudprint } from "./cloudprint";
 import { orbitalEarth } from "./orbitalEarth";
 import { koiPond } from "./koiPond";
+import { lanternWatch, prepareLanternWatch } from "./lanternWatch";
 import { files, showToast } from "./bridge";
 
 /**
@@ -41,7 +41,7 @@ export interface BackgroundPrefs {
 }
 
 export const MAX_DIM = 0.9;
-export const DEFAULT_PREFS: BackgroundPrefs = { id: "warp", path: null, dim: 0.62, placement: "empty", motion: true };
+export const DEFAULT_PREFS: BackgroundPrefs = { id: "lantern-watch", path: null, dim: 0.62, placement: "always", motion: true };
 const STORAGE_KEY = "dial.background";
 
 // ---------------------------------------------------------------------------------------------
@@ -265,6 +265,7 @@ export const PRESETS: Preset[] = [
   { id: "crab-beach", name: "Crab Beach", paint: crabBeach, moving: true },
   { id: "cloudprint", name: "Cloudprint", paint: cloudprint, moving: true },
   { id: "orbital-earth", name: "Orbital Earth", paint: orbitalEarth, moving: true },
+  { id: "lantern-watch", name: "Lantern Watch", paint: lanternWatch, prepare: prepareLanternWatch, moving: true },
 ];
 
 // ---------------------------------------------------------------------------------------------
