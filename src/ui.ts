@@ -10,6 +10,7 @@ export type SettingsTab =
   | ""
   | "updates"
   | "library"
+  | "providers"
   | "roles"
   | "images"
   | "appearance"

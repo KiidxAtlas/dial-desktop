@@ -14,6 +14,7 @@ import UpdatesSettings from "./UpdatesSettings.vue";
 import NotificationSettings from "./NotificationSettings.vue";
 import TypeSettings from "./TypeSettings.vue";
 import ModelLibrary from "./ModelLibrary.vue";
+import ProviderSettings from "./ProviderSettings.vue";
 import RolesPresets from "./RolesPresets.vue";
 import ImageSettings from "./ImageSettings.vue";
 import ProjectTools, { PROJECT_TABS, type ProjectTab } from "./ProjectTools.vue";
@@ -25,7 +26,7 @@ import SSegmented from "./settings/SSegmented.vue";
 import "./settings/settings.css";
 
 type IconName = keyof typeof PATHS;
-type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "library" | "roles" | "images" | ProjectTab;
+type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "library" | "providers" | "roles" | "images" | ProjectTab;
 /** A desktop page, or `engine:<tab>` for one of the engine's tabs. */
 type PageId = DesktopPage | `engine:${string}`;
 
@@ -66,6 +67,7 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
   {
     title: "Models",
     pages: [
+      { id: "providers", label: "Providers", icon: "globe", about: "Sign in to a model provider or configure an API key.", words: "login account authentication credentials hosted setup" },
       { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "download hugging face local delete" },
       { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "role preset profile embedding" },
       { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "image picture flux diffusion steps seed lora size quality mlx serve stable" },
@@ -374,6 +376,7 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           <AppearanceSettings v-if="current === 'appearance'" />
           <NotificationSettings v-else-if="current === 'notifications'" />
           <TypeSettings v-else-if="current === 'types'" />
+          <ProviderSettings v-else-if="current === 'providers'" :key="snap.workspace.root" :snap="snap" />
           <UpdatesSettings v-else />
         </SPage>
 

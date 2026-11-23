@@ -374,7 +374,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         <span class="avatar">{{ snap.workspace.name.slice(0, 1).toUpperCase() }}</span>
         <span class="project-text">
           <span class="truncate name">{{ snap.workspace.name }}</span>
-          <span class="truncate state" :class="status.tone"><i />{{ status.text }}</span>
+          <span class="truncate state" :class="status.tone" :title="status.text"><i />{{ status.text }}</span>
         </span>
         <Icon name="chevronDown" :size="13" />
       </button>
@@ -394,6 +394,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       >
         <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}
       </button>
+      <button
+        v-if="(snap.connection.state === 'failed' && snap.connection.problem === 'other') || (snap.connection.state === 'live' && !(snap.model?.modelId || snap.connection.model))"
+        class="btn btn-secondary retry"
+        @click="ui.settingsTab = 'providers'; ui.settingsOpen = true"
+      >Set up a provider</button>
       <button v-if="status.retry" class="btn btn-secondary retry" @click="engine.reconnect()">
         <Icon name="refresh" :size="13" /> Reconnect
       </button>

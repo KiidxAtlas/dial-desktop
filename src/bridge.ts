@@ -1,7 +1,7 @@
 // The only place the UI talks to the Rust side.
 
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { downloadDir } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -502,6 +502,10 @@ export type AgentBrowserEvent =
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
 export const terminalApi = {
   open: (cols: number, rows: number) => invoke<number>("terminal_open", { cols, rows }),
+  openProviderSetup(workspaceRoot: string, cols: number, rows: number, handler: (event: TerminalEvent) => void) {
+    const output = new Channel<TerminalEvent>(handler);
+    return invoke<number>("provider_setup_open", { workspaceRoot, cols, rows, output });
+  },
   write: (id: number, data: string) => invoke<void>("terminal_write", { id, data }),
   resize: (id: number, cols: number, rows: number) => invoke<void>("terminal_resize", { id, cols, rows }),
   close: (id: number) => invoke<void>("terminal_close", { id }),

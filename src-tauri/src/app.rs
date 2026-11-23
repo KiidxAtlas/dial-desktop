@@ -1531,6 +1531,30 @@ async fn search_files(
         .map_err(|error| error.to_string())?
 }
 
+/// Provider setup has its own PTY: it must not depend on RPC or type into the user's shell.
+#[tauri::command]
+fn provider_setup_open(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    cols: u16,
+    rows: u16,
+    output: tauri::ipc::Channel<terminal::TerminalEvent>,
+) -> Result<u32, String> {
+    let program = engine_program(&shared)?;
+    let inner = shared.lock();
+    let workspace = inner.workspace.as_ref().ok_or("Open a folder first")?;
+    if workspace.root != workspace_root {
+        return Err("The open folder changed".into());
+    }
+    let mut command = portable_pty::CommandBuilder::new(program);
+    command.arg("/providers");
+    command.cwd(&workspace.root);
+    command.env("TERM", "xterm-256color");
+    shared.terminals().open(command, cols, rows, move |event| {
+        let _ = output.send(event);
+    })
+}
+
 /// Start a shell in the workspace; its output follows as `terminal` events.
 #[tauri::command]
 fn terminal_open(
@@ -1670,6 +1694,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             file_diff,
             search_files,
             terminal_open,
+            provider_setup_open,
             terminal_write,
             terminal_resize,
             terminal_close,

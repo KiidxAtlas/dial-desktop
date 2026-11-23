@@ -63,6 +63,8 @@ after adding one outside Desktop. You can also confirm removal of an unused mode
 If Desktop cannot load its initial state, **Reconnect** retries the UI connection without
 resending a prompt. **Copy error** copies the diagnostic for troubleshooting.
 
+Open **Settings › Providers › Open provider setup** to sign in or add an API key. This opens the engine's interactive Providers panel inside Desktop without using the chat or requiring an RPC connection. On first launch, choose **Hosted provider**. Save a model, close setup, then choose **Reconnect**. If an older engine exits before `ready`, the sidebar also links to setup; a handshake failure alone does not mean your credentials are wrong.
+
 ## Updates
 
 The app and the Dial engine update separately, and nothing installs until the user asks

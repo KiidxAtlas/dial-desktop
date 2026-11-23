@@ -221,6 +221,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         <div v-if="snap.connection.state === 'live'" class="filters" role="group" aria-label="Session settings">
           <button :aria-pressed="!modesPage" @click="modesPage = false; nextTick(() => search?.focus())">Model</button>
           <button :aria-pressed="modesPage" @click="showModes">Session modes</button>
+          <button @click="close(false); ui.settingsTab = 'providers'; ui.settingsOpen = true">Set up a provider…</button>
         </div>
         <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
         <template v-else>
