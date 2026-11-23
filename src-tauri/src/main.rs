@@ -1,5 +1,5 @@
-// No console window behind the app in Windows release builds.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Explorer launches should open only the Desktop window, including for debug builds.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use dial_desktop::app::{self, Source};
 use dial_desktop::cli::{self, USAGE};

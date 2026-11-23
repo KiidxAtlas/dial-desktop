@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn commands_map_to_documented_wire_requests() {
     let (purpose, method, params) = Command::Send {
+        type_context: None,
         text: "hi".into(),
         images: vec![],
         inline_images: vec![],
@@ -16,6 +17,7 @@ fn commands_map_to_documented_wire_requests() {
     );
 
     let (_, _, params) = Command::Send {
+        type_context: None,
         text: "  \n".into(),
         images: vec!["/tmp/a.png".into()],
         inline_images: vec!["iVBORw==".into()],
@@ -29,6 +31,7 @@ fn commands_map_to_documented_wire_requests() {
     assert_eq!(params["inline_images"], json!(["iVBORw=="]));
 
     let (_, _, params) = Command::Send {
+        type_context: None,
         text: "Only describe the layout.".into(),
         images: vec!["/tmp/a.png".into()],
         inline_images: vec![],
@@ -172,4 +175,77 @@ fn presets_do_not_write_to_a_changed_session_or_continue_after_model_failure() {
     }, "target", json!({}), main());
     assert_eq!(rejected, Err("Unknown model".into()));
     assert_eq!(calls, ["get_session_stats", "set_setting", "apply_settings", "set_model"]);
+}
+
+#[test]
+fn a_type_context_an_older_engine_cannot_take_is_framed_in_the_text() {
+    let briefing = "<type-context>\nBoard.\n</type-context>";
+    let (_, _, params) = Command::Send {
+        text: "make it warmer".into(),
+        images: vec![],
+        inline_images: vec![],
+        type_context: Some(TypeScope::Framed(TypeContext {
+            id: "inspiration".into(),
+            briefing: briefing.into(),
+        })),
+    }
+    .request();
+    assert_eq!(params["text"], format!("[[type:inspiration]]\n{briefing}\nmake it warmer"));
+    assert!(params.get("type_context").is_none());
+}
+
+#[test]
+fn a_modern_plain_turn_sends_null_and_keeps_an_exact_legacy_literal_as_typed() {
+    // Ordinary modern turn: its multiline text is exactly the old framing shape, and it must reach the engine intact.
+    let literal = "[[type:notes]]\n<type-context>\nlooks like framing\n</type-context>\nliteral";
+    let (_, _, params) = Command::Send {
+        text: literal.into(),
+        images: vec![],
+        inline_images: vec![],
+        type_context: Some(TypeScope::Plain),
+    }
+    .request();
+    assert_eq!(params["text"], literal);
+    assert_eq!(params["type_context"], Value::Null);
+}
+
+#[test]
+fn an_engine_that_predates_the_field_gets_no_type_key_for_a_plain_turn() {
+    let (_, _, params) = Command::Send {
+        text: "hi".into(),
+        images: vec![],
+        inline_images: vec![],
+        type_context: None,
+    }
+    .request();
+    assert_eq!(params["text"], "hi");
+    assert!(params.get("type_context").is_none());
+}
+#[test]
+fn a_structured_type_context_rides_beside_the_unchanged_text() {
+    let briefing = "<type-context>\nBoard.\n</type-context>";
+    let (purpose, method, params) = Command::Send {
+        text: "make it warmer".into(),
+        images: vec![],
+        inline_images: vec![],
+        type_context: Some(TypeScope::Typed(TypeContext {
+            id: "inspiration".into(),
+            briefing: briefing.into(),
+        })),
+    }
+    .request();
+    assert_eq!((purpose, method), (Purpose::Turn, "send"));
+    assert_eq!(params["text"], "make it warmer");
+    assert_eq!(
+        params["type_context"],
+        json!({"id": "inspiration", "briefing": briefing})
+    );
+    let (_, _, plain) = Command::Send {
+        text: "hi".into(),
+        images: vec![],
+        inline_images: vec![],
+        type_context: None,
+    }
+    .request();
+    assert!(plain.get("type_context").is_none(), "a plain prompt names no Type");
 }

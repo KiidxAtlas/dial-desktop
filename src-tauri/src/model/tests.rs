@@ -49,6 +49,7 @@ fn respond(model: &mut Model, id: RequestId, method: &str, result: Value) -> Vec
 
 fn prompt(text: &str, images: usize) -> Command {
     Command::Send {
+        type_context: None,
         text: text.into(),
         images: vec!["/tmp/shot.png".into(); images],
         inline_images: vec![],
@@ -70,6 +71,29 @@ fn a_prompt_with_images_shows_their_count() {
 }
 
 #[test]
+fn a_type_turn_shows_the_users_own_words_and_a_literal_marker_stays() {
+    let briefing = "<type-context>\nBoard.\n</type-context>";
+    for text in ["make it warmer", "[[type:notes]] is literal text"] {
+        let mut model = Model::starting();
+        model.apply(Update::Connected(Box::new(ready("s1"))));
+        let command = Command::Send {
+            text: text.into(),
+            images: vec![],
+            inline_images: vec![],
+            type_context: Some(crate::engine::TypeScope::Framed(crate::engine::TypeContext {
+                id: "inspiration".into(),
+                briefing: briefing.into(),
+            })),
+        };
+        requested(&mut model, command, 1);
+        match model.conversation.entries() {
+            [Entry::User(user)] => assert_eq!(user.text, text),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
 fn connecting_goes_live_and_asks_for_sessions() {
     let mut model = Model::starting();
     assert_eq!(model.connection(), &Connection::Starting);
@@ -77,7 +101,7 @@ fn connecting_goes_live_and_asks_for_sessions() {
     let follow = model.apply(Update::Connected(Box::new(ready("s1"))));
     assert_eq!(
         follow,
-        vec![Command::ListSessions, Command::State, Command::ListModels]
+        vec![Command::ListSessions, Command::State, Command::DiscoverModels]
     );
     assert!(
         matches!(model.connection(), Connection::Live { model, .. } if model == "claude-sonnet")
@@ -484,7 +508,7 @@ fn state_and_models_load_the_model_controls() {
     assert!(current.thinking_settable);
     assert_eq!(model.approval.as_deref(), Some("ask"));
 
-    let (models, _) = requested(&mut model, Command::ListModels, 2);
+    let (models, _) = requested(&mut model, Command::DiscoverModels, 2);
     respond(
         &mut model,
         models,
@@ -532,6 +556,20 @@ fn discovering_models_asks_for_a_refresh_and_replaces_the_list() {
     assert!(model.models_changed);
     assert_eq!(model.models.len(), 2);
     assert!(model.models.iter().all(|m| m.listed && !m.catalog_only));
+}
+
+#[test]
+fn automatic_scans_are_live_only_and_coalesced_until_the_next_interval() {
+    let mut model = Model::starting();
+    let interval = Duration::from_secs(60);
+    assert!(model.discover_if_due(Instant::now(), interval).is_none());
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let first = model.last_discovery.unwrap();
+    assert!(model.discover_if_due(first + interval, Duration::ZERO).is_none());
+    let (id, _) = requested(&mut model, Command::DiscoverModels, 1);
+    respond(&mut model, id, "list_models", json!({"models": []}));
+    assert!(model.discover_if_due(first, interval).is_none());
+    assert_eq!(model.discover_if_due(first + interval, interval), Some(Command::DiscoverModels));
 }
 
 #[test]
@@ -857,4 +895,18 @@ fn first_line_clips_by_characters() {
     assert_eq!(first_line("  héllo\nworld", 10), "héllo");
     assert_eq!(first_line("abcdef", 4), "abc…");
     assert_eq!(first_line("", 4), "");
+}
+
+#[test]
+fn the_structured_type_context_is_negotiated_from_ready_features_on_every_connection() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    assert!(!model.type_context_supported, "an engine without the feature gets the legacy framing");
+    // A reconnect to an upgraded engine re-negotiates; the flag follows the latest ready frame.
+    let mut upgraded = ready("s2");
+    upgraded.raw["features"] = json!({"type_context": true});
+    model.apply(Update::Connected(Box::new(upgraded)));
+    assert!(model.type_context_supported);
+    model.apply(Update::Connected(Box::new(ready("s3"))));
+    assert!(!model.type_context_supported);
 }

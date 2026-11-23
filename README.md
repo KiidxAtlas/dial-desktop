@@ -60,10 +60,14 @@ detects on disk, open the composer’s model picker and choose **Downloaded**. M
 the source, folder and size. Use **Get models…** to download a library model, or reload the list
 after adding one outside Desktop. You can also confirm removal of an unused model from a supported store.
 
+Desktop scans connected providers when it connects and about every five minutes while a project is open. Returning to Desktop or opening the model picker also checks for updates if the last scan was at least a minute ago. Sign-ins saved by the CLI are picked up from the same Dial home; you don’t need to run `/models` or change your current model.
+
 If Desktop cannot load its initial state, **Reconnect** retries the UI connection without
 resending a prompt. **Copy error** copies the diagnostic for troubleshooting.
 
-Open **Settings › Providers › Open provider setup** to sign in or add an API key. This opens the engine's interactive Providers panel inside Desktop without using the chat or requiring an RPC connection. On first launch, choose **Hosted provider**. Save a model, close setup, then choose **Reconnect**. If an older engine exits before `ready`, the sidebar also links to setup; a handshake failure alone does not mean your credentials are wrong.
+Open **Settings › Providers** to sign in to a subscription or save a provider API key. Complete browser authorization if prompted; enter keys and codes in the Settings form, not in chat. Desktop refreshes the model picker after setup without switching your active model. If the engine is missing or too old to offer provider setup, install or update it in **Settings › Updates**.
+
+Choose **Remove key** to forget that endpoint’s saved API key on this computer across all projects. This does not sign you out of a subscription, change environment variables, or revoke the key at its issuer. Engines that can save keys but cannot remove them still offer **Add key** and **Replace key**. Desktop checks the engine’s `can_remove` capability rather than its version and never reads its credential store directly.
 
 ## Updates
 
@@ -75,12 +79,13 @@ The app and the Dial engine update separately, and nothing installs until the us
   only bundles signed with the key in `src-tauri/tauri.release.conf.json` (`plugins.updater.pubkey`).
   Builds without that config (development, local `npm run build`) do not update themselves. On Linux only
   the AppImage self-updates; the `.deb` updates through its package manager.
-- **The engine** is the user's own `dial`, found on `PATH` or in the usual install directories,
-  never bundled. The app asks it `dial update --check --json` and updates it with `dial update`,
-  which updates it however it was installed (signed release, Homebrew, Cargo, a checkout) and
-  rolls back on failure; then it reconnects. If no engine is found, the app offers to run Dial's
-  signed installer (`curl -fsSL https://dial.rootatlas.dev/install | sh`, or `install.ps1` on
-  Windows). An engine whose RPC protocol the app does not speak shows **Update Dial engine**.
+- **The engine** is not bundled. Desktop checks the selected `dial` and uses its own updater
+  for signed releases, Homebrew, Cargo or source checkouts. If the engine is missing or a
+  newer release is available for an externally managed install, choose **Install Desktop copy**
+  in Settings. This runs Dial's signed release installer in a separate Desktop folder without
+  replacing the original engine. Desktop prefers that copy on future launches unless you set
+  `--dial` or `DIAL_BIN`. On Windows the installer also adds that folder to the user PATH.
+  Running sessions can reconnect when idle to use the new engine.
 - **CLI only**: people who do not want the app install the engine alone with the same one-line
   installer from <https://dial.rootatlas.dev/install?cli>.
 
@@ -91,6 +96,13 @@ Push a tag `vX.Y.Z` matching the version in `package.json`, `src-tauri/tauri.con
 Windows and Linux with `--config src-tauri/tauri.release.conf.json` (which adds updater
 artifacts), uploads them and `latest.json` into a draft release, publishes it once every platform
 succeeds, and asks the website to refresh its download links.
+
+Before tagging, smoke-test the candidate from the app icon in a clean OS account, with no
+`dial` or `hf` on PATH. Open a project, install the engine, connect a test provider or download
+a local model, and send a prompt with a screenshot. Edit and resend that prompt; confirm the
+image is still attached. Create and remove a read-only schedule. Using a signed update fixture,
+interrupt a download, retry in Settings, and verify a running turn finishes before restart.
+No step should require opening a shell or copying a command.
 
 One-time repository setup:
 
@@ -147,6 +159,7 @@ continues. Local builds without the release config do not contact Azure.
   Search for a **Task recipe** by name (for example, **Review my changes** or **Fix a failing
   test**) to add an editable prompt to the current draft. The same recipes are available on an
   empty conversation. They preserve existing draft content and attachments and never send on their own.
+- **File attachments:** paste copied files into the composer, drop them onto the chat, or use **Attach files**. A prompt can carry up to 10 files, 64 MiB each, including PDFs and files without an extension. On send, documents are copied into a new `.dial-attachments-*` directory in the open project. It contains its own Git ignore rule. Dial can read these copies with its normal tools; what it can extract depends on the file format and installed readers. Keep the directory for follow-ups or delete it when it is no longer needed.
 - **Appearance** (Settings → Appearance): light, dark or the system's theme, and the zoom level.
   Saved on this computer. A pane over background artwork keeps the dark palette so text stays
   readable on the art.
@@ -158,7 +171,7 @@ continues. Local builds without the release config do not contact Azure.
   is written with `set_setting` and applied to the running session (`apply_settings`) at once, or
   when the running turn ends. Settings marked "Restart" take effect the next time Dial starts.
   Credentials are never shown and cannot be edited here.
-- **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (read straight from disk, honoring `HF_HUB_CACHE` and `HF_HOME`; no CLI needed). **Search Hugging Face** finds any MLX or GGUF model on the Hub, most downloaded first; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. A few suggested models follow, pinned to tested revisions. Every download is confirmed with its size first and uses the official Hugging Face CLI (`hf` on PATH, also used for search) and its normal cache. You can leave Settings while downloading, return to see the outcome, or cancel. Downloading does not select a model or install an inference runtime.
+- **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (honoring `HF_HUB_CACHE` and `HF_HOME`). **Browse Hugging Face** finds MLX and GGUF models; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. Suggested models are pinned to tested revisions. Each download asks for confirmation with its size. If the official Hugging Face helper is missing, Desktop offers to download it and a private Python runtime into its app data, then continues the selected download. **Set up model downloads** also lets you do this after a search error. No terminal, administrator access or restart is needed. You can leave Settings while a model downloads, return to see the outcome, or cancel. Downloading does not select a session model or install an inference runtime.
 - **Backgrounds** (Settings → Background): artwork behind your sessions, drawn by the app at the
   window's resolution. Choose still artwork (Warp or Dune), animated artwork
   (Fireflies, Trace Route, Koi Pond, Crab Beach, Cloudprint, or Orbital Earth), or your own image. Over a
@@ -201,7 +214,9 @@ continues. Local builds without the release config do not contact Azure.
   change restarts an idle session into itself; a running turn finishes first. Engines older than
   the flag start without the guidance, so cards and diagrams then appear only when asked for.
   Hover a message to copy it (the last answer keeps its copy button in view); the last prompt also
-  offers undo, and edit (undo, then put the prompt back in the box). A failed turn offers Retry.
+  offers undo, and edit (undo, then restore the draft). Editing the most recent local submission
+  restores its attachments when Desktop can identify the original row. For replayed image turns,
+  Desktop warns before a text-only edit so you can cancel without losing the turn. A failed turn offers Retry.
   Scrolling up stops following new output, and a button jumps back to the latest.
   Use the search button or <kbd>⌘/Ctrl</kbd>+<kbd>F</kbd> to find matching messages;
   <kbd>Enter</kbd> and <kbd>Shift</kbd>+<kbd>Enter</kbd> cycle through them.
@@ -227,11 +242,7 @@ continues. Local builds without the release config do not contact Azure.
   questions, and ended turns while Dial is unfocused. Click it to return to the session while Dial
   is running. Alerts do not show prompts, session names, or project names. macOS uses the installed
   app bundle; Linux needs a notification daemon with action support for click-through.
-- **Images**: paste screenshots or copied images directly into the prompt (⌘V / Ctrl+V), or use
-  the image button or drop files on the window. On macOS the image button also offers **Paste image from clipboard** if the system does not deliver a paste event. Supports PNG, JPEG, GIF and WebP (up to 10 images,
-  64 MiB each); macOS clipboard TIFF images are converted to PNG when needed. Pasted images are
-  saved in private files so both pasted and chosen images travel by path. The button is disabled when the model is known not to take
-  images. Relative Markdown image links in replies preview supported images inside the open project.
+- **Images**: pasted screenshots and supported image files (PNG, JPEG, GIF, WebP) can be sent as vision inputs. On macOS, the attach menu also offers native clipboard image paste and can convert TIFF screenshots to PNG. Relative Markdown image links in replies preview supported images inside the open project.
 - **Side panel** (drag its left edge to resize; the width is remembered per kind of panel):
   - **Plan** and **Changes** are always named. The panel menu opens **Files**, **Terminal**, **Browser**, **App**, and **Activity** (recent tool calls).
   - **App**: Dial defaults to a private Windows guest on Windows and a private Linux guest on Linux. The [packaged QEMU runtime](docs/app-runtime-packaging.md) tries Windows Hypervisor Platform (WHPX) or Linux KVM first; it still needs an imported guest disk. On Apple Silicon, [prepare and import a virtual Mac](packaging/macos-guest/prepare/README.md) to use the native macOS default. You can still explicitly select a different guest, including an existing unlabelled QEMU disk. Dial never downloads an OS or runs the project on the host as a fallback.
@@ -295,7 +306,7 @@ Not yet: images in question answers, agent screenshots of the browser outside ma
 | `src-tauri/src/files.rs` | Project files for the Files and Changes panels: listing, reading, `git diff`, all confined to the project |
 | `src-tauri/src/terminal.rs` | PTY shells for the Terminal panel (`terminal` events) |
 | `src-tauri/src/preview.rs` | Built-in session fed through the real `Conversation` reducer, for design work |
-| `src-tauri/src/attachments.rs` | Checks image attachments and reads their thumbnails |
+| `src-tauri/src/attachments.rs` | Image previews, native clipboard files and workspace copies for document attachments |
 | `src-tauri/src/cli.rs`, `time.rs` | Command-line options; session timestamps and relative labels |
 | `src/bridge.ts` | The only UI code that talks to Rust (`invoke`, events, toasts) |
 | `src/types.ts` | TypeScript mirror of `view.rs` and `settings.rs` |
@@ -306,7 +317,7 @@ Not yet: images in question answers, agent screenshots of the browser outside ma
 | `src/workspace.ts` | Side panel widths, live-preview detection, handing files and pages to the prompt |
 | `src/backgrounds.ts` | Background artwork painters (still and animated), the saved preference, the user's image |
 | `src/markdown.ts` | markdown-it rendering and Shiki highlighting (JavaScript regex engine, no WebAssembly) |
-| `src/attachments.ts` | The draft's image attachments (picker, paste, drop) |
+| `src/attachments.ts` | The draft's file attachments (picker, paste, drop) |
 | `src/components/` | `Sidebar`, `TopBar`, `Timeline`, `ToolRow`, `Composer` (+ approvals, attachments, `ContextMeter`), `QuestionCard`, `Inspector` (+ `workspace/BrowserPane`, `FilesPane`, `DiffPane`, `TerminalPane`), `Settings` (+ `SettingRow`, `AppearanceSettings`, `BackgroundSettings`), `ContextMenu`, `Palette`, `Shortcuts`, `EmptyState`, `Toasts` |
 | `src/styles.css` | Design tokens (palette, spacing, radii, type) and shared styles |
 

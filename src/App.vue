@@ -234,6 +234,10 @@ function onKey(event: KeyboardEvent) {
   }
 }
 
+function scanOnReturn() {
+  if (opened.value?.connection.state === "live") void engine.discoverModels();
+}
+
 let stopFollowing: (() => void) | null = null;
 let stopFollowingApp: (() => void) | null = null;
 let stopFullscreen: (() => void) | null = null;
@@ -241,6 +245,7 @@ onMounted(async () => {
   window.addEventListener("keydown", onKey);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", hideHints);
+  window.addEventListener("focus", scanOnReturn);
   restoreImage();
   startUpdateChecks();
   void followFullscreen().then((stop) => (stopFullscreen = stop));
@@ -251,6 +256,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", hideHints);
+  window.removeEventListener("focus", scanOnReturn);
   fullscreenTimers.forEach(clearTimeout);
   stopFullscreen?.();
   stopFollowing?.();

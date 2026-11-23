@@ -97,6 +97,17 @@ pub fn import_shell_env() {
     }
 }
 
+/// Piping standard I/O does not prevent Windows from opening a separate console for a GUI's child.
+pub(crate) fn without_console(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Run `command` with no stdin and no controlling terminal, returning its stdout if it succeeds
 /// within `timeout`.
 ///
@@ -121,7 +132,7 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<
             });
         }
     }
-    let mut child = command
+    let mut child = without_console(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -155,13 +166,29 @@ pub fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// The engine binary: `explicit` (`--dial` or `DIAL_BIN`), else `dial` on `path`, else in a
-/// common install folder, else plain `dial` (the launch error then explains).
+pub const DIAL_NAME: &str = if cfg!(windows) { "dial.exe" } else { "dial" };
+pub const ENGINE_SELECTION: &str = "engine-selection";
+
+/// Only completed installations are selected; an interrupted install never shadows PATH.
+pub fn desktop_engine(app_dir: &Path) -> Option<PathBuf> {
+    let name = std::fs::read_to_string(app_dir.join(ENGINE_SELECTION)).ok()?;
+    if !name.starts_with("engine-") || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let binary = app_dir.join(name).join(DIAL_NAME);
+    binary.is_file().then_some(binary)
+}
+
+/// An explicit override wins, then the user's Desktop install, then PATH and the usual folders.
 pub fn find_dial(explicit: Option<OsString>, path: Option<&OsStr>, home: Option<&Path>) -> PathBuf {
     if let Some(explicit) = explicit.filter(|p| !p.is_empty()) {
         return PathBuf::from(explicit);
     }
-    let name = if cfg!(windows) { "dial.exe" } else { "dial" };
+    if let Some(installed) = app_dir(home).and_then(|dir| desktop_engine(&dir)) {
+        return installed;
+    }
+    let name = DIAL_NAME;
     let on_path = path.into_iter().flat_map(std::env::split_paths);
     let fallback = FALLBACK_DIRS
         .iter()
@@ -258,12 +285,17 @@ impl Recents {
                 std::fs::create_dir_all(dir)?;
             }
             let lock = std::fs::File::options()
-                .create(true).truncate(false).read(true).write(true)
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
                 .open(file.with_extension("lock"))?;
             lock.lock()?;
             Ok(lock)
         })();
-        let Ok(_lock) = lock else { return change(&mut self.paths) };
+        let Ok(_lock) = lock else {
+            return change(&mut self.paths);
+        };
         self.refresh();
         let changed = change(&mut self.paths);
         if changed {

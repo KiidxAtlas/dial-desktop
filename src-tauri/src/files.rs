@@ -191,7 +191,7 @@ pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
     }
     let rel = relative(root, &file);
     let git = |args: &[&str]| {
-        Command::new("git")
+        crate::launcher::without_console(&mut Command::new("git"))
             .arg("-C")
             .arg(root)
             .args(args)
@@ -288,7 +288,7 @@ pub fn search(root: &Path, query: &str, limit: usize) -> Result<Vec<String>, Str
 
 /// Tracked and non-ignored untracked files via `git ls-files`; `None` outside a Git work tree.
 fn git_files(root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = crate::launcher::without_console(&mut Command::new("git"))
         .arg("-C")
         .arg(root)
         .args([

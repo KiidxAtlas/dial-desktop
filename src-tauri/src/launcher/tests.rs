@@ -33,6 +33,7 @@ fn shell_env_fills_gaps_and_extends_path_without_overriding() {
     assert!(env_changes(&current, &[pair("PATH", "/bin")]).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn shell_probe_has_no_controlling_terminal() {
     // An interactive probe shell that shares the caller's terminal takes its foreground and
@@ -42,6 +43,24 @@ fn shell_probe_has_no_controlling_terminal() {
         SHELL_TIMEOUT,
     );
     assert_eq!(out.as_deref(), Some(&b"none\n"[..]));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_probe_captures_stdout_without_a_visible_console() {
+    let script = r#"
+Add-Type -Name Console -Namespace Probe -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hwnd);
+'@
+[Probe.Console]::IsWindowVisible([Probe.Console]::GetConsoleWindow())
+"#;
+    let out = run_with_timeout(
+        Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]),
+        Duration::from_secs(30),
+    )
+    .expect("probe returned its piped stdout");
+    assert_eq!(String::from_utf8(out).unwrap().trim(), "False");
 }
 
 #[test]
@@ -158,7 +177,10 @@ fn recents_forget_removes_a_folder_and_persists() {
 #[test]
 fn recents_merge_changes_from_independent_windows() {
     let file = std::env::temp_dir()
-        .join(format!("dial-desktop-recents-windows-{}", std::process::id()))
+        .join(format!(
+            "dial-desktop-recents-windows-{}",
+            std::process::id()
+        ))
         .join("recent.json");
     let mut first = Recents::load(Some(file.clone()));
     first.touch(Path::new("/old"));

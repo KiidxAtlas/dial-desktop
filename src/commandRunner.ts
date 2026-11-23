@@ -5,12 +5,13 @@
 
 import { ref } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { engine, showToast } from "./bridge";
+import { engine, showToast, snapshot, type TerminalTask } from "./bridge";
 import { applySaved, engineCall, loadModes, readable, setMode, setPlanMode, type EngineCommand } from "./engineTools";
 import { openSession, startRename } from "./sessionActions";
 import { editQueued, queueFor, removeQueued } from "./queue";
 import { showPanel } from "./workspace";
 import { ui, type SettingsTab } from "./ui";
+import { saveSchedule, typedSchedule } from "./schedules";
 import type { OpenSnapshot } from "./types";
 
 // ── The command panel ─────────────────────────────────────────────────────────
@@ -40,10 +41,11 @@ async function call(
   method: string,
   params: Record<string, unknown> = {},
   render?: (reply: any) => Partial<CommandResult> | null,
+  root?: string,
 ) {
   showResult({ title, busy: true });
   try {
-    const reply = await engineCall<any>(method, params);
+    const reply = await engineCall<any>(method, params, root);
     if (commandResult.value?.title !== title) return reply;
     const shown = render ? render(reply) : { text: describe(reply) };
     if (shown === null) commandResult.value = null;
@@ -92,21 +94,21 @@ function textOf(reply: any): string {
 
 // ── The Terminal panel ────────────────────────────────────────────────────────
 
-/** A line for the Terminal panel's shell to run; `n` changes for every request. */
-export const terminalRequest = ref<{ line: string; n: number } | null>(null);
-let requests = 0;
+/** A slash command for a dedicated engine PTY, never input to the user's shell. */
+export const terminalRequest = ref<{ task: TerminalTask; root: string } | null>(null);
 
-/** Quote for a POSIX shell. */
-export function shellQuote(text: string) {
-  return `'${text.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Run a slash command in the real terminal UI, in the Terminal panel (a new session there). */
-export function runInTerminal(command: string) {
-  terminalRequest.value = { line: `dial ${shellQuote(command.trim())}`, n: ++requests };
+export function openTaskTerminal(task: TerminalTask, root: string) {
+  if (terminalRequest.value) return showToast("A command is already opening");
+  terminalRequest.value = { task, root };
+  ui.settingsOpen = false;
   ui.inspectorOpen = true;
   showPanel("terminal");
-  showToast(`Running ${command.split(/\s/)[0]} in the terminal panel`);
+}
+
+export function runInTerminal(command: string) {
+  const root = snapshot.value?.workspace?.root;
+  if (!root) return showToast("Open a project first");
+  openTaskTerminal({ kind: "slash", command: command.trim() }, root);
 }
 
 // ── Arguments ─────────────────────────────────────────────────────────────────
@@ -544,16 +546,25 @@ const HANDLERS: Record<string, Handler> = {
   },
   "add-dir": ({ rest }) => (rest.trim() ? call("Add folder", "add_dir", { path: rest.trim() }, (r) => ({ text: r.changed ? `Added ${r.path}.` : `${r.path} was already in this session.` })) : settingsAt("folders")),
   "remove-dir": ({ rest }) => (rest.trim() ? call("Remove folder", "remove_dir", { path: rest.trim() }, (r) => ({ text: r.changed ? `Removed ${r.path}.` : `${r.path} was not added.` })) : settingsAt("folders")),
-  schedule: async ({ args }) => {
+  schedule: async ({ snap, args, rest }) => {
     const [action = "list", id] = args;
     if (action === "list") return call("Schedules", "list_schedules");
     if (action === "status") return call("Scheduler", "schedule_status");
     if (action === "remove") {
       if (!id) return usage("schedule", "remove <id>");
       if (!(await confirm(`Remove the schedule ${id}?`, "Remove schedule", "Remove"))) return;
-      return call("Schedules", "remove_schedule", { id, confirm: true }, () => ({ text: `Removed ${id}.` }));
+      return call("Schedules", "remove_schedule", { id, confirm: true }, () => ({ text: `Removed ${id}.` }), snap.workspace.root);
     }
-    runInTerminal(`/schedule ${args.join(" ")}`);
+    if (action === "add" && args.length === 1) return settingsAt("schedules");
+    if (action === "add") {
+      const saved = await saveSchedule(typedSchedule(args.slice(1)), snap.workspace.root,
+        summary => confirm(summary, "Save schedule", "Save"),
+        request => engineCall("add_schedule", request, snap.workspace.root));
+      if (saved) { settingsAt("schedules"); showToast("Schedule saved"); }
+      return;
+    }
+    if (action === "run" && !(await confirm(`Run due schedules in ${snap.workspace.root} with their saved tool approvals?`, "Run schedules", "Run"))) return;
+    openTaskTerminal({ kind: "slash", command: `/schedule ${rest}` }, snap.workspace.root);
   },
   extensions: ({ args }) => (args[0] === "skills" ? settingsAt("skills") : settingsAt("extensions")),
 
@@ -595,7 +606,7 @@ const HANDLERS: Record<string, Handler> = {
     })();
   },
   reload: () => applySaved().then(() => showToast("Settings reloaded")).catch((e) => showToast(readable(e))),
-  login: ({ rest }) => runInTerminal(`/login ${rest}`),
+  login: () => settingsAt("providers"),
   logout: async ({ args }) => {
     if (!args[0]) return usage("logout", "<provider>");
     if (!(await confirm(`Sign out of ${args[0]}?`, "Sign out", "Sign out"))) return;
@@ -625,7 +636,7 @@ const HANDLERS: Record<string, Handler> = {
 };
 
 /** Desktop-only names the engine lists as terminal-only but the desktop shows its own way. */
-const DESKTOP_TERMINAL = new Set(["changes", "tree", "modelpreset"]);
+const DESKTOP_TERMINAL = new Set(["changes", "tree", "modelpreset", "login", "schedule"]);
 
 /** Whether `name` has an argument-aware desktop handler. */
 export function hasHandler(name: string) {

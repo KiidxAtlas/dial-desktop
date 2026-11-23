@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Updates arriving within one frame are published together.
@@ -69,8 +69,8 @@ struct Shared {
     wake: Mutex<Sender<()>>,
     /// The Terminal panel's shells, all running in the open workspace.
     terminals: Mutex<Terminals>,
-    /// The engine installed from the app after none was found; used instead of the launch
-    /// choice from then on.
+    provider_setup: Mutex<Option<ProviderSetup>>,
+    /// A signed release selected during this run, ahead of the initial launch choice.
     installed: Mutex<Option<PathBuf>>,
     /// The snapshot the UI has, so each `snapshot` event carries only what changed.
     published: Mutex<Published>,
@@ -112,6 +112,7 @@ impl Shared {
     ) -> Result<Option<String>, String> {
         let workspace = self.workspace(path);
         let mut inner = self.lock();
+        inner.tabs.allow_work()?;
         let current = inner.workspace.as_ref().map(|w| w.root.as_str());
         if current == Some(workspace.root.as_str()) {
             return Ok(None);
@@ -143,6 +144,7 @@ impl Shared {
 
     fn reconnect(&self) -> Result<(), String> {
         let mut inner = self.lock();
+        inner.tabs.allow_work()?;
         let root = inner
             .workspace
             .as_ref()
@@ -313,11 +315,28 @@ fn publish(app: &AppHandle) {
             }
             messages.extend(tab.model.toast.take());
         }
+        // Setup owns a separate RPC connection. Its prompts never enter a chat transcript.
+        if let Some(setup) = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            for update in setup.engine.drain() {
+                use engine::Update;
+                use dial_client::Message;
+                let event = match update {
+                    Update::Message(Message::Event(e)) if matches!(e.kind.as_str(), "auth_url" | "auth_progress" | "auth_prompt") => e.body,
+                    Update::ConnectFailed(error) => serde_json::json!({"event":"failed", "message":error}),
+                    Update::Message(Message::Disconnected { .. }) => serde_json::json!({"event":"failed", "message":"Provider setup disconnected."}),
+                    _ => continue,
+                };
+                let _ = setup.output.send(event);
+            }
+        }
         tabs.sync_deletions();
         messages.extend(tabs.background_news(&before));
         let notices = tabs.session_notices();
         let closed = tabs.close_idle();
         let active = tabs.active_mut();
+        if let Some(scan) = active.model.discover_if_due(Instant::now(), Duration::from_secs(300)) {
+            dispatch(app, active.engine.as_ref(), vec![scan]);
+        }
         if !closed.is_empty() {
             // Those sessions' titles and activity changed.
             dispatch(app, active.engine.as_ref(), vec![Command::ListSessions]);
@@ -584,28 +603,21 @@ async fn engine_update(shared: State<'_, Shared>) -> Result<String, String> {
         .map_err(|error| error.to_string())?
 }
 
-/// Install the engine with Dial's signed release installer, then connect to it.
+/// Install a separate signed release. Running engines only switch when reconnected.
 #[tauri::command]
 async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
     engine_program(&shared)?;
-    let log = tauri::async_runtime::spawn_blocking(updates::install_engine)
-        .await
-        .map_err(|error| error.to_string())??;
-    let home = shared.home.as_deref().map(Path::new);
-    let found = launcher::find_dial(None, std::env::var_os("PATH").as_deref(), home);
-    if !found.is_file() {
-        return Err(format!(
-            "The installer finished but no Dial engine was found in the usual folders.\n{log}"
-        ));
-    }
+    let directory = launcher::app_dir(shared.home.as_deref().map(Path::new))
+        .ok_or("Could not locate the Desktop settings directory")?;
+    let (found, log) =
+        tauri::async_runtime::spawn_blocking(move || updates::install_engine(&directory))
+            .await
+            .map_err(|error| error.to_string())??;
     *shared
         .installed
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Some(found);
-    let has_workspace = shared.lock().workspace.is_some();
-    if has_workspace {
-        shared.reconnect()?;
-    }
+    // Let the UI distinguish installation from reconnecting; reconnect itself protects live work.
     Ok(log)
 }
 
@@ -613,6 +625,33 @@ async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
 #[tauri::command]
 fn app_updates_enabled(app: AppHandle) -> bool {
     updates::updater_configured(app.config().plugins.0.get("updater")) && !cfg!(debug_assertions)
+}
+
+#[tauri::command]
+fn app_try_reserve_restart(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    confirmed: Vec<u32>,
+) -> Result<crate::tabs::RestartDecision, String> {
+    if webview.label() != "main" {
+        return Err("Only the app UI can reserve a restart".into());
+    }
+    let mut inner = shared.lock();
+    let mut terminals = shared.terminals();
+    let decision = inner.tabs.reserve_restart(terminals.open_ids(), &confirmed)?;
+    if decision == crate::tabs::RestartDecision::Reserved {
+        terminals.close_all();
+    }
+    Ok(decision)
+}
+
+#[tauri::command]
+fn app_release_restart(webview: tauri::Webview, shared: State<'_, Shared>) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Only the app UI can release a restart".into());
+    }
+    shared.lock().tabs.release_restart();
+    Ok(())
 }
 
 fn check_session(
@@ -651,6 +690,7 @@ fn workspace_rpc(
     params: serde_json::Value,
 ) -> Result<engine::RpcReply, String> {
     let inner = shared.lock();
+    inner.tabs.allow_work()?;
     if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(root) {
         return Err("The project changed. Try again from the current project.".into());
     }
@@ -685,6 +725,7 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("list_extensions", 30),
     ("memory", 30),
     ("list_schedules", 20),
+    ("add_schedule", 20),
     ("remove_schedule", 20),
     ("list_checkpoints", 20),
     ("checkpoint_files", 20),
@@ -805,6 +846,7 @@ async fn local_model_removal(
 
 #[tauri::command]
 async fn send_prompt(
+    webview: tauri::Webview,
     shared: State<'_, Shared>,
     store: State<'_, crate::types::Store>,
     workspace_root: String,
@@ -812,13 +854,25 @@ async fn send_prompt(
     text: String,
     images: Vec<String>,
     inline_images: Vec<String>,
-) -> Result<(), String> {
-    let text = text.trim();
-    if text.is_empty() && images.is_empty() && inline_images.is_empty() {
+    documents: Option<Vec<attachments::documents::Document>>,
+    type_id: Option<String>,
+) -> Result<Option<String>, String> {
+    if webview.label() != "main" {
+        return Err("Only the app UI can submit attachments".into());
+    }
+    let documents = documents.unwrap_or_default();
+    if images.len() + inline_images.len() + documents.len() > attachments::MAX_IMAGES {
+        return Err(format!(
+            "Attach at most {} files to one prompt",
+            attachments::MAX_IMAGES
+        ));
+    }
+    let text = text.trim().to_owned();
+    if text.is_empty() && images.is_empty() && inline_images.is_empty() && documents.is_empty() {
         return Err("The prompt is empty".into());
     }
+    check_session(&shared.lock(), &workspace_root, session_id.as_deref())?;
     attachments::check(&images, &inline_images)?;
-    let text = crate::types::with_context(&store, text);
     // Pasted images go by path like chosen files: inline base64 pushed the request past the
     // engine's 1 MiB RPC limit.
     let mut images = images;
@@ -831,20 +885,45 @@ async fn send_prompt(
             .join("pasted-images");
         images.extend(attachments::save_pasted(&dir, &inline_images)?);
     }
-    let reply = {
+    let (text, staged) = if documents.is_empty() {
+        (text, None)
+    } else {
+        let root = PathBuf::from(&workspace_root);
+        tauri::async_runtime::spawn_blocking(move || {
+            attachments::documents::stage(&root, text, documents)
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    let (reply, displayed) = {
         let mut inner = shared.lock();
+        inner.tabs.allow_work()?;
         check_session(&inner, &workspace_root, session_id.as_deref())?;
         let tab = inner.tabs.active_mut();
         if tab.transitioning() || !tab.model.can_send() {
             return Err("Dial is not ready to accept a prompt".into());
         }
-        tab.submit_prompt(Command::Send {
+        let type_context = crate::types::type_scope(
+            &store,
+            type_id.as_deref(),
+            tab.model.type_context_supported,
+        );
+        // File staging can change the displayed prompt. Return that exact text so Desktop can
+        // associate the original attachments with the live transcript row, not a replay.
+        let displayed = (!images.is_empty() || staged.is_some()).then(|| text.clone());
+        let reply = tab.submit_prompt(Command::Send {
             text,
             images,
             inline_images: Vec::new(),
-        })?
+            type_context,
+        })?;
+        (reply, displayed)
     };
-    rpc_reply(reply, None).await.map(|_| ())
+    // Once submitted, keep the copies for tool reads, including later turns and resumed sessions.
+    if let Some(folder) = staged {
+        let _ = folder.keep();
+    }
+    rpc_reply(reply, None).await.map(|_| displayed)
 }
 
 /// Send `text` to session `session_id` without showing it: to the tab that has it open, or to a
@@ -857,17 +936,20 @@ fn send_background(
     workspace_root: String,
     session_id: String,
     text: String,
+    type_id: Option<String>,
 ) -> Result<(), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("The prompt is empty".into());
     }
-    let send = Command::Send {
-        text: crate::types::with_context(&store, text),
+    let build = |modern: bool| Command::Send {
+        text: text.to_owned(),
         images: Vec::new(),
         inline_images: Vec::new(),
+        type_context: crate::types::type_scope(&store, type_id.as_deref(), modern),
     };
     let mut inner = shared.lock();
+    inner.tabs.allow_work()?;
     if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
         return Err("The project changed".into());
     }
@@ -877,7 +959,8 @@ fn send_background(
             if tab.protects_work() || !tab.model.can_send() {
                 return Err("Dial is still working on the last one; try again when it finishes".into());
             }
-            tab.enqueue(send)?;
+            let structured = tab.model.type_context_supported;
+            tab.enqueue(build(structured))?;
         }
         Route::Closing => return Err("Dial is just finishing up; try again in a moment".into()),
         Route::Elsewhere => return Err(OPEN_ELSEWHERE.into()),
@@ -887,7 +970,7 @@ fn send_background(
                 .ok_or(PREVIEW_NOTICE)?;
             let mut tab = Tab::new(Model::starting(), Some(engine));
             tab.enqueue(Command::Resume(session_id))?;
-            tab.enqueue(send)?;
+            tab.enqueue(build(false))?;
             inner.tabs.add_background(tab);
         }
     }
@@ -906,6 +989,15 @@ async fn read_image(webview: tauri::Webview, path: String) -> Result<ImageFile, 
     tauri::async_runtime::spawn_blocking(move || attachments::read_image(Path::new(&path)))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// File-manager copies may have paths on the native pasteboard but no DOM File objects.
+#[tauri::command]
+fn read_clipboard_file_paths(webview: tauri::Webview) -> Result<Vec<String>, String> {
+    if webview.label() != "main" {
+        return Err("Clipboard files are only available in the composer".into());
+    }
+    attachments::clipboard_paths::read()
 }
 
 /// Read the native clipboard only for the app UI, never for the integrated browser.
@@ -1272,19 +1364,21 @@ fn export_session(app: AppHandle, shared: State<'_, Shared>, path: String) -> Re
 
 /// Undo the last turn of the session on screen, files included.
 #[tauri::command]
-fn undo_turn(
+async fn undo_turn(
     shared: State<'_, Shared>,
     workspace_root: String,
     session_id: Option<String>,
 ) -> Result<(), String> {
-    let inner = shared.lock();
-    check_session(&inner, &workspace_root, session_id.as_deref())?;
-    let tab = inner.tabs.active();
-    let command = tab.model.undo()?;
-    tab.engine
-        .as_ref()
-        .ok_or("Dial is not connected")?
-        .enqueue(command)
+    let reply = {
+        let inner = shared.lock();
+        check_session(&inner, &workspace_root, session_id.as_deref())?;
+        let tab = inner.tabs.active();
+        tab.engine
+            .as_ref()
+            .ok_or("Dial is not connected")?
+            .submit(tab.model.undo()?)?
+    };
+    rpc_reply(reply, None).await.map(|_| ())
 }
 
 /// Add guidance to the turn running in the session on screen.
@@ -1295,12 +1389,21 @@ async fn steer(
     workspace_root: String,
     session_id: Option<String>,
     text: String,
+    type_id: Option<String>,
 ) -> Result<(), String> {
-    let text = crate::types::with_context(&store, text.trim());
     let reply = {
         let inner = shared.lock();
         check_session(&inner, &workspace_root, session_id.as_deref())?;
         let tab = inner.tabs.active();
+        let text = match crate::types::type_scope(
+            &store,
+            type_id.as_deref(),
+            tab.model.type_context_supported,
+        ) {
+            // An engine that predates `type_context` reads the Type's framing in the guidance text.
+            Some(crate::engine::TypeScope::Framed(context)) => crate::types::legacy_prompt(&context, text.trim()),
+            _ => text.trim().to_owned(),
+        };
         let command = tab.model.steer(&text)?;
         tab.engine
             .as_ref()
@@ -1316,6 +1419,7 @@ async fn steer(
 #[tauri::command]
 fn retry_turn(shared: State<'_, Shared>) -> Result<(), String> {
     let mut inner = shared.lock();
+    inner.tabs.allow_work()?;
     let tab = inner.tabs.active_mut();
     if tab.transitioning() {
         return Err("Wait for the session to finish opening or sending".into());
@@ -1328,6 +1432,7 @@ fn retry_turn(shared: State<'_, Shared>) -> Result<(), String> {
 #[tauri::command]
 fn compact_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
     let inner = shared.lock();
+    inner.tabs.allow_work()?;
     let tab = inner.tabs.active();
     let command = tab.model.compact()?;
     dispatch(&app, tab.engine.as_ref(), vec![command]);
@@ -1338,6 +1443,7 @@ fn compact_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), Stri
 #[tauri::command]
 fn voice_start(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
     let mut inner = shared.lock();
+    inner.tabs.allow_work()?;
     let tab = inner.tabs.active_mut();
     if tab.transitioning() {
         return Err("Wait for the session to finish opening".into());
@@ -1402,13 +1508,13 @@ fn refresh_sessions(app: AppHandle, shared: State<'_, Shared>) {
 }
 
 #[tauri::command]
-fn refresh_models(app: AppHandle, shared: State<'_, Shared>) {
-    request(&app, &shared, Command::ListModels);
-}
-
-#[tauri::command]
-fn discover_models(app: AppHandle, shared: State<'_, Shared>) {
-    request(&app, &shared, Command::DiscoverModels);
+fn discover_models(app: AppHandle, shared: State<'_, Shared>, force: Option<bool>) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let interval = if force.unwrap_or(false) { Duration::ZERO } else { Duration::from_secs(60) };
+    if let Some(scan) = tab.model.discover_if_due(Instant::now(), interval) {
+        dispatch(&app, tab.engine.as_ref(), vec![scan]);
+    }
 }
 
 #[tauri::command]
@@ -1531,44 +1637,68 @@ async fn search_files(
         .map_err(|error| error.to_string())?
 }
 
-/// Provider setup has its own PTY: it must not depend on RPC or type into the user's shell.
+struct ProviderSetup {
+    id: u32,
+    root: PathBuf,
+    engine: Engine,
+    output: tauri::ipc::Channel<serde_json::Value>,
+}
+
 #[tauri::command]
-fn provider_setup_open(
+fn provider_setup_open(shared: State<'_, Shared>, workspace_root: String, output: tauri::ipc::Channel<serde_json::Value>) -> Result<u32, String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let root = panel_root(&shared, &workspace_root)?;
+    let engine = shared.spawn(&root).ok_or(PREVIEW_NOTICE)?;
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let old = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner)
+        .replace(ProviderSetup { id, root, engine, output });
+    if let Some(old) = old { thread::spawn(move || drop(old)); }
+    Ok(id)
+}
+
+#[tauri::command]
+async fn provider_setup_call(shared: State<'_, Shared>, id: u32, method: String, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let method = ["auth_providers", "login", "auth_code", "auth_cancel", "logout", "remove_api_key"].into_iter()
+        .find(|m| *m == method).ok_or("Unsupported provider action")?;
+    let root = shared.root()?;
+    let reply = {
+        let setup = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner);
+        let setup = setup.as_ref().filter(|s| s.id == id && s.root == root).ok_or("Provider setup has closed")?;
+        setup.engine.rpc(method, params)?
+    };
+    rpc_reply(reply, None).await
+}
+
+#[tauri::command]
+fn provider_setup_close(shared: State<'_, Shared>, id: u32) {
+    let mut slot = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(setup) = slot.take_if(|s| s.id == id) { thread::spawn(move || drop(setup)); }
+}
+
+/// Open a workspace PTY, streaming output only to the view that requested it.
+#[tauri::command]
+fn terminal_open(
     shared: State<'_, Shared>,
     workspace_root: String,
     cols: u16,
     rows: u16,
+    task: Option<terminal::Task>,
     output: tauri::ipc::Channel<terminal::TerminalEvent>,
 ) -> Result<u32, String> {
-    let program = engine_program(&shared)?;
     let inner = shared.lock();
-    let workspace = inner.workspace.as_ref().ok_or("Open a folder first")?;
-    if workspace.root != workspace_root {
-        return Err("The open folder changed".into());
+    inner.tabs.allow_work()?;
+    if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(&workspace_root) {
+        return Err("The project changed before the terminal could open".into());
     }
-    let mut command = portable_pty::CommandBuilder::new(program);
-    command.arg("/providers");
-    command.cwd(&workspace.root);
-    command.env("TERM", "xterm-256color");
-    shared.terminals().open(command, cols, rows, move |event| {
+    let root = Path::new(&workspace_root);
+    let child = match task {
+        Some(task) => task.child(&engine_program(&shared)?, root)?,
+        None => terminal::login_shell(root),
+    };
+    shared.terminals().open(child, cols, rows, move |event| {
         let _ = output.send(event);
     })
-}
-
-/// Start a shell in the workspace; its output follows as `terminal` events.
-#[tauri::command]
-fn terminal_open(
-    app: AppHandle,
-    shared: State<'_, Shared>,
-    cols: u16,
-    rows: u16,
-) -> Result<u32, String> {
-    let root = shared.root()?;
-    shared
-        .terminals()
-        .open(terminal::login_shell(&root), cols, rows, move |event| {
-            let _ = app.emit("terminal", event);
-        })
 }
 
 #[tauri::command]
@@ -1643,9 +1773,12 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             engine_update,
             engine_install,
             app_updates_enabled,
+            app_try_reserve_restart,
+            app_release_restart,
             send_prompt,
             send_background,
             read_image,
+            read_clipboard_file_paths,
             read_clipboard_image,
             save_image,
             read_transcript_image,
@@ -1680,9 +1813,9 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::model_library::model_download_cancel,
             crate::model_library::model_cache_list,
             crate::model_library::model_cache_remove,
+            crate::model_library::model_hub_setup,
             crate::model_library::model_hub_search,
             crate::model_library::model_hub_files,
-            refresh_models,
             discover_models,
             set_model,
             set_thinking,
@@ -1695,6 +1828,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             search_files,
             terminal_open,
             provider_setup_open,
+            provider_setup_call,
+            provider_setup_close,
             terminal_write,
             terminal_resize,
             terminal_close,
@@ -1745,6 +1880,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 home,
                 wake: Mutex::new(wake_tx),
                 terminals: Mutex::new(Terminals::default()),
+                provider_setup: Mutex::new(None),
                 installed: Mutex::new(None),
                 published: Mutex::new(Published::default()),
                 answer_style: Mutex::new(answer_style),

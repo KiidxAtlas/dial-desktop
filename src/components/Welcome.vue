@@ -24,11 +24,11 @@ onMounted(loadRecentProjects);
       </button>
       <div v-if="updates.engine?.state === 'missing'" class="engine-missing">
         <p>
-          Dial Desktop runs the Dial engine, and none was found on this computer. Install it once; the same
-          <code>dial</code> also works in your terminal.
+          Dial Desktop couldn’t find an engine. Install a signed copy for Desktop to use.
+          On macOS and Linux, this copy stays private to Desktop and isn’t added to your terminal’s PATH.
         </p>
-        <button class="btn btn-secondary" :disabled="!!updates.engineBusy" @click="installEngine()">
-          <Icon name="download" :size="14" /> {{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}
+        <button class="btn btn-secondary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine()">
+          <Icon name="download" :size="14" /> {{ updates.engineBusy ? "Installing…" : "Install Desktop copy" }}
         </button>
         <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
       </div>

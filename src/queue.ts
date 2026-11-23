@@ -6,7 +6,7 @@ import { DRAFTS, QUEUES, readLocal, writeLocal } from "./localPrompts";
 import { canRetry } from "./sessionActions";
 import type { Attachment, OpenSnapshot } from "./types";
 import { focusComposer } from "./ui";
-import { typedPrompt } from "./savedTypes";
+import { typeIdFor } from "./savedTypes";
 
 export interface QueuedPrompt {
   id: number;
@@ -90,7 +90,6 @@ export function queueFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): S
 /** Add a follow-up prompt to this session's queue; returns whether anything was queued. */
 export async function enqueuePrompt(snap: OpenSnapshot, text: string, attachments: Attachment[]): Promise<boolean> {
   if (!snap.sessionId || !snap.turnRunning || snap.connection.state !== "live") return false;
-  if (attachments.length && snap.model?.acceptsImages === false) return false;
   const trimmed = text.trim();
   if (!trimmed && !attachments.length) return false;
   const queue = queueFor(snap);
@@ -122,7 +121,7 @@ export async function editQueued(snap: OpenSnapshot, id: number): Promise<boolea
     return false;
   }
   const text = draft.text;
-  const images = [...draft.attachments];
+  const previous = [...draft.attachments];
   const remaining = queue.items.filter((entry) => entry.id !== id);
   draft.sending = true;
   try {
@@ -130,7 +129,7 @@ export async function editQueued(snap: OpenSnapshot, id: number): Promise<boolea
     if (!saved) return false;
     // Preserve input added by another control while the local transaction finished.
     draft.text = draft.text !== text && draft.text ? `${draft.text}\n\n${item.text}` : item.text;
-    draft.attachments = [...item.attachments, ...draft.attachments.filter((a) => !images.some((old) => old.key === a.key))];
+    draft.attachments = [...item.attachments, ...draft.attachments.filter((a) => !previous.some((old) => old.key === a.key))];
     if (key === observedKey) focusComposer();
     return true;
   } finally {
@@ -144,7 +143,7 @@ export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
   const key = keyOf(snap);
   const queue = queues.get(key);
   if (!queue || queue.loading || queue.saving || queue.sending || !queue.items.length) return false;
-  if (snap.question || snap.approvals.length || (queue.items[0].attachments.length && snap.model?.acceptsImages === false)) {
+  if (snap.question || snap.approvals.length) {
     queue.paused = true;
     return false;
   }
@@ -153,8 +152,8 @@ export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
   queue.paused = false;
   // Keep the restart warning on a rejected or unconfirmed send.
   try {
-    const scope = { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId };
-    const accepted = await engine.send(typedPrompt(item.text, snap.sessionId), item.attachments, scope);
+    const scope = { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, typeId: typeIdFor(snap.sessionId) };
+    const accepted = await engine.send(item.text, item.attachments, scope);
     if (!accepted) {
       // No acceptance: leave the persisted copy intact and require manual review before retry.
       queue.paused = true;

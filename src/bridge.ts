@@ -9,6 +9,9 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { ref, shallowRef } from "vue";
+import { attachmentPayload } from './attachmentFormats';
+import type { KeyProvider } from './providerKeys';
+import { LastSubmission } from './promptEdit';
 import type {
   Answer,
   ApprovalMode,
@@ -32,6 +35,7 @@ import type {
 /** Latest state published by the app; `null` until the first one arrives. Parts unchanged since
  * the previous snapshot keep their identity (see {@link share}), so Vue skips redrawing them. */
 export const snapshot = shallowRef<Snapshot | null>(null);
+export const lastSubmission = new LastSubmission();
 export const startupError = ref<string | null>(null);
 export const connecting = ref(false);
 
@@ -71,6 +75,7 @@ export interface CachedModel { repo: string; bytes: number }
 export interface HubModel { id: string; downloads: number; likes: number; pipeline_tag: string | null }
 export interface HubFile { path: string; size: number; split: boolean }
 export const modelDownloads = {
+  setup: () => invoke<boolean>('model_hub_setup'),
   status: () => invoke<DownloadStatus>('model_download_status'),
   cancel: () => invoke<DownloadStatus>('model_download_cancel'),
   cached: () => invoke<CachedModel[]>('model_cache_list'),
@@ -79,7 +84,15 @@ export const modelDownloads = {
   async start(repo: string, size: string, file?: string) {
     const what = file ? `${file} from ${repo}` : repo;
     if (!await ask(`Download ${what} (about ${size}) from Hugging Face to this computer? This does not switch your session model.`, { title: 'Download model?' })) return null;
-    return invoke<DownloadStatus>('model_download_start', { repo, file: file ?? null });
+    const start = () => invoke<DownloadStatus | null>('model_download_start', { repo, file: file ?? null });
+    const started = await start();
+    if (started) return started;
+    // Null means the helper executable is missing (other failures reject). Keep the confirmed
+    // repo/file and retry only after separate native consent for the helper installation.
+    if (!await modelDownloads.setup()) return null;
+    const retried = await start();
+    if (!retried) throw new Error('The model helper was not found after setup.');
+    return retried;
   },
   /** Delete a downloaded model from the Hugging Face cache after confirming; the bytes freed, or `null` if cancelled. */
   async remove(repo: string, size: string) {
@@ -156,6 +169,7 @@ let resyncAgain = false;
 function accept(seq: number, next: Snapshot) {
   snapshotSeq = seq;
   snapshot.value = share(snapshot.value, next);
+  lastSubmission.observe(snapshot.value);
   startupError.value = null;
 }
 
@@ -233,12 +247,18 @@ async function call(command: string, args?: Record<string, unknown>) {
 }
 
 export const engine = {
-  send: (text: string, attachments: Attachment[], scope: { workspaceRoot: string; sessionId: string | null }) =>
-    call("send_prompt", {
-      ...scope, text,
-      images: attachments.flatMap((a) => (a.path ? [a.path] : [])),
-      inlineImages: attachments.flatMap((a) => (a.data ? [a.data] : [])),
-    }),
+  async send(text: string, attachments: Attachment[], scope: { workspaceRoot: string; sessionId: string | null; typeId?: string | null }) {
+    const settle = lastSubmission.start(snapshot.value, scope, text, attachments);
+    try {
+      const displayed = await invoke<string | null>('send_prompt', { ...scope, text, ...attachmentPayload(attachments, snapshot.value?.model?.acceptsImages) });
+      settle?.(displayed ?? undefined);
+      return true;
+    } catch (error) {
+      settle?.();
+      showToast(String(error));
+      return false;
+    }
+  },
   approve: (approvalId: string, decision: Decision) => call("approve", { approvalId, decision }),
   abort: () => call("abort"),
   newSession: () => call("new_session"),
@@ -298,20 +318,21 @@ export const engine = {
       showToast(`Could not open the save dialog: ${error}`);
     }
   },
-  /** Undo the last turn, files included, after the user confirms; resolves to whether it was sent. */
-  async undoTurn(): Promise<boolean> {
+  /** Confirm before undoing; only report success after the engine accepts the undo. */
+  async undoTurn(edit?: { missingImages: number; stillCurrent: () => boolean }): Promise<boolean> {
     const current = snapshot.value;
     if (!current?.workspace) return false;
     const { sessionId } = current;
     const workspaceRoot = current.workspace.root;
     const confirmed = await ask(
-      "Dial restores the files the last turn changed and removes that prompt and its answer from the conversation.",
-      { title: "Undo the last turn?", kind: "warning", okLabel: "Undo", cancelLabel: "Cancel" },
+      'Dial restores the files the last turn changed and removes that prompt and its answer from the conversation.' +
+        (edit?.missingImages ? `\n\nOnly the prompt text can be restored. You’ll need to attach ${edit.missingImages === 1 ? 'the image' : `all ${edit.missingImages} images`} again. Cancel to keep the original turn.` : ''),
+      { title: edit ? 'Edit the last prompt?' : 'Undo the last turn?', kind: 'warning', okLabel: edit ? (edit.missingImages ? 'Edit text only' : 'Edit prompt') : 'Undo', cancelLabel: 'Cancel' },
     ).catch(() => false);
-    return confirmed && await call("undo_turn", { workspaceRoot, sessionId });
+    return confirmed && (!edit || edit.stillCurrent()) && await call('undo_turn', { workspaceRoot, sessionId });
   },
   /** Add guidance to the running turn; Dial reads it at its next step. */
-  steer: (text: string, scope: { workspaceRoot: string; sessionId: string | null }) => call("steer", { ...scope, text }),
+  steer: (text: string, scope: { workspaceRoot: string; sessionId: string | null; typeId?: string | null }) => call("steer", { ...scope, text }),
   /** Send the last prompt again after its turn failed. */
   retryTurn: () => call("retry_turn"),
   /** Summarize the conversation so far to free context. */
@@ -327,8 +348,7 @@ export const engine = {
   /** Read a reply aloud; with no text, stop reading. */
   readAloud: (text: string | null) => call("read_aloud", { text }),
   refreshSessions: () => call("refresh_sessions"),
-  refreshModels: () => call("refresh_models"),
-  /** Re-queries signed-in providers (for example Antigravity's account list); slower than `refreshModels`. */
+  refreshModels: () => call("discover_models", { force: true }),
   discoverModels: () => call("discover_models"),
   setModel: (snap: import("./types").OpenSnapshot, provider: string, modelId: string) => call("set_model", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, provider, modelId }),
   /** `default` restores the model's own level. */
@@ -393,6 +413,7 @@ export const files = {
   /** Check the image at `path` and read its thumbnail; throws a readable message. */
   readImage: (path: string) => invoke<ImageFile>("read_image", { path }),
   readClipboardImage: () => isTauri() ? invoke<string | null>("read_clipboard_image") : Promise.resolve(null),
+  readClipboardFilePaths: () => isTauri() ? invoke<string[]>('read_clipboard_file_paths') : Promise.resolve([]),
   readTranscriptImage: (workspaceRoot: string, path: string) =>
     invoke<ImageFile>("read_transcript_image", { workspaceRoot, path }),
   /** Open a project image in the system's default viewer (Preview on a Mac). */
@@ -400,13 +421,9 @@ export const files = {
     invoke<void>("open_transcript_image", { workspaceRoot, path }).catch((error) => showToast(String(error))),
   /** Show the file in the system file manager (Finder, Explorer). */
   reveal: (path: string) => revealItemInDir(path).catch((error) => showToast(`Could not show the file: ${error}`)),
-  /** Ask for images with the system dialog; empty when cancelled. */
-  async chooseImages(): Promise<string[]> {
-    const picked = await openDialog({
-      multiple: true,
-      title: "Attach images",
-      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
-    });
+  /** Ask for files with the system dialog; empty when cancelled. */
+  async chooseFiles(): Promise<string[]> {
+    const picked = await openDialog({ multiple: true, title: 'Attach files' });
     return Array.isArray(picked) ? picked : picked ? [picked] : [];
   },
   /** Ask for one background image with the system dialog; `null` when cancelled. */
@@ -499,17 +516,34 @@ export type AgentBrowserEvent =
   | { kind: "show" }
   | { kind: "activity"; busy: boolean; text?: string };
 
+export interface ProviderAccount { provider: string; name: string; signed_in: boolean }
+export type { KeyProvider } from './providerKeys';
+export type ProviderEvent =
+  | { event: "auth_url"; provider: string; url: string; instructions: string | null }
+  | { event: "auth_progress"; provider: string; message: string }
+  | { event: "auth_prompt"; provider: string; prompt_id: string; message: string; placeholder?: string; allow_empty: boolean; secret: boolean }
+  | { event: "failed"; message: string };
+const setupCall = <T>(id: number, method: string, params = {}) => invoke<T>("provider_setup_call", { id, method, params });
+export const providerApi = {
+  open: (workspaceRoot: string, handler: (event: ProviderEvent) => void) =>
+    invoke<number>("provider_setup_open", { workspaceRoot, output: new Channel<ProviderEvent>(handler) }),
+  list: (id: number) => setupCall<{ providers: ProviderAccount[]; key_providers?: KeyProvider[] }>(id, "auth_providers"),
+  login: (id: number, provider: string) => setupCall(id, "login", { provider }),
+  answer: (id: number, prompt_id: string, code: string) => setupCall(id, "auth_code", { prompt_id, code }),
+  cancel: (id: number, provider: string) => setupCall(id, "auth_cancel", { provider }),
+  logout: (id: number, provider: string) => setupCall(id, "logout", { provider }),
+  removeKey: (id: number, provider: string) => setupCall(id, "remove_api_key", { provider, confirm: true }),
+  close: (id: number) => invoke<void>("provider_setup_close", { id }),
+};
+
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
+export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler" };
 export const terminalApi = {
-  open: (cols: number, rows: number) => invoke<number>("terminal_open", { cols, rows }),
-  openProviderSetup(workspaceRoot: string, cols: number, rows: number, handler: (event: TerminalEvent) => void) {
-    const output = new Channel<TerminalEvent>(handler);
-    return invoke<number>("provider_setup_open", { workspaceRoot, cols, rows, output });
-  },
+  open: (workspaceRoot: string, cols: number, rows: number, task: TerminalTask | undefined, onEvent: (event: TerminalEvent) => void) =>
+    invoke<number>("terminal_open", { workspaceRoot, cols, rows, task, output: new Channel<TerminalEvent>(onEvent) }),
   write: (id: number, data: string) => invoke<void>("terminal_write", { id, data }),
   resize: (id: number, cols: number, rows: number) => invoke<void>("terminal_resize", { id, cols, rows }),
   close: (id: number) => invoke<void>("terminal_close", { id }),
-  onEvent: (handler: (event: TerminalEvent) => void) => listen<TerminalEvent>("terminal", (e) => handler(e.payload)),
 };
 
 /**
@@ -522,22 +556,28 @@ export const updatesApi = {
   appVersion: () => getVersion(),
   /** The newer signed app release, or `null` when this one is current. */
   checkApp: (): Promise<Update | null> => checkAppUpdate(),
-  /** Download, verify and install `update`, reporting progress as 0..1, then restart into it. */
-  async installApp(update: Update, progress: (fraction: number | null) => void) {
+  tryReserveRestart: (confirmed: number[]) => invoke<import("./appInstaller").RestartDecision>("app_try_reserve_restart", { confirmed }),
+  releaseRestart: () => invoke<void>("app_release_restart"),
+  confirmTerminals: (count: number) => ask(`Updating will close ${count} open terminal session${count === 1 ? "" : "s"} and stop any running commands or scheduler tasks in them. Keep working to review or close them yourself.`, {
+    title: "Close terminals and restart Dial Desktop?", okLabel: "Close terminals and restart", cancelLabel: "Keep working", kind: "warning",
+  }),
+  /** Download and verify now; install only once no turns are running. */
+  async downloadApp(update: Update, progress: (fraction: number | null) => void) {
     let total = 0;
     let done = 0;
-    await update.downloadAndInstall((event) => {
+    await update.download((event) => {
       if (event.event === "Started") total = event.data.contentLength ?? 0;
       else if (event.event === "Progress") {
         done += event.data.chunkLength;
         progress(total ? Math.min(done / total, 1) : null);
       }
     });
-    await relaunch();
   },
+  installApp: (update: Update) => update.install(),
+  restartApp: relaunch,
   checkEngine: () => invoke<EngineUpdateView>("engine_update_check"),
   /** Run `dial update`; resolves to its output. */
   updateEngine: () => invoke<string>("engine_update"),
-  /** Install the engine with Dial's signed installer and connect to it; resolves to its output. */
+  /** Install and select a separate signed release; existing connections stay intact. */
   installEngine: () => invoke<string>("engine_install"),
 };

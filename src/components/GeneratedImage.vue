@@ -14,8 +14,8 @@ import { viewAttachment, viewImage } from "../imageViewer";
 import Icon from "./Icon.vue";
 
 /** One image a tool wrote, shown in the conversation. Click opens it larger in the viewer;
- * right-click copies or saves it. */
-const props = defineProps<{ path: string }>();
+ * right-click copies or saves it. `compact`: a thumbnail under a folded run of calls. */
+const props = defineProps<{ path: string; compact?: boolean }>();
 
 const image = ref<ImageFile | null>(null);
 const error = ref<string | null>(null);
@@ -65,13 +65,13 @@ function menu(event: MouseEvent) {
 </script>
 
 <template>
-  <figure class="generated">
-    <button v-if="image" class="frame" :title="`View ${image.name}`" @click.stop="openInViewer" @contextmenu="menu">
+  <figure class="generated" :class="{ compact }">
+    <button v-if="image" class="frame" :title="compact ? `${image.name} — click to view` : `View ${image.name}`" @click.stop="openInViewer" @contextmenu="menu">
       <img :src="image.url" :alt="image.name" draggable="false" />
     </button>
-    <div v-else-if="error" class="missing">Preview unavailable: {{ error }}</div>
+    <div v-else-if="error" class="missing" :title="error">{{ compact ? "No preview" : `Preview unavailable: ${error}` }}</div>
     <div v-else class="loading" />
-    <figcaption v-if="image">
+    <figcaption v-if="image && !compact">
       <button class="name mono truncate" :title="path" @click.stop="openInViewer">{{ image.name }}</button>
       <button v-if="!path.startsWith('artifact://')" class="act" title="Show in Finder" aria-label="Show in Finder" @click.stop="files.reveal(path)">
         <Icon name="folder" :size="13" />
@@ -99,16 +99,43 @@ function menu(event: MouseEvent) {
 img {
   display: block;
   max-width: 100%;
-  max-height: 280px;
+  max-height: 240px;
   object-fit: contain;
   -webkit-user-drag: none;
   pointer-events: none;
+  animation: fade-in 240ms var(--ease) both;
 }
+@keyframes fade-in { from { opacity: 0; } }
 .loading {
   width: 240px;
   height: 160px;
   border-radius: var(--radius-md);
-  background: var(--hover);
+  background: linear-gradient(90deg, var(--hover) 0%, var(--active) 50%, var(--hover) 100%) 0 0 / 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+@keyframes shimmer { to { background-position: -200% 0; } }
+.compact .frame {
+  transition: transform 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.compact .frame:hover {
+  transform: translateY(-1px);
+  box-shadow: inset 0 0 0 1px var(--border-strong), 0 6px 18px rgb(0 0 0 / 22%);
+}
+.compact img {
+  height: 72px;
+  max-width: 160px;
+  object-fit: cover;
+}
+.compact .loading {
+  width: 72px;
+  height: 72px;
+}
+.compact .missing {
+  margin: 0;
+  font-size: 11px;
+}
+@media (prefers-reduced-motion: reduce) {
+  img, .loading { animation: none; }
 }
 .missing {
   margin-top: 4px;

@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "dial-desktop"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "block2",
@@ -803,6 +803,8 @@ dependencies = [
  "objc2-web-kit",
  "png",
  "portable-pty",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -815,6 +817,7 @@ dependencies = [
  "tauri-winrt-notification",
  "tempfile",
  "tokio",
+ "zip",
 ]
 
 [[package]]
@@ -1194,6 +1197,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -3202,6 +3206,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -5827,6 +5832,7 @@ checksum = "63e50f7b2212e4635244be3c363b53273d159f2523eb7db3096c1d2861c1b603"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
+ "flate2",
  "getrandom 0.4.3",
  "indexmap 2.14.2",
  "libc",

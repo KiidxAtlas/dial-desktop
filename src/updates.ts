@@ -2,11 +2,14 @@
 // Checks run at start and every few hours; nothing installs without the user asking.
 
 import { reactive } from "vue";
+import { ask } from "@tauri-apps/plugin-dialog";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { engine, showToast, snapshot, updatesApi } from "./bridge";
 import type { EngineUpdateView } from "./types";
+import { createAppInstaller, restartBlocked } from "./appInstaller";
 
 const RECHECK_MS = 6 * 60 * 60 * 1000;
+const installer = createAppInstaller<Update>(() => restartBlocked(snapshot.value), updatesApi);
 
 export const updates = reactive({
   /** The app's own version. */
@@ -16,12 +19,14 @@ export const updates = reactive({
   /** A newer app release: its version and notes. */
   app: null as { version: string; notes: string } | null,
   appChecking: false,
-  /** 0..1 while downloading, `null` when the size is unknown; `undefined` when idle. */
-  appProgress: undefined as number | null | undefined,
+  appPhase: installer.phase,
+  appStatus: installer.status,
+  appAction: installer.label,
   appError: "",
 
   engine: null as EngineUpdateView | null,
   engineChecking: false,
+  engineChanged: false,
   /** What the engine button is doing. */
   engineBusy: "" as "" | "updating" | "installing",
   /** Output of the last engine install or update, for the Updates page. */
@@ -48,11 +53,14 @@ export function bannerKey(): string {
 }
 
 export async function checkApp() {
-  if (!updates.appEnabled || updates.appChecking) return;
+  if (!updates.appEnabled || updates.appChecking || updates.appPhase !== "idle" || installer.installed.value) return;
   updates.appChecking = true;
   updates.appError = "";
   try {
+    const old = pendingApp;
     pendingApp = await updatesApi.checkApp();
+    if (old) void old.close().catch(() => {});
+    if (pendingApp?.version !== old?.version) installer.error.value = "";
     updates.app = pendingApp ? { version: pendingApp.version, notes: pendingApp.body ?? "" } : null;
   } catch (error) {
     updates.appError = String(error);
@@ -63,61 +71,77 @@ export async function checkApp() {
 
 /** Download and install the app update, then restart into it. */
 export async function installApp() {
-  if (!pendingApp || updates.appProgress !== undefined) return;
-  updates.appError = "";
-  updates.appProgress = 0;
+  if (!pendingApp || updates.appChecking || updates.engineBusy) return;
+  await installer.run(pendingApp);
+}
+
+let engineCheckId = 0;
+
+export async function checkEngine() {
+  if (updates.engineBusy || updates.engineChecking || snapshot.value?.connection.state === "preview") return;
+  await refreshEngineStatus();
+}
+
+async function refreshEngineStatus() {
+  const id = ++engineCheckId;
+  updates.engineChecking = true;
   try {
-    await updatesApi.installApp(pendingApp, (fraction) => (updates.appProgress = fraction));
+    const result = await updatesApi.checkEngine();
+    if (id === engineCheckId) updates.engine = result;
   } catch (error) {
-    updates.appError = String(error);
-    updates.appProgress = undefined;
+    if (id === engineCheckId) updates.engine = { state: "failed", error: String(error) };
+  } finally {
+    if (id === engineCheckId) updates.engineChecking = false;
   }
 }
 
-export async function checkEngine() {
-  if (updates.engineChecking || snapshot.value?.connection.state === "preview") return;
-  updates.engineChecking = true;
-  try {
-    updates.engine = await updatesApi.checkEngine();
-  } catch (error) {
-    updates.engine = { state: "failed", error: String(error) };
-  } finally {
-    updates.engineChecking = false;
+async function finishEngineChange(message: string) {
+  updates.engineChanged = true;
+  // Supersede any check of the previous engine that was still in flight.
+  await refreshEngineStatus();
+  if (snapshot.value?.workspace) {
+    if (snapshot.value.turnRunning || !(await engine.reconnect())) {
+      showToast(`${message} Use Reconnect this session in Settings › Updates when idle.`);
+      return;
+    }
   }
+  showToast(message);
 }
 
 /** Run `dial update`, then reconnect so the new engine is used (after a running turn, never during). */
 export async function updateEngine() {
-  if (updates.engineBusy) return;
+  if (updates.engineBusy || updates.appPhase !== "idle") return;
+  if (updates.engine?.state === "checked" && !updates.engine.status.can_update) return installEngine();
   updates.engineBusy = "updating";
   updates.engineError = "";
+  updates.engineLog = "";
   try {
     updates.engineLog = await updatesApi.updateEngine();
-    await checkEngine();
-    if (snapshot.value?.turnRunning) showToast("Dial engine updated. Reconnect after this turn to use it.");
-    else {
-      showToast("Dial engine updated.");
-      if (snapshot.value?.workspace) await engine.reconnect();
-    }
+    await finishEngineChange("Engine update command finished.");
   } catch (error) {
     updates.engineError = String(error);
+    showToast("Could not update the Dial engine; see Settings › Updates.");
   } finally {
     updates.engineBusy = "";
   }
 }
 
-/** Install the engine with Dial's signed installer; the app connects to it when done. */
+/** Install a separately managed copy only after the user agrees to switch engines. */
 export async function installEngine() {
-  if (updates.engineBusy) return;
+  if (updates.engineBusy || updates.appPhase !== "idle") return;
   updates.engineBusy = "installing";
   updates.engineError = "";
+  updates.engineLog = "";
   try {
+    const confirmed = await ask("Desktop will install a signed Dial release in its own folder and select it for new connections. Your existing engine will not be replaced. On Windows the installer also adds the folder to your user PATH. An explicit engine override still wins on the next launch.", {
+      title: "Install a separate Dial engine?", okLabel: "Install Desktop copy", cancelLabel: "Cancel",
+    });
+    if (!confirmed) return;
     updates.engineLog = await updatesApi.installEngine();
-    showToast("Dial engine installed.");
-    await checkEngine();
+    await finishEngineChange("Dial engine installed for Desktop.");
   } catch (error) {
     updates.engineError = String(error);
-    showToast("Could not install the Dial engine; see Settings › Updates.");
+    showToast(snapshot.value?.workspace ? "Could not install the Dial engine; see Settings › Updates." : "Could not install the Dial engine. You can retry here.");
   } finally {
     updates.engineBusy = "";
   }

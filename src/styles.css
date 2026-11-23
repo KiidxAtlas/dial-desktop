@@ -615,10 +615,13 @@ kbd {
   width: max-content;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background: var(--glass-soft);
+  background: var(--surface);
 }
 .prose th,
 .prose td {
+  /* Keep prose columns readable; the table scrolls when these no longer fit. */
+  min-width: 10em;
+  vertical-align: top;
   padding: 8px 14px;
   text-align: left;
   border-bottom: 1px solid var(--border);

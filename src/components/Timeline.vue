@@ -8,16 +8,15 @@ import { draftFor } from "../drafts";
 import { isLongPrompt, withQuote } from "../quote";
 import type { OpenSnapshot } from "../types";
 import Markdown from "./Markdown.vue";
-import ToolRow from "./ToolRow.vue";
+import ToolRun from "./ToolRun.vue";
 import EmptyState from "./EmptyState.vue";
 import Icon from "./Icon.vue";
-import { pendingSave, saveMenu, withoutTypeTag } from "../savedTypes";
+import { pendingSave, saveMenu } from "../savedTypes";
 import WorkingIndicator from "./WorkingIndicator.vue";
 import { turnReviews } from "../turnReview";
 import CodeBlock from "./CodeBlock.vue";
-import GeneratedImage from "./GeneratedImage.vue";
 import { showPanel } from "../workspace";
-import { runActivity, toolRuns, type ToolRun } from "../toolFolds";
+import { toolRuns, type ToolRun as Run } from "../toolFolds";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const reviews = computed(() => turnReviews(props.snap.entries, props.snap.turnRunning));
@@ -297,34 +296,34 @@ function words(text: string) {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k words` : n === 1 ? "1 word" : `${n} words`;
 }
 
-/** Consecutive tool calls sit close together. */
-function gap(index: number) {
-  const entries = props.snap.entries;
-  if (index === 0) return "";
-  return entries[index].kind === "tool" && entries[index - 1].kind === "tool" ? "tight" : "";
-}
-
 const runs = computed(() => toolRuns(props.snap.entries));
-const activity = computed(() => new Map([...runs.value].map(([index, run]) => [index, runActivity(run)])));
-/** A run stays open while it was opened, one of its calls is expanded, or a search lands in it. */
-function folded(run: ToolRun) {
+/** Tool entries drawn by their run's line rather than as rows of their own. */
+const inRun = computed(() => {
+  const out = new Set<number>();
+  for (const run of runs.value.values()) for (let i = run.start; i <= run.end; i++) out.add(i);
+  return out;
+});
+/** A run opens when it was opened, one of its calls is expanded, or a search lands in it. */
+function folded(run: Run) {
   if (ui.expanded.has(run.key) || run.tools.some((t) => ui.expanded.has(t.key))) return false;
   const inside = (i: number) => i >= run.start && i <= run.end;
   return !inside(transcriptMatch.value) && !(matches.value.length && inside(activeMatch.value));
 }
-/** Entries hidden inside a folded run. */
-const hidden = computed(() => {
-  const out = new Set<number>();
-  for (const run of runs.value.values()) if (folded(run)) for (let i = run.start; i <= run.end; i++) out.add(i);
-  return out;
-});
-function toggleFold(run: ToolRun) {
-  if (folded(run)) ui.expanded.add(run.key);
+function setOpen(run: Run, open: boolean) {
+  if (open) ui.expanded.add(run.key);
   else {
     ui.expanded.delete(run.key);
     for (const t of run.tools) ui.expanded.delete(t.key);
   }
 }
+/** ⌥-click opens or closes every run in the conversation, as in Finder's outline views. */
+function toggleFold(run: Run, event: MouseEvent) {
+  const open = folded(run);
+  if (!event.altKey) return setOpen(run, open);
+  for (const each of runs.value.values()) if (each.tools.length > 1) setOpen(each, open);
+}
+/** The entry a search highlights, or -1. */
+const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch.value : matches.value.length ? activeMatch.value : -1));
 </script>
 
 <template>
@@ -349,37 +348,15 @@ function toggleFold(run: ToolRun) {
         <button class="btn btn-secondary" @click="ui.transcriptJump = null">Dismiss</button>
       </p>
       <template v-for="(entry, index) in snap.entries" :key="entry.kind === 'tool' ? entry.key : index">
-        <button
-          v-if="runs.get(index)"
-          class="fold"
-          :class="{ open: !hidden.has(index) }"
-          :aria-expanded="!hidden.has(index)"
-          :title="hidden.has(index) ? 'Show tool calls' : 'Collapse tool calls'"
-          @click="toggleFold(runs.get(index)!)"
-        >
-          <Icon class="fold-icon" :name="hidden.has(index) ? 'chevronRight' : 'chevronDown'" :size="12" />
-          <span class="fold-label">{{ runs.get(index)!.label }}</span>
-          <span class="fold-count">{{ runs.get(index)!.tools.length }} calls</span>
-          <span v-if="activity.get(index)!.failed" class="fold-failed">{{ activity.get(index)!.failed }} failed</span>
-          <span v-if="activity.get(index)!.unknown" class="fold-count">{{ activity.get(index)!.unknown }} unknown</span>
-          <span v-if="activity.get(index)!.running" class="spinner fold-spinner" aria-label="Running" role="img" />
-          <Transition name="fold-step" mode="out-in">
-            <span :key="activity.get(index)!.current.key" class="fold-target truncate">
-              {{ activity.get(index)!.current.label }}{{ activity.get(index)!.current.target ? ` · ${activity.get(index)!.current.target}` : '' }}
-            </span>
-          </Transition>
-        </button>
-        <div v-if="runs.get(index) && hidden.has(index) && runs.get(index)!.tools.some((t) => t.images.length)" class="fold-images">
-          <template v-for="t in runs.get(index)!.tools" :key="t.key">
-            <GeneratedImage v-for="path in t.images" :key="path" :path="path" />
-          </template>
+        <div v-if="runs.get(index)" class="row k-run">
+          <ToolRun :run="runs.get(index)!" :open="!folded(runs.get(index)!)" :match="highlighted" @toggle="toggleFold(runs.get(index)!, $event)" />
         </div>
-        <div v-if="!hidden.has(index)" class="row" :class="[`k-${entry.kind}`, gap(index), { 'current-match': index === transcriptMatch || (matches.length && index === activeMatch) }]" :data-entry="index">
+        <div v-else-if="!inRun.has(index)" class="row" :class="[`k-${entry.kind}`, { 'current-match': index === transcriptMatch || (matches.length && index === activeMatch) }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
             <div class="bubble">
-              <div class="user-text" :class="{ clamped: isLongPrompt(withoutTypeTag(entry.text)) && !ui.expanded.has(`prompt:${index}`) }">{{ withoutTypeTag(entry.text) }}</div>
-              <button v-if="isLongPrompt(withoutTypeTag(entry.text))" class="more" @click="toggle(`prompt:${index}`)">
-                {{ ui.expanded.has(`prompt:${index}`) ? "Show less" : `Show all ${withoutTypeTag(entry.text).split("\n").length} lines` }}
+              <div class="user-text" :class="{ clamped: isLongPrompt(entry.text) && !ui.expanded.has(`prompt:${index}`) }">{{ entry.text }}</div>
+              <button v-if="isLongPrompt(entry.text)" class="more" @click="toggle(`prompt:${index}`)">
+                {{ ui.expanded.has(`prompt:${index}`) ? "Show less" : `Show all ${entry.text.split("\n").length} lines` }}
               </button>
               <div v-if="entry.images" class="images">
                 <Icon name="image" :size="13" />
@@ -387,7 +364,7 @@ function toggleFold(run: ToolRun) {
               </div>
             </div>
             <div class="actions">
-              <button class="act" title="Copy" @click="copyText(withoutTypeTag(entry.text))">
+              <button class="act" title="Copy" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
               </button>
               <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" @click="forkAt(index, entry.text)"><Icon name="duplicate" :size="14" /></button>
@@ -445,8 +422,6 @@ function toggleFold(run: ToolRun) {
               </button>
             </div>
           </template>
-
-          <ToolRow v-else-if="entry.kind === 'tool'" :tool="entry" />
 
           <div v-else-if="entry.kind === 'notice' && entry.lane === 'alert'" class="alert">
             {{ entry.message }}
@@ -602,6 +577,8 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   overflow-y: auto;
   scrollbar-gutter: stable both-edges;
 }
+/* Focused only from code (closing find), to keep arrow-key scrolling; no ring needed. */
+.scroller:focus { outline: none; }
 .column {
   max-width: var(--content);
   margin: 0 auto;
@@ -614,50 +591,11 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 .row:first-child {
   margin-top: 0;
 }
-.fold {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  max-width: 100%;
-  margin: 18px 0 0 -6px;
-  padding: 4px 10px 4px 6px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--text-muted);
-  text-align: left;
-  animation: rise 200ms var(--ease) both;
-  transition: background 120ms var(--ease), color 120ms var(--ease);
+.row.k-run {
+  margin-top: 14px;
 }
-.fold:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-.fold + .fold { margin-top: 4px; }
-.fold-icon { flex: none; color: var(--text-faint); }
-.fold-label { flex: none; color: var(--text); font-weight: 600; }
-.fold-count, .fold-failed { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; }
-.fold-count { color: var(--text-muted); }
-.fold-failed { color: var(--danger); }
-.fold-spinner { flex: none; width: 10px; height: 10px; }
-.fold-target { min-width: 0; }
-.fold-step-enter-active { transition: opacity 160ms var(--ease), transform 160ms var(--ease); }
-.fold-step-enter-from { opacity: 0; transform: translateY(3px); }
-@media (prefers-reduced-motion: reduce) {
-  .fold, .fold-spinner { animation: none; }
-  .fold-step-enter-active { transition: none; }
-  .fold-step-enter-from { opacity: 1; transform: none; }
-}
-.fold-images {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin: 8px 0 0 18px;
-}
-.fold.open + .row {
-  margin-top: 6px;
-}
-.row.tight {
-  margin-top: 4px;
+.row.k-run:first-child {
+  margin-top: 0;
 }
 .row.k-user {
   display: flex;

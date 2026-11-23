@@ -28,6 +28,25 @@ const SESSION_PAGE: u64 = 100;
 /// Wakes the UI after an update is queued (the Tauri pump thread).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// What a send says about the Type its prompt was written in. The id is kept with the conversation's
+/// messages; the briefing is context for the model only. The request carries `Plain` as `null`,
+/// `Typed` as an object, and `Framed` as framing in the text for an engine that predates the field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeScope {
+    /// A modern engine and a prompt that names no Type: `type_context: null`.
+    Plain,
+    /// A modern engine: the prompt was written in this Type.
+    Typed(TypeContext),
+    /// An engine that predates `type_context`: the Type's framing is written into the text.
+    Framed(TypeContext),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeContext {
+    pub id: String,
+    pub briefing: String,
+}
+
 /// Something the user asked the engine to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -36,6 +55,8 @@ pub enum Command {
         text: String,
         images: Vec<String>,
         inline_images: Vec<String>,
+        /// The Type scope of the prompt. `None` sends no field: an engine that predates `type_context`.
+        type_context: Option<TypeScope>,
     },
     /// Answer a pending approval.
     Approve {
@@ -77,8 +98,6 @@ pub enum Command {
     Recover,
     /// Read the model, thinking level and approval mode in force.
     State,
-    /// Load the models `SetModel` accepts.
-    ListModels,
     /// Load the models after the engine re-queries signed-in and configured providers
     /// (`list_models` with `refresh: true`), so account listings such as Antigravity's are current.
     DiscoverModels,
@@ -212,6 +231,7 @@ impl Command {
                 text,
                 images,
                 inline_images,
+                type_context,
             } => {
                 // Engine admission requires nonblank text even when the turn has images.
                 let text = if text.trim().is_empty() && !(images.is_empty() && inline_images.is_empty()) {
@@ -222,6 +242,11 @@ impl Command {
                 } else {
                     text.as_str()
                 };
+                let framed = match type_context {
+                    Some(TypeScope::Framed(context)) => Some(crate::types::legacy_prompt(context, text)),
+                    _ => None,
+                };
+                let text = framed.as_deref().unwrap_or(text);
                 let mut params = json!({ "text": text });
                 // A plain prompt stays a plain `send`; attachments are only named when present.
                 if !images.is_empty() {
@@ -229,6 +254,14 @@ impl Command {
                 }
                 if !inline_images.is_empty() {
                     params["inline_images"] = json!(inline_images);
+                }
+                match type_context {
+                    // A modern engine: `null` states that the prompt names no Type.
+                    Some(TypeScope::Plain) => params["type_context"] = Value::Null,
+                    Some(TypeScope::Typed(context)) => {
+                        params["type_context"] = json!({ "id": context.id, "briefing": context.briefing });
+                    }
+                    Some(TypeScope::Framed(_)) | None => {}
                 }
                 (Purpose::Turn, "send", params)
             }
@@ -273,7 +306,6 @@ impl Command {
             Self::ApplySettings => (Purpose::ApplySettings, "apply_settings", json!({})),
             Self::Recover => (Purpose::Recover, "recovery_snapshot", json!({})),
             Self::State => (Purpose::State, "state", json!({})),
-            Self::ListModels => (Purpose::Models, "list_models", json!({})),
             Self::DiscoverModels => (Purpose::Models, "list_models", json!({ "refresh": true })),
             Self::ListImageModels => (
                 Purpose::ImageModels,
