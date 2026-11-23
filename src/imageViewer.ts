@@ -3,7 +3,7 @@
 
 import { shallowRef } from "vue";
 import { snapshot } from "./bridge";
-import type { Attachment } from "./types";
+export { IMAGE_FILE as IMAGE_EXT } from './attachmentFormats';
 
 export interface ViewedImage {
   /** The path as the conversation named it (relative to the project, or absolute). */
@@ -16,15 +16,12 @@ export interface ViewedImage {
   asset?: boolean;
 }
 
-type AttachmentPreview = Pick<Attachment, "name" | "url">;
+type AttachmentPreview = { name: string; url: string };
 export const viewedImage = shallowRef<ViewedImage | { attachment: AttachmentPreview } | null>(null);
 
 export function viewAttachment({ name, url }: AttachmentPreview) {
   viewedImage.value = { attachment: { name, url } };
 }
-
-/** Raster image file names the app can preview (the backend checks the real file too). */
-export const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
 
 /** Whether `path` is already an absolute POSIX or Windows path. */
 export function isAbsolutePath(path: string): boolean {

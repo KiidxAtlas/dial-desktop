@@ -219,14 +219,7 @@ pub struct RunOutput {
 /// cannot be started or runs out of time.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<RunOutput, String> {
     let shown = format!("{:?}", command.get_program());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // No console window flashes up behind the app.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = command
+    let mut child = crate::launcher::without_console(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

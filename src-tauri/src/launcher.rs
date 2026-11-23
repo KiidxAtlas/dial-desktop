@@ -97,6 +97,17 @@ pub fn import_shell_env() {
     }
 }
 
+/// Piping standard I/O does not prevent Windows from opening a separate console for a GUI's child.
+pub(crate) fn without_console(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Run `command` with no stdin and no controlling terminal, returning its stdout if it succeeds
 /// within `timeout`.
 ///
@@ -121,7 +132,7 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<
             });
         }
     }
-    let mut child = command
+    let mut child = without_console(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -808,6 +808,7 @@ async fn local_model_removal(
 
 #[tauri::command]
 async fn send_prompt(
+    webview: tauri::Webview,
     shared: State<'_, Shared>,
     store: State<'_, crate::types::Store>,
     workspace_root: String,
@@ -815,13 +816,25 @@ async fn send_prompt(
     text: String,
     images: Vec<String>,
     inline_images: Vec<String>,
+    documents: Option<Vec<attachments::documents::Document>>,
 ) -> Result<(), String> {
-    let text = text.trim();
-    if text.is_empty() && images.is_empty() && inline_images.is_empty() {
+    if webview.label() != "main" {
+        return Err("Only the app UI can submit attachments".into());
+    }
+    let documents = documents.unwrap_or_default();
+    if images.len() + inline_images.len() + documents.len() > attachments::MAX_IMAGES {
+        return Err(format!(
+            "Attach at most {} files to one prompt",
+            attachments::MAX_IMAGES
+        ));
+    }
+    let text = text.trim().to_owned();
+    if text.is_empty() && images.is_empty() && inline_images.is_empty() && documents.is_empty() {
         return Err("The prompt is empty".into());
     }
+    check_session(&shared.lock(), &workspace_root, session_id.as_deref())?;
     attachments::check(&images, &inline_images)?;
-    let text = crate::types::with_context(&store, text);
+    let text = crate::types::with_context(&store, &text);
     // Pasted images go by path like chosen files: inline base64 pushed the request past the
     // engine's 1 MiB RPC limit.
     let mut images = images;
@@ -834,6 +847,16 @@ async fn send_prompt(
             .join("pasted-images");
         images.extend(attachments::save_pasted(&dir, &inline_images)?);
     }
+    let (text, staged) = if documents.is_empty() {
+        (text, None)
+    } else {
+        let root = PathBuf::from(&workspace_root);
+        tauri::async_runtime::spawn_blocking(move || {
+            attachments::documents::stage(&root, text, documents)
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
     let reply = {
         let mut inner = shared.lock();
         check_session(&inner, &workspace_root, session_id.as_deref())?;
@@ -847,6 +870,10 @@ async fn send_prompt(
             inline_images: Vec::new(),
         })?
     };
+    // Once submitted, keep the copies for tool reads, including later turns and resumed sessions.
+    if let Some(folder) = staged {
+        let _ = folder.keep();
+    }
     rpc_reply(reply, None).await.map(|_| ())
 }
 
@@ -909,6 +936,15 @@ async fn read_image(webview: tauri::Webview, path: String) -> Result<ImageFile, 
     tauri::async_runtime::spawn_blocking(move || attachments::read_image(Path::new(&path)))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// File-manager copies may have paths on the native pasteboard but no DOM File objects.
+#[tauri::command]
+fn read_clipboard_file_paths(webview: tauri::Webview) -> Result<Vec<String>, String> {
+    if webview.label() != "main" {
+        return Err("Clipboard files are only available in the composer".into());
+    }
+    attachments::clipboard_paths::read()
 }
 
 /// Read the native clipboard only for the app UI, never for the integrated browser.
@@ -1649,6 +1685,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             send_prompt,
             send_background,
             read_image,
+            read_clipboard_file_paths,
             read_clipboard_image,
             save_image,
             read_transcript_image,

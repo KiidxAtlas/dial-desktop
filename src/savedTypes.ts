@@ -293,7 +293,7 @@ async function startTypeSession(id: string, root: string): Promise<string | null
  * Send `text` in type `id`'s own conversation, starting it first when the type has none in this
  * project. The type must be the one open.
  */
-export async function sendInType(id: string, text: string, images: Parameters<typeof engine.send>[1] = []): Promise<boolean> {
+export async function sendInType(id: string, text: string, attachments: Parameters<typeof engine.send>[1] = []): Promise<boolean> {
   const root = snapshot.value?.workspace?.root;
   if (!root) return false;
   try {
@@ -316,7 +316,7 @@ export async function sendInType(id: string, text: string, images: Parameters<ty
         // An unnamed conversation still works.
       }
     }
-    return await engine.send(`[[type:${id}]]\n${text}`, images, { workspaceRoot: root, sessionId: session });
+    return await engine.send(`[[type:${id}]]\n${text}`, attachments, { workspaceRoot: root, sessionId: session });
   } catch (error) {
     showToast(`Could not send: ${error instanceof Error ? error.message : error}`);
     return false;

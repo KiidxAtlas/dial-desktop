@@ -1,4 +1,4 @@
-//! Images attached to a prompt.
+//! Files attached to a prompt. Images use the engine's vision input; other files are read from workspace copies.
 //!
 //! A file chosen in the picker or dropped on the window stays a path: the engine reads it when the
 //! turn starts. The UI still needs to show it, so [`read_image`] returns a small data URL preview
@@ -8,6 +8,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 use std::path::Path;
+
+pub(crate) mod clipboard_paths;
+pub(crate) mod documents;
 
 #[cfg(test)]
 mod tests;

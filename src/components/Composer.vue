@@ -4,6 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
 import { engine, files, showToast, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
+import { clipboardAction, MAX_ATTACHMENTS, MAX_FILE_BYTES } from '../attachmentFormats';
 import { viewAttachment } from "../imageViewer";
 import { openMenu, ui } from "../ui";
 import { beginSend, draftFor } from "../drafts";
@@ -97,30 +98,29 @@ function editHeard(text: string) {
   draft.value.text = text;
   focus();
 }
-/** `false` only when the model is known not to take images; unknown models may try. */
-const imagesAllowed = computed(() => props.snap.model?.acceptsImages !== false);
+const attachmentHelp = `Choose, paste or drop up to ${MAX_ATTACHMENTS} files (${MAX_FILE_BYTES / (1024 * 1024)} MiB each). Copies may be saved in this project when you send.`;
 const hasContent = computed(() => !!draft.value.text.trim() || draft.value.attachments.length > 0);
-const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && !queue.value.loading && !queue.value.saving && !queue.value.sending && hasContent.value && (!draft.value.attachments.length || imagesAllowed.value));
+const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && !queue.value.loading && !queue.value.saving && !queue.value.sending && hasContent.value);
 async function queueDraft() {
   if (!canQueue.value) return;
   const target = draft.value;
   const text = target.text;
-  const images = [...target.attachments];
+  const attached = [...target.attachments];
   const finish = beginSend(target);
   focus();
   let queued = false;
   try {
-    queued = await enqueuePrompt(props.snap, text, images);
+    queued = await enqueuePrompt(props.snap, text, attached);
   } finally {
     finish(queued);
   }
 }
-/** While a turn runs, typed text goes to it as guidance (images cannot). */
+/** While a turn runs, typed text goes to it as guidance (files cannot). */
 const steering = computed(
   () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
 );
 const canSend = computed(() => !draft.value.sending && (slash.value.length > 0 || steering.value || (
-  props.snap.canSend && hasContent.value && (imagesAllowed.value || !draft.value.attachments.length)
+  props.snap.canSend && hasContent.value
 )));
 /** Files are being dragged over the window. */
 const dropping = ref(false);
@@ -187,7 +187,7 @@ async function send() {
     if (target.text === original) target.text = "";
     return;
   }
-  const images = [...target.attachments];
+  const attached = [...target.attachments];
   const steer = steering.value;
   const finish = beginSend(target);
   focus();
@@ -198,67 +198,51 @@ async function send() {
     accepted = steer
       ? await engine.steer(typedPrompt(text, scope.sessionId), scope)
       : ui.typeOpen && !typeSessionOnScreen()
-        ? await sendInType(ui.typeOpen, text, images)
-        : await engine.send(typedPrompt(text, scope.sessionId), images, scope);
+        ? await sendInType(ui.typeOpen, text, attached)
+        : await engine.send(typedPrompt(text, scope.sessionId), attached, scope);
   } finally {
     finish(accepted);
   }
 }
 
-async function chooseImages() {
+async function chooseFiles() {
   const target = draft.value;
   try {
-    await attachments.addPaths(target, await files.chooseImages());
+    await attachments.addPaths(target, await files.chooseFiles());
   } catch (error) {
     showToast(`Could not open the file picker: ${error}`);
   }
   if (target === draft.value) focus();
 }
 
-async function pasteImage(images?: File[]) {
+async function paste(action: ReturnType<typeof clipboardAction>) {
   const target = draft.value;
   const before = target.attachments.length;
-  if (images) await attachments.addBlobs(target, images);
-  else await attachments.addNativeClipboardImage(target);
+  if (action.kind === 'files') {
+    if (action.hasDirectory) showToast('Folders cannot be attached. Choose the files inside instead.');
+    await attachments.addBlobs(target, action.files);
+  } else if (action.kind === 'macImage') await attachments.addNativeClipboardImage(target);
+  else if (action.kind === 'nativeFiles') await attachments.addNativeClipboardFiles(target, props.snap.platform);
   if (!unmounted && target === draft.value && target.attachments.length > before) focus();
 }
 
 function attachmentMenu(event: MouseEvent) {
-  if (props.snap.platform !== 'macos') return void chooseImages();
+  if (props.snap.platform !== 'macos') return void chooseFiles();
   openMenu(event, [
-    { label: 'Choose image files…', run: chooseImages },
-    { label: 'Paste image from clipboard', run: () => pasteImage() },
+    { label: 'Choose files…', run: chooseFiles },
+    { label: 'Paste files or image from clipboard', run: () => paste({ kind: 'nativeFiles' }) },
   ], event.currentTarget as HTMLElement);
 }
 
-/** Attach clipboard images without interfering with normal text paste. */
+/** Only intercept file pastes in the composer or transcript. Text keeps its normal behavior. */
 function onPaste(event: ClipboardEvent) {
   const el = event.target;
   const inTranscript = el instanceof HTMLElement && !!el.closest('.main .scroller') && !el.closest('input, textarea, [contenteditable=true]');
   if (el !== input.value && !inTranscript || ui.settingsOpen || ui.paletteOpen || ui.shortcutsOpen || draft.value.sending) return;
-  const clipboard = event.clipboardData;
-  const images = Array.from(clipboard?.files ?? []).filter((f) => f.type.startsWith("image/"));
-  if (!images.length) {
-    for (const item of Array.from(clipboard?.items ?? [])) {
-      if (item.kind !== "file") continue;
-      const file = item.getAsFile();
-      if (file?.type.startsWith("image/")) images.push(file);
-    }
-  }
-  if (images.length && !imagesAllowed.value) {
-    event.preventDefault();
-    return showToast(`${props.snap.model?.label ?? 'This model'} does not take images. Choose a vision model to attach a screenshot.`);
-  }
-  const native = event.isTrusted && props.snap.platform === 'macos' && imagesAllowed.value;
-  if (native && images.length && images.every(f => /^image\/(?:x-)?tiff?$/i.test(f.type))) {
-    event.preventDefault();
-    void pasteImage();
-  } else if (images.length) {
-    event.preventDefault();
-    void pasteImage(images);
-  } else if (native && !clipboard?.getData('text/plain')) {
-    void pasteImage();
-  }
+  const action = clipboardAction(event, props.snap.platform);
+  if (action.kind === 'text') return;
+  event.preventDefault();
+  void paste(action);
 }
 
 // Files dropped anywhere on the window attach to the draft.
@@ -269,8 +253,8 @@ onMounted(async () => {
   const unlisten = await getCurrentWebview()
     .onDragDropEvent(({ payload }) => {
       const overBoard = payload.type !== "leave" && imageBoardAt(payload.position);
-      dropping.value = !overBoard && imagesAllowed.value && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
-      if (!overBoard && payload.type === "drop" && payload.paths.length && imagesAllowed.value && !ui.settingsOpen) {
+      dropping.value = !overBoard && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
+      if (!overBoard && payload.type === "drop" && payload.paths.length && !ui.settingsOpen) {
         const target = draft.value;
         void attachments.addPaths(target, payload.paths).then(() => {
           if (target === draft.value) focus();
@@ -410,17 +394,17 @@ onMounted(focus);
         <strong>{{ queue.paused ? 'Queue paused' : 'Queued follow-ups' }}</strong>
         <p v-if="queue.recovered" class="faint queue-recovery">Restored after restart. Check the transcript before sending a follow-up that may already have been sent.</p>
         <div v-for="item in queue.items" :key="item.id" class="queue-row">
-          <span class="truncate" :title="item.text">{{ item.text || 'Image prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} image(s)` : '' }}</span>
+          <span class="truncate" :title="item.text">{{ item.text || 'File prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} file${item.attachments.length === 1 ? '' : 's'}` : '' }}</span>
           <button class="icon-btn" title="Edit queued prompt" aria-label="Edit queued prompt" :disabled="queue.saving || queue.sending || draft.sending" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
           <button class="icon-btn" title="Remove queued prompt" aria-label="Remove queued prompt" :disabled="queue.saving || queue.sending" @click="removeQueued(snap, item.id)"><Icon name="cross" :size="14" /></button>
         </div>
-        <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.loading || queue.saving || queue.sending || !snap.canSend || (!imagesAllowed && !!queue.items[0]?.attachments.length)" @click="sendQueuedNext(snap)">Send next</button>
+        <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.loading || queue.saving || queue.sending || !snap.canSend" @click="sendQueuedNext(snap)">Send next</button>
       </section>
       <Transition name="pop">
         <VoicePanel v-if="snap.voice.phase !== 'off'" :voice="snap.voice" :turn-running="snap.turnRunning" @edit="editHeard" />
       </Transition>
       <div class="composer" :class="{ dropping }" @click="input?.focus()">
-        <div v-if="dropping" class="drop-hint"><Icon name="image" :size="16" /> Drop images to attach</div>
+        <div v-if="dropping" class="drop-hint"><Icon name="file" :size="16" /> Drop files to attach</div>
         <Transition name="pop">
           <div v-if="slash.length" class="slash" @click.stop>
             <div class="slash-head">Commands</div>
@@ -441,11 +425,12 @@ onMounted(focus);
           <div class="slash-foot"><kbd>↑</kbd><kbd>↓</kbd> choose <kbd>Tab</kbd> insert <kbd>Esc</kbd> dismiss</div>
         </div>
         <div v-if="draft.attachments.length" class="thumbs" @click.stop>
-          <div v-for="a in draft.attachments" :key="a.key" class="thumb" :title="a.name">
-            <button class="preview-thumb" :aria-label="`Preview ${a.name}`" :title="`Preview ${a.name}`" @click="viewAttachment(a)">
+          <div v-for="a in draft.attachments" :key="a.key" class="thumb" :class="{ 'file-chip': !a.url }" :title="`${a.name} · ${attachmentHelp}`">
+            <button v-if="a.url" class="preview-thumb" :aria-label="`Preview ${a.name}`" :title="`Preview ${a.name}`" @click="viewAttachment({ name: a.name, url: a.url! })">
               <img :src="a.url" alt="" />
             </button>
-            <button class="remove" :aria-label="`Remove ${a.name}`" :title="`Remove ${a.name}`" @click="draft.attachments = draft.attachments.filter((image) => image.key !== a.key)">
+            <template v-else><Icon name="file" :size="15" /><span class="truncate">{{ a.name }}</span></template>
+            <button class="remove" :aria-label="`Remove ${a.name}`" :title="`Remove ${a.name}`" @click="draft.attachments = draft.attachments.filter((file) => file.key !== a.key)">
               <Icon name="cross" :size="11" />
             </button>
           </div>
@@ -464,12 +449,11 @@ onMounted(focus);
         <div class="bar" @click.stop>
           <button
             class="attach"
-            :disabled="!imagesAllowed"
-            aria-label="Attach images"
-            :title="imagesAllowed ? 'Attach images (or paste / drop them)' : `${snap.model?.label ?? 'This model'} does not take images`"
+            aria-label="Attach files"
+            :title="attachmentHelp"
             @click="attachmentMenu"
           >
-            <Icon name="image" :size="15" />
+            <Icon name="file" :size="15" />
           </button>
           <ModelPicker ref="modelPicker" :snap="snap" />
           <ApprovalMenu ref="approvalMenu" :snap="snap" />
@@ -635,6 +619,8 @@ onMounted(focus);
   border: 1px solid var(--border);
   background: var(--bg);
 }
+.file-chip { display: inline-flex; align-items: center; align-self: center; gap: 6px; width: auto; max-width: min(100%, 220px); height: auto; padding: 7px 12px; font-size: var(--text-sm); }
+.file-chip svg { flex: none; }
 .preview-thumb { display: block; width: 100%; height: 100%; padding: 0; border-radius: inherit; cursor: zoom-in; }
 .thumb img {
   width: 100%;

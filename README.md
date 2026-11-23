@@ -149,6 +149,7 @@ continues. Local builds without the release config do not contact Azure.
   Search for a **Task recipe** by name (for example, **Review my changes** or **Fix a failing
   test**) to add an editable prompt to the current draft. The same recipes are available on an
   empty conversation. They preserve existing draft content and attachments and never send on their own.
+- **File attachments:** paste copied files into the composer, drop them onto the chat, or use **Attach files**. A prompt can carry up to 10 files, 64 MiB each, including PDFs and files without an extension. On send, documents are copied into a new `.dial-attachments-*` directory in the open project. It contains its own Git ignore rule. Dial can read these copies with its normal tools; what it can extract depends on the file format and installed readers. Keep the directory for follow-ups or delete it when it is no longer needed.
 - **Appearance** (Settings → Appearance): light, dark or the system's theme, and the zoom level.
   Saved on this computer. A pane over background artwork keeps the dark palette so text stays
   readable on the art.
@@ -229,11 +230,7 @@ continues. Local builds without the release config do not contact Azure.
   questions, and ended turns while Dial is unfocused. Click it to return to the session while Dial
   is running. Alerts do not show prompts, session names, or project names. macOS uses the installed
   app bundle; Linux needs a notification daemon with action support for click-through.
-- **Images**: paste screenshots or copied images directly into the prompt (⌘V / Ctrl+V), or use
-  the image button or drop files on the window. On macOS the image button also offers **Paste image from clipboard** if the system does not deliver a paste event. Supports PNG, JPEG, GIF and WebP (up to 10 images,
-  64 MiB each); macOS clipboard TIFF images are converted to PNG when needed. Pasted images are
-  saved in private files so both pasted and chosen images travel by path. The button is disabled when the model is known not to take
-  images. Relative Markdown image links in replies preview supported images inside the open project.
+- **Images**: pasted screenshots and supported image files (PNG, JPEG, GIF, WebP) can be sent as vision inputs. On macOS, the attach menu also offers native clipboard image paste and can convert TIFF screenshots to PNG. Relative Markdown image links in replies preview supported images inside the open project.
 - **Side panel** (drag its left edge to resize; the width is remembered per kind of panel):
   - **Plan** and **Changes** are always named. The panel menu opens **Files**, **Terminal**, **Browser**, **App**, and **Activity** (recent tool calls).
   - **App**: Dial defaults to a private Windows guest on Windows and a private Linux guest on Linux. The [packaged QEMU runtime](docs/app-runtime-packaging.md) tries Windows Hypervisor Platform (WHPX) or Linux KVM first; it still needs an imported guest disk. On Apple Silicon, [prepare and import a virtual Mac](packaging/macos-guest/prepare/README.md) to use the native macOS default. You can still explicitly select a different guest, including an existing unlabelled QEMU disk. Dial never downloads an OS or runs the project on the host as a fallback.
@@ -297,7 +294,7 @@ Not yet: images in question answers, agent screenshots of the browser outside ma
 | `src-tauri/src/files.rs` | Project files for the Files and Changes panels: listing, reading, `git diff`, all confined to the project |
 | `src-tauri/src/terminal.rs` | PTY shells for the Terminal panel (`terminal` events) |
 | `src-tauri/src/preview.rs` | Built-in session fed through the real `Conversation` reducer, for design work |
-| `src-tauri/src/attachments.rs` | Checks image attachments and reads their thumbnails |
+| `src-tauri/src/attachments.rs` | Image previews, native clipboard files and workspace copies for document attachments |
 | `src-tauri/src/cli.rs`, `time.rs` | Command-line options; session timestamps and relative labels |
 | `src/bridge.ts` | The only UI code that talks to Rust (`invoke`, events, toasts) |
 | `src/types.ts` | TypeScript mirror of `view.rs` and `settings.rs` |
@@ -308,7 +305,7 @@ Not yet: images in question answers, agent screenshots of the browser outside ma
 | `src/workspace.ts` | Side panel widths, live-preview detection, handing files and pages to the prompt |
 | `src/backgrounds.ts` | Background artwork painters (still and animated), the saved preference, the user's image |
 | `src/markdown.ts` | markdown-it rendering and Shiki highlighting (JavaScript regex engine, no WebAssembly) |
-| `src/attachments.ts` | The draft's image attachments (picker, paste, drop) |
+| `src/attachments.ts` | The draft's file attachments (picker, paste, drop) |
 | `src/components/` | `Sidebar`, `TopBar`, `Timeline`, `ToolRow`, `Composer` (+ approvals, attachments, `ContextMeter`), `QuestionCard`, `Inspector` (+ `workspace/BrowserPane`, `FilesPane`, `DiffPane`, `TerminalPane`), `Settings` (+ `SettingRow`, `AppearanceSettings`, `BackgroundSettings`), `ContextMenu`, `Palette`, `Shortcuts`, `EmptyState`, `Toasts` |
 | `src/styles.css` | Design tokens (palette, spacing, radii, type) and shared styles |
 

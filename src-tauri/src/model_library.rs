@@ -54,6 +54,7 @@ fn split_gguf(path: &str) -> bool {
 
 fn hf() -> Command {
     let mut cmd = Command::new("hf");
+    crate::launcher::without_console(&mut cmd);
     cmd.current_dir(std::env::temp_dir()).stdin(Stdio::null());
     cmd
 }

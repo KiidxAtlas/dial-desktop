@@ -9,6 +9,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { ref, shallowRef } from "vue";
+import { attachmentPayload } from './attachmentFormats';
 import type {
   Answer,
   ApprovalMode,
@@ -236,8 +237,7 @@ export const engine = {
   send: (text: string, attachments: Attachment[], scope: { workspaceRoot: string; sessionId: string | null }) =>
     call("send_prompt", {
       ...scope, text,
-      images: attachments.flatMap((a) => (a.path ? [a.path] : [])),
-      inlineImages: attachments.flatMap((a) => (a.data ? [a.data] : [])),
+      ...attachmentPayload(attachments, snapshot.value?.model?.acceptsImages),
     }),
   approve: (approvalId: string, decision: Decision) => call("approve", { approvalId, decision }),
   abort: () => call("abort"),
@@ -392,6 +392,7 @@ export const files = {
   /** Check the image at `path` and read its thumbnail; throws a readable message. */
   readImage: (path: string) => invoke<ImageFile>("read_image", { path }),
   readClipboardImage: () => isTauri() ? invoke<string | null>("read_clipboard_image") : Promise.resolve(null),
+  readClipboardFilePaths: () => isTauri() ? invoke<string[]>('read_clipboard_file_paths') : Promise.resolve([]),
   readTranscriptImage: (workspaceRoot: string, path: string) =>
     invoke<ImageFile>("read_transcript_image", { workspaceRoot, path }),
   /** Open a project image in the system's default viewer (Preview on a Mac). */
@@ -399,13 +400,9 @@ export const files = {
     invoke<void>("open_transcript_image", { workspaceRoot, path }).catch((error) => showToast(String(error))),
   /** Show the file in the system file manager (Finder, Explorer). */
   reveal: (path: string) => revealItemInDir(path).catch((error) => showToast(`Could not show the file: ${error}`)),
-  /** Ask for images with the system dialog; empty when cancelled. */
-  async chooseImages(): Promise<string[]> {
-    const picked = await openDialog({
-      multiple: true,
-      title: "Attach images",
-      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
-    });
+  /** Ask for files with the system dialog; empty when cancelled. */
+  async chooseFiles(): Promise<string[]> {
+    const picked = await openDialog({ multiple: true, title: 'Attach files' });
     return Array.isArray(picked) ? picked : picked ? [picked] : [];
   },
   /** Ask for one background image with the system dialog; `null` when cancelled. */
