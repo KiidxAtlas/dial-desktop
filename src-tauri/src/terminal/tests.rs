@@ -52,3 +52,19 @@ fn a_shell_streams_output_and_reports_its_exit() {
     // Closing an already-exited shell remains a safe no-op.
     terminals.close(id);
 }
+
+#[test]
+fn slash_command_preserves_literal_argument_and_configured_program() {
+    let program = Path::new("configured engine");
+    let root = Path::new("project root");
+    let text = "/doctor 'quoted' $(example) & %name%";
+    let child = slash_command(program, root, text).unwrap();
+    assert_eq!(child.get_argv(), &[program.as_os_str(), text.as_ref()]);
+    assert_eq!(child.get_cwd().map(Path::new), Some(root));
+    for invalid in ["", "dial", "--help", " /doctor", "/", "/a\nb", "/a\u{1b}"] {
+        assert!(
+            slash_command(program, root, invalid).is_err(),
+            "{invalid:?}"
+        );
+    }
+}

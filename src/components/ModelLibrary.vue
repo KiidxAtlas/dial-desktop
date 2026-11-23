@@ -5,6 +5,18 @@ import { engine, modelDownloads, openExternal, showToast, snapshot, type CachedM
 const props = defineProps<{ preview: boolean }>();
 const query = ref(''), format = ref('All'), error = ref(''), pending = ref(false);
 const status = ref<DownloadStatus | null>(null);
+const settingUp = ref(false), setupMessage = ref('');
+async function setupDownloads() {
+  if (props.preview || settingUp.value) return;
+  settingUp.value = true; setupMessage.value = '';
+  try {
+    if (await modelDownloads.setup() && mounted) {
+      setupMessage.value = 'Model downloads are ready. Choose a model to download.';
+      error.value = ''; await searchHub();
+    }
+  } catch (e) { if (mounted) setupMessage.value = String(e); }
+  finally { settingUp.value = false; }
+}
 const cached = ref<CachedModel[] | null>(null);
 const matches = (text: string) => text.toLowerCase().includes(query.value.trim().toLowerCase());
 const results = computed(() => catalog.filter(m => (format.value === 'All' || format.value === m.format) && matches(m.repo + ' ' + m.description + ' ' + m.name)));
@@ -40,9 +52,12 @@ async function openRepo(repo: string) {
 const ggufFiles = computed(() => (opened.value?.files ?? []).filter(f => f.path.toLowerCase().endsWith('.gguf')).sort((a, b) => a.size - b.size));
 const repoBytes = computed(() => (opened.value?.files ?? []).reduce((sum, f) => sum + f.size, 0));
 async function downloadHub(repo: string, bytes: number, file?: string) {
-  if (pending.value) return;
+  if (pending.value || settingUp.value) return;
   pending.value = true; error.value = ''; ++version; clearTimeout(timer);
-  try { const next = await modelDownloads.start(repo, size(bytes), file); if (next) status.value = next; }
+  try {
+    const next = await modelDownloads.start(repo, size(bytes), file);
+    if (next) { status.value = next; if (mounted && hubError.value) void searchHub(); }
+  }
   catch (e) { error.value = String(e); }
   finally { pending.value = false; if (mounted) void refresh(); }
 }
@@ -71,11 +86,11 @@ async function refresh() {
   if (mounted && id === version && status.value?.running) timer = setTimeout(refresh, 1000);
 }
 async function act(model?: typeof catalog[number]) {
+  if (model) return downloadHub(model.repo, model.bytes);
   if (pending.value) return;
   pending.value = true; error.value = ''; ++version; clearTimeout(timer);
   try {
-    const next = model ? await modelDownloads.start(model.repo, size(model.bytes)) : await modelDownloads.cancel();
-    if (next) status.value = next;
+    status.value = await modelDownloads.cancel();
   } catch(e) { error.value = String(e); }
   finally { pending.value = false; if (mounted) void refresh(); }
 }
@@ -92,11 +107,12 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
     <h2>Model library</h2><p class="note">Download a local model for offline use. Choose MLX for Apple silicon, or GGUF for a compatible local runner. Downloading doesn’t change the model in your session.</p>
     <div class="filters"><input aria-label="Filter downloaded and suggested models" placeholder="Filter downloaded and suggested models…" v-model="query" /><select aria-label="Suggested model format" v-model="format"><option>All</option><option>MLX</option><option>GGUF</option></select></div>
     <p v-if="preview">Preview only. Open Desktop normally to download models.</p>
+    <p v-if="pending && !status?.running" role="status">Preparing your download. If this is your first download, helper setup can take a few minutes.</p>
     <aside v-if="status?.message" role="status"><strong>{{ status.repo }}</strong><br />{{ status.message }} <button v-if="status.running" class="btn btn-secondary" :disabled="pending" @click="act()">Cancel download</button></aside>
     <aside v-if="error" role="alert">{{ error }}</aside>
     <template v-if="cached !== null">
       <h3>Downloaded <span class="head-tools"><span v-if="cached.length">{{ cached.length }} · {{ size(cachedTotal) }}</span><button class="guide reload" title="Check the Hugging Face cache again" @click="loadCached">Reload</button></span></h3>
-      <p v-if="!cached.length">Nothing in your Hugging Face cache yet. Models you download with <code>hf download</code> or from the list below appear here.</p>
+      <p v-if="!cached.length">Nothing in your Hugging Face cache yet. Choose a model below to download it.</p>
       <p v-else-if="!downloaded.length">No downloaded model matches.</p>
       <article v-for="m in downloaded" :key="'cached-' + m.repo">
         <div><strong>{{ m.repo }}</strong><p>{{ size(m.bytes) }} on disk</p></div>
@@ -107,6 +123,9 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
       </article>
     </template>
     <h3>Browse Hugging Face</h3>
+    <div v-if="!preview && (hubError || error || settingUp || setupMessage)"><button class="btn btn-secondary" :disabled="settingUp || pending || status?.running" @click="setupDownloads">{{ settingUp ? 'Setting up model downloads…' : 'Set up model downloads' }}</button>
+      <p class="note" role="status">{{ setupMessage || (settingUp ? 'This can take a few minutes.' : 'Use this if the Hugging Face helper is missing or incompatible. No terminal or administrator access needed.') }}</p>
+    </div>
     <form class="filters" @submit.prevent="searchHub">
       <input aria-label="Search Hugging Face models" placeholder="Narrow by name, e.g. qwen coder, llama, gemma…" v-model="hubQuery" :disabled="preview" />
       <div class="segmented" role="radiogroup" aria-label="Model format">
@@ -115,7 +134,7 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
     </form>
     <p v-if="!hubQuery.trim() && hub?.length" class="note">Most downloaded {{ hubFormat }} models{{ hubFormat === 'MLX' ? ' (Apple silicon)' : '' }}.</p>
     <p v-if="hubBusy && !hub" class="note">Loading models…</p>
-    <aside v-if="hubError" role="alert">{{ hubError }}</aside>
+    <aside v-if="hubError && hubError !== error" role="alert">{{ hubError }}</aside>
     <p v-if="hub && !hub.length">No {{ hubFormat }} models match “{{ hubQuery }}”.</p>
     <div v-if="hub?.length" class="hub" :class="{ stale: hubBusy }">
       <article v-for="m in hub" :key="m.id" class="hub-row">
@@ -148,7 +167,7 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
       <button class="btn btn-secondary" :aria-label="`Download ${m.name} (${m.format})`" :disabled="preview || pending || status?.running" @click="act(m)">{{ status?.running && status.repo === m.repo ? 'Downloading…' : isCached(m.repo) ? 'Update' : 'Download' }}</button>
     </article>
     <p v-if="!results.length">No matches. Try another name or format.</p>
-    <p>Downloads use the Hugging Face cache. <button class="guide" @click="openExternal('https://huggingface.co/docs/huggingface_hub/guides/cli')">Hugging Face CLI setup guide ↗</button></p>
+    <p>Downloads use your Hugging Face cache.</p>
   </section>
 </template>
 <style scoped>

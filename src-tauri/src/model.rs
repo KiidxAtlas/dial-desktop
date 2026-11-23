@@ -240,6 +240,8 @@ pub struct Model {
     pub toast: Option<String>,
     /// Whether the model the engine started with takes images (`ready.image_input`).
     pub ready_image_input: Option<bool>,
+    /// Whether the engine takes the structured `type_context` on `send` (`ready.features`).
+    pub type_context_supported: bool,
     /// The settings reference (`settings_schema`'s `settings`), once loaded.
     pub settings_schema: Option<Vec<Value>>,
     /// Saved settings' effective values by key, once loaded.
@@ -627,6 +629,7 @@ impl Model {
                     text,
                     images,
                     inline_images,
+                    ..
                 } = &command
                 {
                     self.conversation
@@ -642,6 +645,9 @@ impl Model {
                 self.pending.insert(id, purpose);
             }
             Update::RequestFailed { command, error } => {
+                if command == Command::LiveStop {
+                    self.voice.stopped();
+                }
                 if command == Command::DiscoverModels {
                     self.discovering = false;
                 }
@@ -657,10 +663,16 @@ impl Model {
                 // The wire client keeps structured tool data but not top-level journal attachment
                 // fields. Project retained references into the same channel as live results.
                 match &mut message {
-                    Message::Event(event) if event.kind == "replay_message" => replay_images(&mut event.body["message"]),
+                    Message::Event(event) if event.kind == "replay_message" => {
+                        replay_images(&mut event.body["message"]);
+                        crate::legacy_text::project_user_message(&mut event.body["message"]);
+                    }
                     Message::Response { result: Ok(body), .. } if body.get("messages").is_some() => {
                         if let Some(messages) = body["messages"].as_array_mut() {
-                            for message in messages { replay_images(message); }
+                            for message in messages {
+                                replay_images(message);
+                                crate::legacy_text::project_user_message(message);
+                            }
                         }
                     }
                     _ => {}
@@ -687,6 +699,7 @@ impl Model {
         self.pending.clear();
         self.recovering = false;
         self.ready_image_input = ready.raw["image_input"].as_bool();
+        self.type_context_supported = ready.raw["features"]["type_context"].as_bool() == Some(true);
         self.connection = Some(Connection::Live {
             model: ready.model.clone(),
             engine_version: ready.engine_version.clone(),
@@ -768,9 +781,9 @@ impl Model {
                             self.apply_after_turn(follow);
                         }
                     }
-                    (Purpose::LiveMute | Purpose::LiveStop | Purpose::Speak, Ok(_)) => {}
+                    (Purpose::LiveMute | Purpose::Speak, Ok(_)) => {}
                     // Ending voice mode after the engine's session is gone is not a problem.
-                    (Purpose::LiveStop, Err(_)) => {}
+                    (Purpose::LiveStop, _) => self.voice.stopped(),
                     (Purpose::State, Ok(state)) => {
                         if state["session_id"].as_str().is_some_and(|id| Some(id) != self.conversation.session_id()) {
                             return;

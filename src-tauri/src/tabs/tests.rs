@@ -27,6 +27,7 @@ fn model(session: &str, busy: bool) -> Model {
     if busy {
         model.apply(Update::Requested {
             command: Command::Send {
+                type_context: None,
                 text: format!("work in {session}"),
                 images: vec![],
                 inline_images: vec![],
@@ -175,6 +176,7 @@ fn a_completed_turn_notifies_once_but_an_engine_exit_does_not() {
     let mut tabs = Tabs::new(tab("s1", false));
     tabs.active_mut().apply(Update::Requested {
         command: Command::Send {
+            type_context: None,
             text: "quick turn".into(),
             images: vec![],
             inline_images: vec![],
@@ -325,4 +327,30 @@ fn model_removal_is_refused_while_background_work_is_running() {
         ..Default::default()
     });
     assert!(tabs.check_model_removal("selected").is_err());
+}
+
+#[test]
+fn restart_reservation_rechecks_terminals_and_all_tabs_before_blocking_work() {
+    use RestartDecision::*;
+    let mut tabs = Tabs::new(tab("running", true));
+    tabs.open(tab("idle", false));
+    assert_eq!(tabs.reserve_restart(vec![], &[]), Ok(Busy));
+    finish(&mut tabs.tabs[0].model);
+    // Queued before an engine request ID (or session id in the first place) exists.
+    let mut queued = Tab::new(Model::starting(), None);
+    queued.turn_queued = true;
+    tabs.add_background(queued);
+    assert_eq!(tabs.reserve_restart(vec![], &[]), Ok(Busy));
+    tabs.tabs.last_mut().unwrap().turn_queued = false;
+    assert_eq!(tabs.reserve_restart(vec![1], &[]), Ok(ConfirmTerminals { ids: vec![1] }));
+    assert_eq!(tabs.reserve_restart(vec![2], &[1]), Ok(ConfirmTerminals { ids: vec![2] }));
+    tabs.active_mut().model.voice.start(None);
+    assert_eq!(tabs.reserve_restart(vec![2], &[2]), Ok(Busy));
+    tabs.active_mut().model.voice.stop();
+    assert_eq!(tabs.reserve_restart(vec![2], &[2]), Ok(Busy));
+    tabs.active_mut().model.voice.stopped();
+    assert_eq!(tabs.reserve_restart(vec![2], &[2]), Ok(Reserved));
+    assert!(tabs.allow_work().is_err());
+    tabs.release_restart();
+    assert!(tabs.allow_work().is_ok());
 }

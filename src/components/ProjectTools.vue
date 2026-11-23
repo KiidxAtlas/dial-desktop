@@ -18,6 +18,8 @@ import { computed, onMounted, ref } from "vue";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { OpenSnapshot } from "../types";
 import { showToast } from "../bridge";
+import { openTaskTerminal } from "../commandRunner";
+import { saveSchedule } from "../schedules";
 import { applySaved, count, engineCall, readable, tryEngine, usd } from "../engineTools";
 
 const props = defineProps<{ which: ProjectTab; snap: OpenSnapshot }>();
@@ -70,7 +72,7 @@ async function load() {
         data.value = await engineCall("list_dirs");
         break;
       case "schedules":
-        data.value = await engineCall("list_schedules");
+        [data.value, extra.value] = await Promise.all([engineCall("list_schedules"), engineCall("schedule_status").catch(() => null)]);
         break;
     }
   } catch (e) {
@@ -296,15 +298,36 @@ const dirs = computed<string[]>(() => (data.value?.dirs ?? []).map((d: any) => (
 
 // ── Schedules ──
 const schedules = computed<any[]>(() => data.value?.schedules ?? []);
-function scheduleText(s: any) {
-  return s.prompt ?? s.task ?? s.name ?? s.id;
+const schedulePrompt = ref("");
+const trigger = ref<"every" | "watch">("every");
+const interval = ref("1h");
+const pattern = ref("");
+const saving = ref(false);
+async function createSchedule() {
+  if (saving.value) return;
+  const root = props.snap.workspace.root;
+  saving.value = true;
+  try {
+    const draft = { prompt: schedulePrompt.value.trim(), ...(trigger.value === "every" ? { every: interval.value.trim() } : { watch: [pattern.value.trim()] }) };
+    if (await saveSchedule(draft, root, summary => ask(summary, { title: "Save schedule", kind: "warning", okLabel: "Save" }), request => engineCall("add_schedule", request, root))) {
+      schedulePrompt.value = "";
+      showToast("Schedule saved");
+      await load();
+    }
+  } catch (e) { showToast(readable(e)); }
+  finally { saving.value = false; }
 }
-function scheduleWhen(s: any) {
-  return [s.every ?? s.interval ?? s.cron ?? s.trigger ?? s.when, s.next_run ? `next ${s.next_run}` : ""].filter(Boolean).join(" · ");
+async function startRunner() {
+  const root = props.snap.workspace.root;
+  if (await ask(`Run this project's saved schedules in ${root}? Due tasks may start immediately, with each schedule's saved tool approvals. The runner stays open in the Terminal panel until ended or the project closes.`, { title: "Start scheduler", kind: "warning", okLabel: "Start" })) {
+    openTaskTerminal({ kind: "scheduler" }, root);
+  }
 }
-async function removeSchedule(s: any) {
-  if (!(await ask(`Remove the schedule “${scheduleText(s)}”?`, { title: "Remove schedule", kind: "warning", okLabel: "Remove" }))) return;
-  if ((await tryEngine("remove_schedule", { id: String(s.id), confirm: true }, "Could not remove the schedule")) !== null) await load();
+async function removeSchedule(entry: { id: string; prompt: string }) {
+  const root = props.snap.workspace.root;
+  if (!(await ask(`Remove the schedule “${entry.prompt}”?`, { title: "Remove schedule", kind: "warning", okLabel: "Remove" }))) return;
+  try { await engineCall("remove_schedule", { id: entry.id, confirm: true }, root); await load(); }
+  catch (e) { showToast(readable(e)); }
 }
 </script>
 
@@ -518,10 +541,24 @@ async function removeSchedule(s: any) {
       <!-- Schedules -->
       <template v-else-if="which === 'schedules'">
         <section class="group">
-          <p v-if="!schedules.length" class="muted">No schedules. Ask Dial to “run the tests every morning”, or use <span class="mono">/schedule add</span>.</p>
-          <div v-for="s in schedules" :key="s.id" class="item">
-            <div class="grow"><b>{{ scheduleText(s) }}</b><div class="muted small">{{ scheduleWhen(s) }}</div></div>
-            <button class="link bad" @click="removeSchedule(s)">Remove</button>
+          <h3>Create a read-only schedule</h3>
+          <form class="form" @submit.prevent="createSchedule">
+            <label class="form-field">Prompt <textarea v-model="schedulePrompt" class="field schedule-prompt" rows="3" required placeholder="Summarize recent changes" /></label>
+            <div class="inline">
+              <select v-model="trigger" class="field" aria-label="Trigger"><option value="every">Repeat every</option><option value="watch">When files change</option></select>
+              <input v-if="trigger === 'every'" v-model="interval" class="field" aria-label="Interval" required placeholder="30s, 5m, 2h or 1d" />
+              <input v-else v-model="pattern" class="field" aria-label="File pattern" required placeholder="src/**/*.ts" />
+              <button class="btn btn-primary" :disabled="saving || !schedulePrompt.trim() || !(trigger === 'every' ? interval : pattern).trim()">Save schedule</button>
+            </div>
+          </form>
+        </section>
+        <section class="group">
+          <div class="item"><div class="grow"><b>{{ extra?.running ? "Scheduler running" : extra ? "Scheduler stopped" : "Scheduler status unavailable" }}</b><div class="muted small">Saved schedules need a running scheduler. Refresh to check its status.</div></div>
+            <button v-if="!extra?.running" class="btn btn-secondary" :disabled="!schedules.length" @click="startRunner">Start scheduler</button></div>
+          <p v-if="!schedules.length" class="muted">No schedules yet.</p>
+          <div v-for="s in schedules" :key="s.entry.id" class="item">
+            <div class="grow"><b>{{ s.entry.prompt }}</b><div class="muted small">{{ [s.entry.every_secs && `Every ${s.entry.every_secs}s`, ...(s.entry.watch ?? []), s.access].filter(Boolean).join(' · ') }}</div></div>
+            <button class="link bad" @click="removeSchedule(s.entry)">Remove</button>
           </div>
         </section>
       </template>
@@ -565,6 +602,7 @@ h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; text-transform: capita
 .inline { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .stack { margin-top: 12px; }
 .field { flex: 1; min-width: 0; height: 32px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; font-size: var(--text-sm); }
+.field.schedule-prompt { flex: none; height: auto; padding-block: 7px; resize: vertical; }
 .field:focus { outline: none; border-color: var(--accent); }
 .check { display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-sm); color: var(--text-muted); white-space: nowrap; }
 .link { font-size: var(--text-sm); color: var(--text-muted); }

@@ -381,7 +381,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       <button
         v-if="snap.connection.state === 'failed' && snap.connection.problem === 'missing'"
         class="btn btn-primary retry"
-        :disabled="!!updates.engineBusy"
+        :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
         @click="installEngine()"
       >
         <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}
@@ -389,7 +389,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
       <button
         v-else-if="snap.connection.state === 'failed' && snap.connection.problem === 'incompatible'"
         class="btn btn-primary retry"
-        :disabled="!!updates.engineBusy"
+        :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
         @click="updateEngine()"
       >
         <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}

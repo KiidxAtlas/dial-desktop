@@ -409,16 +409,25 @@ fn a_type_prompt_carries_what_the_type_is() {
             "view": {"layout": "board"}
         })))
         .unwrap();
-    let sent = with_context(&store, &format!("[[type:{}]]\nmake it warmer", def.id));
+    let sent = match type_scope(&store, Some(def.id.as_str()), false) {
+        Some(crate::engine::TypeScope::Framed(context)) => legacy_prompt(&context, "make it warmer"),
+        other => panic!("{other:?}"),
+    };
     assert!(sent.starts_with(&format!("[[type:{}]]\n{CONTEXT_OPEN}", def.id)));
     assert!(sent.contains("Image board") && sent.contains("Pictures that set a mood"));
-    assert!(sent.contains("board layout") && sent.contains("not about the project's code"));
     assert!(sent.ends_with("make it warmer"));
-    // Already briefed, plain, or about an unknown type: unchanged.
-    assert_eq!(with_context(&store, &sent), sent);
-    assert_eq!(with_context(&store, "fix the build"), "fix the build");
-    let unknown = "[[type:nope-1234]]\nhello";
-    assert_eq!(with_context(&store, unknown), unknown);
+    // A modern engine gets the Type beside the user's own text.
+    match type_scope(&store, Some(def.id.as_str()), true) {
+        Some(crate::engine::TypeScope::Typed(context)) => {
+            assert_eq!(context.id, def.id);
+            assert!(context.briefing.starts_with(CONTEXT_OPEN) && context.briefing.contains("board layout"));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A modern prompt in no Type says so explicitly; an older engine gets nothing for it.
+    assert_eq!(type_scope(&store, None, true), Some(crate::engine::TypeScope::Plain));
+    assert_eq!(type_scope(&store, Some("nope-1234"), true), Some(crate::engine::TypeScope::Plain));
+    assert_eq!(type_scope(&store, None, false), None);
 }
 
 #[test]

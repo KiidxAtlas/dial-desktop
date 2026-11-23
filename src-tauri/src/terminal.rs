@@ -1,13 +1,13 @@
 //! Interactive shells for the Terminal panel: one pseudo-terminal per shell, its output streamed
 //! to a sink (the app forwards it as `terminal` events), keystrokes and resizes sent back in.
 
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::Serialize;
 
 /// What a shell reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -54,6 +54,51 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
     command
 }
 
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Task {
+    Slash { command: String },
+    Scheduler,
+}
+
+impl Task {
+    pub fn child(self, program: &Path, cwd: &Path) -> Result<CommandBuilder, String> {
+        match self {
+            Self::Slash { command } => slash_command(program, cwd, &command),
+            Self::Scheduler => {
+                let mut child = CommandBuilder::new(program);
+                child.args(["schedule", "run"]);
+                child.cwd(cwd);
+                Ok(child)
+            }
+        }
+    }
+}
+
+/// A separate interactive engine with one literal startup argument; never execute shell syntax.
+pub fn slash_command(program: &Path, cwd: &Path, text: &str) -> Result<CommandBuilder, String> {
+    let name = text
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|s| s.strip_prefix('/'));
+    if !text.starts_with('/')
+        || text.chars().any(char::is_control)
+        || !name.is_some_and(|s| {
+            s.starts_with(|c: char| c.is_ascii_alphabetic())
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        })
+    {
+        return Err("Expected a single-line slash command".into());
+    }
+    let mut child = CommandBuilder::new(program);
+    child.arg(text);
+    child.cwd(cwd);
+    child.env("TERM", "xterm-256color");
+    child.env("COLORTERM", "truecolor");
+    Ok(child)
+}
+
 impl Terminals {
     fn lock_shells(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Shell>> {
         self.shells.lock().unwrap_or_else(PoisonError::into_inner)
@@ -61,6 +106,10 @@ impl Terminals {
 
     pub fn has_shells(&self) -> bool {
         !self.lock_shells().is_empty()
+    }
+
+    pub fn open_ids(&self) -> Vec<u32> {
+        self.lock_shells().keys().copied().collect()
     }
     /// Start `command` in a terminal of `cols`×`rows`; its output goes to `sink` from a reader
     /// thread until it ends. Returns the shell's id.

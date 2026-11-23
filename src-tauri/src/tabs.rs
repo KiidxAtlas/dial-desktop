@@ -275,11 +275,20 @@ pub struct SessionNotice {
     pub session_id: String,
     pub kind: NoticeKind,
 }
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum RestartDecision {
+    Busy,
+    ConfirmTerminals { ids: Vec<u32> },
+    Reserved,
+}
+
 /// The open tabs; one is on screen.
 pub struct Tabs {
     tabs: Vec<Tab>,
     active: usize,
     closing: HashMap<String, Weak<AtomicBool>>,
+    restart_reserved: bool,
 }
 
 impl Tabs {
@@ -288,6 +297,7 @@ impl Tabs {
             tabs: vec![tab],
             active: 0,
             closing: HashMap::new(),
+            restart_reserved: false,
         }
     }
 
@@ -301,6 +311,35 @@ impl Tabs {
 
     pub fn protects_work(&self) -> bool {
         self.tabs.iter().any(Tab::protects_work)
+    }
+
+    /// Called with the same Inner lock as turn submissions, voice starts and terminal opens.
+    pub fn reserve_restart(
+        &mut self,
+        terminals: Vec<u32>,
+        confirmed: &[u32],
+    ) -> Result<RestartDecision, String> {
+        self.allow_work()?;
+        if self.protects_work() || self.tabs.iter().any(|tab| tab.model.voice.prevents_restart()) {
+            return Ok(RestartDecision::Busy);
+        }
+        if terminals.iter().any(|id| !confirmed.contains(id)) {
+            return Ok(RestartDecision::ConfirmTerminals { ids: terminals });
+        }
+        self.restart_reserved = true;
+        Ok(RestartDecision::Reserved)
+    }
+
+    pub fn allow_work(&self) -> Result<(), String> {
+        if self.restart_reserved {
+            Err("Dial Desktop is installing an update and restarting. Try again after restart.".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn release_restart(&mut self) {
+        self.restart_reserved = false;
     }
 
     pub fn check_model_removal(&self, model: &str) -> Result<(), String> {

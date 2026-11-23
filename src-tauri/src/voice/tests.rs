@@ -390,6 +390,7 @@ fn a_user_set_style_is_not_overridden_and_a_running_turn_must_finish_first() {
     requested(
         &mut busy,
         Command::Send {
+            type_context: None,
             text: "work".into(),
             images: vec![],
             inline_images: vec![],

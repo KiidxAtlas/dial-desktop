@@ -1,75 +1,92 @@
-// The draft's image attachments: chosen in the dialog, dropped on the window or pasted.
+// Files selected, dropped or pasted into the draft. Only images get previews.
+import { files, showToast } from './bridge';
+import { IMAGE_FILE, imageMime, MAX_ATTACHMENTS, MAX_FILE_BYTES } from './attachmentFormats';
+import type { Draft } from './drafts';
+import type { Attachment } from './types';
 
-import { files, showToast } from "./bridge";
-import type { Draft } from "./drafts";
-
-/** Matches `MAX_IMAGES` in `src-tauri/src/attachments.rs`. */
-export const MAX_IMAGES = 10;
-export const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
-const IMAGE_MIME = /^image\/(png|jpeg|gif|webp)$/i;
-/** Matches `MAX_IMAGE_BYTES` in the desktop backend. */
-const MAX_IMAGE_BYTES = 64 * 1024 * 1024;
+export { IMAGE_FILE } from './attachmentFormats';
 
 function hasRoom(draft: Draft): boolean {
-  if (draft.attachments.length < MAX_IMAGES) return true;
-  showToast(`Attach at most ${MAX_IMAGES} images to one prompt`);
+  if (draft.attachments.length < MAX_ATTACHMENTS) return true;
+  showToast(`Attach at most ${MAX_ATTACHMENTS} files to one prompt`);
   return false;
 }
 
-/** Attach image files by path; other files are skipped with a message. */
+/** Check again after async reads: another batch may have filled the draft. */
+function append(draft: Draft, attachment: Attachment): boolean {
+  if (attachment.path !== null && draft.attachments.some(a => a.path === attachment.path)) return true;
+  if (!hasRoom(draft)) return false;
+  draft.attachments.push(attachment);
+  return true;
+}
+
+/** Documents stay as paths until send, when the backend checks the file and its size. */
 export async function addPaths(draft: Draft, paths: string[]) {
-  const images = [...new Set(paths.filter((p) => IMAGE_FILE.test(p)))];
-  if (paths.some((p) => !IMAGE_FILE.test(p))) showToast("Only PNG, JPEG, GIF and WebP images can be attached");
-  for (const path of images) {
-    if (draft.attachments.some((a) => a.path === path)) continue;
+  for (const path of new Set(paths)) {
+    if (draft.attachments.some(a => a.path === path)) continue;
     if (!hasRoom(draft)) return;
     try {
-      const image = await files.readImage(path);
-      if (draft.attachments.some((a) => a.path === image.path)) continue;
-      if (!hasRoom(draft)) return;
-      draft.attachments.push({ key: crypto.randomUUID(), name: image.name, url: image.url, path: image.path, data: null });
+      const file = IMAGE_FILE.test(path) ? await files.readImage(path) : { path, name: path.split(/[\\/]/).pop() || path, url: null };
+      if (!append(draft, { ...file, key: crypto.randomUUID(), data: null })) return;
     } catch (error) {
       showToast(String(error));
     }
   }
 }
 
-/** Attach pasted image data (clipboard files have no path). */
+function readBase64(file: File): Promise<string> {
+  if (!file.size) return Promise.resolve('');
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result);
+      const comma = url.indexOf(',');
+      if (comma < 0) reject(new Error('Missing file data'));
+      else resolve(url.slice(comma + 1));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+/** DOM clipboard files expose bytes rather than a local path. */
 export async function addBlobs(draft: Draft, blobs: File[]) {
   for (const blob of blobs) {
-    if (!IMAGE_MIME.test(blob.type)) {
-      showToast("Only PNG, JPEG, GIF and WebP images can be attached");
-      continue;
-    }
-    if (blob.size > MAX_IMAGE_BYTES) {
-      showToast(`Pasted images can be at most ${MAX_IMAGE_BYTES / (1024 * 1024)} MiB`);
-      continue;
-    }
-    if (!hasRoom(draft)) return;
-    const url = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    }).catch(() => null);
-    const data = url?.split(",", 2)[1];
-    if (!url || !data) {
-      showToast("The pasted image could not be read");
+    const mime = imageMime(blob);
+    const name = blob.name || (mime ? `Pasted image.${mime.slice(6)}` : 'Pasted file');
+    if (blob.size > MAX_FILE_BYTES) {
+      showToast(`${name} is too large. Attach files up to ${MAX_FILE_BYTES / (1024 * 1024)} MiB each.`);
       continue;
     }
     if (!hasRoom(draft)) return;
-    draft.attachments.push({ key: crypto.randomUUID(), name: blob.name || "Pasted image", url, path: null, data });
+    try {
+      const data = await readBase64(blob);
+      const url = mime ? `data:${mime};base64,${data}` : null;
+      if (!append(draft, { key: crypto.randomUUID(), name, url, path: null, data })) return;
+    } catch (error) {
+      showToast(`Could not read ${name}: ${error}`);
+    }
   }
 }
 
-/** Fallback for WebKit paste events that do not expose the clipboard's image bytes. */
+/** WebKit may expose only TIFF, or no image bytes, for a copied screenshot. */
 export async function addNativeClipboardImage(draft: Draft) {
   try {
     const data = await files.readClipboardImage();
     if (!data) return showToast('No clipboard image found. Copy the screenshot, or choose its file.');
-    if (!hasRoom(draft)) return;
-    draft.attachments.push({ key: crypto.randomUUID(), name: "Pasted image", url: `data:image/png;base64,${data}`, path: null, data });
+    append(draft, { key: crypto.randomUUID(), name: 'Pasted image.png', url: `data:image/png;base64,${data}`, path: null, data });
   } catch (error) {
     showToast(String(error));
+  }
+}
+
+/** Native Finder / Explorer file lists may not be exposed as DOM files. */
+export async function addNativeClipboardFiles(draft: Draft, platform: string) {
+  try {
+    const paths = await files.readClipboardFilePaths();
+    if (paths.length) await addPaths(draft, paths);
+    else if (platform === 'macos') await addNativeClipboardImage(draft);
+  } catch (error) {
+    showToast(`Could not read clipboard files: ${error}`);
   }
 }

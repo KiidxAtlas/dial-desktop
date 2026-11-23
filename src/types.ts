@@ -186,16 +186,12 @@ export interface LocalModelRemoval {
   deleted: boolean;
 }
 
-/** An image attached to the draft: a file sent by path, or pasted bytes sent inline. */
-export interface Attachment {
+/** A file chosen by path or pasted inline. Only supported raster images have a preview URL. */
+export type Attachment = {
   key: string;
   name: string;
-  /** `data:` URL for the thumbnail. */
-  url: string;
-  path: string | null;
-  /** Base64 bytes of a pasted image. */
-  data: string | null;
-}
+  url: string | null;
+} & ({ path: string; data: null } | { path: null; data: string });
 
 export type ApprovalMode = "readonly" | "ask" | "write" | "auto";
 

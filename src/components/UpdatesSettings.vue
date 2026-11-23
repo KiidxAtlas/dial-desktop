@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // Settings › Updates: the app's own version and the Dial engine's, each with check and install.
 import { computed } from "vue";
+import { engine, snapshot } from "../bridge";
 import {
   checkApp,
   checkEngine,
@@ -49,30 +50,22 @@ const canUpdateEngine = computed(
   () =>
     (engineUpdateAvailable() && engineStatus.value?.can_update) || updates.engine?.state === "unsupported",
 );
-const manualEngine = computed(() =>
-  engineUpdateAvailable() && engineStatus.value && !engineStatus.value.can_update ? engineStatus.value.update_command : "",
-);
+const manualEngine = computed(() => engineStatus.value && !engineStatus.value.can_update && engineUpdateAvailable());
 
 const appLine = computed(() => {
   if (!updates.appEnabled) return "This build does not update itself (development or local build).";
   if (updates.appChecking) return "Checking…";
-  if (updates.app) return `Dial Desktop ${updates.app.version} is available`;
   if (updates.appError) return `Could not check: ${updates.appError}`;
+  if (updates.app) return `Dial Desktop ${updates.app.version} is available`;
   return "Dial Desktop is up to date";
-});
-
-const appProgressText = computed(() => {
-  const p = updates.appProgress;
-  if (p === undefined) return "";
-  return p === null ? "Downloading…" : `Downloading… ${Math.round(p * 100)}%`;
 });
 </script>
 
 <template>
   <SGroup title="Dial Desktop">
-    <SRow :label="`Version ${updates.appVersion || 'unknown'}`" :description="appProgressText || appLine">
-      <button v-if="updates.app" class="btn btn-primary" :disabled="updates.appProgress !== undefined" @click="installApp">
-        <Icon name="download" :size="14" /> Install and restart
+    <SRow :label="`Version ${updates.appVersion || 'unknown'}`" :description="updates.appStatus || appLine">
+      <button v-if="updates.app" class="btn btn-primary" :disabled="updates.appPhase !== 'idle' || updates.appChecking || !!updates.engineBusy" @click="installApp">
+        <Icon name="download" :size="14" /> {{ updates.appAction }}
       </button>
       <button v-else class="btn btn-secondary" :disabled="!updates.appEnabled || updates.appChecking" @click="checkApp">
         <Icon name="refresh" :size="14" /> Check
@@ -83,22 +76,25 @@ const appProgressText = computed(() => {
     </SRow>
   </SGroup>
 
-  <SGroup title="Dial engine" description="The same dial your terminal runs; updating it here updates it there too.">
+  <SGroup title="Dial engine" description="Update the selected Dial engine, or install a separate signed release when its updates are managed elsewhere.">
     <SRow
       :label="engineStatus ? `Version ${engineStatus.current}` : 'Engine'"
       :description="updates.engineBusy === 'updating' ? 'Updating… (a source or Cargo install rebuilds Dial; this can take minutes)' : updates.engineBusy === 'installing' ? 'Installing the signed Dial release…' : engineLine"
     >
-      <button v-if="updates.engine?.state === 'missing'" class="btn btn-primary" :disabled="!!updates.engineBusy" @click="installEngine">
-        <Icon name="download" :size="14" /> Install engine
+      <button v-if="updates.engine?.state === 'missing' || manualEngine" class="btn btn-primary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine">
+        <Icon name="download" :size="14" /> Install Desktop copy
       </button>
-      <button v-else-if="canUpdateEngine" class="btn btn-primary" :disabled="!!updates.engineBusy" @click="updateEngine">
+      <button v-else-if="canUpdateEngine" class="btn btn-primary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="updateEngine">
         <Icon name="download" :size="14" /> Update engine
       </button>
       <button class="btn btn-secondary" :disabled="updates.engineChecking || !!updates.engineBusy" @click="checkEngine">
         <Icon name="refresh" :size="14" /> Check
       </button>
+      <button v-if="updates.engineChanged && snapshot?.workspace" class="btn btn-secondary" :disabled="!!updates.engineBusy || snapshot.turnRunning" @click="engine.reconnect()">
+        Reconnect this session
+      </button>
       <template v-if="manualEngine" #below-text>
-        <div class="s-desc">To update: <code>{{ manualEngine }}</code></div>
+        <div class="s-desc">Installing a separate copy lets Desktop use the latest release without replacing your existing engine.</div>
       </template>
     </SRow>
     <template #after>

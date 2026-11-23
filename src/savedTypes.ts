@@ -137,7 +137,7 @@ export async function setTypeLocation(saveIn: TypeScope) {
 
 // A type's own conversation. Opening a type shows its session (the composer talks to it, and the
 // Chat switch shows its transcript); those sessions stay out of the session list. Prompts sent
-// there start with a `[[type:ID]]` line, so Dial knows which type "this" is.
+// there name the type with `typeId`, so Dial knows which type "this" is; the text stays the user's own.
 //
 // A type gets its conversation only when something is sent in it: opening or creating a type
 // never starts a session, so no empty "Untitled session" is left behind, and opening several new
@@ -160,12 +160,6 @@ export const typeState = reactive({
   firstSaves: new Map<string, DesignChoices>(),
 });
 
-const TAG = /^\[\[type:([a-z0-9-]+)\]\]\n?(?:<type-context>[\s\S]*?<\/type-context>\n?)?/;
-
-/** `text` without the type line it was sent with, for the transcript. */
-export function withoutTypeTag(text: string): string {
-  return text.replace(TAG, "");
-}
 
 export function isTypeSession(id: string | null | undefined): boolean {
   return !!id && types.list.some((t) => t.sessions.includes(id));
@@ -178,10 +172,10 @@ export function typeSessionOnScreen(): boolean {
   return !!open && !!id && open.sessions.includes(id);
 }
 
-/** A prompt for session `sessionId`: tagged when it is the open type's conversation. */
-export function typedPrompt(text: string, sessionId: string | null = snapshot.value?.sessionId ?? null): string {
+/** The open type whose own conversation is `sessionId`, or null: its prompts carry that type's briefing. */
+export function typeIdFor(sessionId: string | null = snapshot.value?.sessionId ?? null): string | null {
   const open = types.list.find((t) => t.id === ui.typeOpen);
-  return open && sessionId && open.sessions.includes(sessionId) ? `[[type:${open.id}]]\n${text}` : text;
+  return open && sessionId && open.sessions.includes(sessionId) ? open.id : null;
 }
 
 /**
@@ -293,7 +287,7 @@ async function startTypeSession(id: string, root: string): Promise<string | null
  * Send `text` in type `id`'s own conversation, starting it first when the type has none in this
  * project. The type must be the one open.
  */
-export async function sendInType(id: string, text: string, images: Parameters<typeof engine.send>[1] = []): Promise<boolean> {
+export async function sendInType(id: string, text: string, attachments: Parameters<typeof engine.send>[1] = []): Promise<boolean> {
   const root = snapshot.value?.workspace?.root;
   if (!root) return false;
   try {
@@ -316,7 +310,7 @@ export async function sendInType(id: string, text: string, images: Parameters<ty
         // An unnamed conversation still works.
       }
     }
-    return await engine.send(`[[type:${id}]]\n${text}`, images, { workspaceRoot: root, sessionId: session });
+    return await engine.send(text, attachments, { workspaceRoot: root, sessionId: session, typeId: id });
   } catch (error) {
     showToast(`Could not send: ${error instanceof Error ? error.message : error}`);
     return false;
@@ -424,7 +418,6 @@ export function pendingSave(text: string, images: string[], workspace: string | 
 /** What Dial is asked when an answer is saved to `def`. */
 function savePrompt(def: TypeDef, save: PendingSave): string {
   const lines = [
-    `[[type:${def.id}]]`,
     `Save this to “${def.name}”.${def.designed ? '' : ' Design it from this answer: choose the layout, fields and look. Apply choices with types_update as they are ready, then save the first item with types_add_item.'}`,
     "",
     save.text.trim(),
@@ -450,10 +443,10 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
     const prompt = savePrompt(def, save);
     const session = def.sessions[root];
     if (session && session === snap.sessionId) {
-      return await engine.send(prompt, [], { workspaceRoot: root, sessionId: session });
+      return await engine.send(prompt, [], { workspaceRoot: root, sessionId: session, typeId: def.id });
     }
     if (session) {
-      await invoke("send_background", { workspaceRoot: root, sessionId: session, text: prompt });
+      await invoke("send_background", { workspaceRoot: root, sessionId: session, text: prompt, typeId: def.id });
       showToast(`Dial is adding it to ${def.icon} ${def.name}`);
       return true;
     }
@@ -461,8 +454,8 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
     try {
       await openType(id);
       if (ui.typeOpen !== id) return false;
-      // The prompt carries its own type line, so it is sent as it is.
-      const sent = await sendInType(id, prompt.replace(TAG, ''));
+      // The prompt names its type, so it is sent as it is.
+      const sent = await sendInType(id, prompt);
       if (sent && !def.designed && !(await typeApi.get(id)).items.length) {
         showToast(`No item was saved to ${def.name}. Open its Chat to see what happened.`);
         return false;

@@ -2,9 +2,8 @@
 //!
 //! The engine owns its own updates. The app asks it with `dial update --check --json`, installs
 //! with `dial update` (which follows however Dial was installed: the signed release installer,
-//! Homebrew, Cargo or a source checkout) and, when no engine is found, runs Dial's signed release
-//! installer, the same one the website's CLI-only install uses. The app never replaces the engine
-//! binary itself, so a terminal `dial` and the app always share one engine.
+//! Homebrew, Cargo or a source checkout). For missing or externally managed engines the user
+//! can choose a separate signed release installed into Desktop's own directory.
 //!
 //! The app updates through Tauri's updater plugin against this repository's signed releases. The
 //! verifying public key lives in `tauri.release.conf.json`, so development and local builds,
@@ -12,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -107,7 +106,10 @@ pub fn classify_failure(error: &str) -> EngineProblem {
 pub fn parse_check(outcome: Result<RunOutput, String>) -> EngineUpdateView {
     let output = match outcome {
         Ok(output) => output,
-        Err(error) => return EngineUpdateView::Missing { error },
+        Err(error) if classify_failure(&error) == EngineProblem::Missing => {
+            return EngineUpdateView::Missing { error };
+        }
+        Err(error) => return EngineUpdateView::Failed { error },
     };
     if output.success {
         return match serde_json::from_str::<EngineStatus>(output.stdout.trim()) {
@@ -163,16 +165,56 @@ pub fn install_command(windows: bool) -> (&'static str, Vec<&'static str>) {
     }
 }
 
-/// Install the engine with Dial's signed release installer (into `~/.local/bin`, on PATH for
-/// new terminals). Returns the tail of its output.
-pub fn install_engine() -> Result<String, String> {
-    let (program, args) = install_command(cfg!(windows));
-    let mut command = Command::new(program);
-    command.args(&args);
-    finished(
-        run_bounded(&mut command, INSTALL_TIMEOUT)?,
-        "the Dial installer",
-    )
+/// Reserve a fresh destination: never let the installer overwrite an existing binary or backup.
+pub fn install_engine(app_dir: &Path) -> Result<(PathBuf, String), String> {
+    install_separate(app_dir, |directory| {
+        let (program, args) = install_command(cfg!(windows));
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env("DIAL_INSTALL_DIR", directory)
+            .env("DIAL_NO_MODIFY_PATH", "1")
+            .env_remove("DIAL_ALLOW_UNSIGNED_INSTALL");
+        finished(
+            run_bounded(&mut command, INSTALL_TIMEOUT)?,
+            "the Dial installer",
+        )
+    })
+}
+
+fn install_separate(
+    app_dir: &Path,
+    install: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<(PathBuf, String), String> {
+    use crate::launcher::{DIAL_NAME, ENGINE_SELECTION};
+    use std::io::Write;
+    std::fs::create_dir_all(app_dir).map_err(|e| e.to_string())?;
+    let directory = tempfile::Builder::new()
+        .prefix("engine-")
+        .tempdir_in(app_dir)
+        .map_err(|e| e.to_string())?;
+    let log = install(directory.path())?;
+    let binary = directory.path().join(DIAL_NAME);
+    if !binary.is_file() {
+        return Err(format!(
+            "The installer did not create {}.\n{log}",
+            binary.display()
+        ));
+    }
+    let mut selection = tempfile::NamedTempFile::new_in(app_dir).map_err(|e| e.to_string())?;
+    let name = directory
+        .path()
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid engine directory")?;
+    selection
+        .write_all(name.as_bytes())
+        .map_err(|e| e.to_string())?;
+    selection
+        .persist(app_dir.join(ENGINE_SELECTION))
+        .map_err(|e| e.to_string())?;
+    let _ = directory.keep();
+    Ok((binary, log))
 }
 
 fn finished(output: RunOutput, what: &str) -> Result<String, String> {
@@ -219,14 +261,7 @@ pub struct RunOutput {
 /// cannot be started or runs out of time.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<RunOutput, String> {
     let shown = format!("{:?}", command.get_program());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // No console window flashes up behind the app.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = command
+    let mut child = crate::launcher::without_console(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

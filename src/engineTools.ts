@@ -6,8 +6,7 @@ import { ref } from "vue";
 import { showToast, snapshot } from "./bridge";
 
 /** Call an engine method the desktop allows in the open project; throws a readable message. */
-export async function engineCall<T = Record<string, unknown>>(method: string, params?: Record<string, unknown>): Promise<T> {
-  const root = snapshot.value?.workspace?.root;
+export async function engineCall<T = Record<string, unknown>>(method: string, params?: Record<string, unknown>, root = snapshot.value?.workspace?.root): Promise<T> {
   if (!root) throw new Error("Open a folder first");
   return invoke<T>("engine_call", { workspaceRoot: root, method, params: params ?? {} });
 }

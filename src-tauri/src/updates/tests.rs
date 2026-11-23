@@ -46,6 +46,15 @@ fn a_missing_engine_and_a_broken_answer_are_told_apart() {
         )),
         EngineUpdateView::Missing { .. }
     ));
+    for error in [
+        "could not start dial: Permission denied",
+        "dial did not finish within 30s",
+    ] {
+        assert!(matches!(
+            parse_check(Err(error.into())),
+            EngineUpdateView::Failed { .. }
+        ));
+    }
     assert!(matches!(
         parse_check(ran(true, "not json", "")),
         EngineUpdateView::Failed { .. }
@@ -97,6 +106,29 @@ fn the_installer_is_the_signed_release_installer_for_each_platform() {
         args.last().copied(),
         Some("irm https://dial.rootatlas.dev/install | iex")
     );
+}
+
+#[test]
+fn desktop_install_selects_only_its_own_completed_binary() {
+    use crate::launcher::{DIAL_NAME, desktop_engine};
+    let root = tempfile::tempdir().unwrap();
+    let external = root.path().join(DIAL_NAME);
+    std::fs::write(&external, b"existing").unwrap();
+    let (installed, _) = install_separate(root.path(), |dir| {
+        std::fs::write(dir.join(DIAL_NAME), b"release").unwrap();
+        Ok("installed".into())
+    })
+    .unwrap();
+    assert_eq!(desktop_engine(root.path()), Some(installed.clone()));
+    // A failed command and a successful command that didn't install here must leave the selection alone.
+    for outcome in [
+        Err("interrupted".to_owned()),
+        Ok("nothing installed".to_owned()),
+    ] {
+        assert!(install_separate(root.path(), |_| outcome).is_err());
+        assert_eq!(desktop_engine(root.path()), Some(installed.clone()));
+    }
+    assert_eq!(std::fs::read(external).unwrap(), b"existing");
 }
 
 #[test]

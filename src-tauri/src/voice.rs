@@ -50,6 +50,8 @@ pub struct Voice {
     pub hearing: bool,
     /// Something is being read aloud: a voice reply or one asked for with "Read aloud".
     pub reading: bool,
+    /// `live_stop` submitted but not acknowledged; a preceding listen may still become a turn.
+    stopping: bool,
     /// The `live_listen` request in flight; kept after a stop so its late reply is recognized.
     listen: Option<RequestId>,
     /// That request's speech was recognized, so it now runs as a turn the conversation shows.
@@ -63,10 +65,18 @@ impl Voice {
         self.phase != Phase::Off
     }
 
+    pub fn prevents_restart(&self) -> bool {
+        self.active() || self.listen.is_some() || self.stopping
+    }
+
+    pub fn stopped(&mut self) {
+        self.stopping = false;
+    }
+
     /// Start voice mode, or talk again while paused. `instructions` go to `live_start`.
     pub fn start(&mut self, instructions: Option<String>) -> Option<Command> {
         match self.phase {
-            Phase::Off => {
+            Phase::Off if !self.stopping => {
                 *self = Self {
                     listen: self.listen,
                     phase: Phase::Starting,
@@ -110,6 +120,7 @@ impl Voice {
         }
         commands.push(Command::LiveStop);
         *self = Self {
+            stopping: true,
             listen: self.listen,
             transcribed: self.transcribed,
             ..Self::default()

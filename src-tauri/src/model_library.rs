@@ -7,6 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::State;
+use std::path::Path;
+mod setup;
+#[tauri::command]
+pub async fn model_hub_setup(app: tauri::AppHandle) -> Result<bool, String> {
+    setup::setup(app).await
+}
 
 const HF_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const HF_MAX_OUTPUT: u64 = 4 << 20;
@@ -52,15 +58,16 @@ fn split_gguf(path: &str) -> bool {
     matches!((number(part), number(total)), (Some(i), Some(n)) if n > 1 && i > 0 && i <= n)
 }
 
-fn hf() -> Command {
-    let mut cmd = Command::new("hf");
+fn hf(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    crate::launcher::without_console(&mut cmd);
     cmd.current_dir(std::env::temp_dir()).stdin(Stdio::null());
     cmd
 }
 
 fn hf_missing(e: std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
-        "Hugging Face CLI (hf) was not found. Install it using the setup guide, then restart Desktop."
+        "The Hugging Face helper was not found. Choose Set up model downloads in the Model Library."
             .into()
     } else {
         format!("Could not run the Hugging Face CLI: {e}")
@@ -69,13 +76,13 @@ fn hf_missing(e: std::io::Error) -> String {
 
 /// `hf download` for `repo`: a curated model at its pinned revision and file, or any other Hub
 /// repo (its whole main branch, or just `file`).
-fn download_command(repo: &str, file: Option<&str>) -> Result<Command, String> {
+fn download_command(program: &Path, repo: &str, file: Option<&str>) -> Result<Command, String> {
     if file.is_some_and(split_gguf) {
         return Err("Split GGUF models are not supported by the Model Library".into());
     }
     let models: Vec<Model> = serde_json::from_str(include_str!("../../src/modelLibrary.json"))
         .map_err(|_| "Model catalog unavailable")?;
-    let mut cmd = hf();
+    let mut cmd = hf(program);
     if let Some(m) = models
         .into_iter()
         .find(|m| m.repo == repo && (file.is_none() || file == m.file.as_deref()))
@@ -161,8 +168,8 @@ fn run_bounded(
 }
 
 /// Run `hf` with `args` and parse its JSON output.
-fn hf_json<T: DeserializeOwned>(args: &[String]) -> Result<T, String> {
-    let mut cmd = hf();
+fn hf_json<T: DeserializeOwned>(program: &Path, args: &[String]) -> Result<T, String> {
+    let mut cmd = hf(program);
     cmd.args(args);
     let (status, stdout, stderr) = run_bounded(cmd, HF_QUERY_TIMEOUT)?;
     if !status.success() {
@@ -217,9 +224,10 @@ pub struct HubModel {
 
 /// Search the Hub for MLX or GGUF models, most downloaded first.
 #[tauri::command]
-pub async fn model_hub_search(query: String, format: String) -> Result<Vec<HubModel>, String> {
+pub async fn model_hub_search(app: tauri::AppHandle, query: String, format: String) -> Result<Vec<HubModel>, String> {
+    let program = setup::hf_program(&app)?;
     let args = search_args(&query, &format)?;
-    tauri::async_runtime::spawn_blocking(move || hf_json(&args))
+    tauri::async_runtime::spawn_blocking(move || hf_json(&program, &args))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -236,14 +244,15 @@ pub struct HubFile {
 
 /// The files in `repo` on the Hub, with sizes, so a download can be sized before it starts.
 #[tauri::command]
-pub async fn model_hub_files(repo: String) -> Result<Vec<HubFile>, String> {
+pub async fn model_hub_files(app: tauri::AppHandle, repo: String) -> Result<Vec<HubFile>, String> {
+    let program = setup::hf_program(&app)?;
     if !valid_repo(&repo) {
         return Err("Not a Hugging Face model id".into());
     }
     let args: Vec<String> = ["models", "list", &repo, "--recursive", "--format", "json"]
         .map(String::from)
         .to_vec();
-    let mut files: Vec<HubFile> = tauri::async_runtime::spawn_blocking(move || hf_json(&args))
+    let mut files: Vec<HubFile> = tauri::async_runtime::spawn_blocking(move || hf_json(&program, &args))
         .await
         .map_err(|e| e.to_string())??;
     for file in &mut files {
@@ -315,10 +324,11 @@ pub fn model_download_status(downloads: State<'_, Downloads>) -> Result<Status, 
 }
 #[tauri::command]
 pub fn model_download_start(
+    app: tauri::AppHandle,
     downloads: State<'_, Downloads>,
     repo: String,
     file: Option<String>,
-) -> Result<Status, String> {
+) -> Result<Option<Status>, String> {
     let mut job = downloads
         .0
         .lock()
@@ -329,11 +339,13 @@ pub fn model_download_start(
     }
     let cache = hub_cache().ok_or("No Hugging Face cache folder")?;
     let lock = lock_cache_repo(&cache, &repo)?;
-    job.child = Some(
-        download_command(&repo, file.as_deref())?
-            .spawn()
-            .map_err(hf_missing)?,
-    );
+    // A missing executable is distinct from permission, cache and model errors. Only that case
+    // prompts the GUI to offer setup and retry the exact download that was already confirmed.
+    job.child = Some(match download_command(&setup::hf_program(&app)?, &repo, file.as_deref())?.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(hf_missing(e)),
+    });
     job.cache_lock = Some(lock);
     job.status = Status {
         repo,
@@ -348,7 +360,7 @@ pub fn model_download_start(
         let Ok(mut job) = downloads.lock() else { break };
         if job.refresh().is_err() || !job.status.running { break }
     });
-    Ok(job.status.clone())
+    Ok(Some(job.status.clone()))
 }
 #[tauri::command]
 pub fn model_download_cancel(downloads: State<'_, Downloads>) -> Result<Status, String> {
@@ -484,6 +496,9 @@ pub async fn model_cache_remove(repo: String) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn download_command(repo: &str, file: Option<&str>) -> Result<Command, String> {
+        super::download_command(Path::new("hf"), repo, file)
+    }
     #[test]
     fn split_gguf_shards_are_not_individual_downloads() {
         for shard in ["q/model-00001-of-00002.gguf", "q/model-00002-of-00002.GGUF"] {
@@ -555,9 +570,10 @@ mod tests {
     #[test]
     #[ignore]
     fn live_hub_search() {
-        let found: Vec<HubModel> = hf_json(&search_args("qwen coder", "GGUF").unwrap()).unwrap();
+        let found: Vec<HubModel> = hf_json(Path::new("hf"), &search_args("qwen coder", "GGUF").unwrap()).unwrap();
         assert!(found.len() > 4, "only {} results", found.len());
         let files: Vec<HubFile> = hf_json(
+            Path::new("hf"),
             &[
                 "models",
                 "list",

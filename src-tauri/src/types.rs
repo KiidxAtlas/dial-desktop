@@ -1374,7 +1374,7 @@ Fonts: sans, serif, mono, hand, display, rounded. Textures: none, paper, linen, 
 Prefer built-in layouts. customHtml is a self-contained HTML document (no network or external files); \
 it receives {type:'dial-type', def, items, images} (asset name to data URL) and can post \
 {type:'dial-type-update', itemId, fields|done}. \
-[[type:ID]] marks a conversation inside that Type; 'this' means the Type. Use types_update for \
+Conversations inside a Type are tied to it by the app; 'this' means the Type. Use types_update for \
 design, types_add_item for saves, and types_items to confirm data. Populate each board item with \
 its own image, title and optional note. Reuse any attached file's absolute path; never substitute a \
 different image. If no image is available, leave it empty unless the user wants an illustration.";
@@ -1458,27 +1458,30 @@ fn context(def: &TypeDef, count: usize, scope: Scope) -> String {
     )
 }
 
-/// A prompt as the agent should get it. One that starts with a `[[type:ID]]` line (written inside
-/// that Type's own view) gets the Type's briefing after the line; any other is returned as it is.
-pub fn with_context(store: &Store, text: &str) -> String {
-    let Some((id, rest)) = text
-        .strip_prefix("[[type:")
-        .and_then(|tail| tail.split_once("]]"))
-    else {
-        return text.to_owned();
+/// The scope a prompt written in Type `id` carries to an engine. `modern` is whether the engine takes
+/// `type_context`. `None` sends nothing: an engine that predates the field, for a prompt in no Type.
+pub fn type_scope(store: &Store, id: Option<&str>, modern: bool) -> Option<crate::engine::TypeScope> {
+    let Some((id, briefing)) = id.and_then(|id| framing(store, id)) else {
+        return modern.then_some(crate::engine::TypeScope::Plain);
     };
-    let body = rest.strip_prefix('\n').unwrap_or(rest);
-    if body.starts_with(CONTEXT_OPEN) {
-        return text.to_owned();
-    }
-    let Ok(full) = store.get(id) else {
-        return text.to_owned();
-    };
+    let context = crate::engine::TypeContext { id, briefing };
+    Some(if modern {
+        crate::engine::TypeScope::Typed(context)
+    } else {
+        crate::engine::TypeScope::Framed(context)
+    })
+}
+
+/// The text an engine without `type_context` reads: the Type's `[[type:ID]]` line, its briefing, then the user's text.
+pub fn legacy_prompt(context: &crate::engine::TypeContext, text: &str) -> String {
+    format!("[[type:{}]]\n{}\n{text}", context.id, context.briefing)
+}
+
+/// The Type's id and its briefing, when the Type is saved.
+fn framing(store: &Store, id: &str) -> Option<(String, String)> {
+    let full = store.get(id).ok()?;
     let scope = store.locate(id).map(|(scope, _)| scope).unwrap_or_default();
-    format!(
-        "[[type:{id}]]\n{}\n{body}",
-        context(&full.def, full.items.len(), scope)
-    )
+    Some((id.to_owned(), context(&full.def, full.items.len(), scope)))
 }
 
 /// Run one `types_*` tool for the agent.

@@ -23,6 +23,7 @@ mod notifications;
 pub mod preview;
 pub mod settings;
 pub mod tabs;
+pub mod legacy_text;
 pub mod terminal;
 pub mod time;
 pub mod types;

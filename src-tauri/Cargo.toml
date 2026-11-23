@@ -1,6 +1,6 @@
 [package]
 name = "dial-desktop"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "MIT"
 description = "Native desktop interface for the Dial coding agent"
@@ -30,6 +30,9 @@ serde_json = "1"
 tempfile = "3"
 png = "0.18"
 sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 base64 = "0.23"
 portable-pty = "0.9"
 tauri-plugin-updater = "2"

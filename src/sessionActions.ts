@@ -1,6 +1,6 @@
 // What can be done to a session, shared by its sidebar menu, the title bar menu and the palette.
 
-import { engine, showToast, snapshot } from "./bridge";
+import { engine, lastSubmission, showToast, snapshot } from './bridge';
 import { draftFor, hasDraft } from "./drafts";
 import type { OpenSnapshot, Session } from "./types";
 import { focusComposer, ui, type MenuItem } from "./ui";
@@ -72,11 +72,11 @@ export function canUndo(snap: OpenSnapshot) {
   return !snap.turnRunning && snap.entries.some((e) => e.kind === "user");
 }
 
-/** The text of the last prompt, if any. */
-export function lastPrompt(snap: OpenSnapshot): string | null {
+/** The last user entry, including the image count when replay cannot supply the files. */
+function lastPrompt(snap: Pick<OpenSnapshot, 'entries'>) {
   for (let i = snap.entries.length - 1; i >= 0; i--) {
     const entry = snap.entries[i];
-    if (entry.kind === "user") return entry.text;
+    if (entry.kind === 'user') return entry;
   }
   return null;
 }
@@ -112,15 +112,24 @@ export function canCompact(snap: OpenSnapshot) {
 
 /** Undo the last turn (after confirming) and put its prompt back in the composer to edit. */
 export async function editLastPrompt(snap: OpenSnapshot) {
-  const text = lastPrompt(snap);
-  if (text === null) return;
+  const entry = lastPrompt(snap);
+  if (!entry) return;
   const draft = draftFor(snap);
+  if (draft.loading || draft.sending) return showToast('Wait for your draft to finish loading or sending');
   if (draft.text || draft.attachments.length) {
     showToast("Send or clear your current draft before editing the last prompt");
     return;
   }
-  if (!(await engine.undoTurn()) || draft.text) return;
-  draft.text = text;
+  const original = lastSubmission.forRow(entry);
+  const stillCurrent = () => {
+    const current = snapshot.value;
+    return current?.workspace?.root === snap.workspace.root && current.sessionId === snap.sessionId &&
+      !current.turnRunning && lastPrompt(current) === entry && !draft.text && !draft.attachments.length && !draft.sending;
+  };
+  if (!await engine.undoTurn({ missingImages: original ? 0 : entry.images, stillCurrent })) return;
+  // Preserve any typing that arrived while the native undo request was in flight.
+  draft.text = [original?.text ?? entry.text, draft.text].filter(Boolean).join('\n\n');
+  if (original) draft.attachments.unshift(...original.attachments);
   if (snapshot.value?.workspace?.root === snap.workspace.root && snapshot.value.sessionId === snap.sessionId) focusComposer();
 }
 

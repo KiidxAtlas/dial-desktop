@@ -15,7 +15,7 @@ const text = computed(() => {
   return parts.length ? `${parts.join(" and ")} ${parts.length > 1 ? "are" : "is"} available` : "";
 });
 const shown = computed(() => !!text.value && updates.dismissed !== bannerKey());
-const busy = computed(() => updates.appProgress !== undefined || !!updates.engineBusy);
+const busy = computed(() => updates.appPhase !== "idle" || updates.appChecking || !!updates.engineBusy);
 
 async function update() {
   // The engine first: installing the app restarts it.
@@ -33,8 +33,8 @@ function openUpdates() {
 <template>
   <div v-if="shown" class="banner" role="status">
     <Icon name="download" :size="14" />
-    <span class="truncate">{{ busy ? "Updating…" : text }}</span>
-    <button class="link" :disabled="busy" @click="update">Update</button>
+    <span class="truncate" :title="updates.appStatus || text">{{ updates.appStatus || (busy ? "Updating…" : text) }}</span>
+    <button class="link" :disabled="busy" @click="update">{{ updates.app ? updates.appAction : "Update" }}</button>
     <button class="link muted" @click="openUpdates">Details</button>
     <button class="close" aria-label="Hide until the next release" @click="updates.dismissed = bannerKey()">
       <Icon name="cross" :size="12" />

@@ -49,6 +49,7 @@ fn respond(model: &mut Model, id: RequestId, method: &str, result: Value) -> Vec
 
 fn prompt(text: &str, images: usize) -> Command {
     Command::Send {
+        type_context: None,
         text: text.into(),
         images: vec!["/tmp/shot.png".into(); images],
         inline_images: vec![],
@@ -66,6 +67,29 @@ fn a_prompt_with_images_shows_their_count() {
     match model.conversation.entries() {
         [Entry::User(user)] => assert_eq!((user.text.as_str(), user.images), ("what is this?", 2)),
         other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_type_turn_shows_the_users_own_words_and_a_literal_marker_stays() {
+    let briefing = "<type-context>\nBoard.\n</type-context>";
+    for text in ["make it warmer", "[[type:notes]] is literal text"] {
+        let mut model = Model::starting();
+        model.apply(Update::Connected(Box::new(ready("s1"))));
+        let command = Command::Send {
+            text: text.into(),
+            images: vec![],
+            inline_images: vec![],
+            type_context: Some(crate::engine::TypeScope::Framed(crate::engine::TypeContext {
+                id: "inspiration".into(),
+                briefing: briefing.into(),
+            })),
+        };
+        requested(&mut model, command, 1);
+        match model.conversation.entries() {
+            [Entry::User(user)] => assert_eq!(user.text, text),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -871,4 +895,18 @@ fn first_line_clips_by_characters() {
     assert_eq!(first_line("  héllo\nworld", 10), "héllo");
     assert_eq!(first_line("abcdef", 4), "abc…");
     assert_eq!(first_line("", 4), "");
+}
+
+#[test]
+fn the_structured_type_context_is_negotiated_from_ready_features_on_every_connection() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    assert!(!model.type_context_supported, "an engine without the feature gets the legacy framing");
+    // A reconnect to an upgraded engine re-negotiates; the flag follows the latest ready frame.
+    let mut upgraded = ready("s2");
+    upgraded.raw["features"] = json!({"type_context": true});
+    model.apply(Update::Connected(Box::new(upgraded)));
+    assert!(model.type_context_supported);
+    model.apply(Update::Connected(Box::new(ready("s3"))));
+    assert!(!model.type_context_supported);
 }

@@ -2,7 +2,8 @@
 import { computed } from "vue";
 import type { ToolEntry } from "../types";
 import { toggle, ui } from "../ui";
-import { addToPrompt, showPanel } from "../workspace";
+import { snapshot } from "../bridge";
+import { addToPrompt, showFile, showPanel } from "../workspace";
 import Icon from "./Icon.vue";
 import CodeBlock from "./CodeBlock.vue";
 import GeneratedImage from "./GeneratedImage.vue";
@@ -18,6 +19,15 @@ function askAboutFailure() {
   const detail = t.output?.text || t.progress || t.facts.join("\n");
   addToPrompt(`Help diagnose the failed ${t.label} call (${t.target}).${detail ? `\n\nReported output:\n${detail.slice(-4000)}` : ""}`);
 }
+/** The project file a read or edit call names, to open in the Files panel. */
+const file = computed(() => {
+  const t = props.tool;
+  if (!["read", "edit", "write", "view"].includes(t.label.toLowerCase())) return null;
+  const root = snapshot.value?.workspace?.root ?? "";
+  let path = t.target.trim();
+  if (root && path.startsWith(`${root}/`)) path = path.slice(root.length + 1);
+  return path && !/\s/.test(path) && !path.startsWith("/") && /[./]/.test(path) ? path : null;
+});
 
 /** The one-line result under the call, as a terminal agent prints it. */
 const result = computed(() => {
@@ -34,11 +44,13 @@ const result = computed(() => {
 <template>
   <div class="tool" :class="[tool.state, { open }]" :data-tool="tool.key">
     <button class="head" :aria-expanded="open" @click="toggle(tool.key)">
-      <span v-if="tool.state === 'running'" class="spinner run-spin" :title="tool.state" />
-      <span v-else class="dot" :title="tool.state" />
+      <span class="status" :title="tool.state">
+        <span v-if="tool.state === 'running'" class="spinner run-spin" />
+        <span v-else class="dot" />
+      </span>
       <span class="label">{{ tool.label }}</span>
       <span class="target mono truncate">{{ tool.target }}</span>
-      <Icon class="chevron" :name="open ? 'chevronDown' : 'chevronRight'" :size="12" />
+      <Icon class="chevron" name="chevronRight" :size="12" />
     </button>
     <div v-if="result" class="result">
       <span class="elbow">⎿</span>
@@ -62,9 +74,10 @@ const result = computed(() => {
         :lang="tool.output.caption === 'diff' ? 'diff' : ''"
         :max-height="280"
       />
-      <button v-if="tool.state === 'failed'" class="btn btn-secondary" @click="askAboutFailure">Ask about failure</button>
-      <div v-if="tool.changedPaths.length" class="paths">
-        <button v-for="path in tool.changedPaths" :key="path" class="mono truncate" :title="`Show diff: ${path}`" @click="openDiff(path)">{{ path }}</button>
+      <div v-if="tool.state === 'failed' || file || tool.changedPaths.length" class="tool-actions">
+        <button v-if="tool.state === 'failed'" class="btn btn-secondary" @click="askAboutFailure">Ask about failure</button>
+        <button v-if="file" class="btn btn-secondary" :title="`Open ${file} in the Files panel`" @click="showFile(file)"><Icon name="file" :size="13" /> Open file</button>
+        <button v-for="path in tool.changedPaths" :key="path" class="btn btn-secondary mono" :title="`Show diff: ${path}`" @click="openDiff(path)"><Icon name="diff" :size="13" /> <span class="truncate">{{ path }}</span></button>
       </div>
       <div v-if="tool.facts.length && tool.state !== 'failed'" class="facts">{{ tool.facts.join(" · ") }}</div>
     </div>
@@ -92,16 +105,27 @@ const result = computed(() => {
 .head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   max-width: 100%;
-  margin-left: -6px;
-  padding: 3px 8px 3px 6px;
+  margin-left: -8px;
+  padding: 4px 10px 4px 8px;
   border-radius: var(--radius-sm);
   text-align: left;
-  transition: background 120ms var(--ease);
+  transition: background 140ms var(--ease);
 }
 .head:hover {
   background: var(--hover);
+}
+.head:focus-visible {
+  outline: 1px solid var(--focus-border);
+  outline-offset: 1px;
+}
+.status {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
 }
 .run-spin {
   width: 10px;
@@ -109,43 +133,44 @@ const result = computed(() => {
   color: var(--text-muted);
 }
 .dot {
-  width: 8px;
-  height: 8px;
-  flex: none;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--tone);
-}
-.running .dot {
-  background: var(--text-muted);
-  animation: pulse 1s ease-in-out infinite;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 16%, transparent);
 }
 .unknown .dot {
   background: none;
   box-shadow: inset 0 0 0 1.5px var(--text-faint);
 }
 .label {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 13.5px;
+  font-weight: 560;
   white-space: nowrap;
 }
 .target {
   min-width: 0;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-muted);
 }
 .chevron {
+  flex: none;
   color: var(--text-faint);
   opacity: 0;
-  transition: opacity 120ms var(--ease);
+  transition: opacity 140ms var(--ease), transform 200ms var(--ease);
 }
 .head:hover .chevron,
-.open .chevron {
+.head:focus-visible .chevron,
+.tool.open > .head .chevron {
   opacity: 1;
+}
+.tool.open > .head .chevron {
+  transform: rotate(90deg);
 }
 .result {
   display: flex;
   gap: 8px;
-  padding-left: 18px;
+  padding-left: 16px;
   font-size: 12.5px;
   color: var(--text-faint);
 }
@@ -160,17 +185,24 @@ const result = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin: 8px 0 4px 18px;
+  margin: 6px 0 6px 16px;
+  animation: rise 200ms var(--ease) both;
+}
+.tool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tool-actions .btn {
+  gap: 6px;
+  max-width: 100%;
+  font-size: 12px;
 }
 .images {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: 10px;
-  margin: 8px 0 4px 18px;
-}
-.paths {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
+  margin: 8px 0 4px 16px;
 }
 .facts {
   font-size: var(--text-sm);
