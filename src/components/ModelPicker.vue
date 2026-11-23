@@ -163,28 +163,11 @@ function onOutside(event: MouseEvent) {
   if (root.value && !root.value.contains(event.target as Node)) close(false);
 }
 
-const DISCOVER_INTERVAL_MS = 60_000;
-let lastDiscovery = 0;
-
-/** Account listings need a network fetch; do it on open at most once a minute. */
-function discoverModelsThrottled() {
-  const now = Date.now();
-  if (now - lastDiscovery < DISCOVER_INTERVAL_MS) return;
-  lastDiscovery = now;
-  engine.discoverModels();
-}
-
-function reloadModels() {
-  lastDiscovery = Date.now();
-  engine.discoverModels();
-}
-
 watch(
   () => ui.modelPickerOpen,
   (isOpen) => {
     if (isOpen) {
-      engine.refreshModels();
-      discoverModelsThrottled();
+      void engine.discoverModels();
       const index = flat.value.findIndex(isCurrent);
       active.value = index < 0 ? 0 : index;
       nextTick(() => {
@@ -229,7 +212,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         <label class="search">
           <Icon name="search" :size="14" />
           <input ref="search" v-model="query" placeholder="Search models" spellcheck="false" @keydown="onKey" />
-          <button class="refresh" title="Reload the model list" @click="reloadModels()">
+          <button class="refresh" title="Reload the model list" @click="engine.refreshModels()">
             <Icon name="refresh" :size="13" />
           </button>
         </label>

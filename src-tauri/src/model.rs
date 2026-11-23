@@ -10,6 +10,7 @@ use dial_client::{Conversation, Entry, Message, Ready, RequestId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests;
@@ -233,6 +234,8 @@ pub struct Model {
     pub models: Vec<ModelOption>,
     /// Set when `models` changed; the app publishes the list and clears it.
     pub models_changed: bool,
+    last_discovery: Option<Instant>,
+    discovering: bool,
     /// Short-lived message for the toast area (a refused request, a failed approval).
     pub toast: Option<String>,
     /// Whether the model the engine started with takes images (`ready.image_input`).
@@ -303,6 +306,17 @@ impl Model {
     /// Whether a new prompt can be sent now.
     pub fn can_send(&self) -> bool {
         matches!(self.connection(), Connection::Live { .. }) && !self.conversation.turn_running()
+    }
+
+    /// Reserve one provider scan before it is dispatched (the worker acknowledges it later).
+    pub fn discover_if_due(&mut self, now: Instant, interval: Duration) -> Option<Command> {
+        if !matches!(self.connection(), Connection::Live { .. }) || self.discovering
+            || self.last_discovery.is_some_and(|last| now.saturating_duration_since(last) < interval) {
+            return None;
+        }
+        self.last_discovery = Some(now);
+        self.discovering = true;
+        Some(Command::DiscoverModels)
     }
 
     /// Start voice mode, or talk again while it waits. Replies are asked to suit speech unless
@@ -588,7 +602,9 @@ impl Model {
         match update {
             Update::Connected(ready) => {
                 self.connect(&ready);
-                follow.extend([Command::ListSessions, Command::State, Command::ListModels]);
+                follow.extend([Command::ListSessions, Command::State]);
+                self.discovering = false;
+                follow.extend(self.discover_if_due(Instant::now(), Duration::ZERO));
             }
             Update::ConnectFailed(error) => self.connection = Some(Connection::Failed(error)),
             Update::Requested { command, id } => {
@@ -626,6 +642,9 @@ impl Model {
                 self.pending.insert(id, purpose);
             }
             Update::RequestFailed { command, error } => {
+                if command == Command::DiscoverModels {
+                    self.discovering = false;
+                }
                 if matches!(command, Command::Recover) {
                     self.recovering = false;
                 }
@@ -687,6 +706,9 @@ impl Model {
                 let Some(purpose) = self.pending.remove(id) else {
                     return;
                 };
+                if purpose == Purpose::Models {
+                    self.discovering = false;
+                }
                 match (purpose, result) {
                     (Purpose::Sessions, result) => {
                         let Some((current, offset)) = self.session_page else {
@@ -1046,7 +1068,6 @@ fn describe(command: &Command) -> &'static str {
         Command::ApplySettings => "apply settings",
         Command::Recover => "reload the session",
         Command::State => "read the session settings",
-        Command::ListModels => "load models",
         Command::DiscoverModels => "refresh models",
         Command::ListImageModels => "load image models",
         Command::SetModel { .. } => "switch the model",

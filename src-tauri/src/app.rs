@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Updates arriving within one frame are published together.
@@ -318,6 +318,9 @@ fn publish(app: &AppHandle) {
         let notices = tabs.session_notices();
         let closed = tabs.close_idle();
         let active = tabs.active_mut();
+        if let Some(scan) = active.model.discover_if_due(Instant::now(), Duration::from_secs(300)) {
+            dispatch(app, active.engine.as_ref(), vec![scan]);
+        }
         if !closed.is_empty() {
             // Those sessions' titles and activity changed.
             dispatch(app, active.engine.as_ref(), vec![Command::ListSessions]);
@@ -1402,13 +1405,13 @@ fn refresh_sessions(app: AppHandle, shared: State<'_, Shared>) {
 }
 
 #[tauri::command]
-fn refresh_models(app: AppHandle, shared: State<'_, Shared>) {
-    request(&app, &shared, Command::ListModels);
-}
-
-#[tauri::command]
-fn discover_models(app: AppHandle, shared: State<'_, Shared>) {
-    request(&app, &shared, Command::DiscoverModels);
+fn discover_models(app: AppHandle, shared: State<'_, Shared>, force: Option<bool>) {
+    let mut inner = shared.lock();
+    let tab = inner.tabs.active_mut();
+    let interval = if force.unwrap_or(false) { Duration::ZERO } else { Duration::from_secs(60) };
+    if let Some(scan) = tab.model.discover_if_due(Instant::now(), interval) {
+        dispatch(&app, tab.engine.as_ref(), vec![scan]);
+    }
 }
 
 #[tauri::command]
@@ -1682,7 +1685,6 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::model_library::model_cache_remove,
             crate::model_library::model_hub_search,
             crate::model_library::model_hub_files,
-            refresh_models,
             discover_models,
             set_model,
             set_thinking,

@@ -60,6 +60,8 @@ detects on disk, open the composer’s model picker and choose **Downloaded**. M
 the source, folder and size. Use **Get models…** to download a library model, or reload the list
 after adding one outside Desktop. You can also confirm removal of an unused model from a supported store.
 
+Desktop scans connected providers when it connects and about every five minutes while a project is open. Returning to Desktop or opening the model picker also checks for updates if the last scan was at least a minute ago. Sign-ins saved by the CLI are picked up from the same Dial home; you don’t need to run `/models` or change your current model.
+
 If Desktop cannot load its initial state, **Reconnect** retries the UI connection without
 resending a prompt. **Copy error** copies the diagnostic for troubleshooting.
 

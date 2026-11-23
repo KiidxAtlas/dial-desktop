@@ -77,7 +77,7 @@ fn connecting_goes_live_and_asks_for_sessions() {
     let follow = model.apply(Update::Connected(Box::new(ready("s1"))));
     assert_eq!(
         follow,
-        vec![Command::ListSessions, Command::State, Command::ListModels]
+        vec![Command::ListSessions, Command::State, Command::DiscoverModels]
     );
     assert!(
         matches!(model.connection(), Connection::Live { model, .. } if model == "claude-sonnet")
@@ -484,7 +484,7 @@ fn state_and_models_load_the_model_controls() {
     assert!(current.thinking_settable);
     assert_eq!(model.approval.as_deref(), Some("ask"));
 
-    let (models, _) = requested(&mut model, Command::ListModels, 2);
+    let (models, _) = requested(&mut model, Command::DiscoverModels, 2);
     respond(
         &mut model,
         models,
@@ -532,6 +532,20 @@ fn discovering_models_asks_for_a_refresh_and_replaces_the_list() {
     assert!(model.models_changed);
     assert_eq!(model.models.len(), 2);
     assert!(model.models.iter().all(|m| m.listed && !m.catalog_only));
+}
+
+#[test]
+fn automatic_scans_are_live_only_and_coalesced_until_the_next_interval() {
+    let mut model = Model::starting();
+    let interval = Duration::from_secs(60);
+    assert!(model.discover_if_due(Instant::now(), interval).is_none());
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let first = model.last_discovery.unwrap();
+    assert!(model.discover_if_due(first + interval, Duration::ZERO).is_none());
+    let (id, _) = requested(&mut model, Command::DiscoverModels, 1);
+    respond(&mut model, id, "list_models", json!({"models": []}));
+    assert!(model.discover_if_due(first, interval).is_none());
+    assert_eq!(model.discover_if_due(first + interval, interval), Some(Command::DiscoverModels));
 }
 
 #[test]

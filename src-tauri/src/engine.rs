@@ -77,8 +77,6 @@ pub enum Command {
     Recover,
     /// Read the model, thinking level and approval mode in force.
     State,
-    /// Load the models `SetModel` accepts.
-    ListModels,
     /// Load the models after the engine re-queries signed-in and configured providers
     /// (`list_models` with `refresh: true`), so account listings such as Antigravity's are current.
     DiscoverModels,
@@ -273,7 +271,6 @@ impl Command {
             Self::ApplySettings => (Purpose::ApplySettings, "apply_settings", json!({})),
             Self::Recover => (Purpose::Recover, "recovery_snapshot", json!({})),
             Self::State => (Purpose::State, "state", json!({})),
-            Self::ListModels => (Purpose::Models, "list_models", json!({})),
             Self::DiscoverModels => (Purpose::Models, "list_models", json!({ "refresh": true })),
             Self::ListImageModels => (
                 Purpose::ImageModels,

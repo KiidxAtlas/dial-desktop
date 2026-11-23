@@ -327,8 +327,7 @@ export const engine = {
   /** Read a reply aloud; with no text, stop reading. */
   readAloud: (text: string | null) => call("read_aloud", { text }),
   refreshSessions: () => call("refresh_sessions"),
-  refreshModels: () => call("refresh_models"),
-  /** Re-queries signed-in providers (for example Antigravity's account list); slower than `refreshModels`. */
+  refreshModels: () => call("discover_models", { force: true }),
   discoverModels: () => call("discover_models"),
   setModel: (snap: import("./types").OpenSnapshot, provider: string, modelId: string) => call("set_model", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, provider, modelId }),
   /** `default` restores the model's own level. */
