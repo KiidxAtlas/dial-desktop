@@ -15,7 +15,7 @@ const props = defineProps<{
   connected: boolean;
 }>();
 
-const emit = defineEmits<{ save: [host: string | null]; setup: [user: string, openTerminal: boolean] }>();
+const emit = defineEmits<{ save: [host: string | null]; setup: [user: string, openTerminal: boolean]; cancel: [] }>();
 
 const user = ref(localStorage.getItem("dial.vmSshUser") ?? "");
 const terminalOpen = ref(false);
@@ -57,9 +57,10 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
           :disabled="busy"
           @keydown.enter.prevent="setup"
         />
-        <button type="button" class="btn primary" :disabled="!canSetup" @click="setup">
+        <button type="button" class="btn btn-primary" :disabled="!canSetup" @click="setup">
           {{ busy ? "Setting up SSH…" : link ? "Set up SSH again" : "Set up SSH" }}
         </button>
+        <button v-if="busy && connected" type="button" class="btn btn-secondary" @click="emit('cancel')">Cancel</button>
       </div>
       <label class="check">
         <input v-model="terminalOpen" type="checkbox" :disabled="busy" />
@@ -70,10 +71,21 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
         Dial waits up to 5 minutes for SSH to answer.
       </p>
       <p v-else-if="!connected" class="hint">Connect to the VM and log in to its desktop, then press Set up SSH.</p>
-      <p v-else class="hint">
-        One press: Dial opens a terminal in the VM (Ctrl+Alt+T), types a command that enables sshd and trusts a new key,
-        then adds a <code>Host</code> entry for this VM to <code>~/.ssh/config</code> and links it here.
-      </p>
+      <template v-else>
+        <p class="hint">One press sets up SSH in the VM and links it here.</p>
+        <details class="tech">
+          <summary>Technical details</summary>
+          <p class="hint">
+            Dial opens a terminal in the VM (Ctrl+Alt+T), types a command that enables sshd and trusts a new key,
+            then adds a <code>Host</code> entry for this VM to <code>~/.ssh/config</code> and links it here.
+          </p>
+          <p class="hint">
+            Needs a VirtualBox VM running a Debian/Ubuntu-style guest with <code>apt</code>, logged in to a desktop where
+            Ctrl+Alt+T opens a terminal (or tick the box above with a terminal already focused). Dial may wait up to
+            5 minutes for SSH to answer; Cancel stops the wait.
+          </p>
+        </details>
+      </template>
     </div>
     <label class="title" :for="`${listId}-input`">SSH host for commands</label>
     <div class="row">
@@ -92,8 +104,8 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
       <datalist :id="listId">
         <option v-for="host in hosts" :key="host" :value="host" />
       </datalist>
-      <button type="button" class="btn" :disabled="busy || !valid || unchanged" @click="emit('save', trimmed)">Link</button>
-      <button v-if="link?.source === 'linked'" type="button" class="btn" :disabled="busy" @click="emit('save', null)">Unlink</button>
+      <button type="button" class="btn btn-secondary" :disabled="busy || !valid || unchanged" @click="emit('save', trimmed)">Link</button>
+      <button v-if="link?.source === 'linked'" type="button" class="btn btn-danger" :disabled="busy" @click="emit('save', null)">Unlink</button>
     </div>
     <p v-if="draft && !valid" class="hint warn">Use a single host alias: letters, digits and . _ - @ : only.</p>
     <p v-else-if="link" class="hint">
@@ -116,7 +128,7 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
   flex: none;
 }
 .title {
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-weight: 600;
 }
 .row {
@@ -124,22 +136,21 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
   gap: 6px;
   align-items: center;
 }
+.row > button {
+  flex: none;
+}
 .field {
   flex: 1;
   min-width: 0;
-  height: 26px;
+  height: 30px;
   padding: 0 8px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-family: var(--font-mono, monospace);
 }
-.btn {
-  flex: none;
-  height: 26px;
-  padding: 0 10px;
 .setup {
   display: flex;
   flex-direction: column;
@@ -150,36 +161,27 @@ const listId = computed(() => `vm-ssh-hosts-${props.vmId.replace(/[^A-Za-z0-9_-]
 .field.user {
   font-family: inherit;
 }
-.btn.primary {
-  background: var(--accent, #3b82f6);
-  border-color: var(--accent, #3b82f6);
-  color: #fff;
-  font-weight: 600;
-}
 .check {
   display: flex;
   gap: 6px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
-}
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-  cursor: pointer;
-}
-.btn:disabled {
-  opacity: 0.4;
-  cursor: default;
 }
 .hint {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 .hint.warn {
-  color: var(--danger, #c0392b);
+  color: var(--danger);
+}
+.tech summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.tech .hint {
+  margin-top: 4px;
 }
 </style>

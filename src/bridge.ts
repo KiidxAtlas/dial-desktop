@@ -8,10 +8,12 @@ import { ask, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater";
-import { ref, shallowRef } from "vue";
+import { reactive, ref, shallowRef } from "vue";
+import { readTrash, trashKey, updateTrash, type Deletable } from './deferredDelete';
 import { attachmentPayload } from './attachmentFormats';
 import type { KeyProvider } from './providerKeys';
 import { LastSubmission } from './promptEdit';
+import { nameFailure, settleSaves } from './settingsFeedback';
 import type {
   Answer,
   ApprovalMode,
@@ -31,6 +33,7 @@ import type {
   TerminalEvent,
   Workspace,
 } from "./types";
+import type { WatchPeerBoard, WatchWorker } from './activityWatch';
 
 /** Latest state published by the app; `null` until the first one arrives. Parts unchanged since
  * the previous snapshot keep their identity (see {@link share}), so Vue skips redrawing them. */
@@ -70,8 +73,21 @@ export function share<T>(prev: unknown, next: T): T {
 /** Models the user can switch to; empty until the engine listed them. */
 export const models = shallowRef<ModelOption[]>([]);
 
-export interface DownloadStatus { repo: string; running: boolean; message: string }
-export interface CachedModel { repo: string; bytes: number }
+/** Both the recipient and the sending session are explicit; ids on the two transports are unrelated. */
+export const activityWatchApi = {
+  workers: (workspaceRoot: string, sessionId: string) => invoke<WatchWorker[]>('watch_workers', { workspaceRoot, sessionId }),
+  peers: (workspaceRoot: string, sessionId: string) => invoke<WatchPeerBoard>('watch_peers', { workspaceRoot, sessionId }),
+  message: (workspaceRoot: string, sessionId: string, id: string, text: string, watchToken: string) => invoke<unknown>('watch_message', { workspaceRoot, sessionId, id, text, watchToken }),
+  peerMessage: (workspaceRoot: string, sessionId: string, id: string, text: string) => invoke<unknown>('watch_peer_message', { workspaceRoot, sessionId, id, text }),
+};
+
+export interface DownloadStatus {
+  repo: string; file: string | null; expectedBytes: number; running: boolean; message: string;
+  percent: number | null; receivedBytes: number | null; completedBytes: number | null; totalBytes: number | null;
+  completedFiles: number | null; totalFiles: number | null; elapsedSecs: number; retryable: boolean;
+}
+export interface CachedModelFile { revision: string; path: string; bytes: number }
+export interface CachedModel { repo: string; bytes: number; files: CachedModelFile[] }
 export interface HubModel { id: string; downloads: number; likes: number; pipeline_tag: string | null }
 export interface HubFile { path: string; size: number; split: boolean }
 export const modelDownloads = {
@@ -81,10 +97,10 @@ export const modelDownloads = {
   cached: () => invoke<CachedModel[]>('model_cache_list'),
   search: (query: string, format: 'MLX' | 'GGUF') => invoke<HubModel[]>('model_hub_search', { query, format }),
   files: (repo: string) => invoke<HubFile[]>('model_hub_files', { repo }),
-  async start(repo: string, size: string, file?: string) {
+  async start(repo: string, size: string, bytes: number, file?: string) {
     const what = file ? `${file} from ${repo}` : repo;
     if (!await ask(`Download ${what} (about ${size}) from Hugging Face to this computer? This does not switch your session model.`, { title: 'Download model?' })) return null;
-    const start = () => invoke<DownloadStatus | null>('model_download_start', { repo, file: file ?? null });
+    const start = () => invoke<DownloadStatus | null>('model_download_start', { repo, file: file ?? null, expectedBytes: bytes });
     const started = await start();
     if (started) return started;
     // Null means the helper executable is missing (other failures reject). Keep the confirmed
@@ -94,9 +110,14 @@ export const modelDownloads = {
     if (!retried) throw new Error('The model helper was not found after setup.');
     return retried;
   },
+  async removeFile(repo: string, f: CachedModelFile) {
+    if (!await ask(`Remove ${f.path} from ${repo} at revision ${f.revision}?\n\nOther files and revisions are kept. Shared cache blobs are not deleted, so this may not free disk space.`, { title: 'Remove GGUF file?', kind: 'warning', okLabel: 'Remove file' })) return false;
+    await invoke('model_cache_remove_file', { repo, revision: f.revision, file: f.path });
+    return true;
+  },
   /** Delete a downloaded model from the Hugging Face cache after confirming; the bytes freed, or `null` if cancelled. */
   async remove(repo: string, size: string) {
-    if (!await ask(`Delete ${repo} (${size}) from this computer?\n\nIt is removed from the Hugging Face cache and can be downloaded again later.`, { title: 'Delete model?', kind: 'warning', okLabel: 'Delete' })) return null;
+    if (!await ask(`Delete the entire ${repo} repository (${size}) from this computer?\n\nAll its cached files and revisions will be removed. They can be downloaded again later.`, { title: 'Delete entire repository?', kind: 'warning', okLabel: 'Delete repository' })) return null;
     return invoke<number>('model_cache_remove', { repo });
   },
 };
@@ -104,9 +125,16 @@ export const modelDownloads = {
 /** The settings page; `null` until the engine sent it. */
 export const settingsPage = shallowRef<SettingsPage | null>(null);
 
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface Toast {
   id: number;
   message: string;
+  /** A button on the toast, like Undo; pressing it also dismisses the toast. */
+  action?: ToastAction;
 }
 
 const TOAST_MS = 6000;
@@ -114,6 +142,8 @@ export const toasts = ref<Toast[]>([]);
 let lastToast = 0;
 
 const timers = new Map<number, ReturnType<typeof setTimeout>>();
+/** How long each toast stays when not the default. */
+const durations = new Map<number, number>();
 
 function dismissLater(id: number) {
   clearTimeout(timers.get(id));
@@ -121,24 +151,51 @@ function dismissLater(id: number) {
     id,
     setTimeout(() => {
       timers.delete(id);
+      durations.delete(id);
       toasts.value = toasts.value.filter((t) => t.id !== id);
-    }, TOAST_MS),
+    }, durations.get(id) ?? TOAST_MS),
   );
 }
 
-/** Show `message`; one already on screen stays single and just stays longer. */
-export function showToast(message: string) {
-  const shown = toasts.value.find((t) => t.message === message);
-  if (shown) return dismissLater(shown.id);
+/**
+ * Show `message`; one already on screen stays single and just stays longer. A toast with an
+ * `action` is always its own. Returns the toast's id.
+ */
+export function showToast(message: string, options: { action?: ToastAction; ms?: number } = {}): number {
+  const shown = !options.action && toasts.value.find((t) => t.message === message && !t.action);
+  if (shown) {
+    dismissLater(shown.id);
+    return shown.id;
+  }
   const id = ++lastToast;
-  toasts.value = [...toasts.value.slice(-2), { id, message }];
+  if (options.ms) durations.set(id, options.ms);
+  // At most three; an older plain toast makes room before one that offers an action (Undo).
+  let kept = toasts.value;
+  while (kept.length > 2) {
+    const drop = kept.findIndex((t) => !t.action);
+    const gone = kept[drop < 0 ? 0 : drop];
+    clearTimeout(timers.get(gone.id));
+    timers.delete(gone.id);
+    durations.delete(gone.id);
+    kept = kept.filter((t) => t !== gone);
+  }
+  toasts.value = [...kept, { id, message, action: options.action }];
   dismissLater(id);
+  return id;
+}
+
+/** Run a toast's action button, then dismiss it. */
+export function runToastAction(id: number) {
+  const toast = toasts.value.find((t) => t.id === id);
+  dismissToast(id);
+  toast?.action?.run();
 }
 
 /** Remove a toast now (its close button). */
 export function dismissToast(id: number) {
   clearTimeout(timers.get(id));
   timers.delete(id);
+  durations.delete(id);
   toasts.value = toasts.value.filter((t) => t.id !== id);
 }
 
@@ -168,6 +225,7 @@ let resyncAgain = false;
 
 function accept(seq: number, next: Snapshot) {
   snapshotSeq = seq;
+  if (next.workspace?.root !== snapshot.value?.workspace?.root) loadTrash(next.workspace?.root);
   snapshot.value = share(snapshot.value, next);
   lastSubmission.observe(snapshot.value);
   startupError.value = null;
@@ -221,8 +279,8 @@ export async function connect() {
     if (!subscribed) {
       partial.push(await listen<SnapshotEvent>("snapshot", e => receive(e.payload)));
       partial.push(await listen<ModelOption[]>("models", e => { models.value = e.payload; }));
-      partial.push(await listen<SettingsPage>("settings", e => { settingsPage.value = e.payload; }));
-      partial.push(await listen<string>("toast", e => showToast(e.payload)));
+      partial.push(await listen<SettingsPage>("settings", e => { settingsPage.value = e.payload; settleSaves(); }));
+      partial.push(await listen<string>("toast", e => showToast(nameFailure(e.payload))));
       subscribed = true;
     }
     await resync();
@@ -246,6 +304,35 @@ async function call(command: string, args?: Record<string, unknown>) {
   }
 }
 
+/** Project-scoped local trash; no timer deletes a transcript. */
+export const hiddenSessions = reactive(new Set<string>());
+function replaceTrash(ids: string[]) {
+  hiddenSessions.clear();
+  for (const id of ids) hiddenSessions.add(id);
+}
+function loadTrash(root?: string) {
+  try { replaceTrash(root ? readTrash(localStorage.getItem(trashKey(root))) : []); }
+  catch { replaceTrash([]); showToast('Could not read Recently Deleted on this computer'); }
+}
+if (typeof window !== 'undefined') window.addEventListener('storage', e => {
+  const root = snapshot.value?.workspace?.root;
+  if (root && (!e.key || e.key === trashKey(root))) loadTrash(root);
+});
+function changeTrash(root: string, ids: string[], restore: boolean): boolean {
+  try {
+    const next = updateTrash(localStorage, root, ids, restore);
+    if (snapshot.value?.workspace?.root === root) replaceTrash(next);
+    return true;
+  } catch { showToast('Could not save Recently Deleted. No local change was made.'); return false; }
+}
+export function restoreSessions(root: string, ids: string[]) { return changeTrash(root, ids, true); }
+export async function purgeSession(root: string, session: Deletable) {
+  if (snapshot.value?.workspace?.root !== root || !hiddenSessions.has(session.id)) return;
+  if (!await ask(`Permanently delete “${session.title || 'Untitled session'}” and its history? This cannot be undone.`, { title: 'Delete permanently?', kind: 'warning', okLabel: 'Delete permanently', cancelLabel: 'Cancel' }).catch(() => false)) return;
+  if (snapshot.value?.workspace?.root !== root || !hiddenSessions.has(session.id)) return;
+  if (await call('delete_sessions', { workspaceRoot: root, sessionIds: [session.id], confirmRemoval: true })) restoreSessions(root, [session.id]);
+}
+
 export const engine = {
   async send(text: string, attachments: Attachment[], scope: { workspaceRoot: string; sessionId: string | null; typeId?: string | null }) {
     const settle = lastSubmission.start(snapshot.value, scope, text, attachments);
@@ -263,8 +350,9 @@ export const engine = {
   abort: () => call("abort"),
   newSession: () => call("new_session"),
   resume: (sessionId: string, workspaceRoot?: string, waitForClose = false) => call("resume", { sessionId, workspaceRoot, waitForClose }),
-  searchTranscripts: (workspaceRoot: string, query: string) =>
-    invoke<import("./types").TranscriptResults>("search_transcripts", { workspaceRoot, query }),
+  searchTranscripts: (workspaceRoot: string, query: string, limit: number) =>
+    invoke<import("./types").TranscriptResults>("search_transcripts", { workspaceRoot, query, limit }),
+  setupAtomic: () => invoke<boolean>('atomic_engine_setup'),
   localModelDetails: (workspaceRoot: string, model: string) =>
     invoke<import("./types").LocalModelRemoval>("local_model_removal", { workspaceRoot, model, dryRun: true }),
   async removeLocalModel(workspaceRoot: string, model: string, preview: import("./types").LocalModelRemoval) {
@@ -275,34 +363,44 @@ export const engine = {
     await engine.refreshModels();
     return true;
   },
-  /** Delete sessions after the user confirms; resolves to whether they were asked to go. */
-  async deleteSessions(sessions: { id: string; title: string }[]): Promise<boolean> {
-    if (!sessions.length) return false;
-    const one = sessions.length === 1;
-    const confirmed = await ask(
-      one
-        ? `“${sessions[0].title}” and its history will be removed. This cannot be undone.`
-        : `${sessions.length} sessions and their history will be removed. This cannot be undone.`,
-      {
-        title: one ? "Delete session?" : `Delete ${sessions.length} sessions?`,
-        kind: "warning",
-        okLabel: "Delete",
-        cancelLabel: "Cancel",
-      },
-    ).catch(() => false);
-    return confirmed && await call("delete_sessions", { sessionIds: sessions.map((s) => s.id) });
+  async deleteSessions(sessions: Deletable[]): Promise<boolean> {
+    const snap = snapshot.value, root = snap?.workspace?.root;
+    if (!root || !sessions.length) return false;
+    const ids = sessions.map(s => s.id);
+    const busy = () => snapshot.value?.sessions.some(s => ids.includes(s.id) && (s.running || s.waiting));
+    if (busy()) { showToast('Stop the running session before moving it to Recently Deleted'); return false; }
+    if (ids.length > 1 && !await ask(`Move ${ids.length} sessions to Recently Deleted? You can restore them from the sidebar.`, { title: 'Move sessions?', okLabel: 'Move', cancelLabel: 'Cancel' }).catch(() => false)) return false;
+    if (snapshot.value?.workspace?.root !== root || busy()) return false;
+    if (!changeTrash(root, ids, false)) return false;
+    if (snapshot.value.sessionId && ids.includes(snapshot.value.sessionId) && !await engine.newSession()) {
+      restoreSessions(root, ids);
+      return false;
+    }
+    showToast(`Moved ${ids.length === 1 ? 'session' : `${ids.length} sessions`} to Recently Deleted`, { action: { label: 'Undo', run: () => restoreSessions(root, ids) } });
+    return true;
   },
   renameSession: (sessionId: string, title: string) => call("rename_session", { sessionId, title }),
   pinSession: (sessionId: string, pinned: boolean) => call("pin_session", { sessionId, pinned }),
   /** Copy a session into a new one and open the copy. */
   forkSession: (sessionId: string) => call("fork_session", { sessionId }),
-  async forkBefore(root: string, sessionId: string, prompt: string, occurrence: number, matches: number) {
+  /**
+   * Copy the conversation up to (not including) a prompt and open the copy; resolves to the copy's
+   * id, or `null` when cancelled or it failed. `edit` words the confirmation for "Edit from here".
+   */
+  async forkBefore(root: string, sessionId: string, prompt: string, occurrence: number, matches: number, edit = false): Promise<string | null> {
     try {
-      if (!await ask("Create a copy ending before this prompt? The original conversation and working files stay unchanged.", { title: "Fork from this message?" })) return;
+      const question = edit
+        ? "Create a copy ending before this prompt and put the prompt in the box to edit? The original conversation and working files stay unchanged."
+        : "Create a copy ending before this prompt? The original conversation and working files stay unchanged.";
+      if (!await ask(question, { title: edit ? "Edit from this message?" : "Fork from this message?", okLabel: edit ? "Edit in a copy" : undefined })) return null;
       const id = await invoke<string>("fork_before", { workspaceRoot: root, sessionId, prompt, occurrence, matches });
       if (snapshot.value?.workspace?.root === root && snapshot.value.sessionId === sessionId) await engine.resume(id, root);
       else showToast("Fork created in the original project");
-    } catch (e) { showToast(String(e)); }
+      return id;
+    } catch (e) {
+      showToast(String(e));
+      return null;
+    }
   },
   /** Ask where to save, inside the project folder, and export the session on screen as Markdown. */
   async exportSession(root: string, title: string) {
@@ -318,16 +416,25 @@ export const engine = {
       showToast(`Could not open the save dialog: ${error}`);
     }
   },
-  /** Confirm before undoing; only report success after the engine accepts the undo. */
-  async undoTurn(edit?: { missingImages: number; stillCurrent: () => boolean }): Promise<boolean> {
+  /** Confirm before undoing; only report success after the engine accepts the undo. `regenerate`
+   * words the confirmation for undoing so the same prompt can be sent again. */
+  async undoTurn(edit?: { missingImages: number; stillCurrent: () => boolean; regenerate?: boolean }): Promise<boolean> {
     const current = snapshot.value;
     if (!current?.workspace) return false;
     const { sessionId } = current;
     const workspaceRoot = current.workspace.root;
+    const regenerate = !!edit?.regenerate;
     const confirmed = await ask(
-      'Dial restores the files the last turn changed and removes that prompt and its answer from the conversation.' +
+      (regenerate
+        ? 'Dial restores the files the last turn changed, removes its answer, and sends the same prompt again.'
+        : 'Dial restores the files the last turn changed and removes that prompt and its answer from the conversation.') +
         (edit?.missingImages ? `\n\nOnly the prompt text can be restored. You’ll need to attach ${edit.missingImages === 1 ? 'the image' : `all ${edit.missingImages} images`} again. Cancel to keep the original turn.` : ''),
-      { title: edit ? 'Edit the last prompt?' : 'Undo the last turn?', kind: 'warning', okLabel: edit ? (edit.missingImages ? 'Edit text only' : 'Edit prompt') : 'Undo', cancelLabel: 'Cancel' },
+      {
+        title: regenerate ? 'Regenerate the last answer?' : edit ? 'Edit the last prompt?' : 'Undo the last turn?',
+        kind: 'warning',
+        okLabel: regenerate ? 'Regenerate' : edit ? (edit.missingImages ? 'Edit text only' : 'Edit prompt') : 'Undo',
+        cancelLabel: 'Cancel',
+      },
     ).catch(() => false);
     return confirmed && (!edit || edit.stillCurrent()) && await call('undo_turn', { workspaceRoot, sessionId });
   },
@@ -355,6 +462,8 @@ export const engine = {
   setThinking: (snap: import("./types").OpenSnapshot, level: string) => call("set_thinking", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, level }),
   setApproval: (mode: ApprovalMode) => call("set_approval", { mode }),
   reconnect: () => call("reconnect"),
+  /** Reconnect without a toast; resolves to `null`, or why the app refused (work still protected). */
+  reconnectQuietly: () => invoke("reconnect").then(() => null, (error) => String(error)),
   /** The question is on screen; the engine starts its answer timeout. */
   questionPresented: (questionId: string) => call("question_presented", { questionId }),
   answerQuestion: (questionId: string, answers: Answer[]) =>
@@ -412,6 +521,7 @@ export interface ImageFile {
 export const files = {
   /** Check the image at `path` and read its thumbnail; throws a readable message. */
   readImage: (path: string) => invoke<ImageFile>("read_image", { path }),
+  validateAttachment: (path: string) => invoke<void>("validate_attachment", { path }),
   readClipboardImage: () => isTauri() ? invoke<string | null>("read_clipboard_image") : Promise.resolve(null),
   readClipboardFilePaths: () => isTauri() ? invoke<string[]>('read_clipboard_file_paths') : Promise.resolve([]),
   readTranscriptImage: (workspaceRoot: string, path: string) =>
@@ -472,10 +582,35 @@ export const settings = {
   reset: (key: string, scope: SettingScope) => call("reset_setting", { key, scope }),
 };
 
+/** How the engine binary was chosen (`launcher::EngineOrigin`). */
+export type EngineOrigin = "flag" | "env" | "choice" | "desktop" | "path" | "fallback" | "missing";
+/** Which engine Desktop runs and what went wrong while starting (`launcher::Startup`). */
+export interface StartupReport {
+  engine: string | null;
+  origin: EngineOrigin | null;
+  warnings: string[];
+}
+/** The engine picked in Settings › Updates (`launcher::EngineChoice`); `null` is the usual order. */
+export type EngineChoice = { kind: "custom"; path: string } | { kind: "path" } | { kind: "desktop" };
+export const diagnosticsApi = {
+  startup: () => invoke<StartupReport>("startup_diagnostics"),
+  /** The saved choice, and `flag`/`env` when `--dial` or `DIAL_BIN` outranks it. */
+  engineChoice: () => invoke<{ choice: EngineChoice | null; overriddenBy: EngineOrigin | null }>("engine_choice_get"),
+  /** Save (and, unless outranked, use from the next engine on) a choice; rejects a binary that does not run. */
+  setEngineChoice: (choice: EngineChoice | null) => invoke<StartupReport>("engine_choice_set", { choice }),
+  /** `path --version`: the version line, or a readable failure. */
+  validateEngine: (path: string) => invoke<string>("engine_validate", { path }),
+};
+/** Settings export and import files (picked with the system dialogs). */
+export const settingsFiles = {
+  write: (path: string, text: string) => invoke<void>("settings_file_write", { path, text }),
+  read: (path: string) => invoke<string>("settings_file_read", { path }),
+};
+
 interface NotificationDestination { workspaceRoot: string; sessionId: string }
 
 export const notificationApi = {
-  setEnabled: (enabled: boolean, interactive: boolean) => invoke<void>("set_notifications", { enabled, interactive }),
+  setEnabled: (enabled: boolean, interactive: boolean, kinds: { approval: boolean; question: boolean; finished: boolean }) => invoke<void>("set_notifications", { enabled, interactive, ...kinds }),
   resume: (destination: NotificationDestination) => call("resume", { ...destination, waitForClose: true }),
   onOpen: (handler: (destination: NotificationDestination) => void) =>
     listen<NotificationDestination>("notification-open", ({ payload }) => handler(payload)),

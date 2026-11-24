@@ -94,6 +94,7 @@ function menu(event: MouseEvent, t: Summary) {
       </button>
     </div>
     <div v-if="open" class="rows">
+      <button v-if="types.listError" class="row" @click="refreshTypes">Couldn’t load Types · Retry</button>
       <div v-if="naming && !naming.id" class="row naming">
         <span class="glyph">✦</span>
         <input ref="field" class="name-field" placeholder="Name it — Cookbook, Routine…" aria-label="Type name" maxlength="60" :disabled="busy" @keydown="onKey" @blur="finishNaming" />

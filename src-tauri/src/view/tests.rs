@@ -180,6 +180,22 @@ fn retained_tool_images_survive_live_and_replayed_results() {
 }
 
 #[test]
+fn received_mail_from_live_notices_keeps_every_available_character_but_not_typed_alerts() {
+    let mut model = Model::starting();
+    let preview = "Message from task-1 (reviewer) to parent: <button>stop</button>\nsecond line";
+    let peer = "Project peer session-42 sent a coordination message.";
+    for message in [preview, peer, "Message from an unknown source"] {
+        feed(&mut model, json!({"event":"notice", "message":message}));
+    }
+    feed(&mut model, json!({"event":"notice", "kind":"interrupted", "lane":"alert", "message":preview}));
+    let rows = serde_json::to_value(Snapshot::new(&model, Some(&workspace()), 0).entries).unwrap();
+    assert_eq!(rows[0], json!({"kind":"received", "source":"workerNotice", "sender":"task-1 (reviewer)", "text":preview}));
+    assert_eq!(rows[1], json!({"kind":"received", "source":"peerNotice", "sender":"session-42", "text":peer}));
+    assert_eq!(rows[2]["kind"], "notice");
+    assert_eq!(rows[3]["lane"], "alert");
+}
+
+#[test]
 fn workspace_abbreviates_home_and_relativizes_paths() {
     let w = workspace();
     assert_eq!(w.display, "~/work/app");
@@ -268,6 +284,29 @@ fn apply(prev: &Snapshot, patch: &serde_json::Map<String, Value>) -> Value {
         entries.extend(patch["entriesTail"].as_array().unwrap().iter().cloned());
     }
     out
+}
+
+#[test]
+fn reasoning_preference_projects_only_the_effective_boolean_into_snapshot_updates() {
+    let mut model = Model::starting();
+    let default = Snapshot::new(&model, None, 0);
+    assert_eq!(serde_json::to_value(&default).unwrap()["showThinking"], true);
+
+    let folded = crate::model::SavedSetting {
+        value: json!(false),
+        redacted: false,
+        scope: Some("project".into()),
+    };
+    model.settings = Some(HashMap::from([("ui.show_thinking".into(), folded)]));
+    let saved = Snapshot::new(&model, None, 0);
+    model.settings.as_mut().unwrap().clear();
+    let reset = Snapshot::new(&model, None, 0);
+
+    for (from, to, expected) in [(&default, &saved, false), (&saved, &reset, true)] {
+        let delta = patch(from, to);
+        assert_eq!(json!(delta), json!({"showThinking": expected}));
+        assert_eq!(apply(from, &delta), serde_json::to_value(to).unwrap());
+    }
 }
 
 #[test]
@@ -507,6 +546,7 @@ fn the_model_view_prefers_state_and_labels_from_the_list() {
         local: false,
         listed: false,
         catalog_only: false,
+        local_engine: None,
     }];
     model.approval = Some("ask".into());
     let value = serde_json::to_value(Snapshot::new(&model, None, 0)).unwrap();

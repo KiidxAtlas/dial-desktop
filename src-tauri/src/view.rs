@@ -140,6 +140,11 @@ pub enum EntryView {
         abandoned: bool,
     },
     Tool(Box<ToolView>),
+    Received {
+        sender: String,
+        text: String,
+        source: ReceivedSource,
+    },
     Notice {
         message: String,
         lane: Option<String>,
@@ -149,6 +154,12 @@ pub enum EntryView {
         message: String,
     },
 }
+
+/// Older arrival notices carry only a worker preview, or just the peer's id. Modern delivery
+/// events and journal records have the text itself. Never invent missing content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReceivedSource { Live, WorkerNotice, PeerNotice, Journal }
 
 /// How a tool call settled. An unknown outcome is never shown as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -541,6 +552,7 @@ pub struct ModelOptionView {
     pub local: bool,
     pub listed: bool,
     pub catalog_only: bool,
+    pub local_engine: Option<crate::model::EngineChoice>,
 }
 
 impl From<&ModelOption> for ModelOptionView {
@@ -556,6 +568,7 @@ impl From<&ModelOption> for ModelOptionView {
             local: m.local,
             listed: m.listed,
             catalog_only: m.catalog_only,
+            local_engine: m.local_engine.clone(),
         }
     }
 }
@@ -566,6 +579,7 @@ impl From<&ModelOption> for ModelOptionView {
 pub struct Snapshot {
     /// `macos`, `windows` or `linux`; the UI leaves room for the macOS window buttons.
     pub platform: &'static str,
+    pub apple_silicon: bool,
     /// `None` until the user picks a folder; the UI then shows the welcome screen.
     pub workspace: Option<Workspace>,
     pub connection: ConnectionView,
@@ -575,7 +589,11 @@ pub struct Snapshot {
     pub approval: Option<String>,
     pub session_id: Option<String>,
     pub history_loading: bool,
+    /// Whether to expand reasoning by default, from this engine's effective UI settings.
+    pub show_thinking: bool,
     pub turn_running: bool,
+    pub model_progress: Option<crate::model::ModelProgress>,
+    pub loading_local_model: Option<String>,
     pub can_send: bool,
     pub sessions: Vec<SessionView>,
     /// Shared with the previous snapshot where unchanged (see [`EntryViews`]).
@@ -667,7 +685,7 @@ impl Snapshot {
                 }
             })
             .collect();
-        let entries = views.build(conversation.entries(), shown);
+        let entries = views.build(model, shown);
         let approvals = conversation
             .pending_approvals()
             .iter()
@@ -709,6 +727,7 @@ impl Snapshot {
         let stats = model.tool_stats();
         Self {
             platform: std::env::consts::OS,
+            apple_silicon: crate::app_runner::runtime::host_is_apple_silicon(),
             workspace: workspace.cloned(),
             connection: model.connection().into(),
             model: ModelView::of(model),
@@ -716,7 +735,15 @@ impl Snapshot {
             title: model.title(),
             session_id,
             history_loading: model.recovering,
+            show_thinking: model
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get("ui.show_thinking"))
+                .and_then(|setting| setting.value.as_bool())
+                .unwrap_or(true),
             turn_running: conversation.turn_running(),
+            model_progress: model.model_progress,
+            loading_local_model: None,
             can_send: model.can_send(),
             sessions,
             entries,
@@ -855,38 +882,50 @@ impl Published {
 
 /// The rows of the last snapshot with the entries they were made from.
 ///
-/// A row depends only on its entry, its position and the workspace, so a row whose entry is
-/// unchanged is shared instead of rebuilt. That keeps a streaming frame's cost to comparing the
-/// transcript rather than rebuilding every tool row (and copying its output) on each publish.
+/// Reuse a row when its entry, its mail provenance and its workspace are unchanged. This keeps
+/// a streaming frame from rebuilding every tool row (and copying its output) on each publish.
 #[derive(Default)]
 pub struct EntryViews {
     workspace: Option<Workspace>,
     rows: Vec<(Entry, Arc<EntryView>)>,
+    received_from: HashMap<usize, String>,
 }
 
 impl EntryViews {
     /// The rows for `entries`, rebuilding only the ones that changed.
-    pub fn build(&mut self, entries: &[Entry], workspace: &Workspace) -> Vec<Arc<EntryView>> {
+    fn build(&mut self, model: &Model, workspace: &Workspace) -> Vec<Arc<EntryView>> {
+        let entries = model.conversation.entries();
         if self.workspace.as_ref() != Some(workspace) {
             self.workspace = Some(workspace.clone());
             self.rows.clear();
         }
         self.rows.truncate(entries.len());
+        // Mail provenance rarely changes. Don't hash a row index per historical entry on
+        // every streaming frame; only compare individual senders when the map changed.
+        let same_senders = self.received_from == model.received_from;
         for (index, entry) in entries.iter().enumerate() {
+            if self.rows.get(index).is_some_and(|(cached, _)| cached == entry)
+                && (same_senders || self.received_from.get(&index) == model.received_from.get(&index))
+            {
+                continue;
+            }
+            let sender = model.received_from.get(&index).map(String::as_str);
+            let row = (entry.clone(), Arc::new(entry_view(index, entry, workspace, sender)));
             match self.rows.get_mut(index) {
-                Some((cached, _)) if cached == entry => {}
-                Some(row) => *row = (entry.clone(), Arc::new(entry_view(index, entry, workspace))),
-                None => self
-                    .rows
-                    .push((entry.clone(), Arc::new(entry_view(index, entry, workspace)))),
+                Some(old) => *old = row,
+                None => self.rows.push(row),
             }
         }
+        if !same_senders { self.received_from.clone_from(&model.received_from); }
         self.rows.iter().map(|(_, view)| Arc::clone(view)).collect()
     }
 }
 
-fn entry_view(index: usize, entry: &Entry, workspace: &Workspace) -> EntryView {
+fn entry_view(index: usize, entry: &Entry, workspace: &Workspace, sender: Option<&str>) -> EntryView {
     match entry {
+        Entry::User(user) if let Some(sender) = sender => EntryView::Received {
+            sender: sender.to_owned(), text: user.text.clone(), source: ReceivedSource::Journal,
+        },
         Entry::User(user) => EntryView::User {
             text: user.text.clone(),
             images: user.images,
@@ -898,6 +937,12 @@ fn entry_view(index: usize, entry: &Entry, workspace: &Workspace) -> EntryView {
             abandoned: answer.abandoned,
         },
         Entry::Tool(tool) => EntryView::Tool(Box::new(ToolView::new(index, tool, workspace))),
+        Entry::Notice(notice) if let Some(sender) = sender => EntryView::Received {
+            sender: sender.to_owned(), text: notice.message.clone(), source: ReceivedSource::Live,
+        },
+        Entry::Notice(notice) if notice.kind.is_none() && notice.lane.is_none() && let Some((sender, source)) = notice_sender(&notice.message) => EntryView::Received {
+            sender: sender.to_owned(), text: notice.message.clone(), source,
+        },
         Entry::Notice(notice) => EntryView::Notice {
             message: notice.message.clone(),
             lane: notice.lane.clone(),
@@ -909,6 +954,17 @@ fn entry_view(index: usize, entry: &Entry, workspace: &Workspace) -> EntryView {
     }
 }
 
+/// Older engines send only a preview. Match their two controller notice envelopes,
+/// never user/assistant text, typed alerts, or tool output.
+fn notice_sender(message: &str) -> Option<(&str, ReceivedSource)> {
+    let (sender, source) = if let Some(worker) = message.strip_prefix("Message from ") {
+        (worker.split_once(" to parent: ")?.0, ReceivedSource::WorkerNotice)
+    } else {
+        (message.strip_prefix("Project peer ")?.strip_suffix(" sent a coordination message.")?, ReceivedSource::PeerNotice)
+    };
+    (!sender.trim().is_empty() && !sender.contains(['\r', '\n'])).then_some((sender, source))
+}
+
 /// The fields of `next` that differ from `prev` (see [`SnapshotEvent::patch`]).
 pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
@@ -918,6 +974,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
     // Destructured so a new field cannot be forgotten here.
     let Snapshot {
         platform,
+        apple_silicon,
         workspace,
         connection,
         title,
@@ -925,7 +982,10 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
         approval,
         session_id,
         history_loading,
+        show_thinking,
         turn_running,
+        model_progress,
+        loading_local_model,
         can_send,
         sessions,
         entries,
@@ -945,6 +1005,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
         };
     }
     field!(platform, "platform");
+    field!(apple_silicon, "appleSilicon");
     field!(workspace, "workspace");
     field!(connection, "connection");
     field!(title, "title");
@@ -952,7 +1013,10 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
     field!(approval, "approval");
     field!(session_id, "sessionId");
     field!(history_loading, "historyLoading");
+    field!(show_thinking, "showThinking");
     field!(turn_running, "turnRunning");
+    field!(model_progress, "modelProgress");
+    field!(loading_local_model, "loadingLocalModel");
     field!(can_send, "canSend");
     field!(sessions, "sessions");
     field!(approvals, "approvals");

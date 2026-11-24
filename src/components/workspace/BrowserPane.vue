@@ -8,12 +8,32 @@ import { appearance } from "../../appearance";
 import { openMenu, ui, type MenuItem } from "../../ui";
 import { addToPrompt, workspace } from "../../workspace";
 import { viewedImage } from "../../imageViewer";
+import { paneErrorText } from "../../paneErrors";
 import type { Bounds, BrowserState, PageInfo } from "../../types";
+import {
+  SEARCH_ENGINES,
+  VIEWPORTS,
+  browserOptionsApi,
+  isSearchTemplate,
+  loadSearch,
+  loadViewport,
+  pushHistory,
+  saveSearch,
+  saveViewport,
+  searchLabel,
+  searchTemplate,
+  type HistoryEntry,
+  type SearchChoice,
+  type SearchEngineId,
+  type ViewportId,
+} from "../../browserOptions";
 import Icon from "../Icon.vue";
 
 const props = defineProps<{ active: boolean }>();
 
 const stage = ref<HTMLElement | null>(null);
+/** The box the native view fills: the whole stage, or a viewport preset's frame inside it. */
+const view = ref<HTMLElement | null>(null);
 const input = ref<HTMLInputElement | null>(null);
 const address = ref("");
 const editing = ref(false);
@@ -21,6 +41,18 @@ const state = ref<BrowserState>({ url: "", title: "", loading: false });
 /** The webview exists (created on the first page opened). */
 const created = ref(false);
 const busy = ref(false);
+const search = ref<SearchChoice>(loadSearch());
+const viewport = ref<ViewportId>(loadViewport());
+/** Pages shown in this panel session, newest first. */
+const history = ref<HistoryEntry[]>([]);
+const devtools = ref(false);
+
+const preset = computed(() => VIEWPORTS.find((v) => v.id === viewport.value) ?? VIEWPORTS[0]);
+const viewStyle = computed(() =>
+  preset.value.width
+    ? { width: `min(${preset.value.width}px, 100%)`, height: `min(${preset.value.height}px, 100%)` }
+    : { width: "100%", height: "100%" },
+);
 
 const blank = computed(() => !state.value.url || state.value.url === "about:blank");
 /** Overlays that would be hidden under the native view. */
@@ -30,7 +62,7 @@ const covered = computed(
 const visible = computed(() => props.active && !covered.value && created.value && !blank.value);
 
 function bounds(): Bounds | null {
-  const el = stage.value;
+  const el = view.value ?? stage.value;
   if (!el) return null;
   const box = el.getBoundingClientRect();
   if (box.width < 2 || box.height < 2) return null;
@@ -53,7 +85,7 @@ async function open(url: string) {
     }
     editing.value = false;
   } catch (error) {
-    showToast(String(error));
+    showToast(paneErrorText(error));
   } finally {
     busy.value = false;
   }
@@ -102,14 +134,14 @@ function submit() {
 }
 
 function go(action: "back" | "forward" | "reload" | "stop") {
-  browserApi.go(action).catch((error) => showToast(String(error)));
+  browserApi.go(action).catch((error) => showToast(paneErrorText(error)));
 }
 
 async function inspect(): Promise<PageInfo | null> {
   try {
     return await browserApi.inspect();
   } catch (error) {
-    showToast(String(error));
+    showToast(paneErrorText(error));
     return null;
   }
 }
@@ -161,8 +193,88 @@ async function share(event: MouseEvent) {
   openMenu(event, items, anchor);
 }
 
+function applySearch() {
+  browserOptionsApi.setSearch(searchTemplate(search.value)).catch((error) => showToast(paneErrorText(error)));
+}
+
+function chooseSearch(engine: SearchEngineId, custom = search.value.custom) {
+  search.value = { engine, custom };
+  saveSearch(search.value);
+  applySearch();
+}
+
+function chooseViewport(id: ViewportId) {
+  viewport.value = id;
+  saveViewport(id);
+  placeSoon();
+}
+
+/** **Open file…**: the backend serves the file's folder on loopback and hands back its address. */
+async function openFile() {
+  try {
+    const url = await browserOptionsApi.openFile();
+    if (url) await open(url);
+  } catch (error) {
+    showToast(paneErrorText(error));
+  }
+}
+
+function inspector() {
+  browserOptionsApi.devtools().catch((error) => showToast(paneErrorText(error)));
+}
+
+/** The panel's menu: open a local file, the viewport and the search engine. */
+function more(event: MouseEvent) {
+  const mark = (on: boolean) => (on ? "✓" : undefined);
+  const items: MenuItem[] = [
+    { label: "Open file…", icon: "file", run: () => void openFile() },
+    { divider: true },
+    ...VIEWPORTS.map((v): MenuItem => ({ label: v.label, icon: "monitor", hint: mark(viewport.value === v.id), run: () => chooseViewport(v.id) })),
+    { divider: true },
+    ...SEARCH_ENGINES.map((e): MenuItem => ({
+      label: `Search with ${e.label}`,
+      icon: "search",
+      hint: mark(search.value.engine === e.id),
+      run: () => chooseSearch(e.id),
+    })),
+    {
+      label: search.value.engine === "custom" ? `Custom search: ${search.value.custom}` : "Custom search…",
+      icon: "pencil",
+      hint: mark(search.value.engine === "custom"),
+      prompt: {
+        label: "Search address, with %s where the words go",
+        placeholder: "https://example.com/search?q=%s",
+        maxLength: 500,
+        confirm: "Use",
+        submit: (value: string) => {
+          if (!isSearchTemplate(value)) {
+            showToast("A search address must start with https:// and contain %s");
+            return;
+          }
+          chooseSearch("custom", value.trim());
+        },
+      },
+    },
+  ];
+  openMenu(event, items, event.currentTarget as HTMLElement, `Searches use ${searchLabel(search.value)}`);
+}
+
+/** Recent pages of this panel session, to jump back to. */
+function showHistory(event: MouseEvent) {
+  const items: MenuItem[] = history.value.length
+    ? history.value.map((entry) => ({
+        label: entry.title ? `${entry.title} — ${entry.url}` : entry.url,
+        icon: "globe",
+        hint: entry.url === state.value.url ? "✓" : undefined,
+        run: () => void open(entry.url),
+      }))
+    : [{ label: "No pages yet", disabled: true, run: () => {} }];
+  openMenu(event, items, event.currentTarget as HTMLElement, "Recent pages");
+}
+
 watch(state, (now) => {
   if (!editing.value) address.value = now.url === "about:blank" ? "" : now.url;
+  if (!now.loading) history.value = pushHistory(history.value, now.url, now.title);
 });
 watch(visible, placeSoon);
 watch(() => appearance.zoom, placeSoon);
@@ -206,9 +318,15 @@ let unlisten: (() => void) | null = null;
 onMounted(async () => {
   observer = new ResizeObserver(placeSoon);
   if (stage.value) observer.observe(stage.value);
+  if (view.value) observer.observe(view.value);
   window.addEventListener("resize", placeSoon);
   window.addEventListener("keydown", onKey);
   try {
+    void browserOptionsApi.setSearch(searchTemplate(search.value)).catch(() => {});
+    browserOptionsApi
+      .features()
+      .then((features) => (devtools.value = features.devtools))
+      .catch(() => {});
     unlisten = await browserApi.onState((now) => (state.value = now));
     const now = await browserApi.state();
     if (now.url) {
@@ -228,6 +346,7 @@ onBeforeUnmount(() => {
   cancelPlace?.();
   unlisten?.();
   if (created.value) void browserApi.hide().catch(() => {});
+  void browserOptionsApi.stopLocal().catch(() => {});
 });
 </script>
 
@@ -239,6 +358,9 @@ onBeforeUnmount(() => {
       </button>
       <button type="button" class="icon-btn" title="Forward" :disabled="blank" @click="go('forward')">
         <Icon name="arrowRight" :size="15" />
+      </button>
+      <button type="button" class="icon-btn" title="Recent pages" @click="showHistory">
+        <Icon name="list" :size="15" />
       </button>
       <button
         type="button"
@@ -275,6 +397,12 @@ onBeforeUnmount(() => {
       >
         <Icon name="external" :size="15" />
       </button>
+      <button v-if="devtools" type="button" class="icon-btn" title="Inspect (Web Inspector)" :disabled="blank" @click="inspector">
+        <Icon name="terminal" :size="15" />
+      </button>
+      <button type="button" class="icon-btn" title="Open file, viewport and search engine" @click="more">
+        <Icon name="more" :size="15" />
+      </button>
     </form>
     <div v-if="workspace.agentActivity" class="agent" role="status">
       <Icon name="sparkle" :size="12" />
@@ -282,24 +410,35 @@ onBeforeUnmount(() => {
     </div>
     <div v-if="state.title && !blank" class="page-title truncate" :title="state.title">{{ state.title }}</div>
 
-    <div ref="stage" class="stage">
-      <div v-if="blank" class="start">
-        <Icon name="globe" :size="28" />
-        <strong>Browse without leaving Dial</strong>
-        <span>Open your app's dev server or any page, then hand it to Dial with the send button.</span>
-        <div v-if="workspace.previews.length" class="previews">
-          <span class="section-label">Started in this session</span>
-          <button v-for="url in workspace.previews" :key="url" class="preview" @click="open(url)">
-            <span class="dot" />
-            <span class="mono truncate">{{ url }}</span>
+    <div ref="stage" class="stage" :class="{ framed: preset.width > 0 }">
+      <div ref="view" class="view" :style="viewStyle">
+        <div v-if="blank" class="start">
+          <Icon name="globe" :size="28" />
+          <strong>Browse without leaving Dial</strong>
+          <span>Open your app's dev server or any page, then hand it to Dial with the send button.</span>
+          <button type="button" class="preview open-file" @click="openFile">
+            <Icon name="file" :size="13" />
+            <span>Open a local HTML file…</span>
           </button>
+          <div v-if="workspace.previews.length" class="previews">
+            <span class="section-label">Started in this session</span>
+            <button v-for="url in workspace.previews" :key="url" class="preview" @click="open(url)">
+              <span class="dot" />
+              <span class="mono truncate">{{ url }}</span>
+            </button>
+          </div>
+          <label class="auto">
+            <input v-model="workspace.autoOpenPreviews" type="checkbox" />
+            Open dev servers Dial starts here automatically
+          </label>
         </div>
-        <label class="auto">
-          <input v-model="workspace.autoOpenPreviews" type="checkbox" />
-          Open dev servers Dial starts here automatically
-        </label>
+        <div v-else-if="covered && active" class="covered">
+          <Icon name="globe" :size="20" />
+          <span>Page hidden while the menu is open</span>
+          <span v-if="state.title" class="truncate covered-title">{{ state.title }}</span>
+        </div>
       </div>
-      <div v-else-if="covered && active" class="covered">The page is hidden while this menu is open.</div>
+      <span v-if="preset.width > 0 && !blank" class="frame-label">{{ preset.label }}</span>
     </div>
   </div>
 </template>
@@ -392,6 +531,32 @@ onBeforeUnmount(() => {
   background: var(--bg);
   overflow: hidden;
 }
+.stage.framed {
+  display: grid;
+  place-items: center;
+  background: var(--surface);
+}
+.view {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+.stage.framed .view {
+  background: var(--bg);
+  outline: 1px solid var(--border);
+  box-shadow: 0 0 0 6px color-mix(in srgb, var(--border) 50%, transparent);
+}
+.frame-label {
+  position: absolute;
+  right: 8px;
+  bottom: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.open-file {
+  margin-top: var(--space-lg);
+}
 .start {
   height: 100%;
   display: flex;
@@ -450,9 +615,17 @@ onBeforeUnmount(() => {
 }
 .covered {
   height: 100%;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   font-size: var(--text-sm);
   color: var(--text-faint);
+  padding: var(--space-lg);
+}
+.covered-title {
+  max-width: 100%;
+  font-size: var(--text-xs);
 }
 </style>

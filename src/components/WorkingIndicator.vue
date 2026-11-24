@@ -1,5 +1,23 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, computed } from "vue";
+import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
+
+// `waiting`: the turn is paused on the user (an approval or a question), so it reads as a prompt
+// to act rather than as work in progress, and Esc-to-stop is not offered as the next step.
+const props = defineProps<{ label: string; detail?: string; waiting?: boolean }>();
+
+const statusText = ref<HTMLElement>();
+let handoff: Animation | undefined;
+watch(() => props.label, () => {
+  const el = statusText.value;
+  if (!el || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  // Update the same live text immediately. If phases arrive in a burst, let the current
+  // entrance finish instead of resetting it to its blurred first frame on every update.
+  if (handoff?.playState === "running") return;
+  handoff = el.animate([
+    { transform: "translateY(0.3em)", filter: "blur(1px)" },
+    { transform: "none", filter: "none" },
+  ], { duration: 180, easing: "ease-out" });
+}, { flush: "post" });
 
 // Keep animation updates local so they don't revisit the transcript's rows.
 const GLYPHS = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
@@ -22,10 +40,11 @@ const elapsedLabel = computed(() => {
 </script>
 
 <template>
-  <div class="working">
-    <span class="glyph">{{ GLYPHS[frame] }}</span>
-    <span class="shimmer">Working…</span>
-    <span class="hint">({{ elapsedLabel }} · esc to interrupt)</span>
+  <div class="working" :class="{ waiting }">
+    <span class="glyph" aria-hidden="true">{{ waiting ? "●" : GLYPHS[frame] }}</span>
+    <span ref="statusText" class="label" role="status">{{ label }}</span>
+    <span v-if="detail" class="metric">{{ detail }}</span>
+    <span class="hint">{{ elapsedLabel }}<template v-if="!waiting"> · Esc to stop</template><template v-else> · answer below</template></span>
   </div>
 </template>
 
@@ -33,6 +52,7 @@ const elapsedLabel = computed(() => {
 .working {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 18px;
   font-size: 14px;
@@ -42,21 +62,32 @@ const elapsedLabel = computed(() => {
   text-align: center;
   color: var(--accent);
 }
-.shimmer {
+.label {
   color: var(--accent);
-  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-soft) 50%, var(--accent) 100%) 0 0 / 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: shimmer 2s linear infinite;
+  font-weight: 500;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .working:not(.waiting) .label { animation: breathe 2s ease-in-out infinite; }
+}
+@keyframes breathe {
+  50% { opacity: 0.78; }
+}
+.waiting .glyph,
+.waiting .label {
+  color: var(--warning);
 }
 .hint {
+  font-variant-numeric: tabular-nums;
   font-size: 13px;
   color: var(--text-faint);
 }
-@keyframes shimmer {
-  to {
-    background-position: -200% 0;
-  }
+.metric {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-reduced-motion: reduce) {
+  .glyph { visibility: hidden; }
+  .waiting .glyph { visibility: visible; }
 }
 </style>

@@ -18,3 +18,17 @@ test('an unattended schedule is saved only with consent to its actual access and
     }
   }
 });
+
+test('next run follows the engine: the later of creation and last run, plus the interval', async () => {
+  const { nextRun, schedulerHeadline } = await import('./schedules.ts');
+  for (const [entry, last, expected] of [
+    [{ every_secs: 60, created: 1000 }, null, 1060],
+    [{ every_secs: 60, created: 1000 }, 2000, 2060],
+    [{ every_secs: 60, created: 1000 }, 500, 1060],
+    [{ watch: ['*.md'], created: 1000 }, 2000, null],
+  ]) assert.equal(nextRun(entry, last), expected);
+  // Our own runner wins over the engine's lease probe, which it also holds.
+  assert.equal(schedulerHeadline({ phase: 'running' }, true).ours, true);
+  assert.equal(schedulerHeadline({ phase: 'stopped' }, true).title, 'Running elsewhere');
+  assert.equal(schedulerHeadline(null, false).ours, false);
+});

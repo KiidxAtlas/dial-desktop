@@ -31,6 +31,15 @@ test('a closed rich fence renders in a live reply; a partial fence stays source'
         appearance[pref] = true;
       }
     }
+    // Updating ordinary prose after a list/table must leave that fragment unchanged. Reference
+    // definitions still apply to earlier blocks despite the independent DOM fragments.
+    const source = 'See [guide][ref].\n\n- first\n- second\n\n';
+    const partial = renderMarkdownParts(source + 'Next', true);
+    const longer = renderMarkdownParts(source + 'Next sentence.', true);
+    assert.equal(longer.length, 3);
+    assert.deepEqual(partial.slice(0, -1), longer.slice(0, -1));
+    assert.match(longer[1], /<ul>[\s\S]*<\/ul>/);
+    assert.match(renderMarkdownParts(source + '[ref]: https://example.org', true)[0], /href="https:\/\/example.org"/);
   } finally {
     await vite.close();
   }

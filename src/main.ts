@@ -43,14 +43,14 @@ document.addEventListener(
           return showToast(`Could not open ${href}`);
         }
       }
-      openProjectFile(href);
+      openProjectFile(href, link instanceof HTMLElement ? link : undefined);
     }
   },
   true,
 );
 
 /** `src/app.ts#L12` or an absolute path inside the project; the backend refuses anything else. */
-function openProjectFile(href: string) {
+function openProjectFile(href: string, source?: HTMLElement) {
   const root = snapshot.value?.workspace?.root;
   if (!root) return;
   let path: string;
@@ -64,7 +64,7 @@ function openProjectFile(href: string) {
   if (!path) return;
   const match = /#L([1-9]\d*)(?:-L([1-9]\d*))?$/.exec(href);
   const start = Number(match?.[1]), end = Number(match?.[2] ?? start);
-  showFile(path, Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start ? { start, end } : null);
+  showFile(path, Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start ? { start, end } : null, source);
 }
 
 // Copy buttons in rendered code blocks.

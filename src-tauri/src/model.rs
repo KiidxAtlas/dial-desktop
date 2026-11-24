@@ -12,6 +12,22 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// Mail is display data, not a prompt. Never classify a person's text by a bracketed prefix.
+fn journal_sender(message: &Value) -> Option<&str> {
+    if message["role"] != "user" || message["dial_structured_text"] == true {
+        return None;
+    }
+    // The engine writes these records as plain text; preserve other shapes (e.g. attachments).
+    let text = message["content"].as_str()?;
+    if let Some(sender) = message["dial_worker_result"].as_str() {
+        return Some(if sender.trim().is_empty() { "worker" } else { sender });
+    }
+    if message["dial_child_coordination"] != true { return None; }
+    // Coordination also includes restart briefings. Only a mailbox envelope names a sender.
+    let sender = text.strip_prefix("[Message from ")?.split_once("]\n")?.0;
+    (!sender.trim().is_empty() && !sender.contains(['\r', '\n'])).then_some(sender)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -147,6 +163,15 @@ pub struct ModelOption {
     pub listed: bool,
     /// Only from the static bundled catalog (not configured, local, or live-listed).
     pub catalog_only: bool,
+    pub local_engine: Option<EngineChoice>,
+}
+
+/// Only present when the connected engine supports per-model runtime selection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct EngineChoice {
+    pub selected: String,
+    pub choices: Vec<String>,
+    pub setting: String,
 }
 
 impl ModelOption {
@@ -177,6 +202,7 @@ impl ModelOption {
             local: sources.iter().any(|source| source == "local"),
             listed,
             catalog_only,
+            local_engine: serde_json::from_value(value["local_engine"].clone()).ok(),
         })
     }
 }
@@ -220,6 +246,9 @@ pub enum Reply {
 pub struct Model {
     pub connection: Option<Connection>,
     pub conversation: Conversation,
+    /// Senders of delivery notices and controller-authored journal records. The wire client
+    /// retains the text but not its provenance. Index only rows it actually appended.
+    pub(crate) received_from: HashMap<usize, String>,
     pub sessions: Vec<SessionSummary>,
     /// Ignore late pages from a history refresh superseded by a new one.
     session_page: Option<(RequestId, u64)>,
@@ -242,6 +271,8 @@ pub struct Model {
     pub ready_image_input: Option<bool>,
     /// Whether the engine takes the structured `type_context` on `send` (`ready.features`).
     pub type_context_supported: bool,
+    /// Whether a model switch can ask the engine to start its own local inference server.
+    pub prepare_local_model_supported: bool,
     /// The settings reference (`settings_schema`'s `settings`), once loaded.
     pub settings_schema: Option<Vec<Value>>,
     /// Saved settings' effective values by key, once loaded.
@@ -263,9 +294,26 @@ pub struct Model {
     apply_pending: bool,
     /// The conversation's size in tokens as the engine last reported it (`context_usage`).
     pub context: Option<ContextUsage>,
+    /// Latest telemetry for the active inference request, never conversation history.
+    pub model_progress: Option<ModelProgress>,
     /// Hands-free voice mode.
     pub voice: Voice,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all(serialize = "camelCase"))]
+pub struct ModelProgress {
+    pub phase: InferencePhase,
+    pub processed_tokens: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InferencePhase { Loading, Processing, Generating }
 
 /// How much of the model's context the conversation fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +329,9 @@ pub struct SavedSetting {
     pub value: Value,
     /// A credential: `value` is a placeholder, never the secret.
     pub redacted: bool,
+    /// The saved layer that sets it (`"project"` or `"global"`); `None` when neither does or
+    /// the engine predates the `scope` field.
+    pub scope: Option<String>,
 }
 
 impl Model {
@@ -604,13 +655,16 @@ impl Model {
         match update {
             Update::Connected(ready) => {
                 self.connect(&ready);
-                follow.extend([Command::ListSessions, Command::State]);
+                follow.extend([Command::ListSessions, Command::State, Command::GetSettings]);
                 self.discovering = false;
                 follow.extend(self.discover_if_due(Instant::now(), Duration::ZERO));
             }
             Update::ConnectFailed(error) => self.connection = Some(Connection::Failed(error)),
             Update::Requested { command, id } => {
                 let (purpose, _, _) = command.request();
+                if matches!(purpose, Purpose::Turn | Purpose::Recover) {
+                    self.model_progress = None;
+                }
                 match &command {
                     Command::ListSessions => {
                         self.session_pages.clear();
@@ -660,25 +714,41 @@ impl Model {
                 self.toast = Some(format!("Could not {}: {error}", describe(&command)));
             }
             Update::Message(mut message) => {
-                // The wire client keeps structured tool data but not top-level journal attachment
-                // fields. Project retained references into the same channel as live results.
+                // Preserve delivery metadata and journal attachments before the shared
+                // conversation model reduces the wire message to one of its row types.
+                let index = self.conversation.entries().len();
+                let mut sender = None;
                 match &mut message {
+                    Message::Event(event) if event.kind == "notice" && event.body["kind"].is_null() && event.body["lane"].is_null() => {
+                        let mail = &event.body["received_message"];
+                        if let (Some(from), Some(text)) = (mail["from"].as_str().filter(|s| !s.trim().is_empty()), mail["text"].as_str()) {
+                            sender = Some(from.to_owned());
+                            event.body["message"] = Value::String(text.to_owned());
+                        }
+                    }
                     Message::Event(event) if event.kind == "replay_message" => {
                         replay_images(&mut event.body["message"]);
-                        crate::legacy_text::project_user_message(&mut event.body["message"]);
+                        sender = journal_sender(&event.body["message"]).map(str::to_owned);
+                        if sender.is_none() { crate::legacy_text::project_user_message(&mut event.body["message"]); }
                     }
                     Message::Response { result: Ok(body), .. } if body.get("messages").is_some() => {
                         if let Some(messages) = body["messages"].as_array_mut() {
                             for message in messages {
                                 replay_images(message);
-                                crate::legacy_text::project_user_message(message);
+                                if journal_sender(message).is_none() { crate::legacy_text::project_user_message(message); }
                             }
                         }
                     }
                     _ => {}
                 }
                 self.message(&message, &mut follow);
+                if let Some(sender) = sender && self.conversation.entries().len() == index + 1 {
+                    self.received_from.insert(index, sender);
+                }
             }
+        }
+        if !self.conversation.turn_running() || !matches!(self.connection(), Connection::Live { .. }) {
+            self.model_progress = None;
         }
         // A frame may be published before the worker acknowledges the follow-up request.
         self.recovering |= follow.contains(&Command::Recover);
@@ -696,10 +766,12 @@ impl Model {
     fn connect(&mut self, ready: &Ready) {
         self.voice.reset();
         self.conversation.new_connection(ready);
+        if self.conversation.entries().is_empty() { self.received_from.clear(); }
         self.pending.clear();
         self.recovering = false;
         self.ready_image_input = ready.raw["image_input"].as_bool();
         self.type_context_supported = ready.raw["features"]["type_context"].as_bool() == Some(true);
+        self.prepare_local_model_supported = crate::engine::supports_local_preparation(ready);
         self.connection = Some(Connection::Live {
             model: ready.model.clone(),
             engine_version: ready.engine_version.clone(),
@@ -711,8 +783,10 @@ impl Model {
         // not a failed turn.
         let failed_listen = matches!(message, Message::Response { id, result, .. }
             if self.voice.owns_failed_listen(*id, result.is_err()));
-        if !failed_listen {
-            self.conversation.apply(message);
+        if !failed_listen && self.conversation.apply(message)
+            && matches!(message, Message::Event(e) if e.kind == "active_session")
+        {
+            self.received_from.clear();
         }
         match message {
             Message::Response { id, result, .. } => {
@@ -762,6 +836,14 @@ impl Model {
                         self.recovering = false;
                         if !self.conversation.load_snapshot(snapshot) {
                             self.toast = Some("The engine's recovery snapshot was incomplete; the view may be out of date".into());
+                        } else {
+                            // User-role records each produce one user row in order. Tool/assistant
+                            // records need not, so never use a wire message offset as a row index.
+                            self.received_from = snapshot["messages"].as_array().into_iter().flatten()
+                                .filter(|m| m["role"] == "user")
+                                .zip(self.conversation.entries().iter().enumerate().filter(|(_, e)| matches!(e, Entry::User(_))))
+                                .filter_map(|(m, (i, _))| journal_sender(m).map(|from| (i, from.to_owned())))
+                                .collect();
                         }
                     }
                     (Purpose::LiveStart, result) => {
@@ -908,6 +990,10 @@ impl Model {
                                     let setting = SavedSetting {
                                         value: entry["value"].clone(),
                                         redacted: entry["redacted"].as_bool().unwrap_or_default(),
+                                        scope: entry["scope"]
+                                            .as_str()
+                                            .filter(|s| matches!(*s, "project" | "global"))
+                                            .map(str::to_owned),
                                     };
                                     Some((key.to_owned(), setting))
                                 })
@@ -942,6 +1028,10 @@ impl Model {
                         self.apply_pending = true;
                     }
                     (purpose, Err(error)) => {
+                        // A valid selection can stick even if starting its local runtime failed.
+                        if purpose == Purpose::SetModel {
+                            follow.push(Command::State);
+                        }
                         if purpose == Purpose::Recover {
                             self.recovering = false;
                         }
@@ -967,6 +1057,15 @@ impl Model {
                 self.connection = Some(Connection::Ended);
             }
             Message::Event(event) => match event.kind.as_str() {
+                "model_progress" if self.conversation.turn_running()
+                    && event.body["session_id"].as_str().is_none_or(|s| Some(s) == self.conversation.session_id())
+                    && event.request_id().is_some_and(|id| matches!(self.pending.get(&id), Some(Purpose::Turn | Purpose::Listen))) => {
+                    self.model_progress = serde_json::from_value(event.body["progress"].clone()).ok();
+                }
+                "state_node" if event.body["node"]["kind"] == "inference"
+                    && event.body["node"]["parent"].is_null()
+                    && event.body["node"]["result"]["phase"] == "completed" => self.model_progress = None,
+                "tool_call" | "retry" => self.model_progress = None,
                 "context_usage" => {
                     self.context = event.body["tokens"].as_u64().map(|tokens| ContextUsage {
                         tokens,
@@ -974,7 +1073,7 @@ impl Model {
                     });
                 }
                 // Another session's size is unknown until the engine reports it.
-                "active_session" => { self.context = None; self.current_model = None; }
+                "active_session" => { self.context = None; self.current_model = None; self.model_progress = None; }
                 "live_transcript" => {
                     let text = event.body["text"].as_str().unwrap_or_default();
                     if let Some((id, repeated)) = self.voice.transcript(text) {

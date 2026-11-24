@@ -19,19 +19,24 @@ fn invalid_bytes_become_replacement_characters() {
     assert!(pending.is_empty());
 }
 
-#[cfg(unix)]
 #[test]
 fn a_shell_streams_output_and_reports_its_exit() {
     let mut terminals = Terminals::default();
     let (tx, rx) = mpsc::channel();
-    let mut command = CommandBuilder::new("/bin/sh");
+    let (mut command, input) = if cfg!(windows) {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/D", "/Q", "/V:ON"]);
+        (cmd, "set /a RESULT=40+2\recho dial-!RESULT!\rexit\r")
+    } else {
+        (CommandBuilder::new("/bin/sh"), "echo dial-$((40+2))\nexit\n")
+    };
     command.cwd(std::env::temp_dir());
     let id = terminals
         .open(command, 80, 24, move |event| {
             let _ = tx.send(event);
         })
         .unwrap();
-    terminals.write(id, "echo dial-$((40+2))\nexit\n").unwrap();
+    terminals.write(id, input).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut output = String::new();
     let mut exited = false;

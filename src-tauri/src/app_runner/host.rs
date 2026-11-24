@@ -38,12 +38,20 @@ pub const EVENT: &str = "app_runner_host";
 
 /// Set while an action runs; a second request is refused.
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// Set by [`app_runner_host_cancel`] while a cancellable action runs; [`stream`] then stops it.
+static CANCEL: AtomicBool = AtomicBool::new(false);
+/// The running action can be stopped from the panel (it runs as the user, not elevated).
+static CANCELLABLE: AtomicBool = AtomicBool::new(false);
 /// Windows: the hypervisor platform was turned on and needs a restart to load.
 #[cfg(windows)]
 static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 /// Linux: the user was added to the `kvm` group and must log in again.
 #[cfg(target_os = "linux")]
 static RELOGIN_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn setup_busy() -> bool {
+    BUSY.load(Ordering::SeqCst)
+}
 
 /// What this computer runs the App panel's private guest with, and what is still missing.
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +96,9 @@ pub struct Action {
     pub kind: &'static str,
     /// The system asks for an administrator password or UAC approval.
     pub admin: bool,
+    /// The panel may offer Cancel while it runs. Elevated actions run as another user (pkexec,
+    /// UAC), which Dial cannot stop, so they are never cancellable.
+    pub cancellable: bool,
 }
 
 impl Step {
@@ -130,6 +141,7 @@ fn install(label: &'static str, admin: bool) -> Option<Action> {
         label,
         kind: "install",
         admin,
+        cancellable: !admin,
     })
 }
 
@@ -154,11 +166,12 @@ fn disk_step(guest: GuestTarget, check: &Result<runtime::Runtime, RuntimeError>)
         Err(RuntimeError::Missing(runtime::GUEST_IMAGE)) => Step::missing(
             "guest-disk",
             label,
-            "Choose a bootable raw disk (.raw or .img) for this computer's architecture. Dial copies it and throws away guest changes after each run.",
+            "Choose a bootable disk (.raw or .img, or .qcow2, .vmdk or .vdi to convert with qemu-img) for this computer's architecture. Dial copies it and throws away guest changes after each run.",
             Some(Action {
                 label: "Choose disk…",
                 kind: "import",
                 admin: false,
+                cancellable: false,
             }),
         ),
         Ok(_) => Step::ready("guest-disk", label, "Imported."),
@@ -302,10 +315,20 @@ fn run_install(app: &AppHandle, runner: &AppRunner, step: &str) -> Result<(), St
     if tools.is_file() {
         command.arg("--tools-iso").arg(tools);
     }
-    let code = stream(app, step, command)?;
+    let code = stream(app, step, command);
+    let code = match code {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(error);
+        }
+    };
     match code {
         0 => {}
-        130 => return Err("The macOS install was cancelled. Nothing was kept.".into()),
+        130 => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err("The macOS install was cancelled. Nothing was kept.".into());
+        }
         _ => return Err("The macOS install did not finish. See the lines above for the reason.".into()),
     }
     emit(app, step, "Importing the virtual Mac into Dial…");
@@ -623,11 +646,57 @@ fn stream(app: &AppHandle, step: &str, mut command: Command) -> Result<i32, Stri
     };
     let out = child.stdout.take().map(|s| forward(Box::new(s)));
     let err = child.stderr.take().map(|s| forward(Box::new(s)));
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = loop {
+        if CANCELLABLE.load(Ordering::SeqCst) && CANCEL.load(Ordering::SeqCst) {
+            emit(app, step, "Cancelling…");
+            stop_child(&mut child);
+            for handle in [out, err].into_iter().flatten() {
+                let _ = handle.join();
+            }
+            return Err("Cancelled. Nothing was kept.".into());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        thread::sleep(std::time::Duration::from_millis(150));
+    };
     for handle in [out, err].into_iter().flatten() {
         let _ = handle.join();
     }
     Ok(status.code().unwrap_or(-1))
+}
+
+/// Ask a cancelled action to stop (SIGINT on Unix, so it can clean up), then end it.
+fn stop_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-INT", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for _ in 0..100 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stop the running install when it is cancellable (see [`Action::cancellable`]). Returns
+/// whether a cancel was requested; an elevated action keeps running.
+#[tauri::command]
+pub fn app_runner_host_cancel(webview: Webview) -> Result<bool, AppRunError> {
+    installed::main_view(&webview)?;
+    if !BUSY.load(Ordering::SeqCst) || !CANCELLABLE.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    CANCEL.store(true, Ordering::SeqCst);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -652,16 +721,23 @@ pub async fn app_runner_host_install(
     installed::main_view(&webview)?;
     let runner = runner.inner().clone();
     blocking(move || {
-        let offered = host_setup(&runner).steps.into_iter().any(|s| {
-            s.id == step && s.action.as_ref().is_some_and(|a| a.kind == "install")
+        let offered = host_setup(&runner).steps.into_iter().find_map(|s| {
+            (s.id == step)
+                .then_some(s.action)
+                .flatten()
+                .filter(|a| a.kind == "install")
         });
-        if !offered {
+        let Some(action) = offered else {
             return Err(AppRunError::new("not_offered", "That step has nothing to install right now. Check again."));
-        }
+        };
         if BUSY.swap(true, Ordering::SeqCst) {
             return Err(AppRunError::new("busy", "Another install is still running."));
         }
+        CANCEL.store(false, Ordering::SeqCst);
+        CANCELLABLE.store(action.cancellable, Ordering::SeqCst);
         let result = run_install(&app, &runner, &step);
+        CANCELLABLE.store(false, Ordering::SeqCst);
+        CANCEL.store(false, Ordering::SeqCst);
         BUSY.store(false, Ordering::SeqCst);
         result.map_err(|message| AppRunError::new("install_failed", message))?;
         Ok(host_setup(&runner))
@@ -695,6 +771,8 @@ mod tests {
         assert_eq!(value["steps"][1]["status"], "missing");
         assert_eq!(value["steps"][1]["action"]["kind"], "install");
         assert_eq!(value["steps"][1]["action"]["admin"], false);
+        assert_eq!(value["steps"][1]["action"]["cancellable"], true);
+        assert_eq!(install("Install", true).unwrap().cancellable, false);
         assert_eq!(value["steps"][2]["status"], "blocked");
     }
 

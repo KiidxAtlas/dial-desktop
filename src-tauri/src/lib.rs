@@ -22,6 +22,7 @@ mod model_library;
 mod notifications;
 pub mod preview;
 pub mod settings;
+pub mod scheduler;
 pub mod tabs;
 pub mod legacy_text;
 pub mod terminal;

@@ -5,7 +5,6 @@ use dial_desktop::app::{self, Source};
 use dial_desktop::cli::{self, USAGE};
 use dial_desktop::launcher::{self, Recents};
 use dial_desktop::{agent_browser, browser_mcp};
-use std::path::PathBuf;
 
 fn main() {
     // The engine starts this binary as the Browser panel's MCP server; it needs nothing else.
@@ -30,9 +29,7 @@ fn main() {
         return;
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = launcher::home_dir();
     let recents = Recents::load(Recents::default_file(home.as_deref()));
     let cwd = std::env::current_dir().unwrap_or_default();
     let workspace = launcher::choose_workspace(
@@ -50,16 +47,24 @@ fn main() {
     let source = match cli.preview {
         Some(kind) => Source::Preview(kind),
         None => {
-            let program = launcher::find_dial(
-                cli.dial.or_else(|| std::env::var_os("DIAL_BIN")),
+            let choice = launcher::load_choice(launcher::app_dir(home.as_deref()).as_deref());
+            let (program, origin) = launcher::locate_dial(
+                cli.dial,
+                std::env::var_os("DIAL_BIN"),
+                choice.as_ref(),
                 std::env::var_os("PATH").as_deref(),
                 home.as_deref(),
             );
+            launcher::note_engine(&program, origin);
+            if let Some(warning) = launcher::choice_ignored(choice.as_ref(), origin) {
+                launcher::warn(warning);
+            }
             // Before any engine starts, so its sessions get the Browser panel's tools.
             if let Ok(exe) = std::env::current_exe()
                 && let Err(error) = agent_browser::register(&program, &exe)
             {
                 eprintln!("dial-desktop: the agent's browser tools are off: {error}");
+                launcher::warn(format!("The agent's browser tools are off: {error}"));
             }
             Source::Engine {
                 program,

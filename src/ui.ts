@@ -1,9 +1,42 @@
 // State only the interface owns.
 
-import { reactive } from "vue";
+import { reactive, watch } from "vue";
 
-export type InspectorTab = "plan" | "changes" | "activity" | "files" | "terminal" | "browser" | "app";
+const INSPECTOR_TABS = ["plan", "changes", "activity", "workers", "peers", "files", "terminal", "browser", "app"] as const;
+export type InspectorTab = (typeof INSPECTOR_TABS)[number];
 export interface LineRange { start: number; end: number }
+
+const LAYOUT_KEY = "dial.layout";
+
+/** The panels' open state that survives a restart. */
+export interface Layout {
+  sidebarOpen: boolean;
+  inspectorOpen: boolean;
+  inspectorTab: InspectorTab;
+}
+
+/** Read a stored layout, falling back to the defaults for anything missing or malformed. */
+export function parseLayout(raw: string | null): Layout {
+  const layout: Layout = { sidebarOpen: true, inspectorOpen: false, inspectorTab: "plan" };
+  try {
+    const value = JSON.parse(raw ?? "{}");
+    if (typeof value?.sidebarOpen === "boolean") layout.sidebarOpen = value.sidebarOpen;
+    if (typeof value?.inspectorOpen === "boolean") layout.inspectorOpen = value.inspectorOpen;
+    if (INSPECTOR_TABS.includes(value?.inspectorTab)) layout.inspectorTab = value.inspectorTab;
+  } catch {
+    // A damaged value opens the usual layout.
+  }
+  return layout;
+}
+
+function storedLayout(): Layout {
+  try {
+    return parseLayout(localStorage.getItem(LAYOUT_KEY));
+  } catch {
+    return parseLayout(null);
+  }
+}
+const layout = storedLayout();
 
 /** Settings pages the desktop draws itself; `""` opens the usual first one. */
 export type SettingsTab =
@@ -27,8 +60,8 @@ export const ui = reactive({
   focusComposer: 0,
   sessionFilter: "",
   transcriptJump: null as (import("./types").TranscriptHit & { root: string }) | null,
-  inspectorOpen: false,
-  inspectorTab: "plan" as InspectorTab,
+  inspectorOpen: layout.inspectorOpen,
+  inspectorTab: layout.inspectorTab,
   /** The changed file whose diff the Changes panel shows, or `null` for the list. */
   diffPath: null as string | null,
   diffExpanded: false,
@@ -58,12 +91,23 @@ export const ui = reactive({
   filePalette: false,
   /** The keyboard shortcuts sheet (⌘/). */
   shortcutsOpen: false,
-  sidebarOpen: true,
+  sidebarOpen: layout.sidebarOpen,
   /** Bumped to focus the sidebar's session search (⇧⌘F). */
   focusSearch: 0,
   /** ⌘ is held down: sessions show their ⌘1–9 numbers. */
   jumpHints: false,
 });
+
+watch(
+  () => [ui.sidebarOpen, ui.inspectorOpen, ui.inspectorTab] as const,
+  ([sidebarOpen, inspectorOpen, inspectorTab]) => {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify({ sidebarOpen, inspectorOpen, inspectorTab }));
+    } catch {
+      // Storage may be unavailable; the layout still holds for this run.
+    }
+  },
+);
 
 export type MenuItem =
   | ({
@@ -92,6 +136,11 @@ export function openMenu(event: MouseEvent, items: MenuItem[], anchor?: HTMLElem
 
 export function toggle(key: string) {
   if (!ui.expanded.delete(key)) ui.expanded.add(key);
+}
+
+/** Key for an entry's expanded state, scoped to its session: another session's row at the same index stays closed. */
+export function entryKey(sessionId: string | null | undefined, part: string, index: number) {
+  return `${sessionId ?? "new"}:${part}:${index}`;
 }
 
 export function focusComposer() {

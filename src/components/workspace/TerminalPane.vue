@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// The Terminal panel: your own shell in the project folder (a real terminal), and a feed of the
-// commands Dial ran with their output.
+// The Terminal panel: your own shells in the project folder (real terminals, one tab each), and a
+// feed of the commands Dial ran with their output.
 import { computed, nextTick, ref, watch } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { showToast, type TerminalTask } from "../../bridge";
@@ -14,14 +14,48 @@ const props = defineProps<{ snap: OpenSnapshot; active: boolean }>();
 
 type TaskSlot = TerminalTask["kind"];
 const mode = ref<"shell" | TaskSlot | "agent">("shell");
-const shellView = ref<InstanceType<typeof PtyView> | null>(null);
-const shellKey = ref(0);
+/** Open shells, in tab order. `key` remounts a shell's view (a restart); `id` names the tab. */
+const shells = ref<{ id: number; key: number; ended: boolean }[]>([{ id: 1, key: 0, ended: false }]);
+const currentShell = ref(1);
+const shellViews = new Map<number, InstanceType<typeof PtyView>>();
 const shellVisited = ref(false);
 const tasks = ref<Partial<Record<TaskSlot, { task: TerminalTask; root: string; key: number; ended: boolean }>>>({});
 const taskSlots: TaskSlot[] = ["slash", "scheduler"];
 const slotLabel = { slash: "Command", scheduler: "Scheduler" };
 let nextKey = 0;
+let nextShell = 1;
 const feed = ref<HTMLElement | null>(null);
+const isMac = navigator.platform.includes("Mac");
+
+function shellLabel(index: number) {
+  return shells.value.length > 1 ? `Shell ${index + 1}` : "Shell";
+}
+function showShell(id: number) {
+  currentShell.value = id;
+  mode.value = "shell";
+}
+/** Open another shell beside the others; nothing running is touched. */
+function newShell() {
+  const id = ++nextShell;
+  shells.value.push({ id, key: ++nextKey, ended: false });
+  showShell(id);
+}
+function restartShell(id: number) {
+  const shell = shells.value.find((s) => s.id === id);
+  if (shell) Object.assign(shell, { key: ++nextKey, ended: false });
+}
+async function closeShell(id: number) {
+  const index = shells.value.findIndex((s) => s.id === id);
+  if (index < 0) return;
+  const label = shellLabel(index);
+  if (!shells.value[index].ended && !(await ask(`Close ${label}? Anything running in it is stopped.`, { title: `Close ${label.toLowerCase()}`, kind: "warning", okLabel: "Close shell" }))) return;
+  const now = shells.value.findIndex((s) => s.id === id);
+  if (now < 0) return;
+  shells.value.splice(now, 1);
+  shellViews.delete(id);
+  if (!shells.value.length) shells.value.push({ id: ++nextShell, key: ++nextKey, ended: false });
+  if (currentShell.value === id) currentShell.value = shells.value[Math.min(now, shells.value.length - 1)].id;
+}
 
 async function closeTask(slot: TaskSlot) {
   const active = tasks.value[slot];
@@ -50,6 +84,23 @@ function shareCommand(tool: ToolEntry) {
   addToPrompt(`About the command \`${tool.target}\`${output ? `:\n\n\`\`\`\n${output}\n\`\`\`` : ""}`);
 }
 
+function copyCommand(tool: ToolEntry) {
+  navigator.clipboard.writeText(tool.target).then(() => showToast("Command copied"), () => showToast("Could not copy to the clipboard"));
+}
+
+/** Type a command Dial ran at the current shell's prompt, without pressing Enter. */
+async function runInShell(tool: ToolEntry) {
+  showShell(currentShell.value);
+  await nextTick();
+  const view = shellViews.get(currentShell.value);
+  if (!view) return showToast("The shell is still starting; try again in a moment");
+  if (!view.paste(tool.target)) {
+    showToast(tool.target.includes("\n")
+      ? "This shell would run a multi-line command line by line; copy it instead"
+      : "The shell has ended. Press Enter in it for a new one, then try again");
+  }
+}
+
 watch(
   () => [props.active, mode.value] as const,
   async ([active, now]) => {
@@ -76,28 +127,64 @@ watch(
 <template>
   <div class="terminal">
     <div class="head">
-      <div class="seg" role="tablist">
-        <button role="tab" :class="{ on: mode === 'shell' }" @click="mode = 'shell'">Shell</button>
+      <div class="seg" role="tablist" aria-label="Terminals">
+        <div
+          v-for="(shell, i) in shells"
+          :key="shell.id"
+          class="shell-tab"
+          role="presentation"
+          :class="{ on: mode === 'shell' && currentShell === shell.id }"
+        >
+          <button
+            role="tab"
+            :aria-selected="mode === 'shell' && currentShell === shell.id"
+            :title="shells.length > 1 ? `${shellLabel(i)} (Delete closes it)` : undefined"
+            @click="showShell(shell.id)"
+            @auxclick.middle.prevent="closeShell(shell.id)"
+            @keydown.delete.prevent="shells.length > 1 && closeShell(shell.id)"
+          >{{ shellLabel(i) }}</button>
+          <button
+            v-if="shells.length > 1"
+            class="close"
+            :aria-label="`Close ${shellLabel(i)}`"
+            :title="`Close ${shellLabel(i)}`"
+            @click="closeShell(shell.id)"
+          ><Icon name="cross" :size="10" /></button>
+        </div>
         <template v-for="slot in taskSlots" :key="slot">
-          <button v-if="tasks[slot]" role="tab" :class="{ on: mode === slot }" @click="mode = slot">{{ slotLabel[slot] }}</button>
+          <button v-if="tasks[slot]" role="tab" :aria-selected="mode === slot" :class="{ on: mode === slot }" @click="mode = slot">{{ slotLabel[slot] }}</button>
         </template>
-        <button role="tab" :class="{ on: mode === 'agent' }" @click="mode = 'agent'">
+        <button role="tab" :aria-selected="mode === 'agent'" :class="{ on: mode === 'agent' }" @click="mode = 'agent'">
           Dial's commands <span v-if="commands.length" class="count">{{ commands.length }}</span>
         </button>
       </div>
       <div class="spacer" />
       <template v-if="mode === 'shell'">
-        <button class="icon-btn" title="Give the selection (or the screen) to Dial" @click="shellView?.shareShell()">
+        <button class="icon-btn" :title="`Find in terminal (${isMac ? '⌘F' : 'Ctrl+Shift+F'})`" @click="shellViews.get(currentShell)?.openFind()">
+          <Icon name="search" :size="14" />
+        </button>
+        <button class="icon-btn" title="Give the selection (or the screen) to Dial" @click="shellViews.get(currentShell)?.shareShell()">
           <Icon name="send" :size="14" />
         </button>
-        <button class="icon-btn" title="New shell" @click="shellKey++">
-          <Icon name="plus" :size="14" />
-        </button>
       </template>
+      <button class="icon-btn" title="New shell (keeps the others running)" @click="newShell">
+        <Icon name="plus" :size="14" />
+      </button>
       <button v-if="mode === 'slash' || mode === 'scheduler'" class="btn" @click="closeTask(mode)">{{ tasks[mode]?.ended ? "Close" : "End " + slotLabel[mode].toLowerCase() }}</button>
     </div>
 
-    <PtyView v-if="shellVisited" v-show="mode === 'shell'" :key="'shell' + shellKey" ref="shellView" @restart="shellKey++" :root="snap.workspace.root" :active="active && mode === 'shell'" />
+    <template v-if="shellVisited">
+      <PtyView
+        v-for="shell in shells"
+        v-show="mode === 'shell' && currentShell === shell.id"
+        :key="'shell' + shell.key"
+        :ref="(view) => { if (view) shellViews.set(shell.id, view as InstanceType<typeof PtyView>); }"
+        :root="snap.workspace.root"
+        :active="active && mode === 'shell' && currentShell === shell.id"
+        @restart="restartShell(shell.id)"
+        @ended="shell.ended = true"
+      />
+    </template>
     <template v-for="slot in taskSlots" :key="slot">
       <PtyView v-if="tasks[slot]" v-show="mode === slot" :key="tasks[slot]!.key" :task="tasks[slot]!.task" :root="tasks[slot]!.root" :active="active && mode === slot" @ended="tasks[slot]!.ended = true" />
     </template>
@@ -114,6 +201,12 @@ watch(
             :class="{ running: tool.state === 'running', ok: tool.state === 'succeeded', bad: tool.state === 'failed' }"
           />
           <span class="mono truncate prompt" :title="tool.target">$ {{ tool.target }}</span>
+          <button class="icon-btn" title="Type it at your shell's prompt (doesn't press Enter)" aria-label="Run in my shell" @click="runInShell(tool)">
+            <Icon name="terminal" :size="13" />
+          </button>
+          <button class="icon-btn" title="Copy command" @click="copyCommand(tool)">
+            <Icon name="copy" :size="13" />
+          </button>
           <button class="icon-btn" title="Ask Dial about this command" @click="shareCommand(tool)">
             <Icon name="chat" :size="13" />
           </button>
@@ -154,8 +247,34 @@ watch(
   font-size: var(--text-sm);
   color: var(--text-faint);
 }
-.seg button.on {
+.seg button.on,
+.seg .shell-tab.on {
   background: var(--active);
+  color: var(--text);
+}
+.seg .shell-tab {
+  display: flex;
+  align-items: center;
+  border-radius: 5px;
+}
+.seg .shell-tab.on > button {
+  color: var(--text);
+}
+.seg .shell-tab:has(.close) > button[role="tab"] {
+  padding-right: 2px;
+}
+.seg .close {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  padding: 0;
+  border-radius: 4px;
+  color: var(--text-faint);
+}
+.seg .close:hover {
+  background: var(--hover);
   color: var(--text);
 }
 .count {

@@ -5,6 +5,7 @@ const emit = defineEmits<{ "update:modelValue": [on: boolean] }>();
 
 <template>
   <button
+    type="button"
     class="s-switch"
     :class="{ on: modelValue }"
     role="switch"

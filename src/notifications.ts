@@ -3,16 +3,25 @@ import { folders, notificationApi, showToast, snapshot } from "./bridge";
 import { ui } from "./ui";
 
 const KEY = "dial.desktop-notifications";
-export const notifications = reactive({ enabled: false, busy: false, error: "" });
+const KINDS = `${KEY}.kinds`;
+const defaults = { approval: true, question: true, finished: true };
+type NoticeKind = keyof typeof defaults;
+export const notifications = reactive({ enabled: false, busy: false, error: '', kinds: { ...defaults } });
 
-export async function setNotifications(enabled: boolean, interactive = true) {
+export function setNotificationKind(kind: NoticeKind, value: boolean) {
+  return setNotifications(notifications.enabled, false, { ...notifications.kinds, [kind]: value });
+}
+
+export async function setNotifications(enabled: boolean, interactive = true, kinds = notifications.kinds) {
   if (notifications.busy) return;
   notifications.busy = true;
   notifications.error = "";
   try {
-    await notificationApi.setEnabled(enabled, interactive);
+    await notificationApi.setEnabled(enabled, interactive, kinds);
+    notifications.kinds = kinds;
     notifications.enabled = enabled;
     try {
+      localStorage.setItem(KINDS, JSON.stringify(kinds));
       if (enabled) localStorage.setItem(KEY, "on");
       else localStorage.removeItem(KEY);
     } catch {
@@ -38,6 +47,10 @@ export async function startNotifications() {
     }
   });
   try {
+    const saved = JSON.parse(localStorage.getItem(KINDS) ?? '{}');
+    for (const key of Object.keys(defaults) as NoticeKind[]) {
+      if (typeof saved?.[key] === 'boolean') notifications.kinds[key] = saved[key];
+    }
     if (localStorage.getItem(KEY) === "on") await setNotifications(true, false);
   } catch {
     showToast("Could not read the saved desktop notifications setting");

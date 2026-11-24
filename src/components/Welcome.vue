@@ -1,14 +1,18 @@
 <script setup lang="ts">
 // Shown when no folder is open: pick a project, like starting a terminal agent in one.
-import { onMounted } from "vue";
+import { computed, onMounted } from "vue";
 import { folders } from "../bridge";
 import { installEngine, updates } from "../updates";
-import { openMenu } from "../ui";
+import { openMenu, ui } from "../ui";
 import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
+import { welcomeSteps } from "../setupState";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
 
 onMounted(loadRecentProjects);
+/** First run only: once there are recent projects the user has been through it. */
+const steps = computed(() => welcomeSteps(updates.engine, updates.engineChecking));
+const showSteps = computed(() => !recent.value.length || steps.value[0].state !== "done");
 </script>
 
 <template>
@@ -22,6 +26,21 @@ onMounted(loadRecentProjects);
       <button class="btn btn-primary open" @click="folders.choose()">
         <Icon name="folder" :size="16" /> Open folder…
       </button>
+      <button class="btn btn-secondary settings" title="Appearance, notifications and updates (⌘,)" @click="ui.settingsOpen = true">
+        <Icon name="gear" :size="14" /> Settings
+      </button>
+      <ol v-if="showSteps" class="steps" aria-label="Getting started">
+        <li v-for="(s, i) in steps" :key="s.id" :class="s.state">
+          <span class="num" aria-hidden="true">
+            <Icon v-if="s.state === 'done'" name="check" :size="12" />
+            <template v-else>{{ i + 1 }}</template>
+          </span>
+          <span class="step-text">
+            <span class="step-title">{{ s.title }}</span>
+            <span class="step-detail">{{ s.detail }}</span>
+          </span>
+        </li>
+      </ol>
       <div v-if="updates.engine?.state === 'missing'" class="engine-missing">
         <p>
           Dial Desktop couldn’t find an engine. Install a signed copy for Desktop to use.
@@ -29,6 +48,9 @@ onMounted(loadRecentProjects);
         </p>
         <button class="btn btn-secondary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine()">
           <Icon name="download" :size="14" /> {{ updates.engineBusy ? "Installing…" : "Install Desktop copy" }}
+        </button>
+        <button class="btn btn-secondary" title="Settings › Updates › Use a different engine…" @click="ui.settingsTab = 'updates'; ui.settingsOpen = true">
+          Already installed? Choose it…
         </button>
         <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
       </div>
@@ -85,6 +107,9 @@ h1 {
   justify-content: center;
   height: 40px;
   font-size: 14px;
+}
+.settings {
+  align-self: center;
 }
 .recent {
   display: flex;
@@ -158,6 +183,62 @@ h1 {
 }
 .path {
   font: var(--text-sm) / 1.4 var(--font-mono);
+}
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  list-style: none;
+}
+.steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: var(--text-sm);
+}
+.num {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.steps li.done .num {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--success);
+}
+.steps li.next .num {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.steps li.problem .num {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.step-title {
+  color: var(--text);
+}
+.steps li.later .step-title {
+  color: var(--text-muted);
+}
+.step-detail {
+  color: var(--text-faint);
+  line-height: 1.45;
 }
 .engine-missing {
   display: flex;

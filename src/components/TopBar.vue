@@ -5,6 +5,7 @@ import { openMenu, ui } from "../ui";
 import { finishRename, openSession, sessionItems } from "../sessionActions";
 import { conversationFindOpen } from "../commands";
 import { closeType, types } from "../savedTypes";
+import { showSidebar, sidebarShown } from "../workspace";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
@@ -44,11 +45,11 @@ function more(event: MouseEvent) {
 <template>
   <header class="topbar" data-tauri-drag-region>
     <button
-      v-if="!ui.sidebarOpen"
+      v-if="!sidebarShown()"
       class="icon-btn"
       title="Show sidebar (⌘B)"
       aria-label="Show sidebar"
-      @click="ui.sidebarOpen = true"
+      @click="showSidebar()"
     >
       <Icon name="panelLeft" :size="16" />
     </button>
@@ -94,6 +95,8 @@ function more(event: MouseEvent) {
       class="icon-btn"
       :class="{ on: ui.inspectorOpen }"
       :title="ui.inspectorOpen ? 'Hide plan and changes (⌥⌘I)' : 'Show plan and changes (⌥⌘I)'"
+      aria-label="Plan and changes"
+      :aria-pressed="ui.inspectorOpen"
       @click="ui.inspectorOpen = !ui.inspectorOpen"
     >
       <Icon name="sidebar" :size="16" />
@@ -138,7 +141,7 @@ h1 {
 }
 .title svg {
   color: var(--text-faint);
-  opacity: 0;
+  opacity: 0.6;
   transition: opacity 120ms var(--ease);
 }
 .title:hover {

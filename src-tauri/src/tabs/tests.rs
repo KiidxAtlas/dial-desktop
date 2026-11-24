@@ -55,7 +55,7 @@ fn busy_tab_keeps_latest_model_and_effort_until_both_settle() {
     let mut tabs = Tabs::new(tab("one", true));
     let model = Command::SetModel {
         session_id: "one".into(),
-        provider: "p".into(),
+        provider: "mlx".into(),
         model_id: "new".into(),
     };
     let thinking = |level: &str| Command::SetThinking {
@@ -77,6 +77,7 @@ fn busy_tab_keeps_latest_model_and_effort_until_both_settle() {
     assert!(tabs.tabs[0].apply(reply("send", 1)).contains(&model));
     assert!(tabs.close_idle().is_empty());
     assert_eq!(tabs.tabs[0].apply(reply("set_model", 2)), [high]);
+    assert!(tabs.tabs[0].model.toast.as_deref().unwrap().contains("first prompt"));
     assert!(tabs.active().edits.is_empty() && tabs.active().editing.is_none());
     tabs.tabs[0].apply(reply("set_thinking", 3));
     assert_eq!(tabs.close_idle().len(), 1);

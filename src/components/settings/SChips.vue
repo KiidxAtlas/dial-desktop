@@ -106,7 +106,7 @@ input {
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
 }
 input::placeholder {
   color: var(--text-faint);

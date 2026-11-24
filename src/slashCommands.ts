@@ -9,7 +9,7 @@ import { engine, folders } from "./bridge";
 import { copyText, conversationMarkdown, canCompact, canRetry, canUndo, openSession, startRename } from "./sessionActions";
 import { modes, loadModes, setMode, setPlanMode, type EngineCommand } from "./engineTools";
 import { hasHandler, runInTerminal, runTyped } from "./commandRunner";
-import { showPanel } from "./workspace";
+import { showPanel, showSidebar } from "./workspace";
 import type { OpenSnapshot } from "./types";
 import { ui, type SettingsTab } from "./ui";
 
@@ -81,8 +81,8 @@ function desktopAction(name: string, c: SlashContext): (() => void) | null | und
     mode: c.showModes,
     settings: () => settingsAt(""),
     set: () => settingsAt(""),
-    sessions: () => { ui.sidebarOpen = true; ui.focusSearch++; },
-    search: () => { ui.sidebarOpen = true; ui.focusSearch++; },
+    sessions: () => { showSidebar(); ui.focusSearch++; },
+    search: () => { showSidebar(); ui.focusSearch++; },
     delete: session ? () => void engine.deleteSessions([session]) : null,
     pin: session ? () => void engine.pinSession(session.id, !session.pinned) : null,
     cost: () => settingsAt("usage"),
@@ -110,7 +110,7 @@ function desktopAction(name: string, c: SlashContext): (() => void) | null | und
     copy: snap.entries.length ? () => void copyText(conversationMarkdown(snap), "Conversation copied as Markdown") : null,
     restart: () => void engine.reconnect(),
     // The desktop does these its own way already, without a command.
-    queue: null, draft: null, attachments: null, watch: null, exit: null, commands: null, session: null, tools: null, reload: null,
+    queue: null, draft: null, attachments: null, exit: null, commands: null, session: null, tools: null, reload: null,
   };
   for (const [id, label] of [
     ["plan", "Plan mode"], ["vibe", "Vibe mode"], ["fast", "Fast mode"], ["slow", "Slow mode"],
@@ -127,6 +127,7 @@ function localCommands(c: SlashContext): SlashCommand[] {
   const list: SlashCommand[] = [
     { name: "/clear", detail: "Start a fresh session", kind: "desktop", run: live ? () => void engine.newSession() : undefined },
     { name: "/open", detail: "Open another project folder", kind: "desktop", run: () => void folders.choose() },
+    { name: "/watch", detail: "Open Activity, with links to Workers and Peers", kind: "desktop", run: () => showPanel("activity") },
     { name: "/think", detail: "Model and reasoning level", kind: "desktop", run: () => (ui.modelPickerOpen = true) },
     { name: "/voice", detail: "Talk to Dial and hear the answer (⇧⌘V)", kind: "desktop", run: live && !c.snap.turnRunning && c.snap.voice.phase === "off" ? () => void engine.voiceStart() : undefined },
   ];

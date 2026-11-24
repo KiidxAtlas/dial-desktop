@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { conversationFindOpen } from "../commands";
-import { focusComposer, toggle, ui } from "../ui";
+import { entryKey, focusComposer, toggle, ui } from "../ui";
 import { engine } from "../bridge";
-import { canRetry, canUndo, copyText, editLastPrompt } from "../sessionActions";
+import { canRetry, canUndo, copyText, editFromHere, editLastPrompt, promptOccurrence, regenerateBlocker, regenerateLast, sentImagesFor } from '../sessionActions';
 import { draftFor } from "../drafts";
 import { isLongPrompt, withQuote } from "../quote";
 import type { OpenSnapshot } from "../types";
@@ -14,27 +14,55 @@ import Icon from "./Icon.vue";
 import { pendingSave, saveMenu } from "../savedTypes";
 import WorkingIndicator from "./WorkingIndicator.vue";
 import { turnReviews } from "../turnReview";
+import RecordedTurns from './RecordedTurns.vue';
 import CodeBlock from "./CodeBlock.vue";
 import { showPanel } from "../workspace";
-import { toolRuns, type ToolRun as Run } from "../toolFolds";
+import { phaseOf, toolRuns, type ToolRun as Run } from "../toolFolds";
+import { turnProgress } from "../turnProgress";
+import { findOccurrences, transcriptCandidates } from '../chatFind';
+import FindText from './FindText.vue';
+import { viewAttachment } from '../imageViewer';
+import { renderLazily, rememberScroll, savedAnchor, savedScroll, scrollKey, type ScrollAnchor } from "../chatScroll";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
-const reviews = computed(() => turnReviews(props.snap.entries, props.snap.turnRunning));
+const recorded = ref<InstanceType<typeof RecordedTurns> | null>(null);
+// Folds/receipts depend on row kinds, tools, received messages and notices, not on the contents
+// of a streaming answer. The bridge shares unchanged rows. Reuse the grouping input instead of
+// rebuilding every run and handing every historical ToolRun new props while only the last answer grows.
+const folds = (kind: string) => kind === 'tool' || kind === 'received' || kind === 'notice';
+const grouping = computed<OpenSnapshot['entries']>((previous) => {
+  const entries = props.snap.entries;
+  return previous?.length === entries.length && entries.every((e, i) => e === previous[i] || (!folds(e.kind) && e.kind === previous[i].kind)) ? previous : entries;
+});
+const reviews = computed(() => turnReviews(grouping.value, props.snap.turnRunning));
 function forkAt(index: number, prompt: string) {
   const snap = props.snap;
   if (!snap.sessionId) return;
-  let occurrence = 0, matches = 0;
-  for (const [i, entry] of snap.entries.entries()) {
-    if (entry.kind !== 'user' || entry.text !== prompt) continue;
-    matches++;
-    if (i === index) occurrence = matches;
-  }
+  const { occurrence, matches } = promptOccurrence(snap.entries, index);
   void engine.forkBefore(snap.workspace.root, snap.sessionId, prompt, occurrence, matches);
 }
 function evidence(index: number, key: string) {
   pinned.value = false;
   ui.expanded.add(key);
-  nextTick(() => scroller.value?.querySelector(`[data-entry="${index}"]`)?.scrollIntoView({ block: "center" }));
+  revealEntry(index);
+}
+/** The entry being scrolled to; it always renders fully (see `renderLazily`). */
+const revealing = ref(-1);
+/**
+ * Scroll entry `index` to the middle of the view. Older entries off screen are drawn at an
+ * estimated height until seen, so the ones it passes can settle to their real height and move it;
+ * it is centred again once they have.
+ */
+let revealVersion = 0;
+function revealEntry(index: number, occurrence = false) {
+  const version = ++revealVersion;
+  revealing.value = index;
+  const center = () => {
+    if (version !== revealVersion) return;
+    const row = scroller.value?.querySelector<HTMLElement>(`[data-entry="${index}"]`);
+    (occurrence ? row?.querySelector('.find-current') ?? row : row)?.scrollIntoView({ block: 'center', inline: 'nearest' });
+  };
+  void nextTick(() => { center(); requestAnimationFrame(() => requestAnimationFrame(center)); });
 }
 function workingTree(path: string) {
   ui.diffPath = path;
@@ -53,40 +81,35 @@ const transcriptHit = computed(() => {
   return hit?.root === props.snap.workspace.root && hit.session_id === props.snap.sessionId ? hit : null;
 });
 
-watch([transcriptHit, () => props.snap.entries], ([hit, entries], old) => {
-  if (!hit || hit !== old?.[0]) transcriptMatch.value = -1;
-  if (!hit || transcriptMatch.value >= 0 || !hit.preview.trim()) return;
-  const needle = hit.preview.trim();
-  const matches = entries.flatMap((entry, index) =>
-    ((entry.kind === "user" || entry.kind === "assistant") && entry.kind === hit.role && entry.text.trim() === needle) ? [index] : [],
-  );
-  if (matches.length !== 1) return;
-  transcriptMatch.value = matches[0];
+const candidates = computed(() => transcriptHit.value && !props.snap.historyLoading ? transcriptCandidates(props.snap.entries, transcriptHit.value) : []);
+function visitCandidate(index: number) {
+  transcriptMatch.value = index;
   pinned.value = false;
-  nextTick(() => scroller.value?.querySelector(`[data-entry="${matches[0]}"]`)?.scrollIntoView({ block: "center" }));
-}, { flush: "post", immediate: true });
-const matches = computed(() => {
-  const term = query.value.trim().toLowerCase();
-  if (!conversationFindOpen.value || !term) return [];
-  return props.snap.entries.flatMap((entry, index) => {
-    const text = entry.kind === "tool" ? `${entry.label} ${entry.target}`
-      : entry.kind === "notice" || entry.kind === "error" ? entry.message
-      : entry.text;
-    return text.toLowerCase().includes(term) ? [index] : [];
-  });
-});
-const matchNumber = computed(() => matches.value.indexOf(activeMatch.value) + 1);
+  revealEntry(index);
+}
+watch([transcriptHit, candidates], ([hit, rows], old) => {
+  if (hit === old?.[0] && rows.includes(transcriptMatch.value)) return;
+  transcriptMatch.value = -1;
+  if (rows.length === 1) visitCandidate(rows[0]);
+}, { flush: 'post', immediate: true });
+function nextCandidate() {
+  const rows = candidates.value;
+  if (rows.length) visitCandidate(rows[(rows.indexOf(transcriptMatch.value) + 1) % rows.length]);
+}
+const matches = computed(() => conversationFindOpen.value ? findOccurrences(props.snap.entries, query.value) : []);
+const current = computed(() => matches.value[activeMatch.value]);
+const matchNumber = computed(() => current.value ? activeMatch.value + 1 : 0);
 
 function showMatch(index: number) {
   activeMatch.value = index;
-  if (index < 0) return;
+  if (!current.value) return;
   pinned.value = false;
-  nextTick(() => scroller.value?.querySelector(`[data-entry="${index}"]`)?.scrollIntoView({ block: "center" }));
+  revealEntry(current.value.entry, true);
 }
 
 function stepMatch(step: number) {
   const list = matches.value;
-  if (list.length) showMatch(list[(matchNumber.value - 1 + step + list.length) % list.length]);
+  if (list.length) showMatch((activeMatch.value + step + list.length) % list.length);
 }
 
 function closeFind() {
@@ -98,11 +121,12 @@ function closeFind() {
 function findKey(event: KeyboardEvent) {
   if (event.defaultPrevented || event.isComposing || ui.settingsOpen || ui.menu || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen) return;
   if (event.target instanceof Element && event.target.closest(".xterm")) return;
-  if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f" && !empty.value) {
+  const mod = props.snap.platform === 'macos' ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (mod && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f" && !empty.value) {
     event.preventDefault();
     conversationFindOpen.value = true;
     nextTick(() => { searchInput.value?.focus(); searchInput.value?.select(); });
-  } else if ((event.metaKey || event.ctrlKey) && event.altKey && !event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown") && !empty.value) {
+  } else if (mod && event.altKey && !event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown") && !empty.value) {
     event.preventDefault();
     stepPrompt(event.key === "ArrowUp" ? -1 : 1);
   }
@@ -144,7 +168,7 @@ function onSelect() {
     const sel = window.getSelection();
     const text = sel?.toString() ?? "";
     const node = sel?.anchorNode instanceof Element ? sel.anchorNode : sel?.anchorNode?.parentElement;
-    if (!sel || sel.isCollapsed || !text.trim() || !node?.closest(".row.k-user, .row.k-assistant") || !scroller.value?.contains(node)) {
+    if (!sel || sel.isCollapsed || !text.trim() || !node?.closest(".row.k-user, .row.k-assistant, .received-detail") || !scroller.value?.contains(node)) {
       selection.value = null;
       return;
     }
@@ -156,28 +180,30 @@ function onSelect() {
 onMounted(() => {
   window.addEventListener("keydown", findKey);
   document.addEventListener("selectionchange", onSelectionChange);
+  window.addEventListener('pagehide', saveReadingPosition);
 });
 function onSelectionChange() {
   if (selection.value && window.getSelection()?.isCollapsed) selection.value = null;
 }
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", findKey);
+  window.removeEventListener('pagehide', saveReadingPosition);
+  saveReadingPosition();
+  revealVersion++;
   document.removeEventListener("selectionchange", onSelectionChange);
   conversationFindOpen.value = false;
 });
 watch(searchInput, (el) => el?.focus());
-watch(query, async () => {
-  await nextTick();
-  showMatch(matches.value[0] ?? -1);
-});
-watch(matches, (list) => {
-  if (!list.includes(activeMatch.value)) showMatch(list[0] ?? -1);
-}, { flush: "post" });
+watch([query, matches], ([q, list], [old]) => {
+  if (q !== old || activeMatch.value < 0 || activeMatch.value >= list.length) showMatch(list.length ? 0 : -1);
+}, { flush: 'post' });
 
 const empty = computed(() => props.snap.entries.length === 0 && !props.snap.turnRunning);
-const streaming = computed(() => {
-  const last = props.snap.entries.at(-1);
-  return last?.kind === "assistant" && last.streaming && last.text.length > 0;
+const progress = computed(() => turnProgress(props.snap));
+/** The indicator names what the running call does ("Reading…", "Editing…") rather than "Running a tool…". */
+const progressLabel = computed(() => {
+  const p = progress.value;
+  return p?.tool ? `${phaseOf(p.tool)}…` : p?.label ?? "";
 });
 
 /** Last seen scroll position, to tell scrolling up from scrolling down. */
@@ -196,6 +222,10 @@ function onScroll() {
   }
   if (pinned.value) seen.value = props.snap.entries.length;
   if (selection.value) selection.value = null;
+  if (!pinned.value || savedScroll(positionKey.value) !== null) {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveReadingPosition, 200);
+  }
 }
 /** Scrolling up by wheel, trackpad or keys stops following at once, before the scroll lands, so a
  * streamed update arriving meanwhile does not pull the view back to the end. */
@@ -223,12 +253,72 @@ watch(scroller, (el) => {
   resizeObserver = null;
   if (!el) return;
   resizeObserver = new ResizeObserver(() => {
+    if (restoreTop !== null) return applyRestore();
     if (pinned.value && !matches.value.length) el.scrollTop = el.scrollHeight;
   });
   resizeObserver.observe(el);
   if (el.firstElementChild) resizeObserver.observe(el.firstElementChild);
 }, { flush: "post" });
 onBeforeUnmount(() => resizeObserver?.disconnect());
+
+/**
+ * Older entries skip rendering off screen and start at an estimated height (`renderLazily`), so
+ * one above the view can change height when it first comes near. Where the web view does not keep
+ * the reader's place by itself (`overflow-anchor`), shift the scroll by the change.
+ */
+const nativeAnchoring = typeof CSS !== "undefined" && CSS.supports("overflow-anchor", "auto");
+const heights = new WeakMap<Element, number>();
+let watched = new WeakSet<Element>();
+let lazyObserver: ResizeObserver | null = null;
+function keepPlace(changes: ResizeObserverEntry[]) {
+  const el = scroller.value;
+  if (!el) return;
+  const top = el.getBoundingClientRect().top;
+  let shift = 0;
+  for (const change of changes) {
+    const height = change.borderBoxSize?.[0]?.blockSize ?? change.contentRect.height;
+    const was = heights.get(change.target);
+    heights.set(change.target, height);
+    if (was !== undefined && !pinned.value && change.target.getBoundingClientRect().bottom <= top) shift += height - was;
+  }
+  if (shift) {
+    el.scrollTop += shift;
+    lastTop = el.scrollTop;
+  }
+}
+function watchLazyRows() {
+  const el = scroller.value;
+  if (nativeAnchoring || !el) return;
+  lazyObserver ??= new ResizeObserver(keepPlace);
+  for (const row of el.querySelectorAll(".row.lazy")) {
+    if (watched.has(row)) continue;
+    watched.add(row);
+    lazyObserver.observe(row);
+  }
+}
+watch([() => props.snap.entries.length, scroller], () => void nextTick(watchLazyRows), { flush: "post" });
+onBeforeUnmount(() => lazyObserver?.disconnect());
+
+/** The first entry at least partly in view, and where its top sits relative to the view's top. */
+function topAnchor(el: HTMLElement): ScrollAnchor | null {
+  const top = el.getBoundingClientRect().top;
+  const rows = el.querySelectorAll<HTMLElement>('.column > .row');
+  let lo = 0, hi = rows.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (rows[mid].getBoundingClientRect().bottom <= top) lo = mid + 1; else hi = mid;
+  }
+  const row = rows[lo];
+  return row ? { entry: Number(row.dataset.entry ?? row.dataset.run), offset: row.getBoundingClientRect().top - top } : null;
+}
+/** Scroll so `anchor`'s entry sits where it was; false when that entry is not drawn. */
+function placeAnchor(el: HTMLElement, anchor: ScrollAnchor): boolean {
+  const row = el.querySelector(`.row[data-entry="${anchor.entry}"], .row[data-run="${anchor.entry}"]`);
+  if (!row) return false;
+  el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.offset;
+  lastTop = el.scrollTop;
+  return true;
+}
 
 function jumpToEnd() {
   const el = scroller.value;
@@ -262,32 +352,77 @@ function toggleReading(index: number, text: string) {
   void engine.readAloud(stop ? null : text);
 }
 
-watch(
-  () => props.snap.entries,
-  async () => {
-    if (!pinned.value) return;
-    await nextTick();
-    const el = scroller.value;
-    if (el && pinned.value && !matches.value.length) el.scrollTop = el.scrollHeight;
-  },
-  { flush: "post" },
-);
+/** A remembered position to put the reader back at once the returned-to session's entries show. */
+const positionKey = computed(() => scrollKey(props.snap.workspace.root, props.snap.sessionId));
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let restoreTop = transcriptHit.value ? null : savedScroll(positionKey.value);
+let restoreAnchor = restoreTop === null ? null : savedAnchor(positionKey.value);
+if (restoreTop !== null) pinned.value = false;
+function savePosition(key: string | null) {
+  // Flushed on session change, trailing scroll, unmount and window close.
+  clearTimeout(saveTimer);
+  const el = scroller.value;
+  // Don't replace a valid anchor with measurements from a hidden view or a partial restore.
+  if (!key || !el?.clientHeight || restoreTop !== null) return;
+  rememberScroll(key, el.scrollTop, pinned.value, pinned.value ? null : topAnchor(el));
+}
+function saveReadingPosition() { savePosition(positionKey.value); }
+function applyRestore() {
+  const el = scroller.value;
+  if (restoreTop === null || !el?.clientHeight || props.snap.historyLoading || !props.snap.entries.length) return;
+  el.scrollTop = restoreTop;
+  lastTop = el.scrollTop;
+  restoreTop = null;
+  // Entries above may be drawn at an estimated height, so the pixel offset alone can land
+  // elsewhere: put the entry that was at the top back there, again once heights settle.
+  const anchor = restoreAnchor;
+  restoreAnchor = null;
+  if (anchor && placeAnchor(el, anchor)) {
+    const key = positionKey.value, version = revealVersion;
+    requestAnimationFrame(() => requestAnimationFrame(() => { if (!pinned.value && key === positionKey.value && version === revealVersion && scroller.value === el) placeAnchor(el, anchor); }));
+  }
+}
+
+// The ResizeObserver follows actual content growth (including image loads). Reading scrollHeight
+// after each token flushes layout even when the current line hasn't changed height.
+watch([() => props.snap.entries.length, scroller, () => props.snap.historyLoading], () => {
+  if (restoreTop !== null) applyRestore();
+}, { flush: 'post' });
 
 watch(
-  () => [props.snap.workspace.root, props.snap.sessionId],
-  ([root, id], [wasRoot, wasId]) => {
-    if (root === wasRoot && id === wasId) return;
+  positionKey,
+  (key, previous) => {
+    // Before Vue patches the DOM for the next session, this still measures the old one.
+    savePosition(previous);
+    revealVersion++;
+    lazyObserver?.disconnect();
+    watched = new WeakSet();
     conversationFindOpen.value = false;
     query.value = "";
     activeMatch.value = -1;
-    pinned.value = true;
+    restoreTop = transcriptHit.value ? null : savedScroll(key);
+    restoreAnchor = restoreTop === null ? null : savedAnchor(key);
+    revealing.value = -1;
+    pinned.value = restoreTop === null;
     seen.value = props.snap.entries.length;
     selection.value = null;
+    void nextTick(() => {
+      if (key !== positionKey.value) return;
+      if (restoreTop !== null) applyRestore();
+      else if (pinned.value && scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight;
+    });
   },
 );
 
-function reasoningOpen(index: number, streamingAnswer: boolean, text: string) {
-  return ui.expanded.has(`reasoning:${index}`) || (streamingAnswer && !text);
+// A tool call ends a streaming row, not the reader's choice to see its reasoning.
+const thoughtOverrides = ref(new Map<number, boolean>());
+watch([positionKey, () => props.snap.showThinking], () => thoughtOverrides.value.clear());
+function reasoningOpen(index: number) {
+  if (current.value?.entry === index && current.value.field === 'reasoning') return true;
+  return thoughtOverrides.value.get(index) ?? (props.snap.showThinking !== false);
+}
+function toggleThought(index: number) {
+  thoughtOverrides.value.set(index, !reasoningOpen(index));
 }
 
 /** Words of reasoning, for the "Thought" label. */
@@ -296,34 +431,49 @@ function words(text: string) {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k words` : n === 1 ? "1 word" : `${n} words`;
 }
 
-const runs = computed(() => toolRuns(props.snap.entries));
-/** Tool entries drawn by their run's line rather than as rows of their own. */
+const runs = computed(() => toolRuns(grouping.value, props.snap.sessionId));
+/** Entries drawn by their run's line rather than as rows of their own. */
 const inRun = computed(() => {
   const out = new Set<number>();
   for (const run of runs.value.values()) for (let i = run.start; i <= run.end; i++) out.add(i);
   return out;
 });
-/** A run opens when it was opened, one of its calls is expanded, or a search lands in it. */
+/** Where a row of a run keeps its own open state; status lines have none. */
+function rowKey({ index, entry }: Run['items'][number]) {
+  return entry.kind === 'tool' ? entry.key : entry.kind === 'received' ? entryKey(props.snap.sessionId, 'received', index) : '';
+}
+/** A run opens when it was opened, one of its rows is expanded, or a search lands in it. */
 function folded(run: Run) {
-  if (ui.expanded.has(run.key) || run.tools.some((t) => ui.expanded.has(t.key))) return false;
+  if (ui.expanded.has(run.key) || run.items.some((item) => ui.expanded.has(rowKey(item)))) return false;
   const inside = (i: number) => i >= run.start && i <= run.end;
-  return !inside(transcriptMatch.value) && !(matches.value.length && inside(activeMatch.value));
+  return !inside(transcriptMatch.value) && !(current.value && inside(current.value.entry));
 }
 function setOpen(run: Run, open: boolean) {
   if (open) ui.expanded.add(run.key);
   else {
     ui.expanded.delete(run.key);
-    for (const t of run.tools) ui.expanded.delete(t.key);
+    for (const item of run.items) ui.expanded.delete(rowKey(item));
   }
 }
 /** ⌥-click opens or closes every run in the conversation, as in Finder's outline views. */
 function toggleFold(run: Run, event: MouseEvent) {
   const open = folded(run);
   if (!event.altKey) return setOpen(run, open);
-  for (const each of runs.value.values()) if (each.tools.length > 1) setOpen(each, open);
+  for (const each of runs.value.values()) if (each.items.length > 1) setOpen(each, open);
 }
 /** The entry a search highlights, or -1. */
-const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch.value : matches.value.length ? activeMatch.value : -1));
+const highlighted = computed(() => current.value?.entry ?? transcriptMatch.value);
+/** Entries a search or jump is taking the reader to: drawn fully even when old. */
+const targets = computed(() => [highlighted.value, revealing.value]);
+/** Older entries render only near the view (see `renderLazily`). */
+function lazy(index: number) {
+  return renderLazily(index, props.snap.entries.length, targets.value);
+}
+function lazyRun(run: Run) {
+  return lazy(run.end) && !targets.value.some((t) => t >= run.start && t <= run.end);
+}
+/** "Regenerate" on the last answer: why not, or `""` when it can. */
+const regenerateNote = computed(() => regenerateBlocker(props.snap));
 </script>
 
 <template>
@@ -336,64 +486,76 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
       @keydown.enter.prevent="stepMatch($event.shiftKey ? -1 : 1)"
     />
     <span class="match-count" role="status">{{ query.trim() ? (matches.length ? `${matchNumber} of ${matches.length}` : 'No matches') : '' }}</span>
-    <button aria-label="Previous matching message" title="Previous matching message" :disabled="!matches.length" @click="stepMatch(-1)"><Icon name="arrowUp" :size="14" /></button>
-    <button aria-label="Next matching message" title="Next matching message" :disabled="!matches.length" @click="stepMatch(1)"><Icon name="arrowDown" :size="14" /></button>
+    <button aria-label="Previous occurrence" title="Previous occurrence" :disabled="!matches.length" @click="stepMatch(-1)"><Icon name="arrowUp" :size="14" /></button>
+    <button aria-label="Next occurrence" title="Next occurrence" :disabled="!matches.length" @click="stepMatch(1)"><Icon name="arrowDown" :size="14" /></button>
     <button aria-label="Close conversation search" title="Close conversation search" @click="closeFind"><Icon name="cross" :size="14" /></button>
+  </div>
+  <div v-if="transcriptHit && !conversationFindOpen && (transcriptMatch < 0 || candidates.length > 1)" class="search-preview" role="status">
+    <Icon name="search" :size="14" />
+    <span class="truncate"><strong>{{ candidates.length > 1 ? `${candidates.length} identical messages` : 'Saved search result' }}</strong> · {{ transcriptHit.snippet }}</span>
+    <button v-if="candidates.length > 1" class="btn btn-secondary" @click="nextCandidate">{{ transcriptMatch < 0 ? 'Show first' : `Next (${candidates.indexOf(transcriptMatch) + 1}/${candidates.length})` }}</button>
+    <button class="btn btn-secondary" @click="ui.transcriptJump = null">Dismiss</button>
   </div>
   <div v-if="!empty" ref="scroller" class="scroller" tabindex="-1" @scroll.passive="onScroll" @wheel.passive="onWheel" @keydown="onScrollKey" @mouseup="onSelect" @keyup.shift="onSelect">
     <div class="column">
-      <p v-if="transcriptHit && transcriptMatch < 0" class="search-preview" role="status">
-        <Icon name="search" :size="14" />
-        <span class="truncate"><strong>Search result</strong> · {{ transcriptHit.snippet }}</span>
-        <button class="btn btn-secondary" @click="ui.transcriptJump = null">Dismiss</button>
-      </p>
       <template v-for="(entry, index) in snap.entries" :key="entry.kind === 'tool' ? entry.key : index">
-        <div v-if="runs.get(index)" class="row k-run">
-          <ToolRun :run="runs.get(index)!" :open="!folded(runs.get(index)!)" :match="highlighted" @toggle="toggleFold(runs.get(index)!, $event)" />
+        <div v-if="runs.get(index)" class="row k-run" :data-run="index" :class="{ lazy: lazyRun(runs.get(index)!) }">
+          <ToolRun :run="runs.get(index)!" :open="!folded(runs.get(index)!)" :session="snap.sessionId" :match="highlighted" :occurrence="current" @toggle="toggleFold(runs.get(index)!, $event)" />
         </div>
-        <div v-else-if="!inRun.has(index)" class="row" :class="[`k-${entry.kind}`, { 'current-match': index === transcriptMatch || (matches.length && index === activeMatch) }]" :data-entry="index">
+        <div v-else-if="!inRun.has(index)" class="row" :class="[`k-${entry.kind}`, { 'current-match': index === highlighted, lazy: lazy(index) }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
             <div class="bubble">
-              <div class="user-text" :class="{ clamped: isLongPrompt(entry.text) && !ui.expanded.has(`prompt:${index}`) }">{{ entry.text }}</div>
-              <button v-if="isLongPrompt(entry.text)" class="more" @click="toggle(`prompt:${index}`)">
-                {{ ui.expanded.has(`prompt:${index}`) ? "Show less" : `Show all ${entry.text.split("\n").length} lines` }}
+              <div class="user-text" :class="{ clamped: highlighted !== index && isLongPrompt(entry.text) && !ui.expanded.has(entryKey(snap.sessionId, 'prompt', index)) }"><FindText v-if="current?.entry === index" :text="entry.text" :match="current" /><template v-else>{{ entry.text }}</template></div>
+              <button v-if="highlighted !== index && isLongPrompt(entry.text)" class="more" :aria-expanded="ui.expanded.has(entryKey(snap.sessionId, 'prompt', index))" @click="toggle(entryKey(snap.sessionId, 'prompt', index))">
+                {{ ui.expanded.has(entryKey(snap.sessionId, 'prompt', index)) ? "Show less" : `Show all ${entry.text.split("\n").length} lines` }}
               </button>
               <div v-if="entry.images" class="images">
                 <Icon name="image" :size="13" />
                 {{ entry.images === 1 ? "1 image" : `${entry.images} images` }}
+                <button v-for="(image, n) in sentImagesFor(entry)" :key="n" class="sent-image" :title="`Enlarge ${image.name}`" @click="viewAttachment(image)"><img :src="image.url" :alt="image.name" loading="lazy" /></button>
               </div>
             </div>
-            <div class="actions">
-              <button class="act" title="Copy" @click="copyText(entry.text)">
+            <div class="actions" :class="{ shown: index === lastUser && !snap.turnRunning }">
+              <button class="act" title="Copy" aria-label="Copy prompt" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
               </button>
-              <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" @click="forkAt(index, entry.text)"><Icon name="duplicate" :size="14" /></button>
+              <button v-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'" class="act" title="Fork conversation before this prompt (files unchanged)" aria-label="Fork conversation before this prompt" @click="forkAt(index, entry.text)"><Icon name="duplicate" :size="14" /></button>
               <template v-if="index === lastUser && undoable">
-                <button class="act" title="Edit: undo this turn and put the prompt back in the box" @click="editLastPrompt(snap)">
+                <button class="act" title="Edit: undo this turn and put the prompt back in the box" aria-label="Edit prompt" @click="editLastPrompt(snap)">
                   <Icon name="pencil" :size="14" />
                 </button>
-                <button class="act" title="Undo this turn: restore its files and remove it" @click="engine.undoTurn()">
+                <button class="act" title="Undo this turn: restore its files and remove it" aria-label="Undo this turn" @click="engine.undoTurn()">
                   <Icon name="undo" :size="14" />
                 </button>
               </template>
+              <button
+                v-else-if="snap.sessionId && !snap.turnRunning && snap.connection.state === 'live'"
+                class="act"
+                title="Edit from here: copy the conversation before this prompt and put the prompt in the box (files unchanged)"
+                aria-label="Edit from here in a copy"
+                @click="editFromHere(snap, index)"
+              >
+                <Icon name="pencil" :size="14" />
+              </button>
             </div>
           </div>
 
           <template v-else-if="entry.kind === 'assistant'">
             <div v-if="entry.reasoning" class="reasoning">
-              <button class="thinking" @click="toggle(`reasoning:${index}`)">
+              <button class="thinking" :aria-expanded="reasoningOpen(index)" @click="toggleThought(index)">
                 <span>{{ entry.streaming && !entry.text ? "Thinking…" : `Thought · ${words(entry.reasoning)}` }}</span>
                 <Icon
-                  :name="reasoningOpen(index, entry.streaming, entry.text) ? 'chevronDown' : 'chevronRight'"
+                  :name="reasoningOpen(index) ? 'chevronDown' : 'chevronRight'"
                   :size="12"
                 />
               </button>
-              <div v-if="reasoningOpen(index, entry.streaming, entry.text)" class="thought">
-                {{ entry.reasoning }}
+              <div v-if="reasoningOpen(index)" class="thought">
+                <FindText v-if="current?.entry === index && current.field === 'reasoning'" :text="entry.reasoning" :match="current" /><template v-else>{{ entry.reasoning }}</template>
               </div>
             </div>
             <div v-if="entry.abandoned" class="aside">Discarded attempt</div>
-            <Markdown :class="{ abandoned: entry.abandoned }" :text="entry.text" :streaming="entry.streaming" :workspace-root="snap.workspace.root" />
+            <div v-if="current?.entry === index && current.field === 'text'" class="search-source"><small>Markdown source · Find match</small><FindText :text="entry.text" :match="current" /></div>
+            <Markdown v-show="current?.entry !== index || current.field !== 'text'" :class="{ abandoned: entry.abandoned }" :text="entry.text" :streaming="entry.streaming" :workspace-root="snap.workspace.root" />
             <div
               v-if="!entry.streaming && entry.text.trim()"
               class="actions"
@@ -406,16 +568,28 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
               >
                 <Icon name="bookmark" :size="14" /> Save
               </button>
-              <button class="act" title="Quote in your reply" @click="quote(entry.text)">
+              <button class="act" title="Quote in your reply" aria-label="Quote in your reply" @click="quote(entry.text)">
                 <Icon name="quote" :size="14" />
               </button>
-              <button class="act" title="Copy answer as Markdown" @click="copyText(entry.text)">
+              <button class="act" title="Copy answer as Markdown" aria-label="Copy answer as Markdown" @click="copyText(entry.text)">
                 <Icon name="copy" :size="14" />
+              </button>
+              <button
+                v-if="index === lastAnswer && index > lastUser && undoable"
+                class="act"
+                :class="{ off: !!regenerateNote }"
+                :title="regenerateNote || 'Regenerate: undo this turn (files included) and send the same prompt again'"
+                aria-label="Regenerate answer"
+                :aria-disabled="!!regenerateNote"
+                @click="regenerateLast(snap)"
+              >
+                <Icon name="refresh" :size="14" />
               </button>
               <button
                 v-if="snap.connection.state === 'live'"
                 class="act"
                 :title="readingEntry === index && snap.voice.reading ? 'Stop reading' : 'Read aloud'"
+                :aria-label="readingEntry === index && snap.voice.reading ? 'Stop reading' : 'Read aloud'"
                 @click="toggleReading(index, entry.text)"
               >
                 <Icon :name="readingEntry === index && snap.voice.reading ? 'volumeOff' : 'volume'" :size="14" />
@@ -424,14 +598,17 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
           </template>
 
           <div v-else-if="entry.kind === 'notice' && entry.lane === 'alert'" class="alert">
-            {{ entry.message }}
+            <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template>
           </div>
           <div v-else-if="entry.kind === 'notice'" class="divider">
-            <span>{{ entry.message }}</span>
+            <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><span v-else>{{ entry.message }}</span>
           </div>
 
           <div v-else-if="entry.kind === 'error'" class="error">
-            <span>{{ entry.message }}</span>
+            <span><strong>Error:</strong> <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template></span>
+            <button class="act copy-error" title="Copy error" aria-label="Copy error" @click="copyText(entry.message, 'Error copied')">
+              <Icon name="copy" :size="14" />
+            </button>
             <button v-if="index === lastError" class="btn btn-secondary retry" @click="engine.retryTurn()">
               <Icon name="refresh" :size="13" /> Retry
             </button>
@@ -440,12 +617,12 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
         <details v-for="review in reviews.get(index)" :key="review.start" class="turn-review">
           <summary>
             <Icon class="review-chevron" name="chevronRight" :size="12" />
-            <span>Turn review</span>
-            <span class="review-counts">{{ review.files.length }} {{ review.files.length === 1 ? 'file' : 'files' }} · {{ review.checks.length ? `${review.checks.length} ${review.checks.length === 1 ? 'check' : 'checks'}` : 'No checks' }}</span>
+            <span>Tool receipts</span>
+            <span class="review-counts">{{ review.files.length }} files · {{ review.checks.length }} verification calls</span>
           </summary>
           <section class="review-section">
-            <h4>Checks</h4>
-            <p v-if="!review.checks.length">No verification recorded.</p>
+            <h4>Verification calls</h4>
+            <p v-if="!review.checks.length">No explicit verification calls in this transcript.</p>
             <button v-for="call in review.checks" :key="call.tool.key" class="check-row" title="Show recorded output" @click="evidence(call.index, call.tool.key)">
               <span class="check-target">{{ call.tool.target || call.tool.label }}</span>
               <span class="check-state" :class="call.tool.state">{{ call.tool.state === 'running' ? 'unknown' : call.tool.state }}</span>
@@ -460,13 +637,15 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
               <p v-else>No separate recorded patch for this file.</p>
               <button class="btn btn-secondary" @click="evidence(call.index, call.tool.key)">Show tool receipt · {{ call.tool.state }}</button>
             </div>
+            <button v-if="recorded" class="btn btn-secondary" @click="recorded.chooseCheckpoint(file.path)">Review retained checkpoint…</button>
             <button class="btn btn-secondary" @click="workingTree(file.path)">Compare current working tree</button>
           </details>
           </section>
         </details>
       </template>
 
-      <WorkingIndicator v-if="snap.turnRunning" v-show="!streaming" />
+      <RecordedTurns ref="recorded" v-if="snap.connection.state === 'live' && snap.sessionId && !snap.turnRunning && !snap.historyLoading" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" :session="snap.sessionId" />
+      <WorkingIndicator v-if="progress" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :label="progressLabel" :detail="progress.detail" :waiting="progress.waiting" />
       <div v-if="!pinned && !matches.length" class="jump">
         <button :class="{ wide: unseen }" :title="unseen ? 'Jump to the new replies' : 'Jump to the latest message'" aria-label="Jump to the latest message" @click="jumpToEnd">
           <Icon name="arrowDown" :size="16" />
@@ -490,6 +669,10 @@ const highlighted = computed(() => (transcriptMatch.value >= 0 ? transcriptMatch
 </template>
 
 <style scoped>
+.search-source { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.search-source small { display: block; color: var(--text-muted); }
+.images { flex-wrap: wrap; }
+.sent-image img { display: block; max-width: 90px; max-height: 66px; border-radius: var(--radius-sm); object-fit: contain; }
 .history-loading {
   margin: auto;
   color: var(--text-muted);
@@ -586,7 +769,15 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 }
 .row {
   margin-top: 18px;
-  animation: rise 200ms var(--ease) both;
+}
+/* Older entries render only near the view; `auto` keeps the height they had once seen, and the
+   newest ones (where streaming, scroll-to-end and editing happen) always render. */
+.row.lazy {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+  /* Skipped rows clip their paint; leave room for the action buttons that hang out to the left. */
+  margin-inline: -8px;
+  padding-inline: 8px;
 }
 .row:first-child {
   margin-top: 0;
@@ -629,6 +820,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   transition: opacity 120ms var(--ease);
 }
 .row:hover .actions,
+.row:focus-within .actions,
 .actions:focus-within,
 .actions.shown {
   opacity: 1;
@@ -658,6 +850,21 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 .act:hover {
   background: var(--hover);
   color: var(--text);
+}
+.act.off {
+  opacity: 0.45;
+}
+.error .copy-error {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  color: inherit;
+  opacity: 0.7;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.error .copy-error:hover {
+  opacity: 1;
 }
 .jump {
   position: sticky;
@@ -813,6 +1020,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 .error span {
   flex: 1;
   min-width: 0;
+  overflow-wrap: anywhere;
   padding-top: 2px;
 }
 .error .retry {

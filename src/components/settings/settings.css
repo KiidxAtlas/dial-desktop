@@ -16,7 +16,7 @@
 .s-head h2 {
   margin: 0;
   font-family: ui-serif, Georgia, "Times New Roman", serif;
-  font-size: 26px;
+  font-size: var(--text-title);
   font-weight: 400;
   letter-spacing: -0.01em;
   color: var(--text);
@@ -52,7 +52,7 @@
 }
 .s-group-head h3 {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--text-base);
   font-weight: 600;
   color: var(--text);
 }
@@ -109,7 +109,7 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 13.5px;
+  font-size: var(--text-ui);
   color: var(--text);
 }
 .s-desc {
@@ -152,6 +152,32 @@
   border-color: color-mix(in srgb, var(--success) 40%, transparent);
   color: var(--success);
 }
+.s-tag.warn {
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: var(--warning);
+}
+.s-tag.bad {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  color: var(--danger);
+}
+/* A notice across the top of a page, with an action on the right. */
+.s-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 18px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.s-banner > span {
+  flex: 1;
+  min-width: 0;
+}
 .s-error {
   margin: 0;
   font-size: var(--text-xs);
@@ -178,7 +204,7 @@
   background: var(--bg);
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--text-base);
   outline: none;
   transition: border-color 120ms var(--ease), box-shadow 120ms var(--ease);
 }
@@ -250,7 +276,7 @@
   height: 26px;
   padding: 0 11px;
   border-radius: 6px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-muted);
   white-space: nowrap;
   transition: background 120ms var(--ease), color 120ms var(--ease);
@@ -265,7 +291,7 @@
 }
 
 .s-link {
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-muted);
 }
 .s-link:hover:not(:disabled) {
@@ -287,7 +313,7 @@
   display: flex;
   flex-direction: column;
   gap: 7px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-muted);
   text-align: left;
 }

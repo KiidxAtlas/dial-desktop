@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn preflight_refuses_directories_and_oversized_regular_files() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(validate_path(dir.path()).is_err());
+    let path = dir.path().join("data.txt");
+    let file = std::fs::File::create(&path).unwrap();
+    assert!(validate_path(&path).is_ok());
+    file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+    assert!(validate_path(&path).unwrap_err().contains("64 MiB"));
+}
+
+#[test]
 fn only_supported_image_types_are_accepted() {
     assert_eq!(image_mime(Path::new("a/shot.PNG")), Some("image/png"));
     assert_eq!(image_mime(Path::new("b.jpeg")), Some("image/jpeg"));
@@ -73,7 +84,13 @@ fn saving_an_image_writes_its_bytes_under_a_matching_name() {
 #[test]
 fn attachments_are_checked_before_sending() {
     assert!(check(&[], &[]).is_ok());
-    assert!(check(&["/a/b.png".into()], &["iVBORw==".into()]).is_ok());
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("b.png");
+    std::fs::write(&image, b"\x89PNG").unwrap();
+    let images = [image.to_string_lossy().into_owned()];
+    assert!(check(&images, &["iVBORw==".into()]).is_ok());
+    std::fs::remove_file(&image).unwrap();
+    assert!(check(&images, &[]).is_err());
     assert!(check(&["/a/b.pdf".into()], &[]).is_err());
     assert!(check(&[], &["not base64!".into()]).is_err());
     assert!(check(&[], &[String::new()]).is_err());

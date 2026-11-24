@@ -1,13 +1,30 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
+import { models } from "../bridge";
+import { needsModelSetup } from "../setupState";
 import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes";
 import Logo from "./Logo.vue";
+import Icon from "./Icon.vue";
 import { ui } from "../ui";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
 const enabled = computed(() => canUseTaskRecipes(props.snap));
+
+/** Dismissing setup for one project should not hide onboarding in a new one. */
+const dismissalKey = computed(() => `dial.setupCardDismissed:${props.snap.workspace.root}`);
+const dismissed = ref(false);
+watch(dismissalKey, (key) => { dismissed.value = localStorage.getItem(key) === "1"; }, { immediate: true });
+const setup = computed(() => !dismissed.value && needsModelSetup(props.snap.connection.state === "live", props.snap.model, models.value));
+function dismiss() {
+  dismissed.value = true;
+  localStorage.setItem(dismissalKey.value, "1");
+}
+function providers() {
+  ui.settingsTab = "providers";
+  ui.settingsOpen = true;
+}
 </script>
 
 <template>
@@ -15,6 +32,17 @@ const enabled = computed(() => canUseTaskRecipes(props.snap));
     <div class="hero">
       <h2><Logo :size="30" /> {{ snap.workspace.name }}</h2>
       <p class="mono">{{ snap.workspace.display }}</p>
+    </div>
+    <div v-if="setup" class="setup" role="region" aria-label="Finish setup">
+      <div class="setup-text">
+        <b>Finish setup</b>
+        <span>{{ snap.model ? `Couldn’t confirm setup for ${snap.model.label}. Check its provider or choose another model.` : 'Choose a model to start. Connect a provider if needed.' }}</span>
+      </div>
+      <div class="setup-actions">
+        <button class="btn btn-primary" @click="providers">Set up a provider</button>
+        <button class="btn btn-secondary" @click="ui.modelPickerOpen = true">Choose a model</button>
+        <button class="dismiss" title="Hide for this project" aria-label="Hide setup for this project" @click="dismiss"><Icon name="cross" :size="12" /></button>
+      </div>
     </div>
     <div class="chips">
       <button
@@ -68,6 +96,50 @@ p {
   font-size: 12.5px;
   color: var(--text-faint);
   text-shadow: var(--hero-shadow);
+}
+.setup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  max-width: 560px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: rise 360ms var(--ease) both;
+}
+.setup-text {
+  display: flex;
+  flex: 1 1 240px;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.setup-text b {
+  font-weight: 600;
+  color: var(--text);
+}
+.setup-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dismiss {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: var(--text-faint);
+}
+.dismiss:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 .chips {
   display: flex;

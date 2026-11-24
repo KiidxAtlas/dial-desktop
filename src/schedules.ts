@@ -40,3 +40,50 @@ export async function saveSchedule(
   await save({ ...draft, confirm: true });
   return true;
 }
+
+/** The app-owned background scheduler (`src-tauri/src/scheduler.rs`, `scheduler` event). */
+export type SchedulerPhase = "stopped" | "running" | "restarting" | "failed" | "elsewhere";
+export type SchedulerStatus = {
+  root: string;
+  phase: SchedulerPhase;
+  pid: number | null;
+  startedAtMs: number | null;
+  restarts: number;
+  retryAtMs: number | null;
+  lastExit: { code: number | null; atMs: number; ranMs: number } | null;
+  message: string | null;
+  /** Start with the project; null until the user chose. */
+  background: boolean | null;
+  log: string[];
+}
+
+/** When an interval schedule is next due (Unix seconds), as the engine decides: the later of its
+ * creation and last run, plus the interval. Watch-only schedules have no time. */
+export function nextRun(entry: { every_secs?: number | null; created?: number | null }, lastRun?: number | null): number | null {
+  if (!entry.every_secs || entry.created == null) return null;
+  return Math.max(lastRun ?? entry.created, entry.created) + entry.every_secs;
+}
+
+/** "in 5m", "in 2h", a date, or "due now" (it runs once a scheduler gets to it). */
+export function dueLabel(dueSecs: number, nowMs = Date.now()): string {
+  const mins = Math.round((dueSecs * 1000 - nowMs) / 60000);
+  if (mins <= 0) return "due now";
+  if (mins < 60) return `in ${mins}m`;
+  if (mins < 48 * 60) return `in ${Math.round(mins / 60)}h`;
+  return new Date(dueSecs * 1000).toLocaleDateString();
+}
+
+/** One line for the scheduler card. `engineRunning` is the engine's own lease probe
+ * (`schedule_status.running`), which also sees schedulers this app does not own. */
+export function schedulerHeadline(status: SchedulerStatus | null, engineRunning?: boolean): { title: string; detail: string; ours: boolean } {
+  const phase = status?.phase ?? "stopped";
+  if (phase === "running") return { title: "Running in the background", detail: "Saved schedules run while this project is open, without a terminal.", ours: true };
+  if (phase === "restarting") {
+    const secs = status?.retryAtMs ? Math.max(0, Math.round((status.retryAtMs - Date.now()) / 1000)) : 0;
+    return { title: "Restarting", detail: `The scheduler exited${status?.lastExit?.code != null ? ` (code ${status.lastExit.code})` : ""}; trying again${secs ? ` in ${secs}s` : ""}.`, ours: true };
+  }
+  if (engineRunning) return { title: "Running elsewhere", detail: "Another scheduler (a Terminal tab, another window or a shell) is running this project's schedules.", ours: false };
+  if (phase === "elsewhere") return { title: "Scheduler stopped", detail: status?.message ?? "Another scheduler was running this project's schedules.", ours: false };
+  if (phase === "failed") return { title: "Scheduler stopped after errors", detail: status?.message ?? "See the log.", ours: false };
+  return { title: "Scheduler stopped", detail: "Saved schedules run only while a scheduler is running.", ours: false };
+}

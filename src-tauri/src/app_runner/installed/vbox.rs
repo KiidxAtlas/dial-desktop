@@ -423,6 +423,13 @@ fn machine_python(program_files: &Path) -> Option<PathBuf> {
     installs.pop().map(|dir| dir.join("python.exe"))
 }
 
+/// Whether a console could start for `tool`'s install: the trusted Python 3 and the SDK files
+/// the helper imports are present. Checked without running anything.
+pub(super) fn sdk_ready(tool: &Path) -> Result<(), String> {
+    trusted_python()?;
+    SdkLayout::for_tool(tool).map(|_| ())
+}
+
 /// The VirtualBox install that owns the trusted `VBoxManage`, and its Python SDK.
 #[derive(Debug, PartialEq, Eq)]
 struct SdkLayout {

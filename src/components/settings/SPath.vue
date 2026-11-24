@@ -58,7 +58,7 @@ async function choose() {
   gap: 6px;
   min-width: 0;
   max-width: 200px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text);
 }
 .value.empty {

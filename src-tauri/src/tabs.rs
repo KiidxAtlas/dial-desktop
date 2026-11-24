@@ -123,6 +123,13 @@ impl Tab {
             .as_ref()
             .is_some_and(|c| c.request().1 == method)
         {
+            if ok && !self.model.prepare_local_model_supported
+                && let Some(Command::SetModel { session_id, provider, .. }) = &self.editing
+                && self.session() == Some(session_id.as_str())
+                && crate::engine::managed_local_provider(provider)
+            {
+                self.model.toast = Some("Model selected. This engine loads it on the first prompt. Update Dial engine to load it on selection.".into());
+            }
             self.editing = None;
             if !ok
                 && method == "set_model"
@@ -222,6 +229,14 @@ impl Tab {
         self.opening.is_some()
     }
 
+    /// The model being switched now (not one deferred until the current turn ends).
+    pub fn loading_local_model(&self) -> Option<&str> {
+        let Command::SetModel { provider, model_id, .. } = self.editing.as_ref()? else { return None };
+        if !self.model.prepare_local_model_supported || !crate::engine::managed_local_provider(provider) { return None; }
+        Some(self.model.models.iter().find(|row| &row.provider == provider && &row.model_id == model_id)
+            .map_or(model_id.as_str(), |row| row.label.as_str()))
+    }
+
     pub fn transitioning(&self) -> bool {
         self.opening.is_some()
             || self.turn_queued
@@ -313,6 +328,11 @@ impl Tabs {
         self.tabs.iter().any(Tab::protects_work)
     }
 
+    /// Number of sessions that closing this window would interrupt, including background tabs.
+    pub(crate) fn active_session_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.protects_work() || tab.model.voice.prevents_restart()).count()
+    }
+
     /// Called with the same Inner lock as turn submissions, voice starts and terminal opens.
     pub fn reserve_restart(
         &mut self,
@@ -320,7 +340,7 @@ impl Tabs {
         confirmed: &[u32],
     ) -> Result<RestartDecision, String> {
         self.allow_work()?;
-        if self.protects_work() || self.tabs.iter().any(|tab| tab.model.voice.prevents_restart()) {
+        if self.active_session_count() != 0 {
             return Ok(RestartDecision::Busy);
         }
         if terminals.iter().any(|id| !confirmed.contains(id)) {

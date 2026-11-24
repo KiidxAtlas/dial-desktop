@@ -57,6 +57,26 @@ fn prompt(text: &str, images: usize) -> Command {
 }
 
 #[test]
+fn progress_belongs_only_to_the_active_prompt() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let (id, _) = requested(&mut model, prompt("hello", 0), 7);
+    let progress = |session: &str, request: u64, phase: &str| event(json!({
+        "event":"model_progress", "session_id":session, "request_id":request,
+        "progress":{"phase":phase,"prompt_tokens":20,"processed_tokens":5}
+    }));
+    model.apply(progress("s1", 7, "processing"));
+    model.apply(progress("s2", 7, "generating"));
+    model.apply(progress("s1", 8, "generating"));
+    let view = serde_json::to_value(model.model_progress).unwrap();
+    assert_eq!(view["phase"], "processing");
+    assert_eq!(view["processedTokens"], 5);
+    respond(&mut model, id, "send", json!({}));
+    model.apply(progress("s1", 7, "generating"));
+    assert!(model.model_progress.is_none());
+}
+
+#[test]
 fn a_prompt_with_images_shows_their_count() {
     let mut model = Model::starting();
     let mut ready = ready("s1");
@@ -101,7 +121,7 @@ fn connecting_goes_live_and_asks_for_sessions() {
     let follow = model.apply(Update::Connected(Box::new(ready("s1"))));
     assert_eq!(
         follow,
-        vec![Command::ListSessions, Command::State, Command::DiscoverModels]
+        vec![Command::ListSessions, Command::State, Command::GetSettings, Command::DiscoverModels]
     );
     assert!(
         matches!(model.connection(), Connection::Live { model, .. } if model == "claude-sonnet")
@@ -440,13 +460,20 @@ fn settings_load_and_saved_changes_apply_when_idle() {
         id,
         "get_settings",
         json!({"settings": [
-            {"key": "ui.theme", "value": "dark", "redacted": false},
+            {"key": "ui.theme", "value": "dark", "redacted": false, "scope": "project"},
+            {"key": "ui.motion", "value": false, "redacted": false, "scope": "global"},
+            {"key": "ui.zoom", "value": 1, "redacted": false, "scope": "elsewhere"},
             {"key": "keys.openai", "value": "***", "redacted": true}
         ]}),
     );
     let saved = model.settings.as_ref().unwrap();
     assert_eq!(saved["ui.theme"].value, json!("dark"));
     assert!(saved["keys.openai"].redacted);
+    // The layer that sets each value; older engines (and unknown names) report none.
+    assert_eq!(saved["ui.theme"].scope.as_deref(), Some("project"));
+    assert_eq!(saved["ui.motion"].scope.as_deref(), Some("global"));
+    assert_eq!(saved["ui.zoom"].scope, None);
+    assert_eq!(saved["keys.openai"].scope, None);
 
     // Idle: a save is applied right away.
     let save = Model::save_setting("ui.theme", json!("light"), "global").unwrap();
@@ -818,6 +845,39 @@ fn questions_are_acknowledged_once_then_answered() {
 }
 
 #[test]
+fn received_mail_preserves_provenance_through_replay_recovery_and_session_switch() {
+    use crate::view::{EntryViews, Snapshot, Workspace};
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let w = Workspace::new("/project", None);
+    let mut views = EntryViews::default();
+    let mut rows = |model: &Model| serde_json::to_value(Snapshot::reusing(model, Some(&w), 0, &mut views).entries).unwrap();
+    let text = "[Message from reviewer]\n<script>untrusted</script>\nlast line";
+    let child = json!({"role":"user", "content":text, "dial_child_coordination":true});
+    let prompt = json!({"role":"user", "content":text});
+    let result = json!({"role":"user", "content":text, "dial_worker_result":"task-1"});
+    for message in [&child, &prompt, &result] {
+        model.apply(event(json!({"event":"replay_message", "message":message})));
+    }
+    let journal = |sender: &str| json!({"kind":"received", "source":"journal", "sender":sender, "text":text});
+    let user = json!({"kind":"user", "text":text, "images":0});
+    assert_eq!(rows(&model), json!([journal("reviewer"), user, journal("task-1")]));
+
+    // Identical client entries at the same indices, but opposite provenance: cached rows
+    // may not retain either a worker label or prompt actions after a recovery.
+    let (id, _) = requested(&mut model, Command::Recover, 8);
+    respond(&mut model, id, "recovery_snapshot", json!({"session_id":"s1", "seq":10,
+        "messages":[prompt,result,child], "busy":false, "pending_approvals":[], "question":null,"todo":[]}));
+    assert_eq!(rows(&model), json!([user, journal("task-1"), journal("reviewer")]));
+    model.apply(event(json!({"event":"active_session", "session_id":"s2"})));
+    model.apply(event(json!({"event":"replay_message", "message":prompt})));
+    assert_eq!(rows(&model), json!([user]));
+    model.apply(event(json!({"event":"notice", "message":"Project peer older-label sent a coordination message.",
+        "received_message":{"from":"session-42", "text":text}})));
+    assert_eq!(rows(&model)[1], json!({"kind":"received", "source":"live", "sender":"session-42", "text":text}));
+}
+
+#[test]
 fn lost_events_trigger_one_recovery_once_idle() {
     let mut model = Model::starting();
     model.apply(Update::Connected(Box::new(ready("s1"))));
@@ -909,4 +969,35 @@ fn the_structured_type_context_is_negotiated_from_ready_features_on_every_connec
     assert!(model.type_context_supported);
     model.apply(Update::Connected(Box::new(ready("s3"))));
     assert!(!model.type_context_supported);
+}
+
+#[test]
+fn model_switch_only_requests_preparation_when_the_engine_offers_it() {
+    let mut model = Model::starting();
+    let choice = |provider: &str| Command::SetModel {
+        session_id: "s1".into(),
+        provider: provider.into(),
+        model_id: "model".into(),
+    };
+    for supported in [true, false] {
+        let mut frame = ready("s1");
+        if supported {
+            frame.raw["features"] = json!({"prepare_local_model": true});
+        }
+        model.apply(Update::Connected(Box::new(frame)));
+        for (provider, should_prepare) in [("mlx", supported), ("openai", false)] {
+            let (_, _, params) = choice(provider).negotiated_request(model.prepare_local_model_supported);
+            assert_eq!(params.get("prepare_local_model"), should_prepare.then_some(&Value::Bool(true)));
+        }
+        if supported {
+            let (id, _) = requested(&mut model, choice("mlx"), 1);
+            let follow = model.apply(Update::Message(Message::Response {
+                id,
+                method: "set_model".into(),
+                result: Err(dial_client::RpcError { code: None, message: "llama-server exited".into() }),
+            }));
+            assert_eq!(follow, [Command::State]);
+            assert!(model.toast.as_deref().unwrap().contains("llama-server exited"));
+        }
+    }
 }

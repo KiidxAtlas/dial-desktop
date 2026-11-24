@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // Settings › Updates: the app's own version and the Dial engine's, each with check and install.
-import { computed } from "vue";
-import { engine, snapshot } from "../bridge";
+import { computed, onMounted, ref, watch } from "vue";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { diagnosticsApi, engine, showToast, snapshot, type EngineChoice, type EngineOrigin, type StartupReport } from "../bridge";
 import {
   checkApp,
   checkEngine,
@@ -59,6 +60,146 @@ const appLine = computed(() => {
   if (updates.app) return `Dial Desktop ${updates.app.version} is available`;
   return "Dial Desktop is up to date";
 });
+
+/** How Desktop picked its engine, in the words of `dial-desktop --help`. */
+const ORIGINS: Record<EngineOrigin, string> = {
+  flag: "Chosen with --dial when Desktop was started",
+  env: "Chosen by the DIAL_BIN environment variable",
+  choice: "Chosen here with “Use a different engine…”",
+  desktop: "The copy Desktop installed (Install Desktop copy)",
+  path: "Found on your PATH",
+  fallback: "Found in a usual installation folder (not on PATH)",
+  missing: "Not found: Desktop looked for DIAL_BIN, the engine chosen here, its own copy, PATH and the usual folders",
+};
+const startup = ref<StartupReport | null>(null);
+const startupError = ref("");
+let startupRequest = 0;
+async function loadStartup() {
+  const run = ++startupRequest;
+  startup.value = null;
+  startupError.value = "";
+  try {
+    const result = await diagnosticsApi.startup();
+    if (run === startupRequest) startup.value = result;
+  } catch (error) {
+    if (run === startupRequest) startupError.value = String(error) || "The startup report was unavailable.";
+  }
+}
+onMounted(loadStartup);
+// An install or update can switch the engine in use.
+watch(() => updates.engineChanged, loadStartup);
+
+// ── Which engine to use (saved in the app's folder; below --dial and DIAL_BIN) ─────────────
+
+const choice = ref<EngineChoice | null>(null);
+const overriddenBy = ref<EngineOrigin | null>(null);
+const choosing = ref(false), choiceError = ref(""), choiceNotice = ref("");
+const choiceLoaded = ref(false), choiceLoadError = ref("");
+/** The engine in use changed since this session's engine started: offer a restart. */
+const switched = ref(false);
+async function loadChoice() {
+  choiceLoadError.value = "";
+  try {
+    const saved = await diagnosticsApi.engineChoice();
+    choice.value = saved.choice;
+    overriddenBy.value = saved.overriddenBy;
+    choiceLoaded.value = true;
+  } catch (error) {
+    choiceLoadError.value = `Could not read the engine preference: ${error}`;
+  }
+}
+onMounted(loadChoice);
+const choiceLine = computed(() => {
+  if (!choiceLoaded.value) return choiceLoadError.value || "Reading the engine preference…";
+  const c = choice.value;
+  const base = !c ? "Automatic: DIAL_BIN, then Desktop’s copy, then PATH and the usual folders."
+    : c.kind === "custom" ? `This engine: ${c.path}`
+    : c.kind === "path" ? "The engine on your PATH, ahead of Desktop’s copy."
+    : "Dial Desktop’s own copy.";
+  return overriddenBy.value ? `${base} Not in effect: ${ORIGINS[overriddenBy.value].toLowerCase()}, which wins.` : base;
+});
+const before = computed(() => startup.value?.engine ?? null);
+async function pick(next: EngineChoice | null, done: string) {
+  if (choosing.value) return;
+  choosing.value = true;
+  choiceError.value = choiceNotice.value = "";
+  const previous = before.value;
+  try {
+    startup.value = await diagnosticsApi.setEngineChoice(next);
+    ++startupRequest;
+    startupError.value = "";
+    choice.value = next;
+    if (overriddenBy.value) {
+      choiceNotice.value = `Saved. ${ORIGINS[overriddenBy.value]}, so this applies once Desktop starts without it.`;
+    } else {
+      switched.value = switched.value || startup.value.engine !== previous;
+      choiceNotice.value = `${done}. New sessions use it${switched.value && snapshot.value?.workspace ? "; restart the engine to switch this one" : ""}. Desktop keeps it on the next start.`;
+      void checkEngine();
+    }
+  } catch (error) {
+    choiceError.value = `Could not use that engine: ${error}`;
+  } finally {
+    choosing.value = false;
+  }
+}
+async function chooseEngineFile() {
+  choiceError.value = "";
+  let path: string | null = null;
+  try {
+    const picked = await openDialog({ title: "Choose a Dial engine", multiple: false, directory: false });
+    path = typeof picked === "string" ? picked : null;
+  } catch (error) {
+    choiceError.value = String(error);
+  }
+  if (!path) return;
+  choosing.value = true;
+  let version = "";
+  try {
+    version = await diagnosticsApi.validateEngine(path);
+  } catch (error) {
+    choiceError.value = `That file did not run as a Dial engine (${path} --version): ${error}`;
+    return;
+  } finally {
+    choosing.value = false;
+  }
+  await pick({ kind: "custom", path }, `Using ${version}`);
+}
+const restarting = ref(false);
+async function restartNow() {
+  restarting.value = true;
+  try {
+    if (await engine.reconnect()) {
+      switched.value = false;
+      choiceNotice.value = "This session restarted with the chosen engine.";
+      void checkEngine();
+    }
+  } finally {
+    restarting.value = false;
+  }
+}
+
+/** Everything above as plain text, for a bug report. */
+function report() {
+  const s = startup.value;
+  return [
+    `Dial Desktop ${updates.appVersion || "unknown"}`,
+    `Engine: ${engineLine.value}`,
+    `Engine binary: ${s ? s.engine ?? "none" : "unknown"}${s?.origin ? ` (${ORIGINS[s.origin]})` : ""}`,
+    `Connection: ${snapshot.value?.connection.state ?? "unknown"}`,
+    `Platform: ${navigator.userAgent}`,
+    ...(!s ? [startupError.value ? `Startup diagnostics unavailable: ${startupError.value}` : "Startup diagnostics: loading"]
+      : s.warnings.length ? ["Warnings:", ...s.warnings.map((w) => `- ${w}`)] : ["Warnings: none"]),
+    ...(updates.engineError ? [`Last engine error: ${updates.engineError}`] : []),
+  ].join("\n");
+}
+async function copyReport() {
+  try {
+    await navigator.clipboard.writeText(report());
+    showToast("Diagnostics copied");
+  } catch (error) {
+    showToast(`Could not copy: ${error}`);
+  }
+}
 </script>
 
 <template>
@@ -97,12 +238,55 @@ const appLine = computed(() => {
         <div class="s-desc">Installing a separate copy lets Desktop use the latest release without replacing your existing engine.</div>
       </template>
     </SRow>
+    <SRow
+      v-if="startup?.engine || startup?.origin"
+      label="Engine in use"
+      :description="startup.origin ? ORIGINS[startup.origin] : undefined"
+    >
+      <template #below-text>
+        <code class="path" :title="startup.engine ?? ''">{{ startup.engine }}</code>
+      </template>
+    </SRow>
+    <SRow v-if="snapshot?.connection.state !== 'preview'" label="Engine to use" :description="choiceLine">
+      <button v-if="choiceLoadError" class="btn btn-secondary" @click="loadChoice">Try again</button>
+      <template v-if="choiceLoaded">
+        <button class="btn btn-secondary" :disabled="choosing" @click="chooseEngineFile">Use a different engine…</button>
+        <button v-if="choice?.kind !== 'path'" class="btn btn-secondary" :disabled="choosing" @click="pick({ kind: 'path' }, 'Using the engine on PATH')">Use the one on PATH</button>
+        <button v-if="choice?.kind !== 'desktop'" class="btn btn-secondary" :disabled="choosing" @click="pick({ kind: 'desktop' }, 'Using Dial Desktop’s copy')">Use Dial Desktop’s copy</button>
+        <button v-if="choice" class="btn btn-secondary" :disabled="choosing" title="DIAL_BIN, then Desktop’s copy, then PATH" @click="pick(null, 'Back to the usual order')">Automatic</button>
+      </template>
+      <template v-if="choiceError || choiceNotice || switched" #below-text>
+        <p v-if="choiceError" role="alert" class="error">{{ choiceError }}</p>
+        <p v-else-if="choiceNotice" role="status" class="s-desc">{{ choiceNotice }}</p>
+        <button
+          v-if="switched && snapshot?.workspace"
+          class="btn btn-primary restart"
+          :disabled="restarting || snapshot.turnRunning || !!updates.engineBusy"
+          :title="snapshot.turnRunning ? 'Wait for the running turn to finish' : undefined"
+          @click="restartNow"
+        >{{ restarting ? "Restarting…" : "Restart engine now" }}</button>
+      </template>
+    </SRow>
     <template #after>
       <p v-if="updates.engineError" class="error">{{ updates.engineError }}</p>
       <details v-if="updates.engineLog" class="log">
         <summary>Output of the last install or update</summary>
         <pre>{{ updates.engineLog }}</pre>
       </details>
+    </template>
+  </SGroup>
+
+  <SGroup title="Diagnostics" description="Problems Desktop met while starting, which otherwise only reach a terminal.">
+    <template #aside>
+      <button class="btn btn-secondary" @click="copyReport">Copy diagnostics</button>
+    </template>
+    <SRow v-if="startupError" label="Diagnostics unavailable" :description="startupError">
+      <button class="btn btn-secondary" @click="loadStartup">Try again</button>
+    </SRow>
+    <SRow v-else-if="!startup" label="Loading startup diagnostics…" />
+    <SRow v-else-if="!startup.warnings.length" label="No problems found" description="No startup warnings were reported." />
+    <template v-else>
+      <SRow v-for="w in startup?.warnings ?? []" :key="w" label="Warning" :description="w" />
     </template>
   </SGroup>
 
@@ -118,6 +302,19 @@ code {
   font-family: var(--font-mono);
   font-size: 0.95em;
   color: var(--text-muted);
+}
+.path {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.restart {
+  margin-top: 8px;
 }
 .notes {
   margin-top: 6px;

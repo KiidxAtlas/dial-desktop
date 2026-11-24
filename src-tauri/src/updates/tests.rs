@@ -116,6 +116,11 @@ fn desktop_install_selects_only_its_own_completed_binary() {
     std::fs::write(&external, b"existing").unwrap();
     let (installed, _) = install_separate(root.path(), |dir| {
         std::fs::write(dir.join(DIAL_NAME), b"release").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(DIAL_NAME), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         Ok("installed".into())
     })
     .unwrap();
@@ -127,6 +132,14 @@ fn desktop_install_selects_only_its_own_completed_binary() {
     ] {
         assert!(install_separate(root.path(), |_| outcome).is_err());
         assert_eq!(desktop_engine(root.path()), Some(installed.clone()));
+    }
+    #[cfg(unix)]
+    {
+        assert!(install_separate(root.path(), |dir| {
+            std::fs::write(dir.join(DIAL_NAME), b"not executable").unwrap();
+            Ok("installed".into())
+        }).is_err());
+        assert_eq!(desktop_engine(root.path()), Some(installed));
     }
     assert_eq!(std::fs::read(external).unwrap(), b"existing");
 }

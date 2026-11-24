@@ -50,12 +50,7 @@ fn copy(doc: Document, dest: &Path) -> Result<(), String> {
     match (doc.path, doc.data) {
         (Some(path), None) => {
             let path = Path::new(&path);
-            if !path.is_absolute() || !fs::metadata(path).map_err(save)?.is_file() {
-                return Err(format!(
-                    "Select a regular file, not a directory or device: {}",
-                    doc.name
-                ));
-            }
+            super::validate_path(path)?;
             let file = File::open(path).map_err(save)?;
             let meta = file.metadata().map_err(save)?;
             if !meta.is_file() {

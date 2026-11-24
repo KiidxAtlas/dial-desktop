@@ -5,11 +5,13 @@ import type { OpenSnapshot } from "../types";
 import { ui } from "../ui";
 import { commands, filterCommands, highlightMatch, type Command } from "../commands";
 import Icon, { PATHS } from "./Icon.vue";
+import { shortcutLabel } from "../keysGuard";
 import { workspaceFiles } from "../bridge";
 import { showFile } from "../workspace";
 import { loadRecentProjects } from "../projects";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
+const mac = navigator.platform.toLowerCase().includes("mac");
 
 const query = ref("");
 const active = ref(0);
@@ -48,6 +50,16 @@ const ordered = computed(() => groups.value.flatMap((g) => g.items));
 
 const icon = (name?: string) => (name && name in PATHS ? (name as keyof typeof PATHS) : null);
 
+// Restore the opener before running a command, so its own focus change wins.
+let opener: HTMLElement | null = null;
+watch(() => ui.paletteOpen, open => {
+  if (open) opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  else {
+    if (opener?.isConnected) opener.focus({ preventScroll: true });
+    opener = null;
+  }
+}, { flush: "sync" });
+
 watch(
   () => [ui.paletteOpen, ui.filePalette] as const,
   async ([open]) => {
@@ -83,10 +95,14 @@ async function move(by: number) {
 
 function onKey(event: KeyboardEvent) {
   if (event.isComposing) return;
-  if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) {
+  if (event.key === "Tab" && !event.ctrlKey && !event.metaKey) {
+    // The combobox is the dialog's tab stop; its active option is navigated with arrows.
+    event.preventDefault();
+    input.value?.focus();
+  } else if (event.key === "ArrowDown" || (mac && event.ctrlKey && event.key === "n")) {
     event.preventDefault();
     move(1);
-  } else if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) {
+  } else if (event.key === "ArrowUp" || (mac && event.ctrlKey && event.key === "p")) {
     event.preventDefault();
     move(-1);
   } else if (event.key === "Enter") {
@@ -102,8 +118,8 @@ function onKey(event: KeyboardEvent) {
 
 <template>
   <Transition name="fade">
-    <div v-if="ui.paletteOpen" class="overlay" @mousedown.self="close">
-      <div class="palette" role="dialog" :aria-label="ui.filePalette ? 'Quick-open project file' : 'Command palette'">
+    <div v-if="ui.paletteOpen" class="overlay" @mousedown.self.prevent="close">
+      <div class="palette" role="dialog" aria-modal="true" :aria-label="ui.filePalette ? 'Quick-open project file' : 'Command palette'" @keydown="onKey">
         <label class="field">
           <Icon name="search" :size="16" />
           <input
@@ -113,11 +129,13 @@ function onKey(event: KeyboardEvent) {
             spellcheck="false"
             role="combobox"
             aria-expanded="true"
-            @keydown="onKey"
+            aria-controls="palette-results"
+            :aria-activedescendant="results[active] ? `palette-option-${active}` : undefined"
+            :aria-label="ui.filePalette ? 'Find a project file' : 'Search actions and sessions'"
           />
           <kbd>Esc</kbd>
         </label>
-        <div ref="list" class="results" role="listbox">
+        <div id="palette-results" ref="list" class="results" role="listbox">
           <p v-if="!results.length" class="none">{{ ui.filePalette ? status : `Nothing matches “${query}”.` }}</p>
           <template v-for="group in groups" :key="group.name">
             <div class="group">{{ group.name }}</div>
@@ -125,6 +143,9 @@ function onKey(event: KeyboardEvent) {
               v-for="{ command, index } in group.items"
               :key="command.id"
               role="option"
+              :id="`palette-option-${index}`"
+              tabindex="-1"
+              @mousedown.prevent
               :aria-selected="index === active"
               :class="{ on: index === active }"
               @mousemove="active = index"
@@ -133,7 +154,7 @@ function onKey(event: KeyboardEvent) {
               <Icon v-if="icon(command.icon)" :name="icon(command.icon)!" :size="15" />
               <span v-else class="blank" />
               <span class="label truncate"><template v-for="(part, p) in highlightMatch(command.label, query)" :key="p"><mark v-if="part.hit">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template></span>
-              <kbd v-if="command.hint">{{ command.hint }}</kbd>
+              <kbd v-if="command.hint">{{ shortcutLabel(command.hint, mac) }}</kbd>
             </button>
           </template>
         </div>

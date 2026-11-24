@@ -41,6 +41,10 @@ pub struct SettingView {
     pub redacted: bool,
     /// Takes effect when the engine restarts rather than on apply.
     pub restart: bool,
+    /// The saved layer that sets it (`"project"` or `"global"`); absent when it comes from the
+    /// default or the engine does not report layers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// How a setting is edited.
@@ -179,11 +183,11 @@ pub fn view(schema: &[Value], saved: &HashMap<String, SavedSetting>) -> Settings
         }
         let control = control(entry);
         let default = entry["default"].clone();
-        let (value, redacted) = match &control {
+        let (value, redacted, source) = match &control {
             Control::Table => table_value(key, saved),
             _ => match saved.get(key) {
-                Some(s) => (s.value.clone(), s.redacted),
-                None => (Value::Null, false),
+                Some(s) => (s.value.clone(), s.redacted, s.scope.clone()),
+                None => (Value::Null, false, None),
             },
         };
         let value = if value.is_null() {
@@ -211,6 +215,7 @@ pub fn view(schema: &[Value], saved: &HashMap<String, SavedSetting>) -> Settings
             default,
             redacted,
             restart: entry["restart"].as_bool().unwrap_or_default(),
+            source,
         });
     }
     // "Common" leads; the rest keep the reference's order.
@@ -429,10 +434,11 @@ pub fn offer_image_models(view: &mut SettingsView, rows: &[Value]) {
     }
 }
 
-/// A table setting's value, folded from its saved leaf keys; redacted when any leaf is.
-fn table_value(key: &str, saved: &HashMap<String, SavedSetting>) -> (Value, bool) {
+/// A table setting's value, folded from its saved leaf keys; redacted when any leaf is. Its
+/// source is `project` when any leaf is saved for the project, else `global` when any leaf is.
+fn table_value(key: &str, saved: &HashMap<String, SavedSetting>) -> (Value, bool, Option<String>) {
     if let Some(whole) = saved.get(key) {
-        return (whole.value.clone(), whole.redacted);
+        return (whole.value.clone(), whole.redacted, whole.scope.clone());
     }
     let prefix = format!("{key}.");
     let mut leaves: Vec<(&String, &SavedSetting)> = saved
@@ -440,16 +446,22 @@ fn table_value(key: &str, saved: &HashMap<String, SavedSetting>) -> (Value, bool
         .filter(|(k, _)| k.starts_with(&prefix))
         .collect();
     if leaves.is_empty() {
-        return (Value::Null, false);
+        return (Value::Null, false, None);
     }
     leaves.sort_by(|a, b| a.0.cmp(b.0));
     let mut table = Map::new();
     let mut redacted = false;
+    let mut source: Option<String> = None;
     for (leaf, setting) in leaves {
         redacted |= setting.redacted;
+        match setting.scope.as_deref() {
+            Some("project") => source = Some("project".into()),
+            Some("global") if source.is_none() => source = Some("global".into()),
+            _ => {}
+        }
         insert(&mut table, &leaf[prefix.len()..], setting.value.clone());
     }
-    (Value::Object(table), redacted)
+    (Value::Object(table), redacted, source)
 }
 
 /// Put `value` at dotted `path` inside `table`, creating intermediate tables.

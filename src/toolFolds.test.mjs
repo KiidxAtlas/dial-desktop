@@ -1,19 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runActivity, runFiles, runImages, runSummary, toolRuns } from "./toolFolds.ts";
+import { phaseOf, runActivity, runFiles, runImages, runSummary, toolRuns } from "./toolFolds.ts";
 
 const tool = (key, label, state = "succeeded", check = false, extra = {}) =>
   ({ kind: "tool", key, label, target: key, state, check, changedPaths: [], images: [], output: null, ...extra });
 
-test("one run per burst of calls; messages, notices and questions to the user break it", () => {
+const notice = (lane = null) => ({ kind: "notice", message: "note", lane, noticeKind: null });
+const received = (sender = "task-1") => ({ kind: "received", sender, text: "done", source: "live" });
+
+test("one run per burst of calls; answers, dividers, alerts and questions to the user break it", () => {
   const entries = [
     tool("a", "Read"), tool("b", "Search"), tool("c", "Edit"), tool("d", "Run"), tool("e", "Generate image"),
     { kind: "assistant" }, tool("f", "Web"),
-    { kind: "notice" }, tool("g", "Read"), tool("h", "Ask"), tool("i", "Read"),
+    notice("divider"), tool("g", "Read"), tool("h", "Ask"), tool("i", "Read"),
+    notice("alert"), tool("j", "Read"),
   ];
   assert.deepEqual([...toolRuns(entries).values()].map(({ start, end }) => [start, end]), [
-    [0, 4], [6, 6], [8, 8], [9, 9], [10, 10],
+    [0, 4], [6, 6], [8, 8], [9, 9], [10, 10], [12, 12],
   ]);
+});
+
+test("received messages and the status lines between a burst's rows fold into it", () => {
+  const entries = [
+    notice(), tool("a", "Read"), received(), notice(), tool("b", "Run"), notice("context"), received("peer"),
+    notice(), { kind: "assistant" }, received(), received(), { kind: "user" }, received(), notice(), tool("c", "Ask"),
+  ];
+  const runs = [...toolRuns(entries, "s1").values()];
+  // Status lines before a burst (0), after it (7) or next to a question (13) stay in view.
+  assert.deepEqual(runs.map(({ start, end }) => [start, end]), [[1, 6], [9, 10], [12, 12], [14, 14]]);
+  assert.deepEqual(runs[0].items.map((item) => item.index), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(runs[0].tools.map((t) => t.key), ["a", "b"]);
+  assert.equal(runSummary(runs[0]), "Read 1 file, received 2 messages, ran 1 command");
+  assert.equal(runs[0].key, "fold:a");
+  assert.equal(runSummary(runs[1]), "Received 2 messages");
+  assert.equal(runs[1].key, "fold:s1:received:9");
+  assert.deepEqual(runActivity(runs[1]), { current: undefined, running: false, failed: 0, unknown: 0 });
 });
 
 test("a live row keeps its identity, shows the newest active call, and retains failures", () => {
@@ -56,4 +77,12 @@ test("changed files carry the line counts their calls reported", () => {
     { path: "y", added: null, removed: null },
   ]);
   assert.deepEqual(runImages(run), ["/p/a.png", "/p/b.png"]);
+});
+
+test("each call names its phase for the live line; checks verify, unknown tools work", () => {
+  const phases = [["Read", "Reading"], ["grep", "Searching"], ["Write", "Writing"], ["Edit", "Editing"],
+    ["bash", "Running commands"], ["Web search", "Searching the web"], ["todo", "Making the plan"],
+    ["browser_click", "Working"]];
+  for (const [label, phase] of phases) assert.equal(phaseOf({ label, check: false }), phase);
+  assert.equal(phaseOf({ label: "Custom", check: true }), "Verifying");
 });

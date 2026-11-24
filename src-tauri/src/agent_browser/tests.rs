@@ -5,7 +5,7 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 20);
+    assert_eq!(tools.len(), 27);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
@@ -31,8 +31,9 @@ fn tool_list_is_well_formed() {
     assert_eq!(
         saved,
         [
-            "types_add_item", "types_create", "types_items", "types_list", "types_screenshot",
-            "types_update", "types_update_item",
+            "types_add_item", "types_create", "types_edit", "types_guide", "types_items",
+            "types_list", "types_open", "types_remove_item", "types_run", "types_screenshot",
+            "types_source", "types_state", "types_update", "types_update_item",
         ]
     );
     let screenshot = tools.iter().find(|t| t["name"] == "types_screenshot").unwrap();
@@ -41,6 +42,10 @@ fn tool_list_is_well_formed() {
         "capture of a private Type requires approval"
     );
     assert_eq!(screenshot["inputSchema"]["required"], json!(["type"]));
+    for name in ["types_run", "types_open", "types_edit", "types_state"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name} acts on the user's Type");
+    }
 }
 
 #[test]

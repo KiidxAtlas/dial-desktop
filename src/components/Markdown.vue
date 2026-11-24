@@ -9,10 +9,15 @@ const parts = computed(() => {
   void highlighterVersion.value;
   return renderMarkdownParts(props.text, props.streaming);
 });
+// Ordinary fragments contain only renderer-produced HTML, with no cards or assets to mount.
+const interactive = (html: string) => /(?:class="reply-(?:app|diagram)"|<img [^>]*data-workspace-image=)/.test(html);
 </script>
 
 <template>
   <div class="prose">
-    <MarkdownPart v-for="(html, index) in parts" :key="index" :html="html" :workspace-root="workspaceRoot" :nested="nested" />
+    <template v-for="(html, index) in parts" :key="index">
+      <MarkdownPart v-if="interactive(html)" :html="html" :workspace-root="workspaceRoot" :nested="nested" />
+      <div v-else class="markdown-part" v-html="html" />
+    </template>
   </div>
 </template>

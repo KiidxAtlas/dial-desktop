@@ -9,6 +9,9 @@
 //! Engines run in the open workspace, one per running session ([`Tabs`]). Opening another folder,
 //! or reconnecting after the engine stopped, replaces them without restarting the app.
 
+mod watch;
+mod window;
+
 use crate::attachments::{self, ImageFile};
 use crate::browser::{self, Browser};
 use crate::cli::Preview;
@@ -294,6 +297,7 @@ fn snapshot_of(inner: &mut Inner) -> Snapshot {
         &mut inner.entry_views,
     );
     snapshot.history_loading |= inner.tabs.active().opening_session();
+    snapshot.loading_local_model = inner.tabs.active().loading_local_model().map(str::to_owned);
     snapshot.can_send &= !inner.tabs.active().transitioning();
     snapshot.show_activity(&inner.tabs.activity());
     snapshot
@@ -537,6 +541,7 @@ fn open_workspace(
     if confirm.is_none() {
         // The project's own types join the list.
         crate::types::follow_project(&app, &store, &path);
+        scheduler_project_opened(&app);
     }
     Ok(confirm)
 }
@@ -575,11 +580,122 @@ fn set_answer_style(shared: State<'_, Shared>, cards: bool, diagrams: bool) -> R
     Ok(())
 }
 
+/// Which engine binary is in use, how it was chosen, and what went wrong at startup. An engine
+/// installed since then (`engine_install`) replaces the one chosen at start.
+#[tauri::command]
+fn startup_diagnostics(shared: State<'_, Shared>) -> launcher::Startup {
+    let mut report = launcher::startup();
+    if let Some(current) = shared.program().filter(|p| Some(p) != report.engine.as_ref()) {
+        report.engine = Some(current);
+        report.origin = Some(launcher::EngineOrigin::Desktop);
+    }
+    report
+}
+
 /// The engine binary, or why there is none (the design preview).
 fn engine_program(shared: &Shared) -> Result<PathBuf, String> {
     shared
         .program()
         .ok_or_else(|| "The design preview has no engine".to_owned())
+}
+
+/// The engine picked in Settings › Updates, and the start-up rule that outranks it, if any.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineChoiceView {
+    choice: Option<launcher::EngineChoice>,
+    /// `flag` or `env` when `--dial` or `DIAL_BIN` chose the engine instead.
+    overridden_by: Option<launcher::EngineOrigin>,
+}
+
+fn outranked() -> Option<launcher::EngineOrigin> {
+    launcher::startup()
+        .origin
+        .filter(|o| matches!(o, launcher::EngineOrigin::Flag | launcher::EngineOrigin::Env))
+}
+
+#[tauri::command]
+fn engine_choice_get(shared: State<'_, Shared>) -> EngineChoiceView {
+    let dir = launcher::app_dir(shared.home.as_deref().map(Path::new));
+    EngineChoiceView { choice: launcher::load_choice(dir.as_deref()), overridden_by: outranked() }
+}
+
+/// Save the engine choice (`None`: the usual order) for the next start and, unless `--dial` or
+/// `DIAL_BIN` chose the engine, use it for engines started from now on. Running sessions keep
+/// theirs until reconnected; the UI offers that.
+#[tauri::command]
+async fn engine_choice_set(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    choice: Option<launcher::EngineChoice>,
+) -> Result<launcher::Startup, String> {
+    if webview.label() != "main" {
+        return Err("Only the app UI can choose the engine".into());
+    }
+    engine_program(&shared)?;
+    let home = shared.home.clone();
+    let dir = launcher::app_dir(home.as_deref().map(Path::new))
+        .ok_or("Could not locate the Desktop settings directory")?;
+    let (program, origin) = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(launcher::EngineChoice::Custom { path }) = &choice {
+            if !path.is_absolute() {
+                return Err("Choose the engine by its full path".to_owned());
+            }
+            launcher::engine_version(path)?;
+        }
+        launcher::save_choice(&dir, choice.as_ref())?;
+        let path = std::env::var_os("PATH");
+        Ok(launcher::locate_dial(None, None, choice.as_ref(), path.as_deref(), home.as_deref().map(Path::new)))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    if outranked().is_none() {
+        *shared.installed.lock().unwrap_or_else(PoisonError::into_inner) = Some(program.clone());
+        launcher::note_engine(&program, origin);
+    }
+    Ok(startup_diagnostics(shared))
+}
+
+/// `path --version`, so a picked binary is known to run before it is saved.
+#[tauri::command]
+async fn engine_validate(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || launcher::engine_version(Path::new(&path)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Exported and imported settings files are small text; anything larger is not one.
+const SETTINGS_FILE_LIMIT: u64 = 1 << 20;
+
+/// Write a settings export to the path the user picked in the save dialog. App UI only.
+#[tauri::command]
+async fn settings_file_write(webview: tauri::Webview, path: String, text: String) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Exporting settings is only available in the app UI".into());
+    }
+    if text.len() as u64 > SETTINGS_FILE_LIMIT {
+        return Err("The export is too large".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, text).map_err(|e| format!("Could not write {path}: {e}")))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Read a settings file the user picked in the open dialog. App UI only.
+#[tauri::command]
+async fn settings_file_read(webview: tauri::Webview, path: String) -> Result<String, String> {
+    if webview.label() != "main" {
+        return Err("Importing settings is only available in the app UI".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let size = std::fs::metadata(&path).map_err(|e| format!("Could not read {path}: {e}"))?.len();
+        if size > SETTINGS_FILE_LIMIT {
+            return Err(format!("{path} is too large to be a settings file"));
+        }
+        std::fs::read_to_string(&path).map_err(|e| format!("Could not read {path}: {e}"))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Ask the engine whether a newer Dial release exists (`dial update --check --json`).
@@ -641,6 +757,8 @@ fn app_try_reserve_restart(
     let decision = inner.tabs.reserve_restart(terminals.open_ids(), &confirmed)?;
     if decision == crate::tabs::RestartDecision::Reserved {
         terminals.close_all();
+        // The relaunch may skip `RunEvent::Exit`; SIGINT lets the scheduler finish on its own.
+        webview.state::<crate::scheduler::Scheduler>().stop_all(false);
     }
     Ok(decision)
 }
@@ -796,16 +914,20 @@ async fn search_transcripts(
     shared: State<'_, Shared>,
     workspace_root: String,
     query: String,
+    limit: usize,
 ) -> Result<serde_json::Value, String> {
     let query = query.trim();
     if query.is_empty() || query.len() > 4096 {
         return Err("Enter a search between 1 and 4096 bytes".into());
     }
+    if !(1..=1000).contains(&limit) {
+        return Err("Search limit must be between 1 and 1000".into());
+    }
     let reply = workspace_rpc(
         &shared,
         &workspace_root,
         "search_sessions",
-        serde_json::json!({"query": query, "limit": 40}),
+        serde_json::json!({"query": query, "limit": limit}),
     )?;
     rpc_reply(reply, Some(Duration::from_secs(20))).await
 }
@@ -877,9 +999,7 @@ async fn send_prompt(
     // engine's 1 MiB RPC limit.
     let mut images = images;
     if !inline_images.is_empty() {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from);
+        let home = launcher::home_dir();
         let dir = launcher::app_dir(home.as_deref())
             .ok_or("Could not find a folder to save the pasted image in")?
             .join("pasted-images");
@@ -977,6 +1097,16 @@ fn send_background(
     drop(inner);
     shared.poke();
     Ok(())
+}
+
+#[tauri::command]
+async fn validate_attachment(webview: tauri::Webview, path: String) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Attachments are only available in the app UI".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || attachments::validate_path(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Check an image chosen or dropped by the user and return its preview. Async, so reading a
@@ -1192,21 +1322,41 @@ fn resume_once(
 
 /// Delete sessions `session_ids` (one or several selected in the sidebar).
 #[tauri::command]
-fn delete_sessions(
+async fn delete_sessions(
     app: AppHandle,
     shared: State<'_, Shared>,
+    workspace_root: String,
     session_ids: Vec<String>,
+    confirm_removal: Option<bool>,
 ) -> Result<(), String> {
     if session_ids.is_empty() {
         return Ok(());
     }
-    let mut inner = shared.lock();
-    if let Some(reason) = inner.tabs.delete_refusal(&session_ids) {
-        return Err(reason);
+    let replies = {
+        let mut inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed. Reopen the original project.".into());
+        }
+        if let Some(reason) = inner.tabs.delete_refusal(&session_ids) {
+            return Err(reason);
+        }
+        let tab = inner.tabs.active_mut();
+        // Recently Deleted must not forget a recoverable item on dispatch alone. For a
+        // trashed session that was reopened elsewhere, don't redirect or switch it here.
+        if confirm_removal == Some(true) && tab.model.conversation.session_id().is_some_and(|id| session_ids.iter().any(|s| s == id)) {
+            return Err("Open a different session before deleting this one permanently.".into());
+        }
+        let commands = tab.model.delete_sessions(&session_ids)?;
+        if confirm_removal != Some(true) {
+            dispatch(&app, tab.engine.as_ref(), commands);
+            return Ok(());
+        }
+        let engine = tab.engine.as_ref().ok_or("Dial is not connected")?;
+        commands.into_iter().map(|cmd| engine.submit(cmd)).collect::<Result<Vec<_>, _>>()?
+    };
+    for reply in replies {
+        rpc_reply(reply, None).await?;
     }
-    let tab = inner.tabs.active_mut();
-    let commands = tab.model.delete_sessions(&session_ids)?;
-    dispatch(&app, tab.engine.as_ref(), commands);
     Ok(())
 }
 
@@ -1582,9 +1732,11 @@ async fn list_dir(
     shared: State<'_, Shared>,
     path: String,
     workspace_root: String,
+    show_ignored: Option<bool>,
 ) -> Result<Vec<DirEntryView>, String> {
     let root = panel_root(&shared, &workspace_root)?;
-    tauri::async_runtime::spawn_blocking(move || files::list(&root, &path))
+    let show_ignored = show_ignored.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || files::list_with(&root, &path, show_ignored))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1613,6 +1765,162 @@ async fn file_diff(
     tauri::async_runtime::spawn_blocking(move || files::diff(&root, &path))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The workspace's changed paths from `git status`; with `counts`, each file's +/- line counts.
+#[tauri::command]
+async fn file_git_status(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    counts: Option<bool>,
+) -> Result<files::GitStatusView, String> {
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::status(&root, counts.unwrap_or(false)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Discard every uncommitted change to file `path` (the UI confirms first). App UI only.
+#[tauri::command]
+async fn file_revert(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    path: String,
+    workspace_root: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Reverting files is only available in the app UI".into());
+    }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::revert(&root, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Undo one hunk of file `path`'s uncommitted changes (the UI confirms first). App UI only.
+#[tauri::command]
+async fn file_revert_hunk(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    path: String,
+    hunk: String,
+    workspace_root: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Reverting changes is only available in the app UI".into());
+    }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::revert_hunk(&root, &path, &hunk))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Stage (`staged`) or unstage project files `paths` in Git's index. App UI only.
+#[tauri::command]
+async fn file_stage(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    paths: Vec<String>,
+    staged: bool,
+    workspace_root: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Staging files is only available in the app UI".into());
+    }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::stage(&root, &paths, staged))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Read the exact staged paths for a user-confirmed commit, independently of session changes.
+#[tauri::command]
+async fn file_commit_review(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+) -> Result<files::CommitReview, String> {
+    if webview.label() != "main" { return Err("Commit review is only available in the app UI".into()); }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::commit_review(&root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Commit the staged changes with `message`; the new commit's short hash. App UI only.
+#[tauri::command]
+async fn file_commit(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    message: String,
+    review: files::CommitReview,
+    workspace_root: String,
+) -> Result<String, String> {
+    if webview.label() != "main" {
+        return Err("Committing is only available in the app UI".into());
+    }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::commit(&root, &message, &review))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Lines of project files containing `query` (case-insensitive), for the Files panel.
+#[tauri::command]
+async fn file_grep(
+    shared: State<'_, Shared>,
+    query: String,
+    workspace_root: String,
+    limit: Option<usize>,
+) -> Result<Vec<files::GrepMatch>, String> {
+    let root = panel_root(&shared, &workspace_root)?;
+    let cap = limit.unwrap_or(200);
+    tauri::async_runtime::spawn_blocking(move || files::grep(&root, &query, cap))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open a checked project file in its default app, or at `line` via the VS Code URI handler.
+#[tauri::command]
+async fn file_open(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    path: String,
+    line: Option<u32>,
+    workspace_root: String,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Opening files is only available in the app UI".into());
+    }
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = files::openable(&root, &path)?;
+        if let Some(line) = line {
+            let uri = files::vscode_line_uri(&file, line)?;
+            return tauri_plugin_opener::open_url(uri, None::<&str>)
+                .map_err(|e| format!("Could not open the line in VS Code. Is it installed? {e}"));
+        }
+        tauri_plugin_opener::open_path(&file, None::<&str>).map_err(|e| format!("Could not open {path}: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Runs whose App → VM **Set up SSH** wait the user cancelled.
+static SSH_SETUP_CANCELLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether the user cancelled **Set up SSH** for `run_id`; reading it clears the request.
+pub(crate) fn ssh_setup_cancelled(run_id: &str) -> bool {
+    let mut runs = SSH_SETUP_CANCELLED.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = runs.len();
+    runs.retain(|id| id != run_id);
+    runs.len() != before
+}
+
+/// Stop waiting for a **Set up SSH** of `run_id`; the wait notices within a few seconds.
+#[tauri::command]
+fn app_runner_vm_ssh_setup_cancel(run_id: String) {
+    SSH_SETUP_CANCELLED.lock().unwrap_or_else(PoisonError::into_inner).push(run_id);
 }
 
 fn panel_root(shared: &Shared, expected: &str) -> Result<PathBuf, String> {
@@ -1716,15 +2024,85 @@ fn terminal_close(shared: State<'_, Shared>, id: u32) {
     shared.terminals().close(id);
 }
 
+/// The open project changed: stop another project's scheduler, start this one's if chosen.
+fn scheduler_project_opened(app: &AppHandle) {
+    let shared = app.state::<Shared>();
+    let root = shared.lock().workspace.as_ref().map(|w| w.root.clone());
+    if let Some(root) = root {
+        app.state::<crate::scheduler::Scheduler>()
+            .project_opened(&root, shared.program().as_deref());
+    }
+}
+
+fn scheduler_root(shared: &Shared, workspace_root: &str) -> Result<(), String> {
+    if shared.lock().workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root) {
+        return Err("The project changed; open it again to manage its schedules".into());
+    }
+    Ok(())
+}
+
+/// The app-owned scheduler for `workspace_root` (phase, pid, last exit, recent log).
+#[tauri::command]
+fn scheduler_status(
+    scheduler: State<'_, crate::scheduler::Scheduler>,
+    workspace_root: String,
+) -> crate::scheduler::Status {
+    scheduler.status(&workspace_root)
+}
+
+/// Run the open project's saved schedules without a terminal; `background` also remembers
+/// whether to start them whenever the project opens.
+#[tauri::command]
+async fn scheduler_start(
+    shared: State<'_, Shared>,
+    scheduler: State<'_, crate::scheduler::Scheduler>,
+    workspace_root: String,
+    background: Option<bool>,
+) -> Result<crate::scheduler::Status, String> {
+    scheduler_root(&shared, &workspace_root)?;
+    let program = engine_program(&shared)?;
+    if let Some(on) = background {
+        scheduler.set_background(&workspace_root, on)?;
+    }
+    let scheduler = scheduler.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || scheduler.start(&workspace_root, &program))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Stop the app-owned scheduler (a no-op when it is not running); `background` as for start.
+#[tauri::command]
+async fn scheduler_stop(
+    scheduler: State<'_, crate::scheduler::Scheduler>,
+    workspace_root: String,
+    background: Option<bool>,
+) -> Result<crate::scheduler::Status, String> {
+    if let Some(on) = background {
+        scheduler.set_background(&workspace_root, on)?;
+    }
+    let scheduler = scheduler.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || scheduler.stop(&workspace_root, true))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Open the window and run until it closes. With no `workspace` the UI asks for a folder.
 pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> tauri::Result<()> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok();
-    let endpoint = crate::agent_browser::endpoint_file(home.as_deref().map(Path::new));
+    let home_path = launcher::home_dir();
+    let endpoint = crate::agent_browser::endpoint_file(home_path.as_deref());
+    let placement_file = launcher::app_dir(home_path.as_deref()).map(|dir| dir.join("window.json"));
+    let mut placement = window::Placement::load(placement_file.as_deref());
+    let initial_placement = placement.clone();
+    let quit = window::Quit::default();
+    let home = home_path.and_then(|p| p.into_os_string().into_string().ok());
     let endpoint_on_exit = endpoint.clone();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(window::menu).on_menu_event(|app, event| {
+        if event.id().as_ref() == "dial-quit" { app.exit(0); }
+    });
+    let app = builder
         // Links in answers open in the system browser, never in the app window.
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1732,7 +2110,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         // checked only when `app_updates_enabled`.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        // A custom type layout's own page (`types::custom_page`), shown in a sandboxed frame.
+        // A type's own app (`types::custom_page`), shown in a sandboxed frame.
         .register_uri_scheme_protocol(crate::types::CUSTOM_SCHEME, |ctx, request| {
             use tauri::Manager as _;
             let store = ctx.app_handle().state::<crate::types::Store>();
@@ -1754,6 +2132,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::types::types_update_item,
             crate::types::types_remove_item,
             crate::types::types_move_item,
+            crate::types::types_set_state,
             crate::types::types_import_image,
             crate::types::types_import_image_data,
             crate::types::types_open_asset,
@@ -1772,12 +2151,19 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             engine_update_check,
             engine_update,
             engine_install,
+            startup_diagnostics,
+            engine_choice_get,
+            engine_choice_set,
+            engine_validate,
+            settings_file_write,
+            settings_file_read,
             app_updates_enabled,
             app_try_reserve_restart,
             app_release_restart,
             send_prompt,
             send_background,
             read_image,
+            validate_attachment,
             read_clipboard_file_paths,
             read_clipboard_image,
             save_image,
@@ -1807,13 +2193,19 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             refresh_sessions,
             search_transcripts,
             engine_call,
+            watch::watch_workers,
+            watch::watch_message,
+            watch::watch_peers,
+            watch::watch_peer_message,
             local_model_removal,
             crate::model_library::model_download_status,
             crate::model_library::model_download_start,
             crate::model_library::model_download_cancel,
             crate::model_library::model_cache_list,
             crate::model_library::model_cache_remove,
+            crate::model_library::model_cache_remove_file,
             crate::model_library::model_hub_setup,
+            crate::model_library::atomic_engine_setup,
             crate::model_library::model_hub_search,
             crate::model_library::model_hub_files,
             discover_models,
@@ -1825,6 +2217,16 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             list_dir,
             read_file,
             file_diff,
+            file_git_status,
+            file_revert,
+            file_revert_hunk,
+            file_stage,
+            file_commit_review,
+            file_commit,
+            file_grep,
+            file_open,
+            app_runner_vm_ssh_setup_cancel,
+            crate::app_disk::app_runner_remove_disk,
             search_files,
             terminal_open,
             provider_setup_open,
@@ -1840,10 +2242,17 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             browser::browser_go,
             browser::browser_inspect,
             browser::browser_state,
+            browser::browser_set_search,
+            browser::browser_features,
+            browser::browser_devtools,
+            browser::browser_open_file,
+            browser::browser_stop_local,
             crate::app_disk::app_runner_import,
+            crate::app_disk::app_runner_import_cancel,
             crate::app_runner::app_runner_preferred_target,
             crate::app_runner::host::app_runner_host,
             crate::app_runner::host::app_runner_host_install,
+            crate::app_runner::host::app_runner_host_cancel,
             crate::app_runner::installed::app_runner_vms,
             crate::app_runner::app_runner_frame_bytes,
             crate::app_runner::installed::app_runner_vm_grant,
@@ -1855,7 +2264,10 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::app_runner::app_runner_start,
             crate::app_runner::app_runner_stop,
             crate::app_runner::app_runner_input,
-            crate::app_runner::app_runner_set_agent_access
+            crate::app_runner::app_runner_set_agent_access,
+            scheduler_status,
+            scheduler_start,
+            scheduler_stop
         ])
         .setup(move |app| {
             let (wake_tx, wake_rx) = mpsc::channel();
@@ -1869,6 +2281,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             let answer_style = crate::answer_style::load(
                 crate::answer_style::file(home.as_deref().map(Path::new)).as_deref(),
             );
+            let scheduler_prefs = launcher::app_dir(home.as_deref().map(Path::new))
+                .map(|dir| dir.join("background-schedules.json"));
             app.manage(Shared {
                 inner: Mutex::new(Inner {
                     tabs: Tabs::new(Tab::new(Model::default(), None)),
@@ -1887,9 +2301,26 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 answer_support: crate::answer_style::Support::default(),
             });
             app.manage(Browser::default());
+            // Saved schedules run in the background while their project is open (`scheduler`).
+            let events = app.handle().clone();
+            app.manage(crate::scheduler::Scheduler::new(
+                scheduler_prefs,
+                move |status| {
+                    let _ = events.emit("scheduler", status);
+                },
+            ));
+            // Tauri cannot name a resource folder for an unbundled build outside `target/`
+            // (a custom CARGO_TARGET_DIR); the executable's folder stands in, as in development.
+            let resource_dir = match app.path().resource_dir() {
+                Ok(dir) => dir,
+                Err(error) => std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                    .ok_or(error)?,
+            };
             app.manage(crate::app_runner::AppRunner::new(
                 app.handle().clone(),
-                app.path().resource_dir()?,
+                resource_dir,
                 app.path().app_data_dir()?,
             ));
             // The agent's tools for the Browser panel (`agent_browser`); without them the panel
@@ -1907,6 +2338,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                     &app.state::<crate::app_runner::AppRunner>(),
                 )?;
                 app.state::<crate::types::Store>().set_project(Some(&path_root));
+                scheduler_project_opened(app.handle());
             }
             let handle = app.handle().clone();
             thread::Builder::new()
@@ -1916,23 +2348,51 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Dial")
                 .inner_size(1380.0, 880.0)
-                .min_inner_size(960.0, 600.0)
+                .min_inner_size(window::MIN_WIDTH, window::MIN_HEIGHT)
+                .visible(false)
                 .background_color(tauri::window::Color(0x0E, 0x0E, 0x11, 0xFF));
             // A unified window: content runs under the macOS title bar, like native editors.
             #[cfg(target_os = "macos")]
             let builder = builder
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true);
-            builder.build()?;
+            let webview = builder.build()?;
+            if let Some(window) = app.get_window("main") {
+                initial_placement.restore(&window);
+            }
+            webview.show()?;
             Ok(())
         })
         .build(tauri::generate_context!())?;
 
     app.run(move |app, event| {
+        match &event {
+            RunEvent::WindowEvent { label, event, .. } if label == "main" => {
+                use tauri::WindowEvent;
+                if let Some(w) = app.get_window(label) {
+                    match event {
+                        WindowEvent::CloseRequested { api, .. } => {
+                            if quit.prevent(&w) { api.prevent_close(); } else { placement.observe(&w); }
+                        }
+                        WindowEvent::Resized(_) | WindowEvent::Moved(_) => placement.observe(&w),
+                        _ => {}
+                    }
+                }
+            }
+            RunEvent::ExitRequested { code, api, .. } => {
+                if let Some(w) = app.get_window("main") {
+                    if *code != Some(tauri::RESTART_EXIT_CODE) && quit.prevent(&w) { api.prevent_exit(); }
+                    else { placement.observe(&w); }
+                }
+            }
+            _ => {}
+        }
         if let RunEvent::Exit = event
             && let Some(shared) = app.try_state::<Shared>()
         {
+            placement.save(placement_file.as_deref());
             app.state::<crate::app_runner::AppRunner>().stop_all();
+            app.state::<crate::scheduler::Scheduler>().stop_all(true);
             shared.terminals().close_all();
             app.state::<crate::model_library::Downloads>().stop();
             if let Some(file) = &endpoint_on_exit {

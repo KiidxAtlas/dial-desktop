@@ -2,10 +2,13 @@
 // Settings: a sidebar of pages grouped by purpose, and the page. Desktop pages work without an
 // engine; engine pages come from its settings reference and save through `dial config`.
 import { computed, nextTick, onMounted, ref, watch } from "vue";
-import type { OpenSnapshot, Setting, SettingScope } from "../types";
-import { settings, settingsPage } from "../bridge";
+import { ask } from "@tauri-apps/plugin-dialog";
+import type { OpenSnapshot, Setting, SettingScope, Snapshot } from "../types";
+import { engine, settings, settingsPage } from "../bridge";
 import { appearance, type Theme } from "../appearance";
 import { notifications, setNotifications } from "../notifications";
+import { restartDone, saveRejected, settingFeedback, startSave } from "../settingsFeedback";
+import { changedCounts, changedTitle, hasSources, resetScope, saveScope } from "../settingScope";
 import { ui } from "../ui";
 import Icon, { PATHS } from "./Icon.vue";
 import SettingRow from "./SettingRow.vue";
@@ -18,6 +21,7 @@ import ProviderSettings from "./ProviderSettings.vue";
 import RolesPresets from "./RolesPresets.vue";
 import ImageSettings from "./ImageSettings.vue";
 import ProjectTools, { PROJECT_TABS, type ProjectTab } from "./ProjectTools.vue";
+import SettingsTransfer from "./SettingsTransfer.vue";
 import SPage from "./settings/SPage.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
@@ -58,19 +62,19 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
   {
     title: "App",
     pages: [
-      { id: "appearance", label: "Appearance", icon: "sun", about: "Theme, zoom, what answers draw, and the background behind sessions, on this computer.", words: "theme dark light zoom background image wallpaper dim interactive cards diagrams charts mermaid calculator" },
-      { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify" },
-      { id: "types", label: "Types", icon: "folder", about: "Where new Types are saved: in the app for every project, or in this project.", words: "type collection save project folder global location storage" },
-      { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, and installing new ones.", words: "version upgrade install" },
+      { id: "appearance", label: "Appearance", icon: "sun", about: "Theme, zoom, what answers draw, and the background behind sessions, on this computer.", words: "theme dark light system zoom in out size background image wallpaper dim interactive cards diagrams charts mermaid calculator answers" },
+      { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify desktop notifications sound finished needs you" },
+      { id: "types", label: "Types", icon: "folder", about: "Where new Types are saved: in the app for every project, or in this project.", words: "type collection save project folder global location storage where new types" },
+      { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, which engine Desktop runs, and startup problems.", words: "version upgrade install check engine path binary dial_bin diagnostics warnings shell environment browser tools reconnect desktop copy" },
     ],
   },
   {
     title: "Models",
     pages: [
-      { id: "providers", label: "Providers", icon: "globe", about: "Sign in to a model provider or configure an API key.", words: "login account authentication credentials hosted setup" },
-      { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "download hugging face local delete" },
-      { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "role preset profile embedding" },
-      { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "image picture flux diffusion steps seed lora size quality mlx serve stable" },
+      { id: "providers", label: "Providers", icon: "globe", about: "Sign in to a model provider or configure an API key.", words: "login sign in out account authentication credentials api key token subscription hosted setup anthropic openai" },
+      { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "download hugging face local delete mlx gguf cache" },
+      { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "role preset profile embedding thinking helper model" },
+      { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "image picture flux diffusion steps seed lora strength size quality moderation edit background mlx serve stable" },
     ],
   },
   {
@@ -107,13 +111,29 @@ const PROJECT_ABOUT: Record<ProjectTab, string> = {
 };
 for (const p of DESKTOP[3].pages) p.about = PROJECT_ABOUT[p.id as ProjectTab];
 
-const props = defineProps<{ snap: OpenSnapshot }>();
+// Without a project (the welcome screen) only the app's own pages show: the engine's settings,
+// providers and models need an engine, which runs in a project.
+const props = defineProps<{ snap: Snapshot }>();
+const project = computed(() => (props.snap.workspace ? (props.snap as OpenSnapshot) : null));
+/** Pages that work without a project. */
+const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates"]);
+const groupsShown = computed(() =>
+  project.value ? DESKTOP : DESKTOP.map((g) => ({ ...g, pages: g.pages.filter((p) => NO_PROJECT.has(p.id)) })).filter((g) => g.pages.length),
+);
 
-const page = computed(() => settingsPage.value);
+const page = computed(() => (project.value ? settingsPage.value : null));
 const live = computed(() => props.snap.connection.state === "live");
 const query = ref("");
 const scope = ref<SettingScope>("global");
-const changedOnly = ref(false);
+const scopeOptions = [{ value: 'global', label: 'Everywhere' }, { value: 'project', label: 'This project' }];
+const scopeDestination = computed(() => scope.value === 'global' ? 'every project' : `${props.snap.workspace?.name ?? 'this project'} only`);
+/** The cross-page list: settings changed from the default, or saved for this project. */
+const listing = ref<"" | "changed" | "project">("");
+const changedOnly = computed(() => listing.value !== "");
+function toggleListing(which: "changed" | "project") {
+  listing.value = listing.value === which ? "" : which;
+  query.value = "";
+}
 const search = ref<HTMLInputElement | null>(null);
 const body = ref<HTMLElement | null>(null);
 
@@ -122,16 +142,24 @@ function fromUi(t: string): PageId {
   if (t === "background") return "appearance";
   return t as PageId;
 }
-const current = ref<PageId>(fromUi(ui.settingsTab));
-// A slash command or palette entry can ask for a page while Settings is already open.
-watch(() => ui.settingsTab, (t) => t && go(fromUi(t)));
+/** A page this window can show: without a project, one of the app's own. */
+const allowed = (id: PageId): PageId => (project.value || NO_PROJECT.has(id) ? id : "overview");
+const current = ref<PageId>(allowed(fromUi(ui.settingsTab)));
+// A slash command or palette entry can ask for a page while Settings is already open. The request
+// is consumed, so asking for the same page again (a row's "Manage in Providers") still moves.
+watch(() => ui.settingsTab, (t) => {
+  if (!t) return;
+  go(fromUi(t));
+  ui.settingsTab = "";
+});
 
 onMounted(() => {
-  settings.load();
+  if (project.value) settings.load();
   search.value?.focus();
+  ui.settingsTab = "";
 });
 // A reconnected engine has a fresh copy.
-watch(live, (now) => now && settings.load());
+watch(live, (now) => now && project.value && settings.load());
 
 const engineTabs = computed(() => {
   const tabs = page.value?.tabs ?? [];
@@ -143,7 +171,11 @@ const desktopPage = computed(() => DESKTOP.flatMap((g) => g.pages).find((p) => p
 
 const all = computed(() => page.value?.settings ?? []);
 const changedIn = (t: string) => all.value.filter((s) => s.tab === t && s.modified).length;
-const changedTotal = computed(() => all.value.filter((s) => s.modified).length);
+/** The engine reports which layer sets each value (older engines do not). */
+const sourced = computed(() => hasSources(all.value));
+const counts = computed(() => changedCounts(all.value));
+const changedTotal = computed(() => counts.value.total);
+const projectTotal = computed(() => all.value.filter((s) => s.source === "project").length);
 
 /** A whole-table setting that other settings already show field by field. */
 function isRawTable(s: Setting) {
@@ -159,7 +191,7 @@ const has = (hay: string) => terms.value.every((t) => hay.toLowerCase().includes
 const pageHits = computed(() => {
   if (!searching.value) return [];
   const pages: PageInfo[] = [
-    ...DESKTOP.flatMap((g) => g.pages),
+    ...groupsShown.value.flatMap((g) => g.pages),
     ...engineTabs.value.map((t) => ({ id: `engine:${t}` as PageId, ...engineInfo(t), words: t })),
   ];
   return pages.filter((p) => has(`${p.label} ${p.about} ${p.words ?? ""}`));
@@ -172,7 +204,8 @@ const sectionName = (s: Setting) => (!s.section || s.section === "Configuration"
 const groups = computed(() => {
   const out: { id: string; title: string; items: Setting[] }[] = [];
   for (const s of all.value) {
-    if (changedOnly.value && !s.modified) continue;
+    if (listing.value === "changed" && !s.modified) continue;
+    if (listing.value === "project" && s.source !== "project") continue;
     if (searching.value) {
       if (!has(`${s.label} ${s.key} ${s.description} ${s.section} ${s.tab} ${engineInfo(s.tab).label}`)) continue;
     } else if (!changedOnly.value && (s.tab !== engineTab.value || isRawTable(s))) continue;
@@ -191,9 +224,9 @@ const overlay = computed(() => searching.value || changedOnly.value);
 // ── Navigation ───────────────────────────────────────────────────────────────
 
 function go(id: PageId) {
-  current.value = id;
+  current.value = allowed(id);
   query.value = "";
-  changedOnly.value = false;
+  listing.value = "";
   nextTick(() => body.value?.scrollTo({ top: 0 }));
 }
 function jump(id: string) {
@@ -208,7 +241,7 @@ function close() {
 
 /** The engine settings on the overview, with plainer words than the reference uses. */
 const QUICK: Record<string, { label: string; description: string }> = {
-  model: { label: "Model", description: "The model that answers in new sessions." },
+  model: { label: "Default model", description: "The model new sessions start with. The model picker in the composer (⇧⌘M) switches only the session you are in." },
   approval: { label: "Ask before acting", description: "When Dial stops to ask before it edits files or runs commands." },
   "sandbox.mode": { label: "Sandbox", description: "Off, project writes only (Dev), or project only with no network (Strict)." },
   "ui.show_thinking": { label: "Show reasoning", description: "Show the model's reasoning, or fold it to one line." },
@@ -225,16 +258,50 @@ const THEMES: { value: Theme; label: string }[] = [
   { value: "dark", label: "Dark" },
 ];
 const tiles = computed<PageInfo[]>(() => [
-  ...DESKTOP.slice(1, 3).flatMap((g) => g.pages),
+  ...groupsShown.value.filter((g) => g.title && g.title !== "This project").flatMap((g) => g.pages),
   ...engineTabs.value.filter((t) => t !== "Common").map((t) => ({ id: `engine:${t}` as PageId, ...engineInfo(t) })),
 ]);
 
 /** Save one setting, and whatever its chosen option brings along (an image model's endpoint). */
-function save(s: Setting, value: unknown, where: SettingScope = scope.value, linked?: Record<string, unknown>) {
-  settings.save(s.key, value, where);
+async function save(s: Setting, value: unknown, where: SettingScope = scope.value, linked?: Record<string, unknown>) {
+  startSave(s, props.snap.turnRunning);
+  if (!(await settings.save(s.key, value, where))) return saveRejected(s.key);
   for (const [key, also] of Object.entries(linked ?? {})) settings.save(key, also, where);
 }
-const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(s.key, where);
+/** Reset the layer that set the value when the engine says which; else the picked scope. */
+async function reset(s: Setting, where: SettingScope = resetScope(s.source, scope.value)) {
+  startSave(s, props.snap.turnRunning);
+  if (!(await settings.reset(s.key, where))) saveRejected(s.key);
+}
+
+/** The changed list: put every row shown back to its default, after asking. */
+const shownChanged = computed(() => groups.value.flatMap((g) => g.items).filter((s) => (listing.value === "project" ? s.source === "project" : s.modified) && !s.redacted));
+async function resetShown() {
+  const list = shownChanged.value;
+  if (!list.length) return;
+  const names = list.slice(0, 8).map((s) => `• ${s.label}`).join("\n") + (list.length > 8 ? `\n…and ${list.length - 8} more` : "");
+  const where = sourced.value
+    ? `Each is reset where it was saved (this project or everywhere).`
+    : `Resets apply to ${scopeDestination.value}. A value set for the other scope (${scope.value === "global" ? "this project" : "everywhere"}) stays and may still apply.`;
+  const ok = await ask(
+    `Reset ${list.length} setting${list.length === 1 ? "" : "s"}?\n\n${names}\n\n${where}`,
+    { title: "Reset settings?", kind: "warning", okLabel: "Reset all", cancelLabel: "Cancel" },
+  ).catch(() => false);
+  if (ok) for (const s of list) await reset(s);
+}
+
+// ── Restart ──────────────────────────────────────────────────────────────────
+
+const restarting = ref(false);
+/** Restart-tagged settings changed since the engine started apply once it restarts. */
+async function restartEngine() {
+  restarting.value = true;
+  try {
+    if (await engine.reconnect()) restartDone();
+  } finally {
+    restarting.value = false;
+  }
+}
 </script>
 
 <template>
@@ -254,7 +321,7 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           <button v-if="query" class="clear" aria-label="Clear search" @click="query = ''"><Icon name="cross" :size="11" /></button>
         </label>
 
-        <template v-for="g in DESKTOP" :key="g.title">
+        <template v-for="g in groupsShown" :key="g.title">
           <div v-if="g.title" class="nav-label">{{ g.title }}</div>
           <button
             v-for="p in g.pages"
@@ -269,17 +336,29 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           </button>
         </template>
 
-        <div class="nav-label">
+        <p v-if="!project" class="nav-hint">Open a project for engine settings, providers and models.</p>
+        <div v-if="project" class="nav-label">
           Engine
-          <button
-            v-if="changedTotal"
-            class="changed"
-            :class="{ on: changedOnly }"
-            :title="changedOnly ? 'Show every page' : 'Show every setting changed from its default'"
-            @click="changedOnly = !changedOnly; query = ''"
-          >
-            {{ changedTotal }} changed
-          </button>
+          <span class="filters">
+            <button
+              v-if="changedTotal"
+              class="changed"
+              :class="{ on: listing === 'changed' }"
+              :title="listing === 'changed' ? 'Show every page' : changedTitle(counts, sourced)"
+              @click="toggleListing('changed')"
+            >
+              {{ changedTotal }} changed
+            </button>
+            <button
+              v-if="sourced && projectTotal"
+              class="changed"
+              :class="{ on: listing === 'project' }"
+              :title="listing === 'project' ? 'Show every page' : `Show the ${projectTotal} setting${projectTotal === 1 ? '' : 's'} saved for this project only`"
+              @click="toggleListing('project')"
+            >
+              {{ projectTotal }} this project
+            </button>
+          </span>
         </div>
         <button
           v-for="t in engineTabs"
@@ -292,18 +371,38 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           <span class="truncate">{{ engineInfo(t).label }}</span>
           <i v-if="changedIn(t)" class="mark" :title="`${changedIn(t)} changed from the default`" />
         </button>
-        <span v-if="!page" class="nav-hint">{{ snap.connection.state === "preview" ? "Needs the engine" : live ? "Loading…" : "Loads with the engine" }}</span>
+        <span v-if="!page && project" class="nav-hint">{{ snap.connection.state === "preview" ? "Needs the engine" : live ? "Loading…" : "Loads with the engine" }}</span>
       </nav>
 
       <div ref="body" class="body">
+        <!-- Restart-tagged settings changed: they apply once the engine restarts. -->
+        <div v-if="settingFeedback.restart.length && live" class="restart-wrap">
+          <div class="s-banner" role="status">
+            <span>
+              {{ settingFeedback.restart.length === 1 ? `“${settingFeedback.restart[0]}” applies` : `${settingFeedback.restart.length} changed settings apply` }}
+              after the engine restarts.<template v-if="snap.turnRunning"> Wait for the running turn to finish.</template>
+            </span>
+            <button class="btn btn-primary" :disabled="snap.turnRunning || restarting" @click="restartEngine">
+              {{ restarting ? "Restarting…" : "Restart engine now" }}
+            </button>
+          </div>
+        </div>
+        <!-- Sign-in may be awaiting a browser or code. Cache only this page, and only for
+             this project's lifetime in Settings; unmounting still closes its auth process. -->
+        <KeepAlive v-if="project" :key="project.workspace.root">
+          <SPage v-if="current === 'providers' && !overlay && desktopPage" :title="desktopPage.label" :description="desktopPage.about">
+            <ProviderSettings :snap="project" />
+          </SPage>
+        </KeepAlive>
         <!-- Search results and the changed-settings list, across every page. -->
         <SPage
           v-if="overlay"
-          :title="searching ? `“${query.trim()}”` : 'Changed settings'"
-          :description="searching ? undefined : 'Everything changed from its default. Reset one with the arrow beside its name.'"
+          :title="searching ? `“${query.trim()}”` : listing === 'project' ? 'Changed in this project' : 'Changed settings'"
+          :description="searching ? undefined : listing === 'project' ? 'Values saved for this project only; they override the everywhere value. Reset one to use the everywhere value again.' : 'Everything changed from its default. Reset one with the arrow beside its name.'"
         >
           <template #actions>
-            <button class="btn btn-secondary" @click="query = ''; changedOnly = false">Done</button>
+            <button v-if="!searching && shownChanged.length" class="btn btn-secondary" @click="resetShown">Reset all shown</button>
+            <button class="btn btn-secondary" @click="query = ''; listing = ''">Done</button>
           </template>
           <SGroup v-if="pageHits.length" title="Pages">
             <button v-for="p in pageHits" :key="p.id" class="s-row link-row" @click="go(p.id)">
@@ -315,31 +414,46 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
               <Icon name="external" :size="12" class="go" />
             </button>
           </SGroup>
+          <div v-if="groups.length" class="result-scope">
+            <SSegmented v-model="scope" :options="scopeOptions" label="Save changes for" />
+            <span class="s-note">
+              Edits apply to {{ scopeDestination }}. A value saved for this project overrides the everywhere value.
+              <template v-if="sourced">Resets apply where each value was saved.</template>
+              <template v-else-if="listing">This engine does not report where each value was saved, so resets also apply to {{ scopeDestination }}.</template>
+            </span>
+          </div>
           <SGroup v-for="g in groups" :key="g.id" :title="g.title">
             <SettingRow
               v-for="s in g.items"
-              :key="`${snap.workspace.root}:${scope}:${s.key}`"
+              :key="`${snap.workspace?.root}:${scope}:${s.key}`"
               :setting="s"
+              :page-scope="scope"
               @save="(value, linked) => save(s, value, scope, linked)"
               @reset="reset(s)"
             />
           </SGroup>
           <p v-if="!pageHits.length && !groups.length" class="nothing">Nothing matches. Try a shorter word.</p>
-          <p v-if="searching && !page" class="s-note">Engine settings are searchable once the engine is connected.</p>
+          <p v-if="searching && project && !page" class="s-note">Engine settings are searchable once the engine is connected.</p>
+          <p v-else-if="searching && !project" class="s-note">Open a project to search engine settings, providers and the model library.</p>
         </SPage>
 
         <!-- Overview -->
         <SPage v-else-if="current === 'overview'" title="Settings" description="The settings most people change. Everything else is a page away.">
+          <div v-if="quick.length" class="result-scope">
+            <SSegmented v-model="scope" :options="scopeOptions" label="Save changes for" />
+            <span class="s-note">Saving for {{ scopeDestination }}<template v-if="sourced">, except values already saved for this project, which stay project values</template>. A value saved for this project overrides the everywhere value.</span>
+          </div>
           <SGroup title="Quick settings">
-            <SRow label="App theme" description="Light, dark, or follow the system.">
+            <SRow label="App theme" description="Light, dark, or follow the system. Applies to this computer.">
               <SSegmented :model-value="appearance.theme" :options="THEMES" label="App theme" @update:model-value="appearance.theme = $event as Theme" />
             </SRow>
             <SettingRow
               v-for="s in quick"
-              :key="`${snap.workspace.root}:global:${s.key}`"
+              :key="`${snap.workspace?.root}:${scope}:${s.key}`"
               :setting="s"
-              @save="(value, linked) => save(s, value, 'global', linked)"
-              @reset="reset(s, 'global')"
+              :page-scope="saveScope(s.source, scope)"
+              @save="(value, linked) => save(s, value, saveScope(s.source, scope), linked)"
+              @reset="reset(s)"
             />
             <SRow label="Desktop notifications" description="An alert when Dial needs you or finishes in the background.">
               <SSwitch
@@ -349,7 +463,15 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
                 @update:model-value="setNotifications"
               />
             </SRow>
+            <template v-if="project && quick.some((q) => q.key === 'model')" #after>
+              <p class="s-note model-link">
+                The default model applies to new sessions.
+                <button class="link" @click="close(); ui.modelPickerOpen = true">Switch this session’s model…</button>
+              </p>
+            </template>
           </SGroup>
+          <SettingsTransfer v-if="project && page" :snap="project" :rows="all" />
+          <p v-if="!project" class="s-note">Engine settings, providers and models live with a project’s engine. Open a project to change them.</p>
           <SGroup title="More settings" plain>
             <div class="tiles">
               <button v-for="p in tiles" :key="p.id" class="tile" @click="go(p.id)">
@@ -363,25 +485,26 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           </SGroup>
         </SPage>
 
+        <!-- Project pages drawn on SPage themselves. -->
+        <RolesPresets v-else-if="project && current === 'roles'" :snap="project" />
+        <ProjectTools v-else-if="project && PROJECT_TABS.some((t) => t.id === current)" :key="current" :which="current as ProjectTab" :snap="project" />
+
         <!-- Pages that draw their own header. -->
-        <div v-else-if="current === 'library' || current === 'roles' || current === 'images' || PROJECT_TABS.some((t) => t.id === current)" class="s-page own">
+        <div v-else-if="project && (current === 'library' || current === 'images')" class="s-page own">
           <ModelLibrary v-if="current === 'library'" :preview="snap.connection.state === 'preview'" />
-          <RolesPresets v-else-if="current === 'roles'" :snap="snap" />
-          <ImageSettings v-else-if="current === 'images'" :snap="snap" />
-          <ProjectTools v-else :key="current" :which="current as ProjectTab" :snap="snap" />
+          <ImageSettings v-else :snap="project" />
         </div>
 
         <!-- Desktop pages. -->
-        <SPage v-else-if="desktopPage" :title="desktopPage.label" :description="desktopPage.about">
+        <SPage v-else-if="desktopPage && current !== 'providers'" :title="desktopPage.label" :description="desktopPage.about">
           <AppearanceSettings v-if="current === 'appearance'" />
           <NotificationSettings v-else-if="current === 'notifications'" />
           <TypeSettings v-else-if="current === 'types'" />
-          <ProviderSettings v-else-if="current === 'providers'" :key="snap.workspace.root" :snap="snap" />
           <UpdatesSettings v-else />
         </SPage>
 
         <!-- Engine pages. -->
-        <div v-else-if="!page" class="state">
+        <div v-else-if="engineTab && !page" class="state">
           <template v-if="snap.connection.state === 'preview'">
             <Icon name="gear" :size="22" />
             <p>Engine settings come from the Dial engine.</p>
@@ -398,16 +521,16 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           </template>
         </div>
 
-        <SPage v-else :title="engineInfo(engineTab ?? '').label" :description="engineInfo(engineTab ?? '').about">
+        <SPage v-else-if="engineTab" :title="engineInfo(engineTab).label" :description="engineInfo(engineTab).about">
           <template #actions>
             <SSegmented
               v-model="scope"
-              :options="[{ value: 'global', label: 'Everywhere' }, { value: 'project', label: 'This project' }]"
+              :options="scopeOptions"
               label="Save changes for"
             />
           </template>
           <p class="scope-note">
-            Saving {{ scope === "global" ? "for every project" : `for ${snap.workspace.name} only` }}. Changes apply right
+            Saving for {{ scopeDestination }}; a value saved for this project overrides the everywhere value.<template v-if="sourced"> Resets apply where each value was saved.</template> Changes apply right
             away<template v-if="snap.turnRunning">, once the running turn ends</template>; those marked
             <span class="s-tag">Restart</span> on the next start.
           </p>
@@ -417,8 +540,9 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
           <SGroup v-for="g in groups" :id="g.id" :key="g.id" :title="g.title">
             <SettingRow
               v-for="s in g.items"
-              :key="`${snap.workspace.root}:${scope}:${s.key}`"
+              :key="`${snap.workspace?.root}:${scope}:${s.key}`"
               :setting="s"
+              :page-scope="scope"
               @save="(value, linked) => save(s, value, scope, linked)"
               @reset="reset(s)"
             />
@@ -430,8 +554,9 @@ const reset = (s: Setting, where: SettingScope = scope.value) => settings.reset(
             <div class="s-card">
               <SettingRow
                 v-for="s in rawTables"
-                :key="`${snap.workspace.root}:${scope}:${s.key}`"
+                :key="`${snap.workspace?.root}:${scope}:${s.key}`"
                 :setting="s"
+                :page-scope="scope"
                 @save="(value, linked) => save(s, value, scope, linked)"
                 @reset="reset(s)"
               />
@@ -539,6 +664,10 @@ h1 {
   font-weight: 600;
   color: var(--text-faint);
 }
+.filters {
+  display: flex;
+  gap: 4px;
+}
 .changed {
   padding: 0 7px;
   border-radius: 999px;
@@ -591,6 +720,16 @@ h1 {
   border-radius: 50%;
   background: var(--accent);
 }
+.model-link {
+  margin: 8px 4px 0;
+}
+.model-link .link {
+  color: var(--accent);
+  font: inherit;
+}
+.model-link .link:hover {
+  text-decoration: underline;
+}
 .nav-hint {
   padding: 4px 10px;
   font-size: 12px;
@@ -622,6 +761,15 @@ h1 {
 .state span {
   font-size: var(--text-sm);
 }
+.restart-wrap {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 20px 40px 0;
+}
+.restart-wrap .s-banner {
+  margin: 0;
+}
+.result-scope { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
 .scope-note {
   margin: -10px 0 18px;
   font-size: 12px;

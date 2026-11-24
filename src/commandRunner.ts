@@ -9,7 +9,7 @@ import { engine, showToast, snapshot, type TerminalTask } from "./bridge";
 import { applySaved, engineCall, loadModes, readable, setMode, setPlanMode, type EngineCommand } from "./engineTools";
 import { openSession, startRename } from "./sessionActions";
 import { editQueued, queueFor, removeQueued } from "./queue";
-import { showPanel } from "./workspace";
+import { showPanel, showSidebar } from "./workspace";
 import { ui, type SettingsTab } from "./ui";
 import { saveSchedule, typedSchedule } from "./schedules";
 import type { OpenSnapshot } from "./types";
@@ -474,7 +474,7 @@ const HANDLERS: Record<string, Handler> = {
     return call(`Archive · ${view}`, "archive", { view, ...(query ? { query } : {}) });
   },
   sessions: async ({ snap, args, rest }) => {
-    if (!args.length) { ui.sidebarOpen = true; ui.focusSearch++; return; }
+    if (!args.length) { showSidebar(); ui.focusSearch++; return; }
     const [what] = args;
     if (what === "this") return HANDLERS.session({ snap, name: "session", rest: "info", args: ["info"] });
     if (what === "fork") { const s = openSession(snap); if (s) void engine.forkSession(s.id); return; }
@@ -495,7 +495,7 @@ const HANDLERS: Record<string, Handler> = {
   },
   search: ({ snap, rest }) => {
     const query = rest.trim();
-    if (!query || ["results", "back"].includes(query)) { ui.sidebarOpen = true; ui.focusSearch++; return; }
+    if (!query || ["results", "back"].includes(query)) { showSidebar(); ui.focusSearch++; return; }
     return call(`Sessions mentioning “${query}”`, "search_sessions", { query, limit: 50 }, (r) => ({
       text: r.hits?.length ? undefined : "No matches.",
       rows: (r.hits ?? []).map((h: any) => ({
@@ -624,6 +624,7 @@ const HANDLERS: Record<string, Handler> = {
   },
 
   // The desktop's own views.
+  watch: () => showPanel("activity"),
   queue: ({ snap, args }) => {
     const item = queueFor(snap).items[Number(args[1]) - 1];
     if (!item) return showToast(args.length ? "No queued prompt with that number" : "Queued prompts show above the message box");
@@ -632,11 +633,11 @@ const HANDLERS: Record<string, Handler> = {
   },
   theme: () => settingsAt("appearance"),
   changes: () => { ui.diffPath = null; showPanel("changes"); },
-  tree: () => { ui.sidebarOpen = true; },
+  tree: () => { showSidebar(); },
 };
 
 /** Desktop-only names the engine lists as terminal-only but the desktop shows its own way. */
-const DESKTOP_TERMINAL = new Set(["changes", "tree", "modelpreset", "login", "schedule"]);
+const DESKTOP_TERMINAL = new Set(["changes", "tree", "watch", "modelpreset", "login", "schedule"]);
 
 /** Whether `name` has an argument-aware desktop handler. */
 export function hasHandler(name: string) {
@@ -671,7 +672,7 @@ export function runTyped(snap: OpenSnapshot, name: string, rest: string, list: E
     if (handler && (surface !== "terminal" || DESKTOP_TERMINAL.has(name))) return void Promise.resolve(handler({ snap, name, rest, args: words(rest) })).catch((e) => showToast(readable(e)));
     if (surface === "terminal") return runInTerminal(`/${name} ${rest}`);
     if (fallback) return fallback();
-    // `/exit`, `/draft`, `/watch`…: the desktop does these with its own controls.
+    // `/exit`, `/draft`…: the desktop does these with its own controls.
     showToast(`/${name} works through the desktop's own controls here`);
   } catch (error) {
     showToast(readable(error));

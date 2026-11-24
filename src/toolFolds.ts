@@ -1,6 +1,10 @@
-// Keep a burst of related tool calls (the calls between two messages) on one line, including
-// while they run. The line summarizes the burst; its calls open beneath it.
+// Keep a burst of related activity (the tool calls between two messages, with the coordination
+// messages and status lines that arrive among them) on one line, including while it runs. The
+// line summarizes the burst; its rows open beneath it.
 import type { Entry, ToolEntry } from "./types";
+
+type ReceivedEntry = Extract<Entry, { kind: "received" }>;
+type NoticeEntry = Extract<Entry, { kind: "notice" }>;
 
 type Kind = "read" | "search" | "edit" | "run" | "web" | "image" | "other";
 
@@ -28,29 +32,101 @@ function breaksRun(tool: ToolEntry) {
   return ["ask", "question"].includes(tool.label.toLowerCase());
 }
 
+/**
+ * What a call is doing, as a present-tense phase for the live line: "Reading", "Editing",
+ * "Verifying". Unknown tools read as "Working".
+ */
+export function phaseOf(tool: Pick<ToolEntry, "label" | "check">): string {
+  if (tool.check) return "Verifying";
+  switch (tool.label.toLowerCase()) {
+    case "read": case "view": case "open":
+      return "Reading";
+    case "search": case "find": case "grep": case "glob": case "ast_search": case "list":
+      return "Searching";
+    case "write": case "create":
+      return "Writing";
+    case "edit": case "ast_edit":
+      return "Editing";
+    case "delete":
+      return "Deleting files";
+    case "move":
+      return "Moving files";
+    case "verify": case "check": case "test":
+      return "Verifying";
+    case "run": case "bash": case "bg": case "background":
+      return "Running commands";
+    case "web search": case "web_search":
+      return "Searching the web";
+    case "web": case "fetch":
+      return "Browsing the web";
+    case "generate image": case "image_gen":
+      return "Generating an image";
+    case "todo": case "todos": case "plan": case "update_plan": case "todo_write":
+      return "Making the plan";
+    case "task": case "agent": case "delegate":
+      return "Delegating";
+    case "ask": case "question":
+      return "Asking you";
+  }
+  return "Working";
+}
+
+/** One transcript row a run folds away, with its index in the conversation. */
+export interface RunItem {
+  index: number;
+  entry: ToolEntry | ReceivedEntry | NoticeEntry;
+}
+
 export interface ToolRun {
-  /** Index of the first and last entry of the run. */
+  /** Index of the first and last entry of the run; every entry between them is one of `items`. */
   start: number;
   end: number;
   /** Key the run's open state is stored under in `ui.expanded`; kept while the run grows. */
   key: string;
   tools: ToolEntry[];
+  /** The calls, received messages and status lines of the run, in transcript order. */
+  items: RunItem[];
 }
 
-/** Consecutive calls form one run; messages, notices and calls that ask the user break it. */
-export function toolRuns(entries: readonly Entry[]): Map<number, ToolRun> {
+/** Status lines that are part of the work around them. Alerts and dividers (a compaction, a
+ * context reset) always stay in view. */
+function incidental(entry: NoticeEntry) {
+  return entry.lane === null || entry.lane === "context";
+}
+
+/**
+ * Consecutive calls and received messages form one run. Status lines between them join it;
+ * ones before or after it stay in view. Prompts, answers, errors, alerts, dividers and calls
+ * that ask the user break it. `session` scopes the key of a run that opens with a message.
+ */
+export function toolRuns(entries: readonly Entry[], session: string | null = null): Map<number, ToolRun> {
   const out = new Map<number, ToolRun>();
   let previous: ToolRun | undefined;
+  /** Status lines since the run's last call or message; they join it only if it continues. */
+  let asides: RunItem[] = [];
+  let asked = false;
   entries.forEach((entry, index) => {
-    if (entry.kind !== "tool") {
+    if (entry.kind === "notice" && incidental(entry)) {
+      if (previous) asides.push({ index, entry });
+      return;
+    }
+    if (entry.kind !== "tool" && entry.kind !== "received") {
       previous = undefined;
-    } else if (previous && !breaksRun(entry) && !breaksRun(previous.tools[previous.tools.length - 1])) {
+      asides = [];
+      return;
+    }
+    const asks = entry.kind === "tool" && breaksRun(entry);
+    if (previous && !asks && !asked) {
+      previous.items.push(...asides, { index, entry });
       previous.end = index;
-      previous.tools.push(entry);
     } else {
-      previous = { start: index, end: index, key: `fold:${entry.key}`, tools: [entry] };
+      const key = entry.kind === "tool" ? entry.key : `${session ?? "new"}:received:${index}`;
+      previous = { start: index, end: index, key: `fold:${key}`, tools: [], items: [{ index, entry }] };
       out.set(index, previous);
     }
+    if (entry.kind === "tool") previous.tools.push(entry);
+    asides = [];
+    asked = asks;
   });
   return out;
 }
@@ -69,17 +145,24 @@ export function runActivity(run: ToolRun) {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-/** "Read 3 files, 2 searches, edited 2 files, ran 1 command", in the order the work happened. */
+/** "Read 3 files, 2 searches, edited 2 files, ran 1 command, received 1 message", in the order the work happened. */
 export function runSummary(run: ToolRun): string {
-  const order: Kind[] = [];
+  const order: (Kind | "message")[] = [];
   const calls = new Map<Kind, ToolEntry[]>();
-  for (const tool of run.tools) {
-    const k = kind(tool);
+  let messages = 0;
+  for (const { entry } of run.items) {
+    if (entry.kind === "received") {
+      if (!messages++) order.push("message");
+      continue;
+    }
+    if (entry.kind !== "tool") continue;
+    const k = kind(entry);
     if (!calls.has(k)) { order.push(k); calls.set(k, []); }
-    calls.get(k)!.push(tool);
+    calls.get(k)!.push(entry);
   }
   const distinct = (values: string[]) => new Set(values.filter(Boolean)).size;
   const parts = order.map((k) => {
+    if (k === "message") return `received ${plural(messages, "message")}`;
     const list = calls.get(k)!;
     switch (k) {
       case "read": return `read ${plural(distinct(list.map((t) => t.target)) || list.length, "file")}`;

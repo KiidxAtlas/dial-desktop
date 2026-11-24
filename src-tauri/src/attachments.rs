@@ -42,6 +42,20 @@ pub fn image_mime(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// Check a selected attachment before showing a ready chip. Recheck on submission too:
+/// files may move or grow between the picker and Send.
+pub fn validate_path(path: &Path) -> Result<(), String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let meta = std::fs::metadata(path).map_err(|e| format!("Could not read {name}: {e}"))?;
+    if !path.is_absolute() || !meta.is_file() {
+        return Err(format!("Select a regular file, not a directory or device: {name}"));
+    }
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!("{name} exceeds the 64 MiB attachment limit"));
+    }
+    Ok(())
+}
+
 /// Check and preview the image at `path`.
 pub fn read_image(path: &Path) -> Result<ImageFile, String> {
     let name = path
@@ -50,16 +64,7 @@ pub fn read_image(path: &Path) -> Result<ImageFile, String> {
         .unwrap_or_else(|| path.display().to_string());
     let mime =
         image_mime(path).ok_or_else(|| format!("{name} is not a PNG, JPEG, GIF or WebP image"))?;
-    let size = std::fs::metadata(path)
-        .map_err(|error| format!("Could not read {name}: {error}"))?
-        .len();
-    if size > MAX_IMAGE_BYTES {
-        return Err(format!(
-            "{name} is {} MiB; images can be at most {} MiB",
-            size.div_ceil(1024 * 1024),
-            MAX_IMAGE_BYTES / (1024 * 1024)
-        ));
-    }
+    validate_path(path)?;
     let bytes = std::fs::read(path).map_err(|error| format!("Could not read {name}: {error}"))?;
     Ok(ImageFile {
         path: path.to_string_lossy().into_owned(),
@@ -73,8 +78,12 @@ pub fn check(images: &[String], inline_images: &[String]) -> Result<(), String> 
     if images.len() + inline_images.len() > MAX_IMAGES {
         return Err(format!("Attach at most {MAX_IMAGES} images to one prompt"));
     }
-    if let Some(path) = images.iter().find(|p| image_mime(Path::new(p)).is_none()) {
-        return Err(format!("{path} is not a PNG, JPEG, GIF or WebP image"));
+    for image in images {
+        let path = Path::new(image);
+        if image_mime(path).is_none() {
+            return Err(format!("{image} is not a PNG, JPEG, GIF or WebP image"));
+        }
+        validate_path(path)?;
     }
     for data in inline_images {
         let data = data.trim();

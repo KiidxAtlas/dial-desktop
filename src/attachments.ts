@@ -20,13 +20,15 @@ function append(draft: Draft, attachment: Attachment): boolean {
   return true;
 }
 
-/** Documents stay as paths until send, when the backend checks the file and its size. */
+/** Check path-only files now for useful feedback; send still validates the current file. */
 export async function addPaths(draft: Draft, paths: string[]) {
   for (const path of new Set(paths)) {
     if (draft.attachments.some(a => a.path === path)) continue;
     if (!hasRoom(draft)) return;
     try {
-      const file = IMAGE_FILE.test(path) ? await files.readImage(path) : { path, name: path.split(/[\\/]/).pop() || path, url: null };
+      const image = IMAGE_FILE.test(path);
+      if (!image) await files.validateAttachment(path);
+      const file = image ? await files.readImage(path) : { path, name: path.split(/[\\/]/).pop() || path, url: null };
       if (!append(draft, { ...file, key: crypto.randomUUID(), data: null })) return;
     } catch (error) {
       showToast(String(error));

@@ -7,6 +7,7 @@
 //! web pages. [`inspect`] reads the page's address, title, selected text, visible text and the
 //! errors it logged, so the user can hand them to the agent.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::Duration;
@@ -19,10 +20,14 @@ use tauri::{
     WebviewBuilder, WebviewUrl,
 };
 
+mod local;
+
 /// The browser webview's label.
 pub const LABEL: &str = "browser";
-/// What a query without an address searches.
+/// What a query without an address searches, unless the user chose another engine.
 const SEARCH: &str = "https://duckduckgo.com/";
+/// Stands for the query in a search engine template.
+const QUERY: &str = "%s";
 /// How long [`inspect`] waits for the page to answer.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -97,6 +102,10 @@ pub struct Browser {
     state: Mutex<BrowserState>,
     /// Pages finished loading so far; the agent's tools wait for it to move.
     loads: AtomicU64,
+    /// The user's search engine template (`%s` is the query); `None` searches DuckDuckGo.
+    search: Mutex<Option<String>>,
+    /// The folder **Open file…** serves, while its page is on show.
+    local: Mutex<Option<local::LocalServer>>,
 }
 
 impl Browser {
@@ -122,11 +131,31 @@ impl Browser {
     pub fn loads(&self) -> u64 {
         self.loads.load(Ordering::SeqCst)
     }
+
+    fn search(&self) -> Option<String> {
+        self.search
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stop the local file server unless it serves `url`.
+    fn keep_local_for(&self, url: &str) {
+        let mut local = self.local.lock().unwrap_or_else(PoisonError::into_inner);
+        if local.as_ref().is_some_and(|server| !server.serves(url)) {
+            *local = None;
+        }
+    }
 }
 
 /// What the user typed into the address bar as a URL to open: a web address as is, a bare host
 /// over HTTPS (HTTP for this computer), anything else as a search.
 pub fn normalize_url(input: &str) -> Result<String, String> {
+    normalize_url_with(input, None)
+}
+
+/// [`normalize_url`], searching with `search` (a template where `%s` is the query) when given.
+pub fn normalize_url_with(input: &str, search: Option<&str>) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("Type an address or a search".into());
@@ -150,7 +179,37 @@ pub fn normalize_url(input: &str) -> Result<String, String> {
             return Ok(url.to_string());
         }
     }
-    Url::parse_with_params(SEARCH, &[("q", input)])
+    search_url(search, input)
+}
+
+/// Check a search engine template: an http(s) address with `%s` where the query goes.
+pub fn check_search_template(template: &str) -> Result<(), String> {
+    let template = template.trim();
+    if !template.contains(QUERY) {
+        return Err("A search address needs %s where the search words go".into());
+    }
+    let url = Url::parse(&template.replace(QUERY, "test"))
+        .map_err(|e| format!("Not a valid search address: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        _ => Err("A search address must start with https:// or http://".into()),
+    }
+}
+
+/// The address that searches for `query`: with the user's `template`, else DuckDuckGo.
+fn search_url(template: Option<&str>, query: &str) -> Result<String, String> {
+    let Some(template) = template.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Url::parse_with_params(SEARCH, &[("q", query)])
+            .map(|url| url.to_string())
+            .map_err(|e| e.to_string());
+    };
+    check_search_template(template)?;
+    let encoded: String = query
+        .split(' ')
+        .map(local::encode)
+        .collect::<Vec<_>>()
+        .join("+");
+    Url::parse(&template.replace(QUERY, &encoded))
         .map(|url| url.to_string())
         .map_err(|e| e.to_string())
 }
@@ -214,7 +273,9 @@ fn create<R: Runtime>(app: &AppHandle<R>, url: Url, bounds: Bounds) -> Result<We
             let url = payload.url().to_string();
             let loading = matches!(payload.event(), PageLoadEvent::Started);
             let browser = loads.state::<Browser>();
-            if !loading {
+            if loading {
+                browser.keep_local_for(&url);
+            } else {
                 browser.loads.fetch_add(1, Ordering::SeqCst);
             }
             browser.update(&loads, |state| {
@@ -252,7 +313,11 @@ pub async fn browser_show(
     bounds: Bounds,
     url: Option<String>,
 ) -> Result<BrowserState, String> {
-    let url = url.as_deref().map(normalize_url).transpose()?;
+    let search = app.state::<Browser>().search();
+    let url = url
+        .as_deref()
+        .map(|u| normalize_url_with(u, search.as_deref()))
+        .transpose()?;
     match app.get_webview(LABEL) {
         Some(view) => {
             view.set_bounds(bounds.rect()).map_err(|e| e.to_string())?;
@@ -307,7 +372,7 @@ pub async fn browser_navigate(
     browser: State<'_, Browser>,
     url: String,
 ) -> Result<String, String> {
-    let url = normalize_url(&url)?;
+    let url = normalize_url_with(&url, browser.search().as_deref())?;
     navigate_to(&webview(&app)?, &url)?;
     browser.update(&app, |state| {
         state.url = url.clone();
@@ -374,6 +439,100 @@ pub(crate) fn eval_view_raw<R: Runtime>(
 #[tauri::command]
 pub fn browser_state(browser: State<'_, Browser>) -> BrowserState {
     browser.current()
+}
+
+/// Search with `template` (an http(s) address where `%s` is the query); `None` or empty
+/// returns to DuckDuckGo. Only what the user types in the address bar uses it.
+#[tauri::command]
+pub fn browser_set_search(
+    browser: State<'_, Browser>,
+    template: Option<String>,
+) -> Result<(), String> {
+    let template = template
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
+    if let Some(template) = &template {
+        check_search_template(template)?;
+    }
+    *browser.search.lock().unwrap_or_else(PoisonError::into_inner) = template;
+    Ok(())
+}
+
+/// What this build's browser can do beyond browsing.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFeatures {
+    /// Web Inspector is compiled in (debug builds).
+    pub devtools: bool,
+}
+
+#[tauri::command]
+pub fn browser_features() -> BrowserFeatures {
+    BrowserFeatures {
+        devtools: cfg!(debug_assertions),
+    }
+}
+
+/// Open the page's Web Inspector (debug builds only).
+#[tauri::command]
+pub async fn browser_devtools(app: AppHandle) -> Result<(), String> {
+    let view = webview(&app)?;
+    #[cfg(debug_assertions)]
+    {
+        view.open_devtools();
+        Ok(())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = view;
+        Err("This build of Dial has no page inspector".into())
+    }
+}
+
+/// **Open file…**: pick a local HTML file in a native dialog and serve its folder on loopback.
+/// Returns the page's `http://127.0.0.1:…` address for the panel to open, or `None` when
+/// cancelled. The webview itself still only opens web pages.
+#[tauri::command]
+pub async fn browser_open_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(picked) = app
+            .dialog()
+            .file()
+            .set_title("Open a local web page")
+            .add_filter("Web page", &["html", "htm", "xhtml", "svg"])
+            .blocking_pick_file()
+        else {
+            return Ok(None);
+        };
+        let path = picked.into_path().map_err(|e| e.to_string())?;
+        let url = serve_file(&app.state::<Browser>(), &path)?;
+        Ok(Some(url))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Serve `file`'s folder (replacing any folder served before) and return the file's address.
+fn serve_file(browser: &Browser, file: &Path) -> Result<String, String> {
+    let file = std::fs::canonicalize(file).map_err(|e| format!("Cannot open that file: {e}"))?;
+    if !file.is_file() {
+        return Err("Choose a file".into());
+    }
+    let folder = file.parent().ok_or("That file has no folder")?;
+    let name = file.file_name().ok_or("That file has no name")?;
+    let mut local = browser.local.lock().unwrap_or_else(PoisonError::into_inner);
+    *local = None;
+    let server = local::LocalServer::start(folder)?;
+    let url = server.url_for(Path::new(name));
+    *local = Some(server);
+    Ok(url)
+}
+
+/// Stop serving a local folder (the panel closed).
+#[tauri::command]
+pub fn browser_stop_local(browser: State<'_, Browser>) {
+    *browser.local.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 #[cfg(test)]

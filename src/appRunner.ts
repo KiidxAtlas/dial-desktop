@@ -21,7 +21,7 @@ export type AppGuestTarget = "default" | "linux" | "windows" | "macos";
 
 /** The selector's choices in display order. Labels are display text only; no policy hangs off them. */
 export const APP_GUEST_TARGETS: readonly { value: AppGuestTarget; label: string }[] = [
-  { value: "default", label: "Imported QEMU guest (unlabelled)" },
+  { value: "default", label: "Imported QEMU guest (no OS label)" },
   { value: "linux", label: "Linux (QEMU guest)" },
   { value: "windows", label: "Windows (QEMU guest)" },
   { value: "macos", label: "macOS (virtual Mac)" },
@@ -58,6 +58,31 @@ export interface AppVmList {
   sshLinks: Record<string, AppVmSshLink>;
   /** Concrete `Host` aliases in the user's `~/.ssh/config`, as link suggestions. */
   sshHosts: string[];
+  /** What each provider still needs before Dial can open its console (`readiness.rs` `Check`). */
+  readiness: AppVmReadiness[];
+}
+
+/** One provider readiness check: found tools, the VirtualBox SDK, VMware VNC consoles. */
+export interface AppVmReadiness {
+  provider: AppVmProvider;
+  id: string;
+  label: string;
+  status: "ready" | "missing" | "unknown";
+  detail: string;
+}
+
+function parseReadiness(raw: unknown): AppVmReadiness[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AppVmReadiness[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { provider, id, label, status, detail } = entry as Record<string, unknown>;
+    if (provider !== "virtualbox" && provider !== "vmware") continue;
+    if (typeof id !== "string" || typeof label !== "string") continue;
+    if (status !== "ready" && status !== "missing" && status !== "unknown") continue;
+    out.push({ provider, id, label, status, detail: typeof detail === "string" ? detail : "" });
+  }
+  return out;
 }
 
 /** An SSH config host alias Dial accepts (same rule as the backend): no spaces, patterns or leading `-`. */
@@ -95,11 +120,12 @@ export function isRunTarget(value: unknown): value is AppRunTarget {
  */
 export function parseVmList(raw: unknown): AppVmList {
   if (!raw || typeof raw !== "object") throw new Error("This build sent a VM list that Dial could not read.");
-  const { machines, notices, sshLinks, sshHosts } = raw as {
+  const { machines, notices, sshLinks, sshHosts, readiness } = raw as {
     machines?: unknown;
     notices?: unknown;
     sshLinks?: unknown;
     sshHosts?: unknown;
+    readiness?: unknown;
   };
   if (!Array.isArray(machines)) throw new Error("This build sent a VM list that Dial could not read.");
   const seen = new Set<string>();
@@ -126,7 +152,7 @@ export function parseVmList(raw: unknown): AppVmList {
     }
   }
   const hosts = Array.isArray(sshHosts) ? sshHosts.filter((h): h is string => typeof h === "string" && isSshAlias(h)) : [];
-  return { machines: out, notices: lines, sshLinks: links, sshHosts: hosts };
+  return { machines: out, notices: lines, sshLinks: links, sshHosts: hosts, readiness: parseReadiness(readiness) };
 }
 
 /** The display label for a wire target. */
@@ -341,7 +367,18 @@ export const appRunnerApi = {
     invoke<AppRunnerState>("app_runner_state", { workspaceRoot, guestTarget }),
   importDisk: (workspaceRoot: string, guestTarget: AppGuestTarget) =>
     invoke<boolean>("app_runner_import", { workspaceRoot, guestTarget }),
-  /** The backend's preference for this machine; explicit `default` always selects the unlabelled disk. */
+  /** Progress of a running disk import (`app_disk.rs` `ImportProgress`), in bytes. */
+  onImportProgress: (handler: (event: AppImportProgress) => void) =>
+    listen<AppImportProgress>("app_runner_import", (e) => handler(e.payload)),
+  /** Stop the disk import in flight; the backend removes its partial copy and the import resolves `false`. */
+  cancelImport: () => invoke<void>("app_runner_import_cancel"),
+  /**
+   * Delete the imported QEMU base disk of `guestTarget` after the backend's own native confirmation.
+   * `false` when the user cancelled or no disk was installed. `vm` and `macos` are refused.
+   */
+  removeDisk: (workspaceRoot: string, guestTarget: AppGuestTarget) =>
+    invoke<boolean>("app_runner_remove_disk", { workspaceRoot, guestTarget }),
+  /** The backend's preference for this machine; explicit `default` always selects the disk with no OS label. */
   preferredTarget: () => invoke<string>("app_runner_preferred_target"),
   /**
    * Boot the project's guest, or connect to the chosen VM (`guestTarget` `vm`, with its `vmId`).
@@ -367,6 +404,8 @@ export const appRunnerApi = {
       user,
       openTerminal,
     }),
+  /** Stop waiting on a running **Set up SSH** for `runId`; the setup call then returns with an error. */
+  vmSshSetupCancel: (runId: string) => invoke<void>("app_runner_vm_ssh_setup_cancel", { runId }),
   /** The newest frame of a run, for a pane that reattaches. Null until the guest has a screen. */
   frame: (runId: string, workspaceRoot: string) =>
     invoke<AppFrameView | null>("app_runner_frame", { runId, workspaceRoot }),
@@ -389,6 +428,27 @@ export const appRunnerApi = {
     listen<AppRevealEvent>("app_runner_reveal", (e) => handler(e.payload)),
 };
 
+/** `app_runner_import` event payload: bytes copied so far of the disk's total size. */
+export interface AppImportProgress {
+  copied: number;
+  total: number;
+  /** `qemu-img` is converting a QCOW2, VMDK or VDI disk: `copied` of `total` is the share done. */
+  converting?: boolean;
+}
+
+/** "42% · 3.1 of 7.4 GB copied" for an import in flight; sizes in GiB like the backend's `human_size`. */
+export function importProgressText(progress: AppImportProgress): string {
+  if (progress.converting) {
+    const share = progress.total > 0 ? Math.min(1, Math.max(0, progress.copied / progress.total)) : 0;
+    return `Converting to raw with qemu-img · ${Math.floor(share * 100)}%`;
+  }
+  const gb = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
+  const total = Math.max(0, progress.total);
+  const copied = Math.min(Math.max(0, progress.copied), total || Infinity);
+  if (!total) return `${gb(copied)} GB copied`;
+  return `${Math.floor((copied / total) * 100)}% · ${gb(copied)} of ${gb(total)} GB copied`;
+}
+
 /** One part of the host's setup (`host.rs` `Step`). */
 export interface AppHostStep {
   id: string;
@@ -396,7 +456,7 @@ export interface AppHostStep {
   status: "ready" | "missing" | "blocked";
   detail: string;
   /** `install` runs `app_runner_host_install`; `import` opens the guest disk import. */
-  action?: { label: string; kind: "install" | "import"; admin: boolean } | null;
+  action?: { label: string; kind: "install" | "import"; admin: boolean; cancellable?: boolean } | null;
 }
 
 /** `app_runner_host`: the hypervisor built into this computer and what it still needs. */
@@ -417,6 +477,8 @@ export const appHostApi = {
   setup: () => invoke<AppHostSetup>("app_runner_host"),
   /** Asks for native confirmation, runs the step's fixed install action, and returns the new setup. */
   install: (step: string) => invoke<AppHostSetup>("app_runner_host_install", { step }),
+  /** Stop the running install when its step is cancellable; `false` when nothing could be cancelled. */
+  cancel: () => invoke<boolean>("app_runner_host_cancel"),
   onProgress: (handler: (event: AppHostProgress) => void) =>
     listen<AppHostProgress>("app_runner_host", (e) => handler(e.payload)),
 };
@@ -468,4 +530,68 @@ export function modifiersOf(event: { shiftKey: boolean; ctrlKey: boolean; altKey
   if (event.altKey) out.push("Alt");
   if (event.metaKey) out.push("Meta");
   return out;
+}
+
+/** Key combinations the guest screen's **Send keys** menu offers; DOM `code`s, modifiers first. */
+export const GUEST_KEY_COMBOS: readonly { label: string; codes: string[] }[] = [
+  { label: "Ctrl+Alt+Delete", codes: ["ControlLeft", "AltLeft", "Delete"] },
+  { label: "Ctrl+Alt+T (terminal)", codes: ["ControlLeft", "AltLeft", "KeyT"] },
+  { label: "Windows / ⌘ key", codes: ["MetaLeft"] },
+  { label: "Esc", codes: ["Escape"] },
+  { label: "Alt+Tab", codes: ["AltLeft", "Tab"] },
+  { label: "Alt+F4", codes: ["AltLeft", "F4"] },
+  ...Array.from({ length: 12 }, (_, i) => ({ label: `F${i + 1}`, codes: [`F${i + 1}`] })),
+];
+
+/** A combination as live key events: each key down in order, then up in reverse. */
+export function comboInputs(codes: readonly string[]): AppInput[] {
+  return [
+    ...codes.map((code): AppInput => ({ kind: "key", code, down: true })),
+    ...[...codes].reverse().map((code): AppInput => ({ kind: "key", code, down: false })),
+  ];
+}
+
+/** Longest text **Paste text** types into the guest at once. */
+export const MAX_TYPED_TEXT = 2000;
+
+const SHIFTED_DIGITS = ")!@#$%^&*(";
+const PUNCTUATION: Record<string, [string, boolean]> = {
+  " ": ["Space", false], "\n": ["Enter", false], "\t": ["Tab", false],
+  "-": ["Minus", false], _: ["Minus", true], "=": ["Equal", false], "+": ["Equal", true],
+  "[": ["BracketLeft", false], "{": ["BracketLeft", true], "]": ["BracketRight", false], "}": ["BracketRight", true],
+  "\\": ["Backslash", false], "|": ["Backslash", true], ";": ["Semicolon", false], ":": ["Semicolon", true],
+  "'": ["Quote", false], '"': ["Quote", true], "`": ["Backquote", false], "~": ["Backquote", true],
+  ",": ["Comma", false], "<": ["Comma", true], ".": ["Period", false], ">": ["Period", true],
+  "/": ["Slash", false], "?": ["Slash", true],
+};
+
+/** The US-layout key and Shift state that type `char`, or null when no single key does. */
+export function keyForChar(char: string): { code: string; shift: boolean } | null {
+  if (/^[a-z]$/.test(char)) return { code: `Key${char.toUpperCase()}`, shift: false };
+  if (/^[A-Z]$/.test(char)) return { code: `Key${char}`, shift: true };
+  if (/^[0-9]$/.test(char)) return { code: `Digit${char}`, shift: false };
+  const shifted = SHIFTED_DIGITS.indexOf(char);
+  if (shifted >= 0) return { code: `Digit${shifted}`, shift: true };
+  const mapped = PUNCTUATION[char];
+  return mapped ? { code: mapped[0], shift: mapped[1] } : null;
+}
+
+/**
+ * Text as live key events on a US keyboard layout (the guest must use one for symbols to come out
+ * right). `\r\n` types one Enter. Characters no key types (emoji, accents) are skipped and counted.
+ */
+export function textInputs(text: string): { inputs: AppInput[]; typed: number; skipped: number } {
+  const inputs: AppInput[] = [];
+  let typed = 0;
+  let skipped = 0;
+  for (const char of Array.from(text.replace(/\r\n?/g, "\n")).slice(0, MAX_TYPED_TEXT)) {
+    const key = keyForChar(char);
+    if (!key) {
+      skipped++;
+      continue;
+    }
+    inputs.push(...comboInputs(key.shift ? ["ShiftLeft", key.code] : [key.code]));
+    typed++;
+  }
+  return { inputs, typed, skipped };
 }

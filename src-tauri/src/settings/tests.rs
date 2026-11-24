@@ -10,6 +10,7 @@ fn saved(entries: &[(&str, Value, bool)]) -> HashMap<String, SavedSetting> {
                 SavedSetting {
                     value: value.clone(),
                     redacted: *redacted,
+                    scope: None,
                 },
             )
         })
@@ -267,4 +268,25 @@ fn tables_fold_leaf_keys_and_hide_credentials() {
         json!({"connect_timeout_secs": 30, "hosts": {"a": {"port": 22}}})
     );
     assert!(!ssh.redacted && ssh.modified);
+}
+
+#[test]
+fn rows_report_the_layer_that_sets_them() {
+    let mut values = saved(&[
+        ("ui.theme", json!("dark"), false),
+        ("providers.openai.base_url", json!("https://x"), false),
+        ("providers.local.base_url", json!("http://localhost:1234/v1"), false),
+    ]);
+    values.get_mut("ui.theme").unwrap().scope = Some("project".into());
+    values.get_mut("providers.openai.base_url").unwrap().scope = Some("global".into());
+    values.get_mut("providers.local.base_url").unwrap().scope = Some("project".into());
+    let page = view(&schema(), &values);
+    let row = |key: &str| page.settings.iter().find(|s| s.key == key).unwrap();
+    assert_eq!(row("ui.theme").source.as_deref(), Some("project"));
+    // A table is set for the project when any of its leaves is.
+    assert_eq!(row("providers").source.as_deref(), Some("project"));
+    // Unset rows, and every row from an engine without layers, have no source.
+    assert_eq!(row("ssh").source, None);
+    let json = serde_json::to_value(row("ssh")).unwrap();
+    assert!(json.get("source").is_none());
 }

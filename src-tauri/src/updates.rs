@@ -195,9 +195,9 @@ fn install_separate(
         .map_err(|e| e.to_string())?;
     let log = install(directory.path())?;
     let binary = directory.path().join(DIAL_NAME);
-    if !binary.is_file() {
+    if !crate::launcher::is_executable(&binary) {
         return Err(format!(
-            "The installer did not create {}.\n{log}",
+            "The installer did not create an executable at {}.\n{log}",
             binary.display()
         ));
     }

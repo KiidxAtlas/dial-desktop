@@ -98,8 +98,13 @@ export async function setPlanMode(enabled: boolean) {
 
 export interface Job { name: string; command: string; status: string; running: boolean; stop_requested: boolean; terminal: boolean }
 
-export async function listJobs() {
-  return (await engineCall<{ jobs: Job[] }>("list_jobs")).jobs ?? [];
+export interface JobList {
+  jobs: Job[];
+  persistent_jobs?: { name: string; status: string; lifetime_secs: number | null }[];
+  persistent_error?: string;
+}
+export async function listJobs(root: string) {
+  return engineCall<JobList>("list_jobs", { include_persistent: true }, root);
 }
 
 // ── Checkpoints ───────────────────────────────────────────────────────────────

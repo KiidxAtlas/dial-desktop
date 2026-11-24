@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { canRemoveKey, removeSavedKey } from "../providerKeys";
-import { engine, openExternal, providerApi, type KeyProvider, type ProviderAccount, type ProviderEvent } from "../bridge";
-import type { OpenSnapshot } from "../types";
+import { engine, models, openExternal, providerApi, settings, settingsPage, type KeyProvider, type ProviderAccount, type ProviderEvent } from "../bridge";
+import { applySaved, engineCall, readable } from "../engineTools";
+import { checkEndpoint, editedTable, endpointForm, endpointTable, ENDPOINT_PROTOCOLS, testProviderId, testResult, type EndpointForm, type ListedReply, type TestResult } from "../providerEndpoint";
+import type { OpenSnapshot, SettingScope } from "../types";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
 
@@ -127,14 +129,187 @@ async function cancel() {
   try { await providerApi.cancel(session, busy.value); }
   catch (e) { if (busy.value) error.value = String(e); cancelling.value = false; }
 }
+
+// ── Connection tests ─────────────────────────────────────────────────────────
+
+/** The last test per `list_models` provider id; shown under the row that ran it. */
+const tests = ref<Record<string, { busy: boolean; result?: TestResult; error?: string }>>({});
+async function testConnection(provider: string) {
+  if (tests.value[provider]?.busy) return;
+  tests.value = { ...tests.value, [provider]: { busy: true } };
+  let next: { busy: boolean; result?: TestResult; error?: string };
+  try {
+    // A test right after saving an endpoint must see it: wait for that apply first.
+    await applying?.catch(() => {});
+    const reply = await engineCall<ListedReply>("list_models", { provider, refresh: true });
+    next = { busy: false, result: testResult(reply, provider) };
+    if (next.result?.ok) void engine.refreshModels();
+  } catch (e) {
+    next = { busy: false, error: `Test failed: ${readable(e)}` };
+  }
+  tests.value = { ...tests.value, [provider]: next };
+}
+const testText = (provider: string) => {
+  const t = tests.value[provider];
+  return !t ? "" : t.busy ? "Testing…" : t.error ?? t.result?.text ?? "";
+};
+/** A short tag beside the row's name; the description carries the full result. */
+const testStatus = (provider: string) => {
+  const t = tests.value[provider];
+  if (!t) return null;
+  if (t.busy) return { text: "Testing…" };
+  return t.error || !t.result?.ok ? { text: "Failed", kind: "bad" as const } : { text: "Connected", kind: "ok" as const };
+};
+
+// ── Custom endpoints (`providers.<id>`) ──────────────────────────────────────
+
+/** The saved `providers` table, and the layer that sets it (when the engine says). */
+const providersRow = computed(() => settingsPage.value?.settings.find((s) => s.key === "providers"));
+const savedTables = computed<Record<string, Record<string, unknown>>>(() => {
+  const table = providersRow.value?.value;
+  if (!table || typeof table !== "object" || Array.isArray(table)) return {};
+  return Object.fromEntries(Object.entries(table as Record<string, unknown>).filter(([, spec]) => spec && typeof spec === "object" && !Array.isArray(spec))) as Record<string, Record<string, unknown>>;
+});
+/** Configured providers from the saved `providers` table (loaded with the settings page). */
+const configured = computed(() =>
+  Object.entries(savedTables.value).flatMap(([id, s]) => {
+    if (typeof s.base_url !== "string" || !s.base_url) return [];
+    return [{ id, label: typeof s.label === "string" && s.label ? s.label : id, baseUrl: s.base_url }];
+  }),
+);
+/** Where an endpoint is saved: the `providers` layer the engine reports, else everywhere. A
+ *  remove that leaves it in place (also saved in the other layer) flips to that one. */
+const otherLayer = ref<Record<string, SettingScope>>({});
+const scopeOf = (id: string): SettingScope => otherLayer.value[id] ?? (providersRow.value?.source === "project" ? "project" : "global");
+/** Every provider id Dial already knows, so a new endpoint does not replace one. */
+const knownIds = computed(() => new Set([
+  ...configured.value.map((p) => p.id),
+  ...models.value.map((m) => m.provider),
+  ...accounts.value.map((p) => testProviderId(p.provider)),
+  ...accounts.value.map((p) => p.provider),
+  ...keys.value.map((p) => testProviderId(p.provider)),
+].filter((id) => id !== editing.value)));
+const blank = (): EndpointForm => ({ id: "", label: "", baseUrl: "", protocol: "chat-completions", apiKeyEnv: "", allowInsecure: false });
+const adding = ref(false), saving = ref(false), tried = ref(false), formError = ref(""), formNotice = ref("");
+/** The endpoint id being edited; `null` while adding a new one. */
+const editing = ref<string | null>(null);
+const removing = ref("");
+const form = ref<EndpointForm>(blank());
+/** A saved protocol this form does not list stays selectable (and valid) while editing. */
+const savedProtocol = computed(() => {
+  const p = editing.value ? savedTables.value[editing.value]?.protocol : undefined;
+  return typeof p === "string" && !ENDPOINT_PROTOCOLS.some((x) => x.value === p) ? p : "";
+});
+const protocols = computed(() => [...ENDPOINT_PROTOCOLS, ...(savedProtocol.value ? [{ value: savedProtocol.value, label: savedProtocol.value }] : [])]);
+const check = computed(() => {
+  const result = checkEndpoint(form.value, knownIds.value);
+  if (savedProtocol.value && form.value.protocol === savedProtocol.value) delete result.errors.protocol;
+  return result;
+});
+const valid = computed(() => Object.keys(check.value.errors).length === 0);
+/** The apply after the last endpoint change; tests wait for it. */
+let applying: Promise<void> | null = null;
+const applyingNow = ref(false);
+
+/** Apply saved settings and resolve once the engine has (a connection test then sees them).
+ *  Mid-turn the engine refuses; the session applies them after the turn: `false`. */
+function applyNow(): Promise<boolean> {
+  const run = (async () => {
+    if (props.snap.turnRunning) {
+      await applySaved();
+      return false;
+    }
+    try {
+      await engineCall("apply_settings");
+    } catch {
+      await applySaved();
+      return false;
+    }
+    // Re-read the saved values and wait for the fresh page, so the list shows the change.
+    await settings.load();
+    const shown = settingsPage.value;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { stop(); resolve(); }, 5000);
+      const stop = watch(settingsPage, (page) => { if (page !== shown) { clearTimeout(timer); stop(); resolve(); } });
+    });
+    void engine.refreshModels();
+    return true;
+  })();
+  applyingNow.value = true;
+  const done = run.then(() => {}, () => {}).finally(() => { if (applying === done) { applying = null; applyingNow.value = false; } });
+  applying = done;
+  return run;
+}
+
+function openForm(id: string | null = null) {
+  editing.value = id;
+  form.value = id && savedTables.value[id] ? endpointForm(id, savedTables.value[id]) : blank();
+  tried.value = false;
+  formError.value = formNotice.value = "";
+  adding.value = true;
+}
+async function saveEndpoint() {
+  tried.value = true;
+  if (!valid.value || saving.value) return;
+  const id = form.value.id.trim(), edit = editing.value;
+  const where: SettingScope = edit ? scopeOf(edit) : "global";
+  const name = form.value.label.trim() || id;
+  const keyNote = form.value.apiKeyEnv.trim() ? ` Dial reads its key from $${form.value.apiKeyEnv.trim()} when it starts.` : "";
+  saving.value = true;
+  formError.value = formNotice.value = "";
+  try {
+    // One table, so the engine never sees a half-made provider.
+    const value = edit ? editedTable(savedTables.value[edit] ?? {}, form.value) : endpointTable(form.value);
+    await engineCall("set_setting", { key: `providers.${id}`, value, scope: where });
+    adding.value = false;
+    editing.value = null;
+    formNotice.value = `Saved “${name}”${where === "project" ? " for this project" : " for every project"}. Applying…`;
+    saving.value = false;
+    const applied = await applyNow();
+    formNotice.value = `Saved “${name}”${where === "project" ? " for this project" : " for every project"}.${keyNote}${applied ? " Testing the connection…" : " It applies when the running turn ends; test it then."}`;
+    if (applied) await testConnection(id);
+  } catch (e) {
+    formError.value = `Could not save the endpoint: ${readable(e)}`;
+  } finally {
+    saving.value = false;
+  }
+}
+async function removeEndpoint(p: { id: string; label: string }) {
+  if (removing.value) return;
+  const where = scopeOf(p.id);
+  const ok = await ask(
+    `Remove the “${p.label}” endpoint (providers.${p.id}) from Dial’s configuration ${where === "project" ? "for this project" : "for every project"}? Sessions using its models need another model afterwards. The server itself and any API key variable are untouched.`,
+    { title: "Remove endpoint?", kind: "warning", okLabel: "Remove", cancelLabel: "Cancel" },
+  ).catch(() => false);
+  if (!ok) return;
+  removing.value = p.id;
+  formError.value = formNotice.value = "";
+  try {
+    await engineCall("reset_setting", { key: `providers.${p.id}`, scope: where });
+    const applied = await applyNow();
+    const left = configured.value.some((c) => c.id === p.id);
+    if (left) otherLayer.value = { ...otherLayer.value, [p.id]: where === "project" ? "global" : "project" };
+    else { const { [p.id]: _, ...rest } = otherLayer.value; otherLayer.value = rest; }
+    const { [p.id]: __, ...tested } = tests.value;
+    tests.value = tested;
+    formNotice.value = left
+      ? `Removed “${p.label}” ${where === "project" ? "from this project" : "from every project"}, but it is also saved ${where === "project" ? "for every project" : "for this project"}. Remove it again to remove that one too.`
+      : `Removed “${p.label}”.${applied ? "" : " The session drops it when the running turn ends."}`;
+  } catch (e) {
+    formError.value = `Could not remove the endpoint: ${readable(e)}`;
+  } finally {
+    removing.value = "";
+  }
+}
 </script>
 
 <template>
   <p v-if="unavailable" class="s-note">{{ unavailable }}</p>
   <template v-else>
     <SGroup title="Provider account" description="Connect a subscription or sign in with your provider.">
-      <SRow v-if="loaded && account" label="Account" :description="account.signed_in ? 'Signed in' : 'Not signed in'">
-        <select v-model="accountId" aria-label="Account provider" :disabled="!!busy"><option v-for="p in accounts" :key="p.provider" :value="p.provider">{{ p.name }}</option></select>
+      <SRow v-if="loaded && account" label="Account" :description="[account.signed_in ? 'Signed in' : 'Not signed in', account.signed_in && testText(testProviderId(account.provider))].filter(Boolean).join(' · ')" :status="account.signed_in ? testStatus(testProviderId(account.provider)) : null">
+        <select v-model="accountId" class="s-select" aria-label="Account provider" :disabled="!!busy"><option v-for="p in accounts" :key="p.provider" :value="p.provider">{{ p.name }}</option></select>
+        <button v-if="account.signed_in" class="btn btn-secondary" :disabled="!!busy || tests[testProviderId(account.provider)]?.busy" @click="testConnection(testProviderId(account.provider))">Test connection</button>
         <button class="btn btn-secondary" :disabled="!!busy" @click="start(accountId, account.signed_in)">{{ account.signed_in ? 'Sign out' : 'Sign in' }}</button>
       </SRow>
       <SRow v-else :label="loading ? 'Loading providers…' : 'Providers unavailable'" :description="loading ? undefined : 'Check the engine in Settings → Updates, then try again.'">
@@ -142,9 +317,10 @@ async function cancel() {
       </SRow>
     </SGroup>
     <SGroup v-if="loaded" title="API key" description="Use a key instead of a subscription. Dial stores it on this computer.">
-      <SRow v-if="keyProvider" label="Key provider" :description="!keyProvider.key_saved ? 'No saved key' : canRemoveKey(keyProvider) ? 'Key saved' : 'Key saved. This engine does not support removing saved keys from Desktop.'">
-        <select v-model="keyId" aria-label="API key provider" :disabled="!!busy"><option v-for="p in keys" :key="p.provider" :value="p.provider">{{ p.name }}</option></select>
+      <SRow v-if="keyProvider" label="Key provider" :description="[!keyProvider.key_saved ? 'No saved key' : canRemoveKey(keyProvider) ? 'Key saved' : 'Key saved. This engine does not support removing saved keys from Desktop.', keyProvider.key_saved && testText(testProviderId(keyProvider.provider))].filter(Boolean).join(' · ')" :status="keyProvider.key_saved ? testStatus(testProviderId(keyProvider.provider)) : null">
+        <select v-model="keyId" class="s-select" aria-label="API key provider" :disabled="!!busy"><option v-for="p in keys" :key="p.provider" :value="p.provider">{{ p.name }}</option></select>
         <button class="btn btn-secondary" :disabled="!!busy" @click="start(keyId)">{{ keyProvider.key_saved ? 'Replace key' : 'Add key' }}</button>
+        <button v-if="keyProvider.key_saved" class="btn btn-secondary" :disabled="!!busy || tests[testProviderId(keyProvider.provider)]?.busy" @click="testConnection(testProviderId(keyProvider.provider))">Test connection</button>
         <button v-if="canRemoveKey(keyProvider)" class="btn btn-secondary" :disabled="!!busy" @click="removeKey">Remove key</button>
       </SRow>
       <SRow v-else label="API-key setup unavailable" description="Update the engine in Settings → Updates to add a key here." />
@@ -152,12 +328,53 @@ async function cancel() {
     <SGroup v-if="busy" :title="busy === keyId ? keyProvider?.name : account?.name">
       <SRow :label="prompt?.message || progress" stacked>
         <form v-if="prompt" @submit.prevent="submit">
-          <input ref="input" v-model="answer" :aria-label="prompt.message" :placeholder="prompt.placeholder || undefined" :type="prompt.secret ? 'password' : 'text'" autocomplete="off" spellcheck="false" />
+          <input ref="input" v-model="answer" class="s-input grow" :aria-label="prompt.message" :placeholder="prompt.placeholder || undefined" :type="prompt.secret ? 'password' : 'text'" autocomplete="off" spellcheck="false" />
           <button class="btn btn-primary" :disabled="cancelling || (!answer && !prompt.allow_empty)">{{ busy === keyId ? 'Save key' : 'Continue' }}</button>
         </form>
         <button v-if="url" class="btn btn-secondary" @click="openExternal(url)">Open sign-in page</button>
         <button v-if="!signingOut" class="btn btn-secondary" :disabled="cancelling" @click="cancel">Cancel</button>
       </SRow>
+    </SGroup>
+    <SGroup title="Custom endpoints" description="OpenAI-compatible and self-hosted servers: Ollama, LM Studio, vLLM, OpenRouter or a company proxy. New ones are saved for every project.">
+      <SRow v-for="p in configured" :key="p.id" :label="p.label" :description="testText(p.id) ? `${p.baseUrl} · ${testText(p.id)}` : p.baseUrl" :hint="`providers.${p.id}${scopeOf(p.id) === 'project' ? ' · this project' : ''}`" :status="applyingNow && !tests[p.id] ? { text: 'Applying…' } : testStatus(p.id)">
+        <button class="btn btn-secondary" :disabled="tests[p.id]?.busy || removing === p.id" :title="applyingNow ? 'Waits for the saved settings to apply' : undefined" @click="testConnection(p.id)">Test connection</button>
+        <button class="btn btn-secondary" :disabled="saving || removing === p.id || (adding && editing === p.id)" @click="openForm(p.id)">Edit</button>
+        <button class="btn btn-secondary" :disabled="saving || !!removing" @click="removeEndpoint(p)">{{ removing === p.id ? "Removing…" : "Remove" }}</button>
+      </SRow>
+      <SRow v-if="!adding" :label="configured.length ? 'Add another endpoint' : 'No custom endpoints'" description="Point Dial at any server that speaks a supported protocol.">
+        <button class="btn btn-secondary" :disabled="unavailable !== ''" @click="openForm()">Add custom endpoint</button>
+      </SRow>
+      <SRow v-else :label="editing ? `Edit “${configured.find((c) => c.id === editing)?.label ?? editing}”` : 'Add custom endpoint'" :description="editing ? `Saved ${scopeOf(editing) === 'project' ? 'for this project' : 'for every project'}; other keys in its table are kept.` : undefined" stacked>
+        <form class="endpoint" novalidate @submit.prevent="saveEndpoint">
+          <label>Id
+            <input v-model="form.id" placeholder="my-proxy" autocomplete="off" spellcheck="false" class="s-input mono" :readonly="!!editing" :title="editing ? 'The id names the provider in model ids; remove and add again to change it' : undefined" :aria-invalid="tried && !!check.errors.id" />
+            <span v-if="tried && check.errors.id" class="s-error">{{ check.errors.id }}</span>
+          </label>
+          <label>Name
+            <input v-model="form.label" class="s-input" :placeholder="form.id || 'My proxy'" autocomplete="off" />
+          </label>
+          <label class="wide">Base URL
+            <input v-model="form.baseUrl" placeholder="http://localhost:11434/v1" autocomplete="off" spellcheck="false" class="s-input mono" :aria-invalid="tried && !!check.errors.baseUrl" />
+            <span v-if="tried && check.errors.baseUrl" class="s-error">{{ check.errors.baseUrl }}</span>
+            <span v-for="w in check.warnings" :key="w" class="s-warn">{{ w }}</span>
+          </label>
+          <label>Protocol
+            <select v-model="form.protocol" class="s-select"><option v-for="p in protocols" :key="p.value" :value="p.value">{{ p.label }}</option></select>
+          </label>
+          <label>API key variable (optional)
+            <input v-model="form.apiKeyEnv" placeholder="MY_PROXY_API_KEY" autocomplete="off" spellcheck="false" class="s-input mono" :aria-invalid="tried && !!check.errors.apiKeyEnv" />
+            <span v-if="tried && check.errors.apiKeyEnv" class="s-error">{{ check.errors.apiKeyEnv }}</span>
+          </label>
+          <label class="check wide"><input v-model="form.allowInsecure" type="checkbox" /> Allow plain HTTP to a non-local host (allow_insecure)</label>
+          <p class="s-note wide">The key itself is never stored here: set the variable in your shell (for example <code>export MY_PROXY_API_KEY=…</code>) before starting Dial. Local servers usually need no key.</p>
+          <div class="actions wide">
+            <button class="btn btn-secondary" type="button" :disabled="saving" @click="adding = false; editing = null">Cancel</button>
+            <button class="btn btn-primary" type="submit" :disabled="saving || (tried && !valid)">{{ saving ? "Saving…" : editing ? "Save changes" : "Save endpoint" }}</button>
+          </div>
+        </form>
+      </SRow>
+      <p v-if="formError" role="alert" class="s-note bad">{{ formError }}</p>
+      <p v-if="formNotice" role="status" class="s-note">{{ formNotice }}</p>
     </SGroup>
     <p v-if="error" role="alert" class="s-note">{{ error }}</p>
     <p v-if="notice" role="status" class="s-note">{{ notice }}</p>
@@ -165,7 +382,16 @@ async function cancel() {
 </template>
 
 <style scoped>
-select, input { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); padding: 6px 8px; font: inherit; }
-select { max-width: min(240px, 100%); }
+/* Inputs and selects use the shared .s-input / .s-select (settings.css). */
 form { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.grow { flex: 1; }
+.endpoint { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 10px 12px; width: 100%; }
+.endpoint label { display: flex; flex-direction: column; gap: 4px; font-size: var(--text-sm); color: var(--text-muted); }
+.endpoint label.check { flex-direction: row; align-items: center; gap: 6px; }
+.endpoint .wide { grid-column: 1 / -1; }
+.endpoint .actions { display: flex; justify-content: flex-end; gap: 8px; }
+.endpoint .s-input, .endpoint .s-select { width: 100%; max-width: 100%; }
+.mono { font-family: var(--font-mono); }
+.s-warn { font-size: 12px; color: var(--warning); }
+.bad { color: var(--danger); }
 </style>

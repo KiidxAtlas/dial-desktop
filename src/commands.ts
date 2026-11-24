@@ -6,7 +6,7 @@ import { recentProjects } from "./projects";
 import type { OpenSnapshot } from "./types";
 import { focusComposer, ui, type SettingsTab } from "./ui";
 import { appearance, zoomBy, type Theme } from "./appearance";
-import { showPanel, workspace } from "./workspace";
+import { showPanel, showSidebar, sidebarShown, toggleSidebar, workspace } from "./workspace";
 import { checkApp, checkEngine } from "./updates";
 import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "./taskRecipes";
 import { markTurnAborted } from "./queue";
@@ -117,7 +117,7 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "focus-composer", group: "Session", label: "Focus the message box", icon: "pencil", hint: "⌘L", keywords: "type prompt input", run: () => { ui.settingsOpen = false; focusComposer(); } });
   add({ id: "next-session", group: "Session", label: "Next session", icon: "arrowDown", hint: "⇧⌘]", keywords: "switch down", run: () => stepSession(snap, 1) }, sessionOrder(snap).length > 1);
   add({ id: "prev-session", group: "Session", label: "Previous session", icon: "arrowUp", hint: "⇧⌘[", keywords: "switch up", run: () => stepSession(snap, -1) }, sessionOrder(snap).length > 1);
-  add({ id: "search-sessions", group: "Session", label: "Search sessions", icon: "search", hint: "⇧⌘F", keywords: "filter find sidebar", run: () => { ui.sidebarOpen = true; ui.focusSearch++; } });
+  add({ id: "search-sessions", group: "Session", label: "Search sessions", icon: "search", hint: "⇧⌘F", keywords: "filter find sidebar", run: () => { showSidebar(); ui.focusSearch++; } });
 
   if (canUseTaskRecipes(snap)) {
     for (const recipe of taskRecipes()) {
@@ -145,7 +145,7 @@ export function commands(snap: OpenSnapshot): Command[] {
     },
   });
 
-  add({ id: "sidebar", group: "View", label: ui.sidebarOpen ? "Hide sidebar" : "Show sidebar", icon: "panelLeft", hint: "⌘B", run: () => (ui.sidebarOpen = !ui.sidebarOpen) });
+  add({ id: "sidebar", group: "View", label: sidebarShown() ? "Hide sidebar" : "Show sidebar", icon: "panelLeft", hint: "⌘B", run: toggleSidebar });
   add({
     id: "inspector",
     group: "View",
@@ -160,6 +160,9 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "quick-open", group: "View", label: "Quick-open project file", icon: "file", hint: "⌘P", run: () => { ui.filePalette = true; ui.paletteOpen = true; } });
   add({ id: "terminal", group: "View", label: "Open the terminal", icon: "terminal", hint: "⌃`", keywords: "shell console commands run", run: () => showPanel("terminal") });
   add({ id: "changes", group: "View", label: "Show changed files", icon: "diff", keywords: "diff review edits", run: () => showPanel("changes") });
+  add({ id: "activity", group: "View", label: "Open Activity", icon: "activity", keywords: "watch jobs tool calls /watch", run: () => showPanel("activity") });
+  add({ id: "workers", group: "View", label: "Open Workers", icon: "chip", keywords: "session tasks messages", run: () => showPanel("workers") });
+  add({ id: "peers", group: "View", label: "Open Peers", icon: "chat", keywords: "project sessions messages", run: () => showPanel("peers") });
   add({
     id: "auto-previews",
     group: "View",
@@ -293,7 +296,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     group: "General",
     keys: [
       ["⌘K", "Command palette"],
-      ["⌘/Ctrl+P", "Quick-open project file"],
+      ["⌘P", "Quick-open project file"],
       ["⌘N", "New session"],
       ["⌘,", "Settings"],
       ["⌘/", "Keyboard shortcuts"],
@@ -312,24 +315,26 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["Enter", "Send (while Dial works: add a note)"],
       ["⇧Enter", "New line"],
       ["⌥⌘↑ / ⌥⌘↓", "Previous / next prompt you sent"],
-      ["⌘/Ctrl+Enter", "Queue a follow-up during a turn"],
+      ["⌘Enter", "Queue a follow-up during a turn"],
       ["@", "Find and insert a project file path"],
       ["⌘F", "Find in conversation"],
       ["↑  ↓", "Earlier prompts (in an empty box)"],
-      ["Esc", "Stop the turn"],
+      ["Esc", "Stop the turn (an open menu closes first; not from the terminal or other fields)"],
       ["⇧⌘M", "Change model"],
       ["⇧⌘V", "Voice: start talking, stop recording, or interrupt a spoken reply"],
       ["/", "Slash commands"],
+      ["Enter  ⌘⌫", "Approval card: allow once (Allow has focus) / deny"],
     ],
   },
   {
     group: "Sessions",
     keys: [
       ["⌘-click  ⇧-click", "Select several"],
-      ["⌘A", "Select all (with a selection)"],
-      ["⌫", "Delete the selected"],
-      ["⌘1 … ⌘9", "Open a session by position (hold ⌘ to see numbers)"],
-      ["⇧⌘[  ⇧⌘]", "Previous or next session (also ⌃⇧Tab, ⌃Tab)"],
+      ["⌘A", "Select all (in the session list with a selection)"],
+      ["⌫", "Move selected to Recently Deleted"],
+      ["⌘1 … ⌘9", "Open a session by position (hold the modifier to see numbers)"],
+      ["⇧⌘[  ⇧⌘]", "Previous or next session"],
+      ["⌃⇧Tab  ⌃Tab", "Cycle sessions backward or forward"],
       ["⇧⌘F", "Search sessions (Esc clears)"],
       ["F2  double-click", "Rename"],
       ["Right-click", "Session actions"],

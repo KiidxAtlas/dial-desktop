@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 use tauri::State;
 use std::path::Path;
 mod setup;
+mod atomic;
+mod progress;
+mod snapshots;
+#[tauri::command]
+pub async fn atomic_engine_setup(app: tauri::AppHandle) -> Result<bool, String> {
+    atomic::setup(app).await
+}
 #[tauri::command]
 pub async fn model_hub_setup(app: tauri::AppHandle) -> Result<bool, String> {
     setup::setup(app).await
@@ -21,6 +28,8 @@ struct Model {
     repo: String,
     revision: String,
     file: Option<String>,
+    #[serde(default)]
+    companions: Vec<String>,
 }
 
 /// A Hub repo id, `owner/name`: letters, digits, `-`, `_` and `.`, never an option or a path.
@@ -28,6 +37,7 @@ fn valid_repo(repo: &str) -> bool {
     let part = |p: &str| {
         !p.is_empty()
             && !p.starts_with(['-', '.'])
+            && !p.contains("--")
             && !p.contains("..")
             && p.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
@@ -76,20 +86,22 @@ fn hf_missing(e: std::io::Error) -> String {
 
 /// `hf download` for `repo`: a curated model at its pinned revision and file, or any other Hub
 /// repo (its whole main branch, or just `file`).
-fn download_command(program: &Path, repo: &str, file: Option<&str>) -> Result<Command, String> {
+fn download_command(program: &Path, repo: &str, file: Option<&str>) -> Result<(Command, bool), String> {
     if file.is_some_and(split_gguf) {
         return Err("Split GGUF models are not supported by the Model Library".into());
     }
     let models: Vec<Model> = serde_json::from_str(include_str!("../../src/modelLibrary.json"))
         .map_err(|_| "Model catalog unavailable")?;
     let mut cmd = hf(program);
+    let mut files = Vec::new();
     if let Some(m) = models
         .into_iter()
         .find(|m| m.repo == repo && (file.is_none() || file == m.file.as_deref()))
     {
         cmd.args(["download", &m.repo, "--revision", &m.revision]);
-        if let Some(file) = m.file {
-            cmd.arg(file);
+        if let Some(selected) = m.file {
+            files.push(selected);
+            if file.is_none() { files.extend(m.companions); }
         }
     } else {
         if !valid_repo(repo) {
@@ -100,11 +112,14 @@ fn download_command(program: &Path, repo: &str, file: Option<&str>) -> Result<Co
             if !valid_file(file) {
                 return Err("Not a file in that model".into());
             }
-            cmd.arg(file);
+            files.push(file.to_owned());
         }
     }
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    Ok(cmd)
+    cmd.args(&files);
+    progress::configure(&mut cmd);
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // hf downloads exactly one filename directly; zero or multiple filenames use snapshot_download.
+    Ok((cmd, files.len() == 1))
 }
 
 /// Run `cmd` with a deadline and bounded stdout/stderr; kills the child on timeout.
@@ -268,28 +283,46 @@ struct Job {
     child: Option<Child>,
     cache_lock: Option<std::fs::File>,
     status: Status,
+    started: Option<Instant>,
+    report: std::sync::Arc<Mutex<progress::Report>>,
+    failed_exit: Option<std::process::ExitStatus>,
 }
 #[derive(Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Status {
     repo: String,
     running: bool,
     message: String,
+    file: Option<String>,
+    expected_bytes: u64,
+    #[serde(flatten)]
+    progress: progress::Metrics,
+    elapsed_secs: u64,
+    retryable: bool,
 }
 impl Job {
     fn refresh(&mut self) -> Result<(), String> {
+        if let Some(t) = self.started { self.status.elapsed_secs = t.elapsed().as_secs(); }
+        let report = self.report.lock().map_err(|_| "Download progress unavailable")?.clone();
+        self.status.progress = report.metrics;
         if let Some(child) = self.child.as_mut()
             && let Some(exit) = child.try_wait().map_err(|e| e.to_string())?
         {
             self.child = None;
             self.cache_lock = None;
             self.status.running = false;
+            self.started = None;
             self.status.message = if exit.success() {
                 "Download complete. Open the session model picker to use it.".into()
             } else {
-                format!(
-                    "Download failed ({exit}). Check your connection, free disk space and Hugging Face CLI installation, then retry."
-                )
+                self.failed_exit = Some(exit);
+                self.status.retryable = true;
+                String::new()
             };
+        }
+        if let Some(exit) = self.failed_exit {
+            let advice = report.recovery.unwrap_or("Check your connection, free disk space and Hugging Face CLI installation, then retry.");
+            self.status.message = format!("Download failed ({exit}). {advice}");
         }
         Ok(())
     }
@@ -303,12 +336,20 @@ impl Job {
             self.child = None;
             self.cache_lock = None;
             self.status.running = false;
+            self.started = None;
+            self.status.retryable = true;
             self.status.message = "Cancelled. Cached files can be reused on retry.".into();
         }
         Ok(())
     }
 }
 impl Downloads {
+    pub(crate) fn running(&self) -> bool {
+        let mut job = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = job.refresh();
+        job.child.is_some()
+    }
+
     pub fn stop(&self) {
         let _ = self.0.lock().unwrap_or_else(|e| e.into_inner()).cancel();
     }
@@ -328,6 +369,7 @@ pub fn model_download_start(
     downloads: State<'_, Downloads>,
     repo: String,
     file: Option<String>,
+    expected_bytes: u64,
 ) -> Result<Option<Status>, String> {
     let mut job = downloads
         .0
@@ -341,23 +383,37 @@ pub fn model_download_start(
     let lock = lock_cache_repo(&cache, &repo)?;
     // A missing executable is distinct from permission, cache and model errors. Only that case
     // prompts the GUI to offer setup and retry the exact download that was already confirmed.
-    job.child = Some(match download_command(&setup::hf_program(&app)?, &repo, file.as_deref())?.spawn() {
+    let (mut command, single_file) = download_command(&setup::hf_program(&app)?, &repo, file.as_deref())?;
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(hf_missing(e)),
-    });
+    };
+    job.report = std::sync::Arc::new(Mutex::new(progress::Report::new(single_file)));
+    if let Some(stderr) = child.stderr.take() {
+        let report = job.report.clone();
+        std::thread::spawn(move || progress::drain(stderr, &report));
+    }
+    job.started = Some(Instant::now());
+    job.failed_exit = None;
+    job.child = Some(child);
     job.cache_lock = Some(lock);
     job.status = Status {
         repo,
         running: true,
         message: "Downloading to your Hugging Face cache…".into(),
+        file,
+        expected_bytes,
+        ..Status::default()
     };
     // Release the cache lock even if the user closes the Model Library while hf runs.
     let downloads = std::sync::Arc::downgrade(&downloads.0);
+    let report = job.report.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let Some(downloads) = downloads.upgrade() else { break };
         let Ok(mut job) = downloads.lock() else { break };
+        if !std::sync::Arc::ptr_eq(&job.report, &report) { break; }
         if job.refresh().is_err() || !job.status.running { break }
     });
     Ok(Some(job.status.clone()))
@@ -377,6 +433,7 @@ pub fn model_download_cancel(downloads: State<'_, Downloads>) -> Result<Status, 
 pub struct CachedModel {
     repo: String,
     bytes: u64,
+    files: Vec<snapshots::CachedFile>,
 }
 
 /// The hub cache `hf` uses: `HF_HUB_CACHE`, else `HF_HOME/hub`, else `$XDG_CACHE_HOME` /
@@ -392,9 +449,13 @@ fn hub_cache_from(mut var: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Op
     get("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            get("HOME")
-                .or_else(|| get("USERPROFILE"))
-                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+            // Python's expanduser on Windows uses USERPROFILE rather than a Git shell's HOME.
+            let home = if cfg!(windows) {
+                get("USERPROFILE").or_else(|| get("HOME"))
+            } else {
+                get("HOME").or_else(|| get("USERPROFILE"))
+            };
+            home.map(|h| std::path::PathBuf::from(h).join(".cache"))
         })
         .map(|c| c.join("huggingface").join("hub"))
 }
@@ -404,7 +465,7 @@ fn hub_cache() -> Option<std::path::PathBuf> {
 }
 
 /// Model repos in `cache` (`models--owner--name` folders), largest first. Sizes count the
-/// downloaded blobs (following symlinks); partial downloads (`*.incomplete`) are left out.
+/// downloaded blobs and unlinked snapshot files; partial downloads (`*.incomplete`) are left out.
 fn cached_models_in(cache: &std::path::Path) -> Vec<CachedModel> {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return Vec::new();
@@ -414,6 +475,10 @@ fn cached_models_in(cache: &std::path::Path) -> Vec<CachedModel> {
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let repo = name.strip_prefix("models--")?.replacen("--", "/", 1);
+            if !valid_repo(&repo) || !snapshots::real_dir(&entry.path()) { return None; }
+            let mut files = Vec::new();
+            let snapshot_bytes = snapshots::walk(&entry.path(), |_, f| files.push(f));
+            files.sort_by(|a, b| a.path.cmp(&b.path).then(a.revision.cmp(&b.revision)));
             let bytes = std::fs::read_dir(entry.path().join("blobs"))
                 .map(|blobs| {
                     blobs
@@ -423,10 +488,10 @@ fn cached_models_in(cache: &std::path::Path) -> Vec<CachedModel> {
                         .filter_map(|b| std::fs::metadata(b.path()).ok())
                         .filter(|m| m.is_file())
                         .map(|m| m.len())
-                        .sum()
+                        .sum::<u64>()
                 })
-                .unwrap_or(0);
-            (bytes > 0).then_some(CachedModel { repo, bytes })
+                .unwrap_or(0) + snapshot_bytes;
+            (bytes > 0 || !files.is_empty()).then_some(CachedModel { repo, bytes, files })
         })
         .collect();
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.repo.cmp(&b.repo)));
@@ -452,9 +517,7 @@ fn remove_cached_in(cache: &std::path::Path, repo: &str) -> Result<u64, String> 
         return Err("Not a Hugging Face model id".into());
     }
     let dir = cache.join(format!("models--{}", repo.replacen('/', "--", 1)));
-    let meta = std::fs::symlink_metadata(&dir)
-        .map_err(|_| format!("{repo} is not in the Hugging Face cache"))?;
-    if !meta.is_dir() {
+    if !snapshots::real_dir(&dir) {
         return Err(format!("{repo} is not a cached model folder"));
     }
     let bytes = cached_models_in(cache)
@@ -493,11 +556,33 @@ pub async fn model_cache_remove(repo: String) -> Result<u64, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Remove one GGUF entry, not the repository or any shared backing blob.
+#[tauri::command]
+pub async fn model_cache_remove_file(repo: String, revision: String, file: String) -> Result<(), String> {
+    let cache = hub_cache().ok_or("No Hugging Face cache folder")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = lock_cache_repo(&cache, &repo)?;
+        snapshots::remove(&cache, &repo, &revision, &file)
+    }).await.map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn download_command(repo: &str, file: Option<&str>) -> Result<Command, String> {
-        super::download_command(Path::new("hf"), repo, file)
+        super::download_command(Path::new("hf"), repo, file).map(|(cmd, _)| cmd)
+    }
+    #[test]
+    fn inkling_bundle_downloads_pinned_pair_but_file_picker_downloads_only_requested_file() {
+        let repo = "AtomicChat/Inkling-2-Mini-GGUF";
+        let target = "Inkling-2-Mini-AD-IQ2_M.gguf";
+        let args = |file| download_command(repo, file).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(args(None), ["download", repo, "--revision", "309509848b3151419aa26d069eb03db57fd29a00", target, "dspark-Inkling-2-Mini-Q8_0.gguf"]);
+        assert_eq!(args(Some(target)).last().unwrap(), target);
+        for (repo, file, single) in [(repo, None, false), (repo, Some(target), true), ("org/model", None, false), ("Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF", None, true)] {
+            assert_eq!(super::download_command(Path::new("hf"), repo, file).unwrap().1, single);
+        }
     }
     #[test]
     fn split_gguf_shards_are_not_individual_downloads() {
@@ -595,24 +680,58 @@ mod tests {
         assert!(gguf.iter().any(|f| f.size > 100_000_000));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn finished_jobs_keep_the_exact_selection_and_only_unsuccessful_jobs_offer_retry() {
+        for (program, cancel, retryable) in [("/usr/bin/true", false, false), ("/usr/bin/false", false, true), ("/bin/sleep", true, true)] {
+            let mut cmd = Command::new(program);
+            if cancel { cmd.arg("30"); }
+            let mut child = cmd.spawn().unwrap();
+            if !cancel { child.wait().unwrap(); }
+            let mut job = Job { child: Some(child), status: Status { running: true, repo: "org/m".into(), file: Some("nested/q.gguf".into()), expected_bytes: 123, ..Status::default() }, ..Job::default() };
+            if cancel { job.cancel().unwrap(); } else { job.refresh().unwrap(); }
+            assert!(!job.status.running);
+            assert_eq!(job.status.retryable, retryable);
+            assert_eq!(job.status.file.as_deref(), Some("nested/q.gguf"));
+            assert_eq!((&*job.status.repo, job.status.expected_bytes), ("org/m", 123));
+        }
+    }
+
     #[test]
     fn lists_cached_model_repos_with_downloaded_sizes() {
-        let dir = std::env::temp_dir().join(format!("dial-hub-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         let blobs = dir.join("models--mlx-community--Qwen2.5-7B").join("blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::write(blobs.join("a"), [0u8; 10]).unwrap();
         std::fs::write(blobs.join("b.incomplete"), [0u8; 99]).unwrap();
         std::fs::create_dir_all(dir.join("datasets--x--y").join("blobs")).unwrap();
         std::fs::create_dir_all(dir.join("models--empty--repo").join("blobs")).unwrap();
-        let found = cached_models_in(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        let snapshots = dir.join("models--org--GGUF/snapshots/revision/quants");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join("model.gguf"), [0u8; 8]).unwrap();
+        std::fs::write(snapshots.join("other.gguf.incomplete"), [0u8; 3]).unwrap();
+        #[cfg(unix)]
+        {
+            let normal = blobs.parent().unwrap().join("snapshots/revision");
+            std::fs::create_dir_all(&normal).unwrap();
+            std::os::unix::fs::symlink(blobs.join("a"), normal.join("weights")).unwrap();
+        }
+        let found = cached_models_in(dir);
         assert_eq!(
             found,
-            vec![CachedModel {
-                repo: "mlx-community/Qwen2.5-7B".into(),
-                bytes: 10
-            }]
+            vec![
+                CachedModel {
+                    repo: "mlx-community/Qwen2.5-7B".into(),
+                    bytes: 10,
+                    files: vec![],
+                },
+                CachedModel {
+                    repo: "org/GGUF".into(),
+                    bytes: 8,
+                    files: vec![snapshots::CachedFile { revision: "revision".into(), path: "quants/model.gguf".into(), bytes: 8 }],
+                },
+            ]
         );
         assert!(cached_models_in(std::path::Path::new("/nonexistent/hub")).is_empty());
     }
@@ -653,7 +772,7 @@ mod tests {
         let path = hub_cache_from(|k| env.get(k).cloned()).unwrap();
         assert_eq!(
             path,
-            std::path::PathBuf::from("/home/alice")
+            std::path::PathBuf::from(if cfg!(windows) { "C:\\Users\\alice" } else { "/home/alice" })
                 .join(".cache")
                 .join("huggingface")
                 .join("hub")

@@ -68,6 +68,27 @@ The panel opens on `browser_open` and shows each step. A "Dial: Clicking [4]" li
 the page while a tool runs (`agent-browser` events, `workspace.agentActivity`). The user can take
 over at any time; it is one shared browser.
 
+The panel's own controls, beside the address bar:
+
+- **Recent pages** lists the pages shown in this panel session; pick one to open it again.
+- **⋯** opens a menu with **Open file…**, the viewport and the search engine:
+  - **Open file…** picks a local HTML file in a native dialog. The webview still opens only web
+    pages, so Dial serves that file's folder on `127.0.0.1` at a random port under a random path
+    prefix (`browser/local.rs`): `GET` only, a `Host` check, nothing outside the folder (no `..`,
+    no links that lead out). The server stops when the panel opens another address or file, or
+    closes.
+  - **Viewport**: Fit panel, Phone 390×844, Tablet 820×1180 or Desktop 1280×800. A preset sizes the
+    page inside a frame, shrinking to the panel when it is smaller; the choice is remembered.
+  - **Search engine**: DuckDuckGo (default), Google, Bing, Brave Search, Kagi, or a custom
+    `https://…%s` address. It applies to what the user types in the address bar
+    (`browser_set_search`) and is kept in the frontend's local storage; the agent's `browser_open`
+    still searches DuckDuckGo.
+- **Inspect** opens Web Inspector for the page. Only builds compiled with it (debug builds) show
+  the button.
+
+The page is a native view drawn above the app, so it hides while a menu, the palette or settings
+is open; the panel says so in its place (no snapshot is drawn).
+
 ## Native apps in the private guest
 
 When asked to launch a graphical app, the agent checks the private guest first; the user need not
@@ -85,7 +106,7 @@ download an image or fall back to the host. This guidance does not redirect ordi
   or two minutes. `type` uses a US keyboard layout (printable ASCII, `\n`, `\t`).
 - **Project files** are never shared by an agent start. The user's own start in the App panel can
   attach a read-only snapshot of committed HEAD (the share option), and only for that start.
-- **Guest target:** Omit `guestTarget` on `state` or `start` to use Windows on Windows, Linux on Linux, or a virtual Mac on Apple Silicon. Other hosts prefer the unlabelled QEMU disk. An explicit `default` always requests that unlabelled disk. `macos`, `linux`, and `windows` select only that target. A virtual Mac requires its own imported base and guest companion. Never substitute another guest or the host. Windows guest boot is unverified.
+- **Guest target:** Omit `guestTarget` on `state` or `start` to use Windows on Windows, Linux on Linux, or a virtual Mac on Apple Silicon. Other hosts prefer the QEMU disk with no OS label. An explicit `default` always requests that disk with no OS label. `macos`, `linux`, and `windows` select only that target. A virtual Mac requires its own imported base and guest companion. Never substitute another guest or the host. Windows guest boot is unverified.
 - **Project recipe:** With an explicitly shared project containing a committed `.dial/app.json`, run `python3 -I DIAL-LAUNCH.py .` from the mounted project disc **inside the guest** (`py -3 -I DIAL-LAUNCH.py .` on Windows). A failure is not permission to download dependencies or run it on the host.
 
 ### Using an existing VirtualBox or VMware VM
