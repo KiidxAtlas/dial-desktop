@@ -320,6 +320,7 @@ fn models() -> Vec<ModelOption> {
         local: provider == "mlx",
         listed: !configured && provider != "mlx",
         catalog_only: false,
+        local_engine: None,
     };
     vec![
         row(

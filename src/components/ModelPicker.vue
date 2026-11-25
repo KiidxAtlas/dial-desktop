@@ -3,9 +3,11 @@
 // how hard the model thinks. The choice applies to this session.
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
-import { engine, models, showToast } from "../bridge";
+import { engine, models, settings, settingsPage, showToast } from "../bridge";
+import { engineCall, loadModes, modes } from "../engineTools";
 import { focusComposer, ui } from "../ui";
 import { buildPickerGroups, pickerProviders, usableModels, type PickerFilter } from "../modelPicker";
+import { lastRequestLabel, selectedRoute, type RequestObservation } from '../setupState';
 import { normalizeArrowKey } from "../macKeys";
 import Icon from "./Icon.vue";
 import ModesMenu from "./ModesMenu.vue";
@@ -27,6 +29,18 @@ function showModes() {
   open();
 }
 defineExpose({ showModes });
+/** Read-only session modes, named next to the model so it is clear Dial won't change files. */
+const activeModes = computed(() => {
+  const m = props.snap.connection.state === "live" ? modes.value : null;
+  if (!m) return [];
+  return [m.plan && "Plan", m.modes.vibe && "Vibe"].filter((x): x is string => !!x);
+});
+// Modes can change from the menu, a slash command or another client; re-read between turns.
+watch(
+  () => [props.snap.sessionId, props.snap.connection.state, props.snap.turnRunning] as const,
+  ([, state, running]) => state === "live" && !running && void loadModes(),
+  { immediate: true },
+);
 
 async function inspectModel(row: ModelOption) {
   const root = props.snap.workspace.root;
@@ -63,6 +77,30 @@ function cannotRemove(row: ModelOption) {
 watch([() => props.snap.workspace.root, () => props.snap.sessionId, filter, () => ui.modelPickerOpen], () => { details.value = null; });
 
 const current = computed(() => props.snap.model);
+/** The `model` setting: what new sessions start with (Settings › Overview › Default model). */
+const defaultModel = computed(() => {
+  const value = settingsPage.value?.settings.find((s) => s.key === "model")?.value;
+  return typeof value === "string" && value ? value : null;
+});
+watch(() => ui.modelPickerOpen, (open) => {
+  if (open && !settingsPage.value && props.snap.connection.state === "live") void settings.load();
+});
+function changeDefault() {
+  close(false);
+  ui.settingsTab = "";
+  ui.settingsOpen = true;
+}
+const lastRequest = ref<RequestObservation | null>(null);
+watch([() => ui.modelPickerOpen, () => props.snap.workspace.root, () => props.snap.sessionId, () => current.value?.provider, () => current.value?.modelId, () => props.snap.turnRunning, () => props.snap.connection.state], async (_, __, cleanup) => {
+  let active = true;
+  cleanup(() => { active = false; });
+  lastRequest.value = null;
+  if (!ui.modelPickerOpen || props.snap.turnRunning || props.snap.connection.state !== 'live') return;
+  try {
+    const data = await engineCall<{session_id: string; last_request: RequestObservation | null}>('evidence', {action: 'model_request'}, props.snap.workspace.root);
+    if (active && data.session_id === props.snap.sessionId) lastRequest.value = data.last_request;
+  } catch { /* Older engines have no request evidence. */ }
+}, { immediate: true });
 const usable = computed(() => props.snap.connection.state === "live" || props.snap.connection.state === "preview");
 const isCurrent = (m: ModelOption) =>
   !!current.value && m.modelId === current.value.modelId && (!current.value.provider || m.provider === current.value.provider);
@@ -116,8 +154,33 @@ function close(refocus = true) {
   if (refocus) focusComposer();
 }
 
+const changingEngine = ref(false);
+const engineNames: Record<string, string> = { auto: 'Automatic', mlx: 'MLX', 'llama-cpp': 'llama.cpp', atomic: 'Atomic Engine' };
+
+async function changeEngine(m: ModelOption, event: Event) {
+  const select = event.target as HTMLSelectElement;
+  const choice = select.value;
+  const pin = m.localEngine;
+  if (!pin) return;
+  select.value = pin.choices.includes(pin.selected) ? pin.selected : '';
+  if (changingEngine.value || !pin.choices.includes(choice)) return;
+  const root = props.snap.workspace.root;
+  changingEngine.value = true;
+  try {
+    if (choice === 'atomic' && !await engine.setupAtomic()) return;
+    if (props.snap.workspace.root !== root) return;
+    await engineCall('set_setting', { key: pin.setting, value: choice, scope: 'global' }, root);
+    if (props.snap.workspace.root === root) {
+      await engine.refreshModels();
+      showToast(`${m.label} will use ${engineNames[choice]} on load.`);
+    }
+  } catch (error) { showToast(String(error)); }
+  finally { changingEngine.value = false; }
+}
+
 function choose(m: ModelOption) {
-  if (props.snap.turnRunning || !isCurrent(m)) {
+  if (changingEngine.value) return;
+  if (props.snap.turnRunning || !isCurrent(m) || m.local || m.provider === 'mlx') {
     const snap = props.snap;
     void engine.setModel(snap, m.provider, m.modelId).then(ok => {
       if (ok && snap.turnRunning) showToast(`Next turn in this session: ${m.label}`);
@@ -134,6 +197,7 @@ function think(level: string) {
 }
 
 function onKey(event: KeyboardEvent) {
+  if (event.target instanceof HTMLSelectElement) return; // Let the native engine menu handle arrows and Enter.
   const key = normalizeArrowKey(event.key);
   const n = flat.value.length;
   if (key === "ArrowDown" && n) {
@@ -190,13 +254,22 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
     <button
       class="trigger"
       :disabled="!usable"
-      :title="`Model and session modes · ${current?.label ?? 'Choose model'}`" :aria-expanded="ui.modelPickerOpen"
+      :title="snap.loadingLocalModel ? `Loading ${snap.loadingLocalModel}` : `Model and session modes · ${current?.label ?? 'Choose model'}`" :aria-expanded="ui.modelPickerOpen"
       @click.stop="ui.modelPickerOpen ? close() : open()"
     >
       <Icon name="chip" :size="14" />
-      <span class="truncate">{{ current?.label ?? "Model" }}</span>
-      <span v-if="thinkingLabel" class="level">· {{ thinkingLabel }}</span>
+      <span class="truncate" aria-live="polite">{{ snap.loadingLocalModel ? `Loading ${snap.loadingLocalModel}…` : current?.label ?? 'Model' }}</span>
+      <span v-if="thinkingLabel && !snap.loadingLocalModel" class="level">· {{ thinkingLabel }}</span>
       <Icon name="chevronDown" :size="12" />
+    </button>
+    <button
+      v-for="name in activeModes"
+      :key="name"
+      class="mode-chip"
+      :title="`${name} mode is on: Dial explores and plans without changing files. Click to change.`"
+      @click.stop="showModes"
+    >
+      {{ name }}
     </button>
 
     <Transition name="pop">
@@ -209,6 +282,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
         <template v-else>
         <p v-if="snap.turnRunning" class="empty">Changes apply to this session after the running turn.</p>
+        <p v-if="snap.connection.state === 'live'" class="empty">{{ current ? `${current.provider || 'Unknown provider'} / ${current.modelId}` : 'Selected route' }} · {{ selectedRoute(current, models) }}. {{ lastRequestLabel(current, lastRequest) }}. No test request made.</p>
         <label class="search">
           <Icon name="search" :size="14" />
           <input ref="search" v-model="query" placeholder="Search models" spellcheck="false" @keydown="onKey" />
@@ -263,10 +337,15 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
                 </span>
                 <Icon v-if="isCurrent(m)" class="tick" name="check" :size="14" />
               </button>
+              <select v-if="m.local && m.localEngine && snap.connection.state === 'live'" class="engine-select" :aria-label="`Inference engine for ${m.label}`" title="Remember an inference engine for this model" :value="m.localEngine.choices.includes(m.localEngine.selected) ? m.localEngine.selected : ''" :disabled="changingEngine || snap.turnRunning" @change="changeEngine(m, $event)">
+                <option v-if="!m.localEngine.choices.includes(m.localEngine.selected)" value="" disabled>Choose an engine…</option>
+                <option v-for="id in m.localEngine.choices" :key="id" :value="id">{{ engineNames[id] ?? id }}</option>
+              </select>
               <button v-if="downloadedOnly && snap.connection.state === 'live'" class="refresh" :aria-label="`Details for ${m.label}`" title="Model details" @click="inspectModel(m)">···</button>
             </div>
           </template>
         </div>
+        <p v-if="changingEngine" class="empty" role="status">Preparing the engine choice…</p>
         <div v-if="downloadedOnly" class="model-details">
           <p v-if="!details">Add models outside Desktop, then reload this list.</p>
           <template v-else>
@@ -299,7 +378,13 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
             </button>
           </div>
         </div>
-        <div class="foot">↑↓ to move · Enter to switch · Esc to close · applies to this session</div>
+        <div class="foot">
+          <span>↑↓ to move · Enter to switch · Esc to close · applies to this session</span>
+          <span v-if="snap.connection.state === 'live'" class="default-model">
+            Default for new sessions: <span class="mono" :title="defaultModel ?? undefined">{{ defaultModel ?? "engine default" }}</span> ·
+            <button class="link" title="Change the default in Settings" @click="changeDefault">Change</button>
+          </span>
+        </div>
         </template>
       </div>
     </Transition>
@@ -307,8 +392,11 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 </template>
 
 <style scoped>
+.engine-select { max-width: 9em; align-self: center; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); padding: 3px; font-size: var(--text-xs); }
 .picker {
   position: relative;
+  display: flex;
+  align-items: center;
   min-width: 0;
 }
 .trigger {
@@ -340,6 +428,24 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   text-overflow: ellipsis;
   min-width: 0;
   flex-shrink: 3;
+}
+/* In a narrow composer the level goes first, so the model name keeps its room rather than both clipping. */
+@container composer-bar (max-width: 500px) {
+  .level { display: none; }
+}
+.mode-chip {
+  height: 22px;
+  margin-left: 2px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.mode-chip:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .trigger > :deep(svg) {
   flex: none;
@@ -504,7 +610,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   align-items: center;
   height: 18px;
   padding: 0 6px;
-  border-radius: 9px;
+  border-radius: 999px;
   background: var(--surface);
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -530,7 +636,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .chip {
   height: 24px;
   padding: 0 9px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   font-size: var(--text-sm);
   color: var(--text-muted);
@@ -547,6 +653,23 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .faint {
   color: var(--text-faint);
   text-transform: none;
+}
+.foot .default-model {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.foot .mono {
+  font-family: var(--font-mono);
+}
+.foot .link {
+  color: var(--accent);
+  font: inherit;
+}
+.foot .link:hover {
+  text-decoration: underline;
 }
 .foot {
   padding: 7px 12px;

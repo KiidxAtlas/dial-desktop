@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { OpenSnapshot, Session, TranscriptHit, TranscriptResults, Workspace } from "../types";
-import { engine, folders } from "../bridge";
+import { computed, nextTick, ref, watch } from "vue";
+import type { OpenSnapshot, Session, TranscriptHit, Workspace } from "../types";
+import { engine, folders, hiddenSessions } from "../bridge";
+import { commandKey, shortcutLabel } from "../keysGuard";
+import { useTranscriptSearch } from "../transcriptSearch";
+import { hasQueuedFollowUp } from "../queue";
+import RecentlyDeleted from "./RecentlyDeleted.vue";
 import { installEngine, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
-import { finishRename, goToSession, sessionGroups, sessionItems, startRename } from "../sessionActions";
-import { isTypeSession, types } from "../savedTypes";
+import { copyText, finishRename, goToSession, sessionGroups, sessionItems, startRename } from "../sessionActions";
+import { isTypeSession } from "../savedTypes";
 import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import Icon from "./Icon.vue";
 import Logo from "./Logo.vue";
@@ -16,34 +20,10 @@ const props = defineProps<{ snap: OpenSnapshot }>();
 
 const live = computed(() => props.snap.connection.state === "live");
 const searchMessages = ref(false);
-const results = ref<TranscriptResults | null>(null);
-const searching = ref(false);
-const visibleHits = computed(() => types.loaded ? results.value?.hits.filter(hit => !isTypeSession(hit.session_id)) ?? [] : []);
-const searchError = ref("");
-let searchVersion = 0;
-
-watch([() => props.snap.workspace.root, () => ui.sessionFilter, searchMessages], () => {
-  searchVersion++;
-  results.value = null;
-  searching.value = false;
-  searchError.value = "";
-});
-
-async function searchTranscripts() {
-  const query = ui.sessionFilter.trim();
-  if (!searchMessages.value || !query || !live.value) return;
-  const version = ++searchVersion;
-  searching.value = true;
-  searchError.value = "";
-  try {
-    const found = await engine.searchTranscripts(props.snap.workspace.root, query);
-    if (version === searchVersion) results.value = found;
-  } catch (error) {
-    if (version === searchVersion) searchError.value = String(error);
-  } finally {
-    if (version === searchVersion) searching.value = false;
-  }
-}
+const { results, searching, searchError, canExpand, loadMore, searchTranscripts } = useTranscriptSearch(
+  () => props.snap.workspace.root, () => ui.sessionFilter, computed(() => searchMessages.value && live.value), engine.searchTranscripts,
+);
+const visibleHits = computed(() => results.value?.hits.filter(hit => !isTypeSession(hit.session_id) && !hiddenSessions.has(hit.session_id)) ?? []);
 
 async function openHit(hit: TranscriptHit) {
   const jump = { ...hit, root: props.snap.workspace.root };
@@ -59,17 +39,22 @@ const groups = computed(() => sessionGroups(props.snap, ui.sessionFilter));
 const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
 /** ⌘1–9 numbers for the first nine rows, shown while ⌘ is held. */
 const jumpNumber = computed(() => new Map(sessions.value.slice(0, 9).map((s, i) => [s.id, i + 1])));
-const mod = navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl+";
+const mac = navigator.platform.toLowerCase().includes("mac");
+const mod = mac ? "⌘" : "Ctrl+";
 
 // ⇧⌘F: focus the session search; Esc in it clears the search, then leaves it.
 const searchInput = ref<HTMLInputElement | null>(null);
 watch(
   () => ui.focusSearch,
-  async () => {
+  async (request) => {
+    if (!request) return;
     await nextTick();
+    if (!searchInput.value || ui.focusSearch !== request) return;
+    ui.focusSearch = 0;
     searchInput.value?.focus();
     searchInput.value?.select();
   },
+  { immediate: true },
 );
 function onSearchKey(event: KeyboardEvent) {
   if (event.key !== "Escape" || event.isComposing) return;
@@ -89,7 +74,12 @@ const status = computed(() => {
     case "preview":
       return { tone: "violet", text: "Design preview", retry: false };
     case "failed":
-      return { tone: "danger", text: c.error, retry: true };
+      // The error itself, and what to do about it, is in the message above the conversation.
+      return {
+        tone: "danger",
+        text: c.problem === "missing" ? "No Dial engine" : c.problem === "incompatible" ? "Engine needs an update" : "Engine could not start",
+        retry: true,
+      };
     case "ended":
       return { tone: "faint", text: "Engine stopped", retry: true };
   }
@@ -98,6 +88,7 @@ const status = computed(() => {
 
 // The project menu: recent projects and "Open folder…".
 const projectMenu = ref<HTMLElement | null>(null);
+const projectButton = ref<HTMLButtonElement | null>(null);
 const menuOpen = ref(false);
 
 async function toggleMenu() {
@@ -119,10 +110,22 @@ function projectMenuFor(event: MouseEvent, w: Workspace, current = false, anchor
 function onOutside(event: MouseEvent) {
   if (projectMenu.value && !projectMenu.value.contains(event.target as Node)) menuOpen.value = false;
 }
-watch(menuOpen, (isOpen) =>
-  isOpen ? document.addEventListener("mousedown", onOutside) : document.removeEventListener("mousedown", onOutside),
-);
-onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
+function onMenuKey(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || ui.menu || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen) return;
+  event.preventDefault();
+  event.stopPropagation();
+  menuOpen.value = false;
+  projectButton.value?.focus({ preventScroll: true });
+}
+watch(menuOpen, (isOpen, _, cleanup) => {
+  if (!isOpen) return;
+  document.addEventListener("mousedown", onOutside);
+  document.addEventListener("keydown", onMenuKey, true);
+  cleanup(() => {
+    document.removeEventListener("mousedown", onOutside);
+    document.removeEventListener("keydown", onMenuKey, true);
+  });
+});
 
 function newSession() {
   ui.settingsOpen = false;
@@ -147,6 +150,7 @@ function click(event: MouseEvent, session: Session) {
 const pickedSessions = computed(() => props.snap.sessions.filter((s) => ui.picked.has(s.id)));
 
 async function remove(list: { id: string; title: string }[]) {
+  // Moving rows to Recently Deleted also removes them from the selection.
   if (await engine.deleteSessions(list)) {
     for (const s of list) ui.picked.delete(s.id);
   }
@@ -164,7 +168,7 @@ function menuFor(event: MouseEvent, s: Session, anchor?: HTMLElement | null) {
         run: () => list.forEach((p) => engine.pinSession(p.id, !pinned)),
       },
       { divider: true },
-      { label: `Delete ${list.length} sessions`, icon: "trash", danger: true, hint: "⌫", run: () => remove(list) },
+      { label: `Move ${list.length} sessions to Recently Deleted`, icon: "trash", danger: true, hint: shortcutLabel("⌫", mac), run: () => remove(list) },
     ]);
     return;
   }
@@ -206,17 +210,15 @@ watch(
 function onKey(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null;
   const typing = target?.closest("input, textarea, select, [contenteditable]");
-  if (typing || !ui.picked.size) return;
-  if (event.key === "Delete" || event.key === "Backspace") {
+  if (typing || !ui.picked.size || event.defaultPrevented) return;
+  if ((event.key === "Delete" || event.key === "Backspace") && !event.metaKey && !event.ctrlKey && !event.altKey) {
     event.preventDefault();
     remove(pickedSessions.value);
-  } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+  } else if (commandKey(event, mac) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "a") {
     event.preventDefault();
     for (const s of sessions.value) ui.picked.add(s.id);
   }
 }
-onMounted(() => window.addEventListener("keydown", onKey));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 </script>
 
 <template>
@@ -224,13 +226,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <div class="brand" data-tauri-drag-region>
       <Logo :size="18" />
       <span class="word" data-tauri-drag-region>Dial</span>
-      <button class="collapse" title="Hide sidebar (⌘B)" aria-label="Hide sidebar" @click="ui.sidebarOpen = false">
+      <button class="collapse" :title="`Hide sidebar (${mod}B)`" aria-label="Hide sidebar" @click="ui.sidebarOpen = false">
         <Icon name="panelLeft" :size="16" />
       </button>
     </div>
 
     <nav class="actions">
-      <button class="item new" :disabled="!live" title="Start a fresh session (⌘N)" @click="newSession">
+      <button class="item new" :disabled="!live" :title="`Start a fresh session (${mod}N)`" @click="newSession">
         <span class="plus"><Icon name="plus" :size="13" /></span>
         New session
       </button>
@@ -248,19 +250,21 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <SidebarTypes />
 
     <nav v-if="searchMessages" class="list" aria-label="Transcript search results">
-      <button class="item" :disabled="!live || searching || !ui.sessionFilter.trim()" @click="searchTranscripts">Search messages</button>
-      <p v-if="searching" class="empty" role="status">Searching messages…</p>
-      <p v-else-if="searchError" class="empty" role="alert">{{ searchError }}</p>
-      <p v-else-if="results && !visibleHits.length" class="empty">No matching messages.</p>
-      <template v-else-if="results">
+      <p v-if="!live" class="empty">Message search needs the Dial engine running.</p>
+      <p v-else-if="!ui.sessionFilter.trim()" class="empty">Type to search every message in this project.</p>
+      <p v-else-if="!results && !searchError" class="empty" role="status">Searching messages…</p>
+      <p v-if="searchError" class="empty" role="alert">{{ searchError }}</p>
+      <template v-if="results">
+        <p v-if="!visibleHits.length" class="empty" role="status">{{ results.has_more ? 'No visible messages in these results.' : `No messages match “${ui.sessionFilter.trim()}”.` }}</p>
         <button v-for="(hit, index) in visibleHits" :key="`${hit.session_id}:${hit.entry_id}:${index}`" class="hit" @click="openHit(hit)">
           <strong class="truncate">{{ hit.title || 'Untitled session' }}</strong>
           <span>{{ hit.snippet }}</span>
         </button>
-        <p v-if="results.has_more" class="empty">Showing the first 40 matches. Refine your search for more specific results.</p>
+        <button v-if="canExpand" class="btn btn-secondary" :disabled="searching" @click="loadMore">{{ searching ? 'Loading more…' : 'Show more matches' }}</button>
+        <p v-else-if="results.has_more" class="empty">Search is limited to the first 1,000 matches. Refine your search for more specific results.</p>
       </template>
     </nav>
-    <nav v-else class="list">
+    <nav v-else class="list" aria-label="Sessions" @keydown="onKey">
       <p v-if="!sessions.length" class="empty">
         {{ snap.sessions.length ? "No sessions match." : "Your sessions appear here." }}
       </p>
@@ -298,6 +302,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           />
           <template v-else>
             <span class="truncate">{{ s.title }}</span>
+            <small v-if="hasQueuedFollowUp(snap.workspace.root, s.id)" title="Follow-up queued for this session">Queued</small>
             <kbd v-if="ui.jumpHints && jumpNumber.has(s.id)" class="jump-hint">{{ mod }}{{ jumpNumber.get(s.id) }}</kbd>
             <i v-if="s.waiting" class="activity waiting" />
             <i v-else-if="s.running" class="activity running" />
@@ -309,9 +314,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
             >
               <Icon name="more" :size="14" />
             </button>
-            <button class="row-btn" :title="`Delete “${s.title}”`" @click.stop="remove([s])">
-              <Icon name="cross" :size="12" />
-            </button>
           </template>
         </div>
       </template>
@@ -320,17 +322,19 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
     <Transition name="pop">
       <div v-if="ui.picked.size" class="picking">
         <span>{{ ui.picked.size }} selected</span>
-        <button class="pick-action danger" title="Delete the selected sessions (⌫)" @click="remove(pickedSessions)">
+        <button class="pick-action danger" :title="`Move selected to Recently Deleted (${shortcutLabel('⌫', mac)})`" @click="remove(pickedSessions)">
           <Icon name="trash" :size="13" /> Delete
         </button>
         <button class="pick-action" title="Clear the selection (Esc)" @click="ui.picked.clear()">Cancel</button>
       </div>
     </Transition>
 
+    <RecentlyDeleted :root="snap.workspace.root" />
+
     <button
       class="item settings-btn"
       :class="{ on: ui.settingsOpen }"
-      title="Settings (⌘,)"
+      :title="`Settings (${mod},)`"
       @click="ui.settingsOpen = !ui.settingsOpen"
     >
       <Icon name="gear" :size="16" />
@@ -370,38 +374,45 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           </button>
         </div>
       </Transition>
-      <button class="project-btn" :title="`${snap.workspace.root} · switch project`" @click="toggleMenu">
+      <button ref="projectButton" class="project-btn" :aria-expanded="menuOpen" :title="`${snap.workspace.root} · switch project`" @click="toggleMenu">
         <span class="avatar">{{ snap.workspace.name.slice(0, 1).toUpperCase() }}</span>
         <span class="project-text">
           <span class="truncate name">{{ snap.workspace.name }}</span>
           <span class="truncate state" :class="status.tone" :title="status.text"><i />{{ status.text }}</span>
         </span>
-        <Icon name="chevronDown" :size="13" />
+        <Icon class="project-chevron" name="chevronDown" :size="13" />
       </button>
+      <!-- With the conversation showing, its banner carries the engine error and its buttons;
+           here they are only offered while settings cover that banner. -->
+      <template v-if="ui.settingsOpen">
+        <button
+          v-if="snap.connection.state === 'failed' && snap.connection.problem === 'missing'"
+          class="btn btn-primary retry"
+          :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
+          @click="installEngine()"
+        >
+          <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}
+        </button>
+        <button
+          v-else-if="snap.connection.state === 'failed' && snap.connection.problem === 'incompatible'"
+          class="btn btn-primary retry"
+          :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
+          @click="updateEngine()"
+        >
+          <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}
+        </button>
+        <button v-if="snap.connection.state === 'failed' && snap.connection.problem === 'other'" class="btn btn-secondary retry" @click="copyText(snap.connection.state === 'failed' ? snap.connection.error : '', 'Error copied')">
+          <Icon name="copy" :size="13" /> Copy error
+        </button>
+        <button v-if="status.retry" class="btn btn-secondary retry" @click="engine.reconnect()">
+          <Icon name="refresh" :size="13" /> Reconnect
+        </button>
+      </template>
       <button
-        v-if="snap.connection.state === 'failed' && snap.connection.problem === 'missing'"
-        class="btn btn-primary retry"
-        :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
-        @click="installEngine()"
-      >
-        <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}
-      </button>
-      <button
-        v-else-if="snap.connection.state === 'failed' && snap.connection.problem === 'incompatible'"
-        class="btn btn-primary retry"
-        :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
-        @click="updateEngine()"
-      >
-        <Icon name="download" :size="13" /> {{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}
-      </button>
-      <button
-        v-if="(snap.connection.state === 'failed' && snap.connection.problem === 'other') || (snap.connection.state === 'live' && !(snap.model?.modelId || snap.connection.model))"
+        v-if="snap.connection.state === 'live' && !(snap.model?.modelId || snap.connection.model)"
         class="btn btn-secondary retry"
         @click="ui.settingsTab = 'providers'; ui.settingsOpen = true"
       >Set up a provider</button>
-      <button v-if="status.retry" class="btn btn-secondary retry" @click="engine.reconnect()">
-        <Icon name="refresh" :size="13" /> Reconnect
-      </button>
     </div>
   </aside>
 </template>
@@ -435,7 +446,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   margin: 0 -4px 0 auto;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
-  opacity: 0;
+  opacity: 0.55;
   transition:
     opacity 120ms var(--ease),
     background 120ms var(--ease);
@@ -593,7 +604,6 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
   font-size: 13.5px;
   color: var(--text-muted);
   cursor: default;
-  outline: none;
   transition:
     background 120ms var(--ease),
     color 120ms var(--ease);
@@ -605,6 +615,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 .session:focus-visible {
   background: var(--hover);
   color: var(--text);
+}
+.session:focus-visible {
+  outline-offset: -2px;
 }
 .session.selected {
   background: var(--active);
@@ -685,21 +698,36 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 .activity.waiting {
   background: var(--warning);
 }
+/* The "…" button floats over the end of the row instead of taking room from it, so hovering a
+   row never re-truncates its title; the title fades out under the button instead. */
 .row-btn {
-  display: none;
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  display: grid;
   place-items: center;
   width: 22px;
   height: 22px;
-  flex: none;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
-}
-.row-btn:last-child {
-  margin-right: -6px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
 }
 .session:hover .row-btn,
 .session:focus-within .row-btn {
-  display: grid;
+  opacity: 1;
+  pointer-events: auto;
+}
+.session:hover .truncate,
+.session:focus-within .truncate {
+  -webkit-mask-image: linear-gradient(to left, transparent 0, transparent 22px, #000 40px);
+  mask-image: linear-gradient(to left, transparent 0, transparent 22px, #000 40px);
+}
+/* Status marks sit where the button appears; the button replaces them while it shows. */
+.session:is(:hover, :focus-within) :is(small, .activity, .jump-hint) {
+  visibility: hidden;
 }
 .row-btn:hover {
   background: var(--hover);
@@ -726,6 +754,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 .project-btn:hover {
   background: var(--hover);
+}
+/* The menu opens above the button: point there, and back down while it is open. */
+.project-chevron {
+  flex: none;
+  transform: rotate(180deg);
+  transition: transform 160ms var(--ease);
+}
+.project-btn[aria-expanded="true"] .project-chevron {
+  transform: none;
 }
 .avatar {
   display: grid;
@@ -783,6 +820,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 }
 .retry {
   width: 100%;
+}
+.fail-text {
+  margin: 0;
+  padding: 0 4px;
+  max-height: 6.5em;
+  overflow-y: auto;
+  font-size: var(--text-xs);
+  color: var(--danger);
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
 }
 .menu {
   position: absolute;

@@ -19,25 +19,37 @@ fn invalid_bytes_become_replacement_characters() {
     assert!(pending.is_empty());
 }
 
-#[cfg(unix)]
 #[test]
 fn a_shell_streams_output_and_reports_its_exit() {
     let mut terminals = Terminals::default();
     let (tx, rx) = mpsc::channel();
-    let mut command = CommandBuilder::new("/bin/sh");
+    let (mut command, input) = if cfg!(windows) {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/D", "/Q", "/V:ON"]);
+        (cmd, "set /a RESULT=40+2\recho dial-!RESULT!\rexit\r")
+    } else {
+        (CommandBuilder::new("/bin/sh"), "echo dial-$((40+2))\nexit\n")
+    };
     command.cwd(std::env::temp_dir());
     let id = terminals
         .open(command, 80, 24, move |event| {
             let _ = tx.send(event);
         })
         .unwrap();
-    terminals.write(id, "echo dial-$((40+2))\nexit\n").unwrap();
+    terminals.write(id, input).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut output = String::new();
     let mut exited = false;
     while Instant::now() < deadline && !exited {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(TerminalEvent::Data { data, .. }) => output.push_str(&data),
+            Ok(TerminalEvent::Data { data, .. }) => {
+                // Windows' ConPTY asks for the cursor position before it runs the shell; the
+                // app's terminal answers, so the test must too.
+                if data.contains("\u{1b}[6n") {
+                    let _ = terminals.write(id, "\u{1b}[1;1R");
+                }
+                output.push_str(&data);
+            }
             Ok(TerminalEvent::Exit { id: ended }) => exited = ended == id,
             Err(_) => {}
         }
@@ -45,7 +57,7 @@ fn a_shell_streams_output_and_reports_its_exit() {
     assert!(output.contains("dial-42"), "{output:?}");
     assert!(exited);
     assert!(
-        !terminals.has_shells(),
+        terminals.open_ids().is_empty(),
         "exited shell must be removed before Exit is reported"
     );
     assert!(terminals.write(id, "x").is_err());
@@ -67,4 +79,14 @@ fn slash_command_preserves_literal_argument_and_configured_program() {
             "{invalid:?}"
         );
     }
+}
+
+#[test]
+fn windows_prefers_powershell_7_when_it_is_on_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::env::join_paths([dir.path()]).unwrap();
+    assert_eq!(windows_shell(Some(&path)), "powershell.exe");
+    assert_eq!(windows_shell(None), "powershell.exe");
+    std::fs::write(dir.path().join("pwsh.exe"), b"").unwrap();
+    assert_eq!(windows_shell(Some(&path)), "pwsh.exe");
 }

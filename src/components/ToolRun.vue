@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { runActivity, runFiles, runImages, runSummary, type ToolRun } from "../toolFolds";
-import { ui } from "../ui";
+import { phaseOf, runActivity, runFiles, runImages, runSummary, type RunItem, type ToolRun } from "../toolFolds";
+import { entryKey, ui } from "../ui";
+import ReceivedRow from "./ReceivedRow.vue";
+import FindText from "./FindText.vue";
 import { showPanel } from "../workspace";
 import Icon from "./Icon.vue";
 import ToolRow from "./ToolRow.vue";
 import GeneratedImage from "./GeneratedImage.vue";
+import type { TextMatch } from '../chatFind';
 
-/** A burst of tool calls on one line. A single call shows as its own row; several show a summary
+/** A burst of tool calls on one line, with the coordination messages and status lines that
+ * arrived among them. A single call or message shows as its own row; several show a summary
  * that updates in place while they run, with the files they changed and the images they made
- * beneath it. Opening the line lists every call. */
-const props = defineProps<{ run: ToolRun; open: boolean; match: number }>();
+ * beneath it. Opening the line lists every row. */
+const props = defineProps<{ run: ToolRun; open: boolean; session: string | null; match: number; occurrence?: TextMatch }>();
 const emit = defineEmits<{ toggle: [event: MouseEvent] }>();
 
 const activity = computed(() => runActivity(props.run));
@@ -20,10 +24,22 @@ const images = computed(() => runImages(props.run));
 const files = computed(() =>
   runFiles(props.run).filter((f) => !images.value.some((img) => img === f.path || img.endsWith(`/${f.path}`))),
 );
+/** Failed calls stay in view under a closed run, so a failure is never two clicks away. */
+const FAILED_SHOWN = 3;
+const failedTools = computed(() => props.run.tools.filter((t) => t.state === "failed"));
+/** While calls run, the line names the phase ("Reading…", "Editing…"); once done, what was done. */
+const headline = computed(() => (activity.value.running ? `${phaseOf(activity.value.current)}…` : summary.value));
 /** At most this many pips; the rest show as a count. */
 const PIPS = 14;
 const tone = computed(() => (activity.value.running ? "running" : activity.value.failed ? "mixed" : activity.value.unknown ? "unknown" : "succeeded"));
 const name = (path: string) => path.split("/").pop() || path;
+const only = computed(() => (props.run.items.length === 1 ? props.run.items[0] : null));
+const messages = computed(() => props.run.items.filter((item) => item.entry.kind === "received").length);
+const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+const contents = computed(() =>
+  [props.run.tools.length && count(props.run.tools.length, "tool call"), messages.value && count(messages.value, "message")].filter(Boolean).join(", "),
+);
+const hit = (item: RunItem) => (props.occurrence?.entry === item.index ? props.occurrence : undefined);
 
 function openDiff(path: string) {
   ui.diffPath = path;
@@ -33,8 +49,18 @@ function openDiff(path: string) {
 
 <template>
   <ToolRow
-    v-if="run.tools.length === 1"
-    :tool="run.tools[0]"
+    v-if="only?.entry.kind === 'tool' && !activity.running"
+    :tool="only.entry"
+    :occurrence="hit(only)"
+    :data-entry="run.start"
+    :class="{ 'current-match': match === run.start }"
+  />
+  <ReceivedRow
+    v-else-if="only?.entry.kind === 'received'"
+    :entry="only.entry"
+    :open-key="entryKey(session, 'received', only.index)"
+    :highlighted="match === run.start"
+    :occurrence="hit(only)"
     :data-entry="run.start"
     :class="{ 'current-match': match === run.start }"
   />
@@ -42,7 +68,7 @@ function openDiff(path: string) {
     <button
       class="line"
       :aria-expanded="open"
-      :title="`${open ? 'Hide' : 'Show'} ${run.tools.length} tool calls (⌥-click: all)`"
+      :title="`${open ? 'Hide' : 'Show'} ${contents} (⌥-click: all)`"
       @click="emit('toggle', $event)"
     >
       <span class="status" aria-hidden="true">
@@ -50,7 +76,7 @@ function openDiff(path: string) {
         <Icon v-else-if="tone === 'succeeded'" name="check" :size="12" />
         <span v-else class="dot" />
       </span>
-      <span class="summary" :class="{ live: activity.running }">{{ summary }}</span>
+      <span class="summary" aria-live="polite" :title="headline">{{ headline }}</span>
       <span class="pips" aria-hidden="true">
         <span
           v-for="t in run.tools.slice(-PIPS)"
@@ -62,13 +88,16 @@ function openDiff(path: string) {
       </span>
       <span v-if="activity.failed" class="badge failed">{{ activity.failed }} failed</span>
       <span v-if="activity.unknown" class="badge">{{ activity.unknown }} unknown</span>
-      <Transition name="tick" mode="out-in">
-        <span v-if="activity.running" :key="activity.current.key" class="current truncate">
-          <b>{{ activity.current.label }}</b> {{ activity.current.progress || activity.current.target }}
-        </span>
-      </Transition>
+      <span v-if="activity.running" class="current truncate">{{ activity.current.progress || activity.current.target }}</span>
       <Icon class="chevron" name="chevronRight" :size="12" />
     </button>
+
+    <div v-if="!open && failedTools.length" class="failures">
+      <ToolRow v-for="t in failedTools.slice(0, FAILED_SHOWN)" :key="t.key" :tool="t" />
+      <button v-if="failedTools.length > FAILED_SHOWN" class="more-failed" @click="emit('toggle', $event)">
+        Show all {{ failedTools.length }} failed calls
+      </button>
+    </div>
 
     <div v-if="!open && (files.length || images.length)" class="previews">
       <div v-if="files.length" class="files">
@@ -94,13 +123,21 @@ function openDiff(path: string) {
       <div v-if="open" class="body">
         <div class="calls">
           <div
-            v-for="(t, i) in run.tools"
-            :key="t.key"
+            v-for="item in run.items"
+            :key="item.entry.kind === 'tool' ? item.entry.key : item.index"
             class="call"
-            :class="{ 'current-match': match === run.start + i }"
-            :data-entry="run.start + i"
+            :class="{ 'current-match': match === item.index }"
+            :data-entry="item.index"
           >
-            <ToolRow :tool="t" />
+            <ToolRow v-if="item.entry.kind === 'tool'" :tool="item.entry" :occurrence="hit(item)" />
+            <ReceivedRow
+              v-else-if="item.entry.kind === 'received'"
+              :entry="item.entry"
+              :open-key="entryKey(session, 'received', item.index)"
+              :highlighted="match === item.index"
+              :occurrence="hit(item)"
+            />
+            <p v-else class="note"><FindText v-if="hit(item)" :text="item.entry.message" :match="hit(item)!" /><template v-else>{{ item.entry.message }}</template></p>
           </div>
         </div>
       </div>
@@ -143,20 +180,17 @@ function openDiff(path: string) {
 }
 .status .spinner { width: 10px; height: 10px; }
 .status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tone); }
+/* The headline gives way (ending in "…", full text on hover) so the failure badge never runs
+   off the edge of a narrow column. */
 .summary {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text);
   font-weight: 560;
   white-space: nowrap;
 }
-.summary.live {
-  background: linear-gradient(90deg, var(--text) 0%, var(--text-faint) 50%, var(--text) 100%) 0 0 / 200% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: shimmer 2.2s linear infinite;
-}
-@keyframes shimmer { to { background-position: -200% 0; } }
 .pips {
   display: inline-flex;
   flex: none;
@@ -195,11 +229,25 @@ function openDiff(path: string) {
 .chevron {
   flex: none;
   color: var(--text-faint);
-  opacity: 0;
+  opacity: 0.45;
   transition: opacity 140ms var(--ease), transform 200ms var(--ease);
 }
 .line:hover .chevron, .line:focus-visible .chevron, .run.open > .line .chevron { opacity: 1; }
 .run.open > .line .chevron { transform: rotate(90deg); }
+
+.failures {
+  margin: 4px 0 2px 16px;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--danger) 45%, transparent);
+}
+.more-failed {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.more-failed:hover { color: var(--text); }
 
 .previews {
   display: flex;
@@ -244,8 +292,18 @@ function openDiff(path: string) {
   padding: 4px 0 2px 14px;
   border-left: 1px solid var(--border-strong);
 }
+.note {
+  margin: 0;
+  padding: 2px 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
 .call.current-match,
-.tool.current-match {
+.tool.current-match,
+.received.current-match {
   border-radius: var(--radius-sm);
   box-shadow: inset 0 0 0 1px var(--accent);
   background: color-mix(in srgb, var(--accent) 7%, transparent);
@@ -254,11 +312,8 @@ function openDiff(path: string) {
   transition: grid-template-rows 240ms var(--ease), opacity 200ms var(--ease);
 }
 .expand-enter-from, .expand-leave-to { grid-template-rows: 0fr; opacity: 0; }
-.tick-enter-active, .tick-leave-active { transition: opacity 140ms var(--ease), transform 140ms var(--ease); }
-.tick-enter-from { opacity: 0; transform: translateY(4px); }
-.tick-leave-to { opacity: 0; transform: translateY(-4px); }
 @media (prefers-reduced-motion: reduce) {
-  .summary.live, .pip, .previews { animation: none; }
-  .expand-enter-active, .expand-leave-active, .tick-enter-active, .tick-leave-active { transition: none; }
+  .pip, .previews { animation: none; }
+  .expand-enter-active, .expand-leave-active { transition: none; }
 }
 </style>

@@ -3,15 +3,8 @@ import { reactive, watch } from "vue";
 import type { Attachment, OpenSnapshot } from "./types";
 import { showToast } from "./bridge";
 import { DRAFTS, localKeys, readLocal, writeLocal } from "./localPrompts";
-
-interface Draft {
-  text: string;
-  attachments: Attachment[];
-  sending: boolean;
-  /** Unacknowledged input stays recoverable alongside the editable next draft. */
-  pending?: { text: string; attachments: Attachment[] };
-  loading: boolean;
-}
+import { combinedInput, restoreInput, type Draft } from './draftInput';
+export { beginSend } from './draftInput';
 
 const drafts = new Map<string, Draft>();
 let warned = false;
@@ -40,50 +33,34 @@ export function draftRecord(text: string, attachments: readonly Attachment[]) {
 function recoverable(draft: Draft) {
   const p = draft.pending;
   if (!p) return draftRecord(draft.text, draft.attachments);
-  const keys = new Set(p.attachments.map(a => a.key));
-  return draftRecord([p.text, draft.text].filter(Boolean).join("\n\n"), [...p.attachments, ...draft.attachments.filter(a => !keys.has(a.key))]);
-}
-
-export function beginSend(draft: Draft) {
-  const pending = { text: draft.text, attachments: draft.attachments };
-  draft.sending = true;
-  draft.text = "";
-  draft.attachments = [];
-  draft.pending = pending;
-  return (accepted: boolean) => {
-    const restored = !accepted && recoverable(draft);
-    draft.pending = undefined;
-    if (restored) {
-      draft.text = restored.text;
-      draft.attachments = restored.attachments;
-    }
-    draft.sending = false;
-  };
+  const combined = combinedInput(p, draft);
+  return draftRecord(combined.text, combined.attachments);
 }
 
 async function attachPersistence(key: string, draft: Draft) {
-  // Install the watcher before loading so an edit during startup wins over stored data.
-  let edited = false;
-  let restoring = false;
+  // Read before the first write. Text typed or files prepared during startup belong
+  // beside the restored draft, and must not replace it on disk before it has loaded.
+  let stored: { text?: unknown; attachments?: Attachment[] } | undefined;
+  try {
+    stored = await readLocal(DRAFTS, key) as typeof stored;
+  } catch { storageError(); }
+  const edited = !!(draft.text || draft.attachments.length);
+  if (typeof stored?.text === 'string' && Array.isArray(stored.attachments)) {
+    restoreInput(draft, { text: stored.text, attachments: stored.attachments });
+  }
+  // Created after the async read: this watcher belongs to the cached draft, not
+  // the component that first opened it. Batch changes to a pending send into one write.
   watch(() => recoverable(draft), (record) => {
-    if (restoring) return;
-    edited = true;
     if (record) storedKeys.add(key); else storedKeys.delete(key);
     void writeLocal(key, { [DRAFTS]: record }).catch(storageError);
-  }, { flush: "sync" });
-  const stored = await readLocal(DRAFTS, key) as { text?: unknown; attachments?: Attachment[] } | undefined;
-  if (edited || typeof stored?.text !== "string" || !Array.isArray(stored.attachments)) return;
-  restoring = true;
-  draft.text = stored.text;
-  draft.attachments = stored.attachments;
-  restoring = false;
+  }, { immediate: edited });
 }
 
 export function draftFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): Draft {
   const key = JSON.stringify([snap.workspace.root, snap.sessionId]);
   let draft = drafts.get(key);
   if (!draft) {
-    const created = reactive<Draft>({ text: "", attachments: [], sending: false, loading: true });
+    const created = reactive<Draft>({ text: '', attachments: [], sending: false, loading: true, reading: 0 });
     drafts.set(key, created);
     void attachPersistence(key, created).catch(storageError).finally(() => { created.loading = false; });
     draft = created;

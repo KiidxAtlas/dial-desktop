@@ -12,6 +12,22 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// Mail is display data, not a prompt. Never classify a person's text by a bracketed prefix.
+fn journal_sender(message: &Value) -> Option<&str> {
+    if message["role"] != "user" || message["dial_structured_text"] == true {
+        return None;
+    }
+    // The engine writes these records as plain text; preserve other shapes (e.g. attachments).
+    let text = message["content"].as_str()?;
+    if let Some(sender) = message["dial_worker_result"].as_str() {
+        return Some(if sender.trim().is_empty() { "worker" } else { sender });
+    }
+    if message["dial_child_coordination"] != true { return None; }
+    // Coordination also includes restart briefings. Only a mailbox envelope names a sender.
+    let sender = text.strip_prefix("[Message from ")?.split_once("]\n")?.0;
+    (!sender.trim().is_empty() && !sender.contains(['\r', '\n'])).then_some(sender)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -91,6 +107,34 @@ pub fn first_line(text: &str, max: usize) -> String {
     }
 }
 
+/// `fresh` (the engine's list, newest activity first) with the rows that did not change since
+/// `previous` kept in their `previous` order. Opening a session can bump its timestamp in the
+/// engine without adding anything to it; without this the clicked row would jump to the top.
+/// Rows that are new or gained messages keep the engine's position, so real activity still
+/// floats up.
+pub fn keep_session_order(
+    previous: &[SessionSummary],
+    fresh: Vec<SessionSummary>,
+) -> Vec<SessionSummary> {
+    let before: HashMap<&str, (usize, u64)> = previous
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), (i, s.messages)))
+        .collect();
+    let unchanged = |s: &SessionSummary| {
+        before
+            .get(s.id.as_str())
+            .is_some_and(|(_, messages)| *messages == s.messages)
+    };
+    let mut kept: Vec<SessionSummary> = fresh.iter().filter(|s| unchanged(s)).cloned().collect();
+    kept.sort_by_key(|s| before[s.id.as_str()].0);
+    let mut kept = kept.into_iter();
+    fresh
+        .into_iter()
+        .map(|s| if unchanged(&s) { kept.next().unwrap_or(s) } else { s })
+        .collect()
+}
+
 /// Counts of tool calls by state, for the activity summary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolStats {
@@ -147,6 +191,15 @@ pub struct ModelOption {
     pub listed: bool,
     /// Only from the static bundled catalog (not configured, local, or live-listed).
     pub catalog_only: bool,
+    pub local_engine: Option<EngineChoice>,
+}
+
+/// Only present when the connected engine supports per-model runtime selection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct EngineChoice {
+    pub selected: String,
+    pub choices: Vec<String>,
+    pub setting: String,
 }
 
 impl ModelOption {
@@ -177,6 +230,7 @@ impl ModelOption {
             local: sources.iter().any(|source| source == "local"),
             listed,
             catalog_only,
+            local_engine: serde_json::from_value(value["local_engine"].clone()).ok(),
         })
     }
 }
@@ -220,6 +274,9 @@ pub enum Reply {
 pub struct Model {
     pub connection: Option<Connection>,
     pub conversation: Conversation,
+    /// Senders of delivery notices and controller-authored journal records. The wire client
+    /// retains the text but not its provenance. Index only rows it actually appended.
+    pub(crate) received_from: HashMap<usize, String>,
     pub sessions: Vec<SessionSummary>,
     /// Ignore late pages from a history refresh superseded by a new one.
     session_page: Option<(RequestId, u64)>,
@@ -242,6 +299,8 @@ pub struct Model {
     pub ready_image_input: Option<bool>,
     /// Whether the engine takes the structured `type_context` on `send` (`ready.features`).
     pub type_context_supported: bool,
+    /// Whether a model switch can ask the engine to start its own local inference server.
+    pub prepare_local_model_supported: bool,
     /// The settings reference (`settings_schema`'s `settings`), once loaded.
     pub settings_schema: Option<Vec<Value>>,
     /// Saved settings' effective values by key, once loaded.
@@ -252,6 +311,8 @@ pub struct Model {
     /// when the engine predates that listing.
     pub image_models: Option<Vec<Value>>,
     pending: HashMap<RequestId, Purpose>,
+    /// User-visible guidance awaiting engine acknowledgement, without legacy Type framing.
+    pending_notes: HashMap<RequestId, String>,
     pub(crate) recovering: bool,
     /// The open question already acknowledged as presented; the engine refuses a second ack.
     presented: Option<String>,
@@ -263,9 +324,26 @@ pub struct Model {
     apply_pending: bool,
     /// The conversation's size in tokens as the engine last reported it (`context_usage`).
     pub context: Option<ContextUsage>,
+    /// Latest telemetry for the active inference request, never conversation history.
+    pub model_progress: Option<ModelProgress>,
     /// Hands-free voice mode.
     pub voice: Voice,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all(serialize = "camelCase"))]
+pub struct ModelProgress {
+    pub phase: InferencePhase,
+    pub processed_tokens: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InferencePhase { Loading, Processing, Generating }
 
 /// How much of the model's context the conversation fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +359,9 @@ pub struct SavedSetting {
     pub value: Value,
     /// A credential: `value` is a placeholder, never the secret.
     pub redacted: bool,
+    /// The saved layer that sets it (`"project"` or `"global"`); `None` when neither does or
+    /// the engine predates the `scope` field.
+    pub scope: Option<String>,
 }
 
 impl Model {
@@ -431,8 +512,17 @@ impl Model {
         Ok(Command::Undo)
     }
 
+    /// Reload the open conversation from the engine, after a change made outside a turn (a move
+    /// through the session tree). Refused while a turn runs.
+    pub fn reload(&self) -> Result<Command, String> {
+        if self.conversation.turn_running() {
+            return Err("Stop the running turn (Esc) first".into());
+        }
+        Ok(Command::Recover)
+    }
+
     /// The request that adds `text` to the running turn; refused when no turn runs.
-    pub fn steer(&self, text: &str) -> Result<Command, String> {
+    pub fn steer(&self, text: &str, scope: Option<crate::engine::TypeScope>) -> Result<Command, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err("Type the guidance to add".into());
@@ -440,7 +530,7 @@ impl Model {
         if !self.conversation.turn_running() {
             return Err("Dial is not working on a turn; send this as a new prompt".into());
         }
-        Ok(Command::Steer(text.to_owned()))
+        Ok(Command::Steer { text: text.to_owned(), scope })
     }
 
     /// The request that sends the last prompt again; the engine refuses it unless that prompt
@@ -604,14 +694,18 @@ impl Model {
         match update {
             Update::Connected(ready) => {
                 self.connect(&ready);
-                follow.extend([Command::ListSessions, Command::State]);
+                follow.extend([Command::ListSessions, Command::State, Command::GetSettings]);
                 self.discovering = false;
                 follow.extend(self.discover_if_due(Instant::now(), Duration::ZERO));
             }
             Update::ConnectFailed(error) => self.connection = Some(Connection::Failed(error)),
             Update::Requested { command, id } => {
                 let (purpose, _, _) = command.request();
+                if matches!(purpose, Purpose::Turn | Purpose::Recover) {
+                    self.model_progress = None;
+                }
                 match &command {
+                    Command::Steer { text, .. } => { self.pending_notes.insert(id, text.clone()); }
                     Command::ListSessions => {
                         self.session_pages.clear();
                         self.session_page = Some((id, 0));
@@ -660,25 +754,41 @@ impl Model {
                 self.toast = Some(format!("Could not {}: {error}", describe(&command)));
             }
             Update::Message(mut message) => {
-                // The wire client keeps structured tool data but not top-level journal attachment
-                // fields. Project retained references into the same channel as live results.
+                // Preserve delivery metadata and journal attachments before the shared
+                // conversation model reduces the wire message to one of its row types.
+                let index = self.conversation.entries().len();
+                let mut sender = None;
                 match &mut message {
+                    Message::Event(event) if event.kind == "notice" && event.body["kind"].is_null() && event.body["lane"].is_null() => {
+                        let mail = &event.body["received_message"];
+                        if let (Some(from), Some(text)) = (mail["from"].as_str().filter(|s| !s.trim().is_empty()), mail["text"].as_str()) {
+                            sender = Some(from.to_owned());
+                            event.body["message"] = Value::String(text.to_owned());
+                        }
+                    }
                     Message::Event(event) if event.kind == "replay_message" => {
                         replay_images(&mut event.body["message"]);
-                        crate::legacy_text::project_user_message(&mut event.body["message"]);
+                        sender = journal_sender(&event.body["message"]).map(str::to_owned);
+                        if sender.is_none() { crate::legacy_text::project_user_message(&mut event.body["message"]); }
                     }
                     Message::Response { result: Ok(body), .. } if body.get("messages").is_some() => {
                         if let Some(messages) = body["messages"].as_array_mut() {
                             for message in messages {
                                 replay_images(message);
-                                crate::legacy_text::project_user_message(message);
+                                if journal_sender(message).is_none() { crate::legacy_text::project_user_message(message); }
                             }
                         }
                     }
                     _ => {}
                 }
                 self.message(&message, &mut follow);
+                if let Some(sender) = sender && self.conversation.entries().len() == index + 1 {
+                    self.received_from.insert(index, sender);
+                }
             }
+        }
+        if !self.conversation.turn_running() || !matches!(self.connection(), Connection::Live { .. }) {
+            self.model_progress = None;
         }
         // A frame may be published before the worker acknowledges the follow-up request.
         self.recovering |= follow.contains(&Command::Recover);
@@ -696,10 +806,13 @@ impl Model {
     fn connect(&mut self, ready: &Ready) {
         self.voice.reset();
         self.conversation.new_connection(ready);
+        if self.conversation.entries().is_empty() { self.received_from.clear(); }
         self.pending.clear();
+        self.pending_notes.clear();
         self.recovering = false;
         self.ready_image_input = ready.raw["image_input"].as_bool();
         self.type_context_supported = ready.raw["features"]["type_context"].as_bool() == Some(true);
+        self.prepare_local_model_supported = crate::engine::supports_local_preparation(ready);
         self.connection = Some(Connection::Live {
             model: ready.model.clone(),
             engine_version: ready.engine_version.clone(),
@@ -711,14 +824,18 @@ impl Model {
         // not a failed turn.
         let failed_listen = matches!(message, Message::Response { id, result, .. }
             if self.voice.owns_failed_listen(*id, result.is_err()));
-        if !failed_listen {
-            self.conversation.apply(message);
+        if !failed_listen && self.conversation.apply(message)
+            && matches!(message, Message::Event(e) if e.kind == "active_session")
+        {
+            self.received_from.clear();
+            self.pending_notes.clear();
         }
         match message {
             Message::Response { id, result, .. } => {
                 let Some(purpose) = self.pending.remove(id) else {
                     return;
                 };
+                if result.is_err() { self.pending_notes.remove(id); }
                 if purpose == Purpose::Models {
                     self.discovering = false;
                 }
@@ -745,10 +862,11 @@ impl Model {
                                 } else {
                                     self.session_page = None;
                                     let mut seen = HashSet::new();
-                                    self.sessions = std::mem::take(&mut self.session_pages)
+                                    let fresh = std::mem::take(&mut self.session_pages)
                                         .into_iter()
                                         .filter(|s| !self.deleted.contains(&s.id) && seen.insert(s.id.clone()))
                                         .collect();
+                                    self.sessions = keep_session_order(&self.sessions, fresh);
                                 }
                             }
                             Err(error) => {
@@ -762,6 +880,14 @@ impl Model {
                         self.recovering = false;
                         if !self.conversation.load_snapshot(snapshot) {
                             self.toast = Some("The engine's recovery snapshot was incomplete; the view may be out of date".into());
+                        } else {
+                            // User-role records each produce one user row in order. Tool/assistant
+                            // records need not, so never use a wire message offset as a row index.
+                            self.received_from = snapshot["messages"].as_array().into_iter().flatten()
+                                .filter(|m| m["role"] == "user")
+                                .zip(self.conversation.entries().iter().enumerate().filter(|(_, e)| matches!(e, Entry::User(_))))
+                                .filter_map(|(m, (i, _))| journal_sender(m).map(|from| (i, from.to_owned())))
+                                .collect();
                         }
                     }
                     (Purpose::LiveStart, result) => {
@@ -873,8 +999,15 @@ impl Model {
                     (Purpose::Compact, Ok(_)) => {
                         follow.extend([Command::Recover, Command::ListSessions]);
                     }
-                    // The engine takes the guidance at the running turn's next step.
-                    (Purpose::Steer, Ok(_)) => {}
+                    // A steer is a note inside the current turn, not a new prompt to undo or retry.
+                    (Purpose::Steer, Ok(_)) => {
+                        if let Some(text) = self.pending_notes.remove(id) {
+                            self.conversation.apply_event(&dial_client::Event {
+                                kind: "notice".into(),
+                                body: json!({"kind":"steer", "lane":"user", "message":text}),
+                            });
+                        }
+                    }
                     (Purpose::Steer, Err(error))
                         if error.code.as_deref() == Some("not_pending") =>
                     {
@@ -908,6 +1041,10 @@ impl Model {
                                     let setting = SavedSetting {
                                         value: entry["value"].clone(),
                                         redacted: entry["redacted"].as_bool().unwrap_or_default(),
+                                        scope: entry["scope"]
+                                            .as_str()
+                                            .filter(|s| matches!(*s, "project" | "global"))
+                                            .map(str::to_owned),
                                     };
                                     Some((key.to_owned(), setting))
                                 })
@@ -942,6 +1079,10 @@ impl Model {
                         self.apply_pending = true;
                     }
                     (purpose, Err(error)) => {
+                        // A valid selection can stick even if starting its local runtime failed.
+                        if purpose == Purpose::SetModel {
+                            follow.push(Command::State);
+                        }
                         if purpose == Purpose::Recover {
                             self.recovering = false;
                         }
@@ -962,11 +1103,21 @@ impl Model {
             }
             Message::Disconnected { .. } => {
                 self.pending.clear();
+                self.pending_notes.clear();
                 self.recovering = false;
                 self.voice.reset();
                 self.connection = Some(Connection::Ended);
             }
             Message::Event(event) => match event.kind.as_str() {
+                "model_progress" if self.conversation.turn_running()
+                    && event.body["session_id"].as_str().is_none_or(|s| Some(s) == self.conversation.session_id())
+                    && event.request_id().is_some_and(|id| matches!(self.pending.get(&id), Some(Purpose::Turn | Purpose::Listen))) => {
+                    self.model_progress = serde_json::from_value(event.body["progress"].clone()).ok();
+                }
+                "state_node" if event.body["node"]["kind"] == "inference"
+                    && event.body["node"]["parent"].is_null()
+                    && event.body["node"]["result"]["phase"] == "completed" => self.model_progress = None,
+                "tool_call" | "retry" => self.model_progress = None,
                 "context_usage" => {
                     self.context = event.body["tokens"].as_u64().map(|tokens| ContextUsage {
                         tokens,
@@ -974,7 +1125,7 @@ impl Model {
                     });
                 }
                 // Another session's size is unknown until the engine reports it.
-                "active_session" => { self.context = None; self.current_model = None; }
+                "active_session" => { self.context = None; self.current_model = None; self.model_progress = None; }
                 "live_transcript" => {
                     let text = event.body["text"].as_str().unwrap_or_default();
                     if let Some((id, repeated)) = self.voice.transcript(text) {
@@ -1093,7 +1244,7 @@ fn describe(command: &Command) -> &'static str {
         Command::ForkSession(_) => "duplicate the session",
         Command::Export(_) => "export the session",
         Command::Undo => "undo the last turn",
-        Command::Steer(_) => "add to the running turn",
+        Command::Steer { .. } => "add to the running turn",
         Command::Retry => "retry the prompt",
         Command::Compact => "compact the conversation",
         Command::LiveStart { .. } => "start voice mode",

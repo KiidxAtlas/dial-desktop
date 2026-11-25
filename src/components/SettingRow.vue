@@ -2,8 +2,12 @@
 // One engine setting, drawn with the control that fits it: a switch, a choice, a stepper, a
 // model or file picker. Text boxes are left for values no list can offer (URLs, variable names).
 import { computed, onMounted, ref, watch } from "vue";
-import type { Choice, Setting } from "../types";
+import type { Choice, Setting, SettingScope } from "../types";
+import { resetTitle, sourceBadge } from "../settingScope";
 import { models } from "../bridge";
+import { usableModels } from "../modelPicker";
+import { ROW_TEXT, settingFeedback } from "../settingsFeedback";
+import { ui } from "../ui";
 import SettingValue from "./SettingValue.vue";
 import SRow from "./settings/SRow.vue";
 import SSwitch from "./settings/SSwitch.vue";
@@ -13,14 +17,30 @@ import SNumber from "./settings/SNumber.vue";
 import SChips from "./settings/SChips.vue";
 import SPath from "./settings/SPath.vue";
 
-const props = defineProps<{ setting: Setting }>();
+/** `pageScope`: where the page saves edits, so a project override can say it shadows them. */
+const props = defineProps<{ setting: Setting; pageScope?: SettingScope }>();
 const emit = defineEmits<{ save: [value: unknown, linked?: Record<string, unknown>]; reset: [] }>();
+
+const badge = computed(() => sourceBadge(props.setting.source, props.pageScope));
 
 const s = computed(() => props.setting);
 const c = computed(() => props.setting.control);
 
 function save(value: unknown) {
   if (JSON.stringify(value) !== JSON.stringify(props.setting.value)) emit("save", value);
+}
+
+/** What happened to the last change of this row (see `settingsFeedback`). */
+const status = computed(() => {
+  const state = settingFeedback.rows[props.setting.key];
+  if (!state) return null;
+  const kind = state === "failed" ? "bad" : state === "restart" || state === "turn" ? "warn" : state === "saved" ? "ok" : undefined;
+  return { text: ROW_TEXT[state], kind } as const;
+});
+
+/** Credentials are set on the Providers page, not typed into a row. */
+function manageProviders() {
+  ui.settingsTab = "providers";
 }
 
 // ── Choices ──────────────────────────────────────────────────────────────────
@@ -92,7 +112,8 @@ const textOptions = computed<ComboOption[] | null>(() => {
   const given: ComboOption[] = c.value.suggestions.map((o) => ({ value: o.value, label: o.label, detail: o.label !== o.value ? o.value : undefined }));
   if (hint.value === "model") {
     const seen = new Set(given.map((o) => o.value));
-    for (const m of models.value) {
+    // The composer picker's list: catalog rows for providers that are not set up are left out.
+    for (const m of usableModels(models.value, (m) => m.modelId === text.value)) {
       if (seen.has(m.modelId)) continue;
       seen.add(m.modelId);
       given.push({ value: m.modelId, label: m.label, group: m.configured ? "Yours" : m.provider, detail: m.label !== m.modelId ? m.modelId : undefined });
@@ -123,6 +144,7 @@ const urlError = ref("");
 const list = computed(() => (Array.isArray(s.value.value) ? s.value.value.map(String) : []));
 const editing = ref(false);
 const structured = ref<unknown>(null);
+const submitted = ref(false);
 const entries = computed(() => {
   const v = s.value.value;
   if (Array.isArray(v)) return v.length;
@@ -133,10 +155,18 @@ function startEditing() {
   editing.value = true;
 }
 function saveStructure() {
+  if (submitted.value) return;
+  if (JSON.stringify(structured.value) === JSON.stringify(s.value.value)) { editing.value = false; return; }
+  submitted.value = true;
   save(structured.value);
-  editing.value = false;
 }
-watch(() => JSON.stringify(s.value.value), () => (editing.value = false));
+// Refreshes (including unrelated saves) can settle row feedback. Only dismiss a submitted
+// draft when the refreshed setting actually matches it; a rejected edit stays retryable.
+watch(() => settingFeedback.rows[s.value.key], (state) => {
+  if (!submitted.value || state === "saving") return;
+  submitted.value = false;
+  if (state && state !== "failed" && JSON.stringify(s.value.value) === JSON.stringify(structured.value)) editing.value = false;
+}, { flush: "post" });
 
 const keyHint = computed(() => `${s.value.key}${defaultText.value && typeof s.value.default !== "object" ? ` · default ${defaultText.value}` : ""}`);
 const stacked = computed(() => c.value.type === "list" || (c.value.type === "table" && editing.value));
@@ -160,9 +190,14 @@ const folderList = computed(() => /(write|paths|dirs|folders|roots)$/.test(s.val
     :restart="s.restart"
     :stacked="stacked"
     :hint="keyHint"
+    :status="status"
+    :badge="badge"
+    :reset-title="resetTitle(s.source)"
     @reset="emit('reset')"
   >
-    <span v-if="s.redacted" class="s-muted secret" title="Credentials are only changed with `dial config` in a terminal">Holds a credential</span>
+    <button v-if="s.redacted" class="btn btn-secondary" title="Credentials are added, replaced and removed on the Providers page" @click="manageProviders">
+      Manage in Providers
+    </button>
 
     <SSwitch v-else-if="c.type === 'toggle'" :model-value="s.value === true" :label="s.label" @update:model-value="save" />
 
@@ -238,12 +273,18 @@ const folderList = computed(() => /(write|paths|dirs|folders|roots)$/.test(s.val
       <button class="btn btn-secondary" @click="startEditing">Edit…</button>
     </template>
     <form v-else class="table-edit" @submit.prevent="saveStructure">
-      <SettingValue :value="structured" :label="s.label" @change="structured = $event" />
-      <div class="actions">
-        <button class="btn btn-secondary" type="button" @click="editing = false">Cancel</button>
-        <button class="btn btn-primary" type="submit">Save</button>
-      </div>
+      <fieldset :disabled="submitted">
+        <SettingValue :value="structured" :label="s.label" @change="structured = $event" />
+        <div class="actions">
+          <button class="btn btn-secondary" type="button" @click="editing = false">Cancel</button>
+          <button class="btn btn-primary" type="submit">{{ submitted ? 'Saving…' : 'Save' }}</button>
+        </div>
+      </fieldset>
     </form>
+    <template v-if="(s.key === 'model' && hint === 'model') || badge?.hint" #below-text>
+      <p v-if="badge?.hint" class="s-desc override">{{ badge.hint }}</p>
+      <p v-if="s.key === 'model' && hint === 'model'" class="s-desc">The default for new sessions. The model picker under the message box switches only the session you are in.</p>
+    </template>
   </SRow>
 </template>
 
@@ -257,12 +298,19 @@ const folderList = computed(() => /(write|paths|dirs|folders|roots)$/.test(s.val
 .typed .s-input {
   width: 240px;
 }
-.secret,
 .count {
   font-size: 12.5px;
   white-space: nowrap;
 }
-.table-edit {
+.override {
+  color: var(--accent);
+}
+.table-edit { width: 100%; }
+.table-edit fieldset {
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;

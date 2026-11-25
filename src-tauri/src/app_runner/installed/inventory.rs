@@ -510,31 +510,24 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 
+/// The trusted `VBoxManage`, when VirtualBox is installed in its standard location.
+pub(crate) fn virtualbox_tool() -> Option<PathBuf> {
+    first_executable(&virtualbox_tools())
+}
+
+/// The trusted `vmrun`, when VMware is installed in its standard location.
+pub(crate) fn vmware_tool() -> Option<PathBuf> {
+    first_executable(&vmware_tools())
+}
+
 /// The first candidate that is a regular file with an execute bit (on Unix).
 fn first_executable(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates
         .iter()
-        .find(|candidate| is_executable(candidate))
+        .find(|candidate| crate::launcher::is_executable(candidate))
         .cloned()
 }
 
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
 
 /// A short, stable, path-free id suffix: the first 16 bytes of SHA-256, in hex.
 fn digest_hex(text: &str) -> String {

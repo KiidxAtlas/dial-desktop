@@ -96,7 +96,7 @@ function add() {
   min-width: 0;
   width: 100%;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: var(--bg);
 }
 .entry {

@@ -3,9 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { connect, connecting, engine, snapshot, startupError } from "./bridge";
+import { installEngine, updateEngine, updates } from "./updates";
+import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey } from "./keysGuard";
 import { focusComposer, ui, type InspectorTab } from "./ui";
 import { copyText, goToSession, sessionOrder, stepSession } from "./sessionActions";
-import { followAgentApp, followAgentBrowser, showPanel, trackPreviews } from "./workspace";
+import { followAgentApp, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -13,7 +15,7 @@ import { markTurnAborted, syncQueue } from "./queue";
 import type { OpenSnapshot } from "./types";
 import Sidebar from "./components/Sidebar.vue";
 import TopBar from "./components/TopBar.vue";
-import Timeline from "./components/Timeline.vue";
+import Timeline from "./components/LiveTimeline.vue";
 import Composer from "./components/Composer.vue";
 import Inspector from "./components/Inspector.vue";
 import Toasts from "./components/Toasts.vue";
@@ -30,6 +32,8 @@ import { startUpdateChecks } from "./updates";
 import TypeView from "./components/types/TypeView.vue";
 import Icon from "./components/Icon.vue";
 import { followTypeSession, typeScopedSnapshot } from "./savedTypes";
+import { AUTO_RECONNECT_SECONDS, initialReconnect, nextReconnect } from "./autoReconnect";
+import { turnAnnouncement, type TurnView } from "./turnAnnounce";
 
 /** A type stays open while its own conversation is on screen; another session closes it. */
 watch(
@@ -64,6 +68,9 @@ watch(() => viewed.value?.turnRunning, (running) => {
   if (running && showingType.value) typeComposerOpen.value = false;
 });
 const reviewing = computed(() => ui.inspectorOpen && ui.inspectorTab === "changes" && !!ui.diffPath && ui.diffExpanded && !ui.settingsOpen);
+watch(() => ui.focusSearch, request => {
+  if (request && reviewing.value) ui.diffExpanded = false;
+});
 watch(() => [opened.value?.workspace.root, opened.value?.sessionId] as const, ([root, id], [previousRoot, previousId]) => {
   if (root !== previousRoot || id !== previousId) {
     ui.diffPath = null;
@@ -114,6 +121,82 @@ async function followFullscreen(): Promise<(() => void) | null> {
   }
 }
 
+/** The engine stopped or could not start: said in the conversation, not only the sidebar footer. */
+const disconnect = computed(() => {
+  const c = opened.value?.connection;
+  if (c?.state === "ended") return { text: "The Dial engine stopped.", detail: "", hint: "", problem: "other" as const };
+  if (c?.state !== "failed") return null;
+  const text = c.problem === "missing" ? "No Dial engine is installed."
+    : c.problem === "incompatible" ? "This Dial engine is too old or too new for the app."
+    : "The Dial engine could not start.";
+  return { text, detail: c.error, hint: c.hint ?? "", problem: c.problem };
+});
+
+// One automatic reconnect a few seconds after a live engine goes away (see `autoReconnect.ts`),
+// with a countdown in the banner that Cancel stops. The app refuses while work must be kept; the
+// banner then says why and Reconnect stays for later.
+let reconnectState = initialReconnect;
+const reconnectIn = ref<number | null>(null);
+const reconnectRefused = ref("");
+let reconnectTimer: ReturnType<typeof setInterval> | undefined;
+function stopCountdown() {
+  clearInterval(reconnectTimer);
+  reconnectTimer = undefined;
+  reconnectIn.value = null;
+}
+function startCountdown() {
+  stopCountdown();
+  reconnectRefused.value = "";
+  reconnectIn.value = AUTO_RECONNECT_SECONDS;
+  reconnectTimer = setInterval(async () => {
+    if (reconnectIn.value === null) return stopCountdown();
+    if (--reconnectIn.value > 0) return;
+    stopCountdown();
+    const refused = await engine.reconnectQuietly();
+    if (refused) reconnectRefused.value = refused;
+  }, 1000);
+}
+watch(
+  () => [opened.value?.connection, opened.value ? `${opened.value.workspace.root}\n${opened.value.sessionId ?? ""}` : null] as const,
+  ([connection, key]) => {
+    if (!connection) return stopCountdown();
+    const next = nextReconnect(reconnectState, key, connection);
+    reconnectState = next.state;
+    if (connection.state === "live" || connection.state === "starting") {
+      stopCountdown();
+      reconnectRefused.value = "";
+    }
+    if (next.start) startCountdown();
+  },
+);
+function reconnectNow() {
+  stopCountdown();
+  reconnectRefused.value = "";
+  void engine.reconnect();
+}
+onBeforeUnmount(stopCountdown);
+
+/** A polite live region says when a turn starts, waits for you or finishes; streamed text is not read. */
+const announcement = ref("");
+let lastTurn: TurnView | null = null;
+watch(viewed, (s) => {
+  if (!s) return;
+  const now: TurnView = {
+    key: `${s.workspace.root}\n${s.sessionId ?? ""}`,
+    turnRunning: s.turnRunning,
+    approvals: s.approvals.length,
+    question: !!s.question,
+    lastKind: s.entries.at(-1)?.kind ?? null,
+  };
+  const said = turnAnnouncement(lastTurn, now);
+  lastTurn = now;
+  // Cleared first, so the same sentence twice in a row is still read out.
+  if (said) {
+    announcement.value = "";
+    void nextTick(() => (announcement.value = said));
+  }
+});
+
 // Holding ⌘ (Ctrl elsewhere) alone for a moment shows the sessions' ⌘1–9 numbers.
 const mac = navigator.platform.toLowerCase().includes("mac");
 let hintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -127,7 +210,17 @@ function onKeyUp(event: KeyboardEvent) {
 
 function onKey(event: KeyboardEvent) {
   const s = opened.value;
-  if (!s) return;
+  if (!s) {
+    // The welcome screen has no project: only Settings (⌘,) and closing it with Esc.
+    if (commandKey(event, mac) && !event.shiftKey && !event.altKey && event.key === ",") {
+      event.preventDefault();
+      ui.settingsOpen = !ui.settingsOpen;
+    } else if (event.key === "Escape" && !event.isComposing && ui.settingsOpen) {
+      event.preventDefault();
+      ui.settingsOpen = false;
+    }
+    return;
+  }
   if (event.key === (mac ? "Meta" : "Control")) {
     if (!event.repeat) {
       clearTimeout(hintTimer);
@@ -136,9 +229,14 @@ function onKey(event: KeyboardEvent) {
     return;
   }
   hideHints();
-  const command = event.metaKey || event.ctrlKey;
+  // Keys typed in a terminal are the shell's, apart from ⌘ shortcuts on macOS and Ctrl+`.
+  if (inTerminal(event.target) && terminalOwnsKey(event, mac)) return;
+  // ⌘ on macOS, where Ctrl+letter belongs to text fields and terminals; Ctrl elsewhere.
+  const command = commandKey(event, mac);
   const plain = command && !event.shiftKey && !event.altKey;
   const key = event.key.toLowerCase();
+  // A modal palette owns navigation; only its own toggle/mode shortcuts belong to the window.
+  if (ui.paletteOpen && !(plain && (key === "k" || key === "p"))) return;
   if (plain && /^Digit[1-9]$/.test(event.code)) {
     const target = sessionOrder(s)[Number(event.code.slice(5)) - 1];
     if (target) {
@@ -157,7 +255,7 @@ function onKey(event: KeyboardEvent) {
   }
   if (command && event.shiftKey && !event.altKey && key === "f") {
     event.preventDefault();
-    ui.sidebarOpen = true;
+    showSidebar();
     ui.focusSearch++;
     return;
   }
@@ -171,10 +269,10 @@ function onKey(event: KeyboardEvent) {
     event.preventDefault();
     startNewSession(s);
   } else if (plain && key === "k") {
-    ui.filePalette = false;
     event.preventDefault();
     ui.menu = null;
-    ui.paletteOpen = !ui.paletteOpen;
+    ui.paletteOpen = ui.filePalette || !ui.paletteOpen;
+    ui.filePalette = false;
   } else if (plain && key === "p" && !event.defaultPrevented) {
     event.preventDefault();
     ui.filePalette = true;
@@ -184,7 +282,7 @@ function onKey(event: KeyboardEvent) {
     ui.shortcutsOpen = !ui.shortcutsOpen;
   } else if (plain && key === "b") {
     event.preventDefault();
-    ui.sidebarOpen = !ui.sidebarOpen;
+    toggleSidebar();
   } else if (command && event.altKey && !event.shiftKey && event.code === "KeyI") {
     event.preventDefault();
     ui.inspectorOpen = !ui.inspectorOpen;
@@ -224,14 +322,27 @@ function onKey(event: KeyboardEvent) {
   } else if (event.key === "Escape" && !event.isComposing && ui.settingsOpen) {
     event.preventDefault();
     ui.settingsOpen = false;
+  } else if (event.key === "Escape" && !event.isComposing && inspectorFloats() && !ui.menu && !ui.paletteOpen && !ui.shortcutsOpen) {
+    // The narrow-window drawer covers the conversation: Esc puts it away first.
+    event.preventDefault();
+    ui.inspectorOpen = false;
   } else if (event.key === "Escape" && !event.isComposing && showingType.value && typeComposerOpen.value) {
     event.preventDefault();
     typeComposerOpen.value = false;
-  } else if (event.key === "Escape" && !event.isComposing && s.turnRunning) {
+  } else if (
+    event.key === "Escape" && !event.isComposing && !event.repeat && !event.defaultPrevented && s.turnRunning &&
+    escapeStopsTurn(event.target, !!ui.menu || ui.paletteOpen || ui.shortcutsOpen)
+  ) {
     event.preventDefault();
     markTurnAborted(s);
     engine.abort();
   }
+}
+
+/** A press on the conversation beside the narrow-window drawer puts the drawer away; the title
+ *  bar keeps its own toggle. */
+function dismissDrawer(event: PointerEvent) {
+  if (inspectorFloats() && event.target instanceof Element && !event.target.closest(".topbar")) ui.inspectorOpen = false;
 }
 
 function scanOnReturn() {
@@ -268,16 +379,41 @@ onBeforeUnmount(() => {
   <div
     v-if="opened && viewed"
     class="shell"
-    :class="{ mac: opened.platform === 'macos', 'no-sidebar': !ui.sidebarOpen, fullscreen }"
+    :class="{ mac: opened.platform === 'macos', 'no-sidebar': !sidebarShown(), fullscreen }"
   >
     <Transition name="drawer">
-      <Sidebar v-if="ui.sidebarOpen && !reviewing" :snap="opened" />
+      <Sidebar v-if="sidebarShown() && !reviewing" :snap="opened" />
     </Transition>
     <!-- Kept mounted under the settings page, so the conversation keeps its scroll and draft. -->
-    <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }">
+    <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }" @pointerdown="dismissDrawer">
       <Backdrop v-if="showBackdrop" :dimmed="!empty" />
       <TopBar :snap="viewed" />
       <UpdateBanner />
+      <div v-if="disconnect" class="disconnect" role="alert">
+        <Icon name="shield" :size="15" />
+        <span class="disconnect-text">
+          <strong>{{ disconnect.text }}</strong>
+          <span v-if="reconnectIn !== null" class="disconnect-detail" role="status">Reconnecting in {{ reconnectIn }} s…</span>
+          <span v-else-if="reconnectRefused" class="disconnect-detail" :title="reconnectRefused">Not reconnected automatically: {{ reconnectRefused }}</span>
+          <span v-if="disconnect.hint" class="disconnect-hint">{{ disconnect.hint }}</span>
+          <span v-if="disconnect.detail" class="disconnect-detail" :title="disconnect.detail">{{ disconnect.detail }}</span>
+        </span>
+        <button
+          v-if="disconnect.problem === 'missing'"
+          class="btn btn-primary"
+          :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
+          @click="installEngine()"
+        >{{ updates.engineBusy ? "Installing…" : "Install Dial engine" }}</button>
+        <button
+          v-else-if="disconnect.problem === 'incompatible'"
+          class="btn btn-primary"
+          :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
+          @click="updateEngine()"
+        >{{ updates.engineBusy ? "Updating…" : "Update Dial engine" }}</button>
+        <button v-if="disconnect.detail" class="btn btn-secondary" @click="copyText(disconnect.detail, 'Error copied')">Copy error</button>
+        <button v-if="reconnectIn !== null" class="btn btn-secondary" @click="stopCountdown">Cancel</button>
+        <button class="btn btn-secondary" @click="reconnectNow"><Icon name="refresh" :size="13" /> {{ reconnectIn !== null ? "Reconnect now" : "Reconnect" }}</button>
+      </div>
       <!-- Kept mounted behind an open type, so the transcript keeps its scroll. Timeline has several
            root nodes, so it is hidden through this wrapper. -->
       <div v-show="!showingType" class="transcript">
@@ -302,6 +438,10 @@ onBeforeUnmount(() => {
       <Inspector v-show="ui.inspectorOpen && !ui.settingsOpen" :open="ui.inspectorOpen" :snap="opened" />
     </Transition>
   </div>
+  <!-- No project yet: the app's own settings (appearance, notifications, updates). -->
+  <div v-else-if="snap && ui.settingsOpen" class="shell welcome-settings" :class="{ mac: snap.platform === 'macos', fullscreen }">
+    <Settings :snap="snap" />
+  </div>
   <Welcome v-else-if="snap" />
   <div v-else-if="startupError" class="boot">
     <section class="boot-error" aria-labelledby="boot-title">
@@ -317,6 +457,7 @@ onBeforeUnmount(() => {
     <Logo :size="40" />
   </div>
   <Toasts />
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{{ announcement }}</div>
   <ContextMenu />
   <template v-if="opened">
     <Palette :snap="opened" />
@@ -329,6 +470,10 @@ onBeforeUnmount(() => {
 .shell {
   display: flex;
   height: 100%;
+}
+/* Settings from the welcome screen: no sidebar, so the macOS window buttons sit over its title. */
+.welcome-settings.mac:not(.fullscreen) :deep(.settings .head) {
+  padding-left: 84px;
 }
 .main {
   position: relative;
@@ -346,6 +491,39 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+.disconnect {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px var(--space-xl) 0;
+  padding: 8px 10px 8px 12px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 28%, transparent);
+  color: var(--danger);
+  font-size: var(--text-sm);
+}
+.disconnect-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.disconnect-text strong { font-weight: 600; }
+.disconnect-detail {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.disconnect-hint { color: var(--text); }
+.disconnect .btn { flex: none; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 /* Room under the type for the round composer button. */
 .main.orb :deep(.type-view) {

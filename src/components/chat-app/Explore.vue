@@ -116,7 +116,7 @@ function step(by: number) {
 :root[data-theme="light"] .has-backdrop .stage :deep(img.diagram-dark) { display: block; }
 .hotspot {
   position: absolute;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: transparent;
   box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--accent) 45%, transparent);
   cursor: pointer;

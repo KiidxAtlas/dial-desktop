@@ -167,9 +167,9 @@ md.renderer.rules.text = (tokens, idx) => {
 
 interface RenderEnv { streaming: boolean; cards: boolean; diagrams: boolean }
 
-/** Keep top-level rich fences in separate DOM fragments. Later streamed prose can then update
- * without unmounting a card or cancelling a diagram's pending image decode. Parse the whole
- * document first so Markdown references still resolve across fragments. */
+/** Keep completed blocks in stable DOM fragments. Appending prose then patches only the tail,
+ * preserving image decodes, interactive cards, selections and code scroll positions. Parse the
+ * whole document so later reference definitions can still change the rendering of earlier text. */
 export function renderMarkdownParts(text: string, streaming = false): string[] {
   const env: RenderEnv = { streaming, cards: appearance.cards, diagrams: appearance.diagrams };
   const tokens = md.parse(text, env);
@@ -180,10 +180,8 @@ export function renderMarkdownParts(text: string, streaming = false): string[] {
     from = end;
   };
   for (const [i, token] of tokens.entries()) {
-    if (token.level === 0 && token.type === 'fence' && /^(mermaid|dial-app)(\s|$)/i.test(token.info.trim())) {
-      flush(i);
-      flush(i + 1);
-    }
+    // Never split a list, blockquote, table or other container across HTML fragments.
+    if (token.level === 0 && token.nesting !== -1) flush(i);
   }
   flush(tokens.length);
   return parts;

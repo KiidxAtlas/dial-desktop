@@ -4,7 +4,7 @@ export type Connection =
   | { state: "starting" }
   | { state: "live"; model: string; engineVersion: string | null }
   | { state: "preview" }
-  | { state: "failed"; error: string; problem: EngineProblem }
+  | { state: "failed"; error: string; problem: EngineProblem; /** The next step, when the system named why the engine may not run. */ hint?: string | null }
   | { state: "ended" };
 
 /** What the UI can offer for a failed connection; mirrors `updates::EngineProblem`. */
@@ -76,6 +76,7 @@ export type Entry =
   | { kind: "user"; text: string; images: number }
   | { kind: "assistant"; text: string; reasoning: string; streaming: boolean; abandoned: boolean }
   | ToolEntry
+  | { kind: "received"; sender: string; text: string; source: "live" | "workerNotice" | "peerNotice" | "journal" }
   | { kind: "notice"; message: string; lane: string | null; noticeKind: string | null }
   | { kind: "error"; message: string };
 
@@ -162,6 +163,7 @@ export interface ModelOption {
   listed?: boolean;
   /** Only from a static bundled catalog (not configured, local, or live-listed). */
   catalogOnly?: boolean;
+  localEngine?: { selected: string; choices: string[]; setting: string } | null;
 }
 
 export interface TranscriptHit {
@@ -193,19 +195,32 @@ export type Attachment = {
   url: string | null;
 } & ({ path: string; data: null } | { path: null; data: string });
 
+/** Request-local telemetry; older engines can run a turn without reporting any. */
+export interface ModelProgress {
+  phase: "loading" | "processing" | "generating";
+  processedTokens?: number | null;
+  promptTokens?: number | null;
+  outputTokens?: number | null;
+  estimated?: boolean;
+}
+
 export type ApprovalMode = "readonly" | "ask" | "write" | "auto";
 
 export interface Snapshot {
   platform: string;
+  appleSilicon: boolean;
   /** `null` until a folder is opened: the UI shows the welcome screen. */
   workspace: Workspace | null;
   connection: Connection;
   title: string;
   model: ModelInfo | null;
   approval: ApprovalMode | null;
+  loadingLocalModel?: string | null;
   sessionId: string | null;
   historyLoading: boolean;
+  showThinking: boolean;
   turnRunning: boolean;
+  modelProgress?: ModelProgress | null;
   canSend: boolean;
   sessions: Session[];
   entries: Entry[];
@@ -286,6 +301,8 @@ export interface Setting {
   redacted: boolean;
   /** Takes effect when the engine restarts. */
   restart: boolean;
+  /** The saved layer that sets it; absent for defaults and on engines that do not report it. */
+  source?: SettingScope;
 }
 
 export interface SettingsPage {

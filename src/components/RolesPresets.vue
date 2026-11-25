@@ -10,6 +10,9 @@ import {
   ROLES, applyPreset, assignRole, deletePreset, presetsIn, readSettings, renamePreset, rolesIn, savePreset, unassignRole, validPresetName,
   type Preset, type Selection,
 } from "../roles";
+import SPage from "./settings/SPage.vue";
+import SGroup from "./settings/SGroup.vue";
+import SRow from "./settings/SRow.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 interface Listed extends RoleModel { thinking_levels: string[]; sources: string[] }
@@ -162,139 +165,111 @@ function inUse(p: Preset) {
 </script>
 
 <template>
-  <div class="roles">
-    <div class="top">
-      <div>
-        <h2>Roles &amp; presets</h2>
-        <p class="note">Dial hands background work to helper models. Pick one per role, then save the whole set as a preset to switch in one click.</p>
-      </div>
-      <button v-if="live" class="btn btn-secondary" :disabled="loading" @click="load(true)">{{ loading ? "Checking…" : "Check & refresh" }}</button>
-    </div>
+  <SPage title="Roles & presets" description="Dial hands background work to helper models. Pick one per role, then save the whole set as a preset to switch in one click.">
+    <template v-if="live" #actions>
+      <button class="btn btn-secondary" :disabled="loading" @click="load(true)">{{ loading ? "Checking…" : "Check & refresh" }}</button>
+    </template>
 
-    <div v-if="!live" class="empty">Connect to the Dial engine to change roles.</div>
-    <div v-else-if="error" class="empty bad">{{ error }}</div>
+    <SGroup v-if="!live"><div class="s-empty">Connect to the Dial engine to change roles.</div></SGroup>
+    <SGroup v-else-if="error"><div class="s-empty bad">{{ error }}</div></SGroup>
     <template v-else>
-      <section class="group">
-        <h3>Conversation</h3>
-        <div class="row">
-          <div class="who"><b>Main model</b><span class="muted">Chats and writes code with you</span></div>
-          <div class="pick">
-            <span class="current">{{ snap.model?.label ?? "—" }}<span v-if="snap.model?.thinking" class="muted"> · {{ snap.model.thinking }}</span></span>
-            <button class="btn btn-secondary" @click="ui.modelPickerOpen = true; ui.settingsOpen = false">Change…</button>
-          </div>
-        </div>
-      </section>
+      <SGroup title="Conversation">
+        <SRow label="Main model" description="Chats and writes code with you">
+          <span class="current">{{ snap.model?.label ?? "—" }}<span v-if="snap.model?.thinking" class="s-muted"> · {{ snap.model.thinking }}</span></span>
+          <button class="btn btn-secondary" @click="ui.modelPickerOpen = true; ui.settingsOpen = false">Change…</button>
+        </SRow>
+      </SGroup>
 
-      <section class="group">
-        <h3>Helper roles</h3>
-        <div v-for="r in ROLES" :key="r.id" class="row" :class="{ busy: busy === r.id }">
-          <div class="who"><b>{{ r.label }}</b><span class="muted">{{ r.detail }}</span></div>
-          <div class="pick">
-            <template v-if="r.chat">
-              <select
-                :value="roles[r.id] ? key(roles[r.id].provider, roles[r.id].model) : ''"
-                :disabled="!!busy || loading"
-                :aria-label="`${r.label} model`"
-                @change="pickModel(r.id, ($event.target as HTMLSelectElement).value)"
-              >
-                <option value="">Unassigned</option>
-                <option v-if="roles[r.id] && !find(roles[r.id])" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} ({{ roles[r.id].provider }})</option>
-                <optgroup v-for="[p, list] in providers" :key="p" :label="p">
-                  <option v-for="m in list" :key="m.model_id" :value="key(p, m.model_id)">{{ m.label }}</option>
-                </optgroup>
-              </select>
-              <select
-                v-if="levels(roles[r.id]).length"
-                class="level"
-                :value="roles[r.id]?.thinking ?? ''"
-                :disabled="!!busy"
-                :aria-label="`${r.label} thinking`"
-                @change="pickLevel(r.id, ($event.target as HTMLSelectElement).value)"
-              >
-                <option value="">Default thinking</option>
-                <option v-for="l in levels(roles[r.id])" :key="l" :value="l">{{ l }}</option>
-              </select>
-            </template>
-            <template v-else-if="forRole[r.id]?.length">
-              <select
-                :value="roles[r.id] ? key(roles[r.id].provider, roles[r.id].model) : ''"
-                :disabled="!!busy || loading"
-                :aria-label="`${r.label} model`"
-                @change="pickFor(r.id, ($event.target as HTMLSelectElement).value)"
-              >
-                <option value="">{{ r.id === "image" ? "Unassigned (main model, when it makes images)" : "Unassigned (keyword recall only)" }}</option>
-                <option v-if="offList(r.id)" :disabled="r.id === 'image'" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} · {{ roles[r.id].provider }}{{ r.id === 'image' ? ' (not listed)' : '' }}</option>
-                <optgroup v-for="[p, list] in groupsFor(r.id)" :key="p" :label="p">
-                  <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ r.id === "image" ? imageModelLabel(m) : (m.label || m.model_id) }}</option>
-                </optgroup>
-              </select>
-            </template>
-            <template v-else>
-              <span class="current">{{ roles[r.id] ? `${shortName(roles[r.id])} · ${roles[r.id].provider}` : "Unassigned" }}</span>
-              <button v-if="roles[r.id]" class="link bad" :disabled="!!busy" @click="busyWith(r.id, () => unassignRole(r.id))">Clear</button>
-              <span class="muted small">No {{ r.id }} models found. Refresh a provider in /models to list them.</span>
-            </template>
-          </div>
-        </div>
-        <p class="muted small">Roles save for every project and apply to this session right away.</p>
-      </section>
+      <SGroup title="Helper roles">
+        <SRow v-for="r in ROLES" :key="r.id" :label="r.label" :description="r.detail" :class="{ busy: busy === r.id }">
+          <template v-if="r.chat">
+            <select
+              class="s-select"
+              :value="roles[r.id] ? key(roles[r.id].provider, roles[r.id].model) : ''"
+              :disabled="!!busy || loading"
+              :aria-label="`${r.label} model`"
+              @change="pickModel(r.id, ($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">Unassigned</option>
+              <option v-if="roles[r.id] && !find(roles[r.id])" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} ({{ roles[r.id].provider }})</option>
+              <optgroup v-for="[p, list] in providers" :key="p" :label="p">
+                <option v-for="m in list" :key="m.model_id" :value="key(p, m.model_id)">{{ m.label }}</option>
+              </optgroup>
+            </select>
+            <select
+              v-if="levels(roles[r.id]).length"
+              class="s-select level"
+              :value="roles[r.id]?.thinking ?? ''"
+              :disabled="!!busy"
+              :aria-label="`${r.label} thinking`"
+              @change="pickLevel(r.id, ($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">Default thinking</option>
+              <option v-for="l in levels(roles[r.id])" :key="l" :value="l">{{ l }}</option>
+            </select>
+          </template>
+          <template v-else-if="forRole[r.id]?.length">
+            <select
+              class="s-select"
+              :value="roles[r.id] ? key(roles[r.id].provider, roles[r.id].model) : ''"
+              :disabled="!!busy || loading"
+              :aria-label="`${r.label} model`"
+              @change="pickFor(r.id, ($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">{{ r.id === "image" ? "Unassigned (main model, when it makes images)" : "Unassigned (keyword recall only)" }}</option>
+              <option v-if="offList(r.id)" :disabled="r.id === 'image'" :value="key(roles[r.id].provider, roles[r.id].model)">{{ roles[r.id].model }} · {{ roles[r.id].provider }}{{ r.id === 'image' ? ' (not listed)' : '' }}</option>
+              <optgroup v-for="[p, list] in groupsFor(r.id)" :key="p" :label="p">
+                <option v-for="m in list" :key="m.provider + m.model_id" :value="key(m.provider, m.model_id)">{{ r.id === "image" ? imageModelLabel(m) : (m.label || m.model_id) }}</option>
+              </optgroup>
+            </select>
+          </template>
+          <template v-else>
+            <span class="current">{{ roles[r.id] ? `${shortName(roles[r.id])} · ${roles[r.id].provider}` : "Unassigned" }}</span>
+            <button v-if="roles[r.id]" class="s-link danger" :disabled="!!busy" @click="busyWith(r.id, () => unassignRole(r.id))">Clear</button>
+          </template>
+          <template v-if="!r.chat && !forRole[r.id]?.length" #below-text>
+            <p class="s-desc">No {{ r.id }} models found. Refresh a provider in /models to list them.</p>
+          </template>
+        </SRow>
+        <template #after><p class="s-note">Roles save for every project and apply to this session right away.</p></template>
+      </SGroup>
 
-      <section class="group">
-        <h3>Presets</h3>
-        <p v-if="!presets.length" class="muted">No presets yet. Save the current models below.</p>
-        <div v-for="p in presets" :key="p.name" class="preset" :class="{ busy: busy === p.name }">
-          <div class="who">
-            <template v-if="renaming === p.name">
-              <input v-model="renameTo" class="field" @keydown.enter="finishRename(p)" @keydown.esc.stop="renaming = ''" @blur="finishRename(p)" />
-            </template>
-            <b v-else>{{ p.name }} <span v-if="inUse(p)" class="tag ok">In use</span></b>
-            <span class="muted small">
+      <SGroup title="Presets">
+        <div v-if="!presets.length" class="s-empty">No presets yet. Save the current models below.</div>
+        <div v-for="p in presets" :key="p.name" class="s-row" :class="{ busy: busy === p.name }">
+          <div class="s-row-text">
+            <input v-if="renaming === p.name" v-model="renameTo" class="s-input" :aria-label="`Rename ${p.name}`" @keydown.enter="finishRename(p)" @keydown.esc.stop="renaming = ''" @blur="finishRename(p)" />
+            <div v-else class="s-label"><b>{{ p.name }}</b><span v-if="inUse(p)" class="s-tag ok">In use</span></div>
+            <p class="s-desc">
               <template v-if="p.main">Main {{ shortName(p.main) }}<template v-if="p.main.thinking"> ({{ p.main.thinking }})</template></template>
               <template v-for="(s, id) in p.roles" :key="id"> · {{ id }} {{ shortName(s) }}</template>
-            </span>
+            </p>
           </div>
-          <div class="actions">
+          <div class="s-control">
             <button class="btn btn-primary" :disabled="!!busy || !snap.sessionId || snap.turnRunning" :title="snap.turnRunning ? 'Wait for the turn to end' : 'Use these models'" @click="use(p)">Apply</button>
-            <button class="link" :disabled="!!busy" title="Replace with the current models" @click="update(p)">Update</button>
-            <button class="link" :disabled="!!busy" @click="startRename(p)">Rename</button>
-            <button class="link bad" :disabled="!!busy" @click="remove(p)">Delete</button>
+            <button class="s-link" :disabled="!!busy" title="Replace with the current models" @click="update(p)">Update</button>
+            <button class="s-link" :disabled="!!busy" @click="startRename(p)">Rename</button>
+            <button class="s-link danger" :disabled="!!busy" @click="remove(p)">Delete</button>
           </div>
         </div>
-        <form class="save" @submit.prevent="saveNew">
-          <input v-model="newName" class="field" placeholder="Name, e.g. cheap-and-fast" :disabled="!!busy" />
+        <form class="s-row" @submit.prevent="saveNew">
+          <input v-model="newName" class="s-input grow" aria-label="New preset name" placeholder="Name, e.g. cheap-and-fast" :disabled="!!busy" :aria-invalid="!!nameProblem" />
           <button class="btn btn-secondary" :disabled="!newName.trim() || !!nameProblem || !!busy || !main">Save current as preset</button>
         </form>
-        <p v-if="nameProblem" class="bad small">{{ nameProblem }}</p>
-        <p class="muted small">Applying sets the roles for every project and switches this session to the preset's main model.</p>
-      </section>
+        <template #after>
+          <p v-if="nameProblem" class="s-note bad">{{ nameProblem }}</p>
+          <p class="s-note">Applying sets the roles for every project and switches this session to the preset's main model.</p>
+        </template>
+      </SGroup>
     </template>
-  </div>
+  </SPage>
 </template>
 
 <style scoped>
-.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
-h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
-.note { margin: 0 0 18px; color: var(--text-muted); font-size: var(--text-sm); }
-.group { margin-bottom: 24px; }
-.muted { color: var(--text-faint); font-weight: 400; }
-.small { font-size: var(--text-sm); }
+/* Cards, rows and controls come from settings.css; only row state and sizes stay here. */
 .bad { color: var(--danger); }
-.empty { padding: 40px 0; text-align: center; color: var(--text-faint); }
-.row, .preset { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .busy { opacity: 0.6; }
-.who { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-.who .muted { font-size: var(--text-sm); }
-.pick, .actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.grow { flex: 1; min-width: 0; }
 .current { font-size: var(--text-sm); }
-select, .field { height: 30px; max-width: 260px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; font-size: var(--text-sm); }
-select.level { max-width: 150px; }
-.field:focus, select:focus { outline: none; border-color: var(--accent); }
-.save { display: flex; gap: 8px; margin-top: 12px; }
-.save .field { flex: 1; max-width: none; }
-.link { font-size: var(--text-sm); color: var(--text-muted); }
-.link:hover:not(:disabled) { color: var(--text); text-decoration: underline; }
-.link.bad:hover:not(:disabled) { color: var(--danger); }
-.tag { margin-left: 6px; padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; font-size: 10.5px; font-weight: 400; color: var(--text-faint); }
-.tag.ok { color: var(--success); }
+.s-select.level { max-width: 150px; }
 </style>

@@ -8,143 +8,56 @@ fn blueprint(value: Value) -> TypeDef {
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000rest-of-a-tiny-file";
 
 #[test]
-fn blueprint_descriptions_fit_engine_mcp_limit() {
+fn tool_descriptions_fit_engine_mcp_limit() {
     for tool in tools() {
-        if matches!(tool["name"].as_str(), Some("types_create" | "types_update")) {
-            let description = tool["description"].as_str().unwrap();
-            assert!(description.len() <= 2048, "{} exceeds the MCP cap", tool["name"]);
-            assert!(description.ends_with("illustration."));
-        }
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.len() <= 2048, "{} exceeds the MCP cap", tool["name"]);
     }
+    assert!(APP_GUIDE.contains("window.dial") && APP_GUIDE.contains("types_screenshot"));
 }
 
 #[test]
-fn design_progress_reports_only_committed_choices_including_explicit_defaults() {
-    let def = normalize(blueprint(json!({"name":"Cookbook", "view":{"layout":"book", "style":"cookbook"},
-        "fields":[{"key":"recipe", "label":"Recipe", "kind":"text"}], "theme":{"font":"serif"}})), 1).unwrap();
-    assert_eq!(design_change(&def, &json!({"icon":"✦"}))["choices"], json!({}));
-    assert_eq!(design_change(&def, &json!({"fields":[]}))["choices"], json!({"fields":["Recipe"]}));
-    assert_eq!(design_change(&def, &json!({"view":{"layout":"book"}, "theme":{"font":"serif"}})),
-        json!({"id":def.id, "choices":{"layout":{"kind":"book", "style":"cookbook"},
-            "look":{"font":"serif", "texture":def.theme.texture, "accent":def.theme.accent}}}));
+fn build_progress_reports_only_what_the_patch_set() {
+    let mut def = normalize(blueprint(json!({"name":"Cookbook",
+        "fields":[{"key":"recipe", "label":"Recipe", "kind":"text"}]})), 1).unwrap();
+    assert_eq!(build_step(&def, &json!({"icon":"✦"})), json!({}));
+    assert_eq!(build_step(&def, &json!({"fields":[]})), json!({"fields":["Recipe"]}));
+    def.html = "x".repeat(1500);
+    assert_eq!(build_step(&def, &json!({"html": "…"})), json!({"app": 2}));
 }
 
 #[test]
-fn normalize_fills_fields_and_view_from_the_layout() {
-    let def = normalize(
-        blueprint(json!({"name": "  Routine ", "view": {"layout": "checklist"}})),
-        7,
-    )
-    .unwrap();
-    assert_eq!(def.name, "Routine");
-    assert_eq!(def.icon, "✦");
-    assert_eq!(def.created, 7);
-    let keys: Vec<&str> = def.fields.iter().map(|f| f.key.as_str()).collect();
-    assert_eq!(keys, ["title", "time", "notes"]);
-    assert_eq!(def.view.title_field.as_deref(), Some("title"));
-    assert_eq!(def.view.time_field.as_deref(), Some("time"));
-    assert_eq!(def.view.lead_minutes, [15, 0]);
-}
-
-#[test]
-fn a_calendar_always_has_a_date_to_place_items_by() {
-    // The user's own case: a calendar drawn as a table, its date kept as text.
-    let def = normalize(
-        blueprint(json!({"name": "calendar", "view": {"layout": "calendar"}, "fields": [
-            {"key": "title", "kind": "text"}, {"key": "when", "kind": "text"}, {"key": "where", "kind": "text"}
-        ]})),
-        1,
-    )
-    .unwrap();
-    assert_eq!(def.fields[1].kind, FieldKind::Datetime);
-    assert_eq!(def.view.time_field.as_deref(), Some("when"));
-
-    // No date-like field: one is added. A time of day alone cannot place an item on a day.
-    let def = normalize(
-        blueprint(json!({"name": "Plans", "view": {"layout": "calendar", "timeField": "at"}, "fields": [
-            {"key": "title", "kind": "text"}, {"key": "at", "kind": "time"}
-        ]})),
-        1,
-    )
-    .unwrap();
-    assert_eq!(def.fields[1].kind, FieldKind::Datetime, "the named time field becomes a datetime");
-    assert_eq!(def.view.time_field.as_deref(), Some("at"));
-
-    let def = normalize(blueprint(json!({"name": "Plans", "view": {"layout": "calendar"}, "fields": [{"key": "title", "kind": "text"}]})), 1).unwrap();
-    let keys: Vec<&str> = def.fields.iter().map(|f| f.key.as_str()).collect();
-    assert_eq!(keys, ["title", "when"]);
-    assert_eq!(def.view.time_field.as_deref(), Some("when"));
-
-    // A date field already there is used as is.
-    let def = normalize(blueprint(json!({"name": "Days", "view": {"layout": "calendar"}, "fields": [{"key": "on", "kind": "date"}]})), 1).unwrap();
-    assert_eq!(def.fields.len(), 1);
-    assert_eq!(def.view.time_field.as_deref(), Some("on"));
-}
-
-#[test]
-fn normalize_cleans_keys_colours_and_references() {
+fn normalize_cleans_names_keys_and_colours() {
     let def = normalize(
         blueprint(json!({
-            "name": "Cookbook",
+            "name": "  Cookbook ",
+            "accent": "red",
             "fields": [
                 {"label": "Recipe Name"},
                 {"key": "Recipe name", "kind": "longtext"},
                 {"key": "photo", "kind": "image"},
-                {"key": "ingredients", "kind": "list"}
+                {"key": "where", "kind": "json"}
             ],
-            "view": {"layout": "book", "title_field": "missing", "image_field": "ingredients", "lead_minutes": [5000, 10, 10]},
-            "theme": {"accent": "#ab12cd", "paper": "red", "radius": 90}
+            "view": {"layout": "book"}
         })),
-        1,
+        7,
     )
     .unwrap();
+    assert_eq!(def.name, "Cookbook");
+    assert_eq!(def.icon, "✦");
+    assert_eq!(def.created, 7);
+    assert_eq!(def.accent, "", "not a hex colour");
     let keys: Vec<&str> = def.fields.iter().map(|f| f.key.as_str()).collect();
-    assert_eq!(keys, ["recipe_name", "photo", "ingredients"]);
-    assert_eq!(def.view.title_field.as_deref(), Some("recipe_name"));
-    assert_eq!(
-        def.view.image_field.as_deref(),
-        Some("photo"),
-        "a list cannot be the image"
-    );
-    assert_eq!(def.view.lead_minutes, [1440, 10]);
-    assert_eq!(def.theme.accent, "#ab12cd");
-    assert_eq!(def.theme.paper, "");
-    assert_eq!(def.theme.radius, 28);
+    assert_eq!(keys, ["recipe_name", "photo", "where"]);
+    assert!(!def.has_app());
+    assert_eq!(normalize(blueprint(json!({"name": "A", "accent": " #ab12cd "})), 1).unwrap().accent, "#ab12cd");
 }
 
 #[test]
-fn a_book_keeps_only_a_style_it_draws() {
-    let style = |layout: &str, style: &str| {
-        normalize(blueprint(json!({"name": "B", "view": {"layout": layout, "style": style}})), 1)
-            .unwrap()
-            .view
-            .style
-    };
-    assert_eq!(style("book", " Cookbook "), "cookbook");
-    assert_eq!(style("book", "journal"), "journal");
-    assert_eq!(style("book", "scroll"), "");
-    assert_eq!(style("cards", "cookbook"), "", "only a book has styles");
-}
-
-#[test]
-fn normalize_refuses_bad_blueprints() {
+fn normalize_refuses_bad_types() {
     assert!(normalize(blueprint(json!({"name": " "})), 1).is_err());
-    assert!(
-        normalize(
-            blueprint(json!({"name": "X", "view": {"layout": "custom"}})),
-            1
-        )
-        .is_err()
-    );
-    assert!(
-        normalize(
-            blueprint(
-                json!({"name": "X", "view": {"layout": "custom"}, "customHtml": "<p>hi</p>"})
-            ),
-            1
-        )
-        .is_ok()
-    );
+    let huge = json!({"name": "X", "html": "x".repeat(MAX_APP + 1)});
+    assert!(normalize(blueprint(huge), 1).is_err());
 }
 
 #[test]
@@ -152,7 +65,8 @@ fn sanitize_shapes_each_kind_and_drops_unknown_fields() {
     let def = normalize(
         blueprint(json!({"name": "T", "fields": [
             {"key": "title"}, {"key": "steps", "kind": "steps"}, {"key": "stars", "kind": "rating"},
-            {"key": "pic", "kind": "image"}, {"key": "on", "kind": "toggle"}, {"key": "n", "kind": "number"}
+            {"key": "pic", "kind": "image"}, {"key": "on", "kind": "toggle"}, {"key": "n", "kind": "number"},
+            {"key": "at", "kind": "json"}
         ]})),
         1,
     )
@@ -166,6 +80,7 @@ fn sanitize_shapes_each_kind_and_drops_unknown_fields() {
             "pic": "/etc/passwd",
             "on": "yes",
             "n": "2.5",
+            "at": {"lat": 51.5, "lon": -0.1},
             "other": "dropped"
         })
         .as_object()
@@ -173,8 +88,20 @@ fn sanitize_shapes_each_kind_and_drops_unknown_fields() {
     );
     assert_eq!(
         Value::Object(out),
-        json!({"title": "Soup", "steps": ["Chop", "Boil", "Serve"], "stars": 5, "on": true, "n": 2.5})
+        json!({"title": "Soup", "steps": ["Chop", "Boil", "Serve"], "stars": 5, "on": true, "n": 2.5, "at": {"lat": 51.5, "lon": -0.1}})
     );
+}
+
+#[test]
+fn a_type_without_fields_keeps_free_form_items() {
+    let def = normalize(blueprint(json!({"name": "Scores"})), 1).unwrap();
+    let out = sanitize_fields(
+        &def,
+        json!({"Player Name": "Ada", "score": 120, "skip": null, "big": "x".repeat(MAX_LONG + 10)})
+            .as_object()
+            .unwrap(),
+    );
+    assert_eq!(Value::Object(out), json!({"player_name": "Ada", "score": 120}));
 }
 
 #[test]
@@ -185,7 +112,7 @@ fn store_round_trip_with_images_and_patches() {
     let def = store
         .create(blueprint(json!({"name": "Cookbook", "icon": "🍳", "fields": [
             {"key": "title"}, {"key": "photo", "kind": "image"}, {"key": "ingredients", "kind": "list"}
-        ], "view": {"layout": "book"}})))
+        ]})))
         .unwrap();
     assert!(def.id.starts_with("cookbook-"), "{}", def.id);
     assert_eq!(store.find("COOKBOOK").unwrap(), def.id);
@@ -235,25 +162,23 @@ fn store_round_trip_with_images_and_patches() {
                         .clone(),
                 ),
                 done: Some(true),
-                done_on: Some("2025-01-02".into()),
-                ..ItemPatch::default()
             },
         )
         .unwrap();
     assert_eq!(patched.fields.get("ingredients"), None);
     assert_eq!(patched.fields["title"], "Leek soup");
-    assert_eq!(patched.done_on.as_deref(), Some("2025-01-02"));
+    assert!(patched.done);
 
     let second = store.get(&def.id).unwrap().items[1].id.clone();
     store.move_item(&def.id, &second, 0).unwrap();
     assert_eq!(store.get(&def.id).unwrap().items[0].id, second);
 
     let restyled = store
-        .update(&def.id, &json!({"theme": {"paper": "#fff8ee"}, "view": {"tagline": "Family recipes"}, "id": "hijack"}))
+        .update(&def.id, &json!({"accent": "#fff8ee", "description": "Family recipes", "id": "hijack"}))
         .unwrap();
     assert_eq!(restyled.id, def.id);
-    assert_eq!(restyled.view.layout, Layout::Book, "view members merge");
-    assert_eq!(restyled.theme.paper, "#fff8ee");
+    assert_eq!(restyled.accent, "#fff8ee");
+    assert_eq!(restyled.fields.len(), 3, "members not named stay");
     assert_eq!(store.get(&def.id).unwrap().items.len(), 2, "items stay");
 
     let listed = store.list().unwrap();
@@ -274,12 +199,12 @@ fn ids_never_leave_the_store() {
 }
 
 #[test]
-fn a_named_type_is_undesigned_and_its_sessions_are_replaced_whole() {
+fn a_named_type_has_no_app_and_its_sessions_are_replaced_whole() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(Some(dir.path().to_path_buf()));
     let def = store.create(blueprint(json!({"name": "Cookbook"}))).unwrap();
-    assert!(!def.designed);
-    assert!(describe(&def, 0).contains("NOT DESIGNED YET"));
+    assert!(!def.has_app());
+    assert!(describe(&def, 0).contains("NO APP YET"));
 
     store
         .update(&def.id, &json!({"sessions": {"/a": "s1", "/b": "s2"}}))
@@ -290,15 +215,13 @@ fn a_named_type_is_undesigned_and_its_sessions_are_replaced_whole() {
     assert_eq!(def.sessions.len(), 1);
     assert_eq!(def.sessions["/b"], "s3");
 
-    let def = store
-        .update(&def.id, &json!({"designed": true, "view": {"layout": "book"}}))
-        .unwrap();
-    assert!(def.designed);
-    assert_eq!(def.sessions["/b"], "s3", "a design change keeps the sessions");
+    let def = store.update(&def.id, &json!({"html": "<p>app</p>"})).unwrap();
+    assert!(def.has_app());
+    assert_eq!(def.sessions["/b"], "s3", "a new app keeps the sessions");
     let summary = &store.list().unwrap()[0];
-    assert!(summary.designed);
+    assert!(summary.has_app);
     assert_eq!(summary.sessions, ["s3"]);
-    assert!(!describe(&def, 0).contains("NOT DESIGNED"));
+    assert!(!describe(&def, 0).contains("NO APP"));
 }
 
 #[test]
@@ -314,25 +237,83 @@ fn claiming_a_type_chat_preserves_other_projects_and_refuses_replacement() {
 }
 
 #[test]
-fn custom_pages_are_served_only_for_custom_layouts() {
+fn the_app_lives_in_its_own_file_and_is_served_with_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new(Some(dir.path().to_path_buf()));
-    let custom = store
-        .create(blueprint(
-            json!({"name": "Mine", "view": {"layout": "custom"}, "customHtml": "<p>hi</p>"}),
-        ))
+    let app = store
+        .create(blueprint(json!({"name": "Weather", "html": "<!doctype html><html><head><title>W</title></head><body>hi</body></html>"})))
         .unwrap();
-    let book = store
-        .create(blueprint(
-            json!({"name": "Book", "view": {"layout": "book"}}),
-        ))
-        .unwrap();
-    let page = custom_page(&store, &format!("/{}?v=3", custom.id));
+    let bare = store.create(blueprint(json!({"name": "Book"}))).unwrap();
+    let folder = dir.path().join(&app.id);
+    assert!(folder.join("app.html").is_file());
+    let saved = std::fs::read_to_string(folder.join("type.json")).unwrap();
+    assert!(!saved.contains("<body>"), "type.json stays small: {saved}");
+
+    // The UI gets everything but the HTML; the scheme serves it.
+    let full = store.get(&app.id).unwrap();
+    assert!(full.has_app && full.def.html.is_empty());
+    assert_eq!(full.state, json!({}));
+
+    let page = custom_page(&store, &format!("/{}?v=3", app.id));
     assert_eq!(page.status(), 200);
-    assert_eq!(page.body(), b"<p>hi</p>");
+    let body = String::from_utf8(page.body().clone()).unwrap();
+    assert!(body.starts_with("<!doctype html><html><head><script>"), "{}", &body[..80]);
+    assert!(body.contains("window.dial = dial") && body.ends_with("<title>W</title></head><body>hi</body></html>"));
     assert_eq!(page.headers()["Content-Security-Policy"], CUSTOM_CSP);
-    assert_eq!(custom_page(&store, &format!("/{}", book.id)).status(), 404);
+    assert!(CUSTOM_CSP.contains("connect-src https:") && !CUSTOM_CSP.contains("ipc"));
+    assert_eq!(custom_page(&store, &format!("/{}", bare.id)).status(), 404);
     assert_eq!(custom_page(&store, "/../x").status(), 404);
+
+    // Clearing the app removes its file.
+    store.update(&app.id, &json!({"html": ""})).unwrap();
+    assert!(!folder.join("app.html").exists());
+}
+
+#[test]
+fn a_legacy_custom_page_becomes_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(Some(dir.path().to_path_buf()));
+    let folder = dir.path().join("old-1234");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("type.json"),
+        json!({"version": 1, "id": "old-1234", "name": "Old", "view": {"layout": "custom"},
+            "theme": {"accent": "#123456"}, "customHtml": "<p>old</p>", "designed": true}).to_string(),
+    )
+    .unwrap();
+    assert!(store.list().unwrap()[0].has_app);
+    assert_eq!(store.app_html("old-1234").unwrap(), "<p>old</p>");
+    store.update("old-1234", &json!({"name": "Older"})).unwrap();
+    assert_eq!(std::fs::read_to_string(folder.join("app.html")).unwrap(), "<p>old</p>");
+}
+
+#[test]
+fn the_runtime_goes_first_in_the_head() {
+    let at = |html: &str| with_runtime(html).find("<script>").unwrap();
+    assert_eq!(at("<HTML lang=en><HEAD>\n<script>x</script>"), "<HTML lang=en><HEAD>".len());
+    assert_eq!(at("<!DOCTYPE html>\n<header>no</header>"), "<!DOCTYPE html>".len(), "<header> is not <head>");
+    assert_eq!(at("<div>fragment</div>"), 0);
+}
+
+#[test]
+fn edits_apply_all_or_none() {
+    let html = "<h1>Hi</h1><p>a</p><p>a</p>";
+    let ok = apply_edits(html, &[json!({"find": "Hi", "replace": "Hello"}), json!({"find": "<p>a</p>", "replace": "<p>b</p>", "all": true})]);
+    assert_eq!(ok.unwrap(), "<h1>Hello</h1><p>b</p><p>b</p>");
+    assert!(apply_edits(html, &[json!({"find": "<p>a</p>", "replace": "x"})]).unwrap_err().contains("2 times"));
+    assert!(apply_edits(html, &[json!({"find": "Hi", "replace": "Yo"}), json!({"find": "nope", "replace": ""})]).unwrap_err().contains("Edit 2"));
+    assert!(apply_edits(html, &[]).is_err());
+}
+
+#[test]
+fn the_app_keeps_its_own_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(Some(dir.path().to_path_buf()));
+    let id = store.create(blueprint(json!({"name": "Snake"}))).unwrap().id;
+    store.set_state(&id, &json!({"best": 42})).unwrap();
+    assert_eq!(store.get(&id).unwrap().state, json!({"best": 42}));
+    assert!(store.set_state(&id, &json!("x".repeat(MAX_STATE))).is_err());
+    assert!(store.set_state("nope-1", &json!({})).is_err());
 }
 
 #[test]
@@ -349,7 +330,7 @@ fn new_types_go_where_the_user_chose_and_both_places_are_listed() {
 
     store.set_save_in(Scope::Project).unwrap();
     let local = store
-        .create(blueprint(json!({"name": "Moodboard", "view": {"layout": "board"}})))
+        .create(blueprint(json!({"name": "Moodboard"})))
         .unwrap();
     let local_dir = project.join(".dial").join("types").join(&local.id);
     assert!(local_dir.join("type.json").is_file());
@@ -405,8 +386,7 @@ fn a_type_prompt_carries_what_the_type_is() {
     let store = Store::new(Some(dir.path().to_path_buf()));
     let def = store
         .create(blueprint(json!({
-            "name": "Image board", "icon": "🖼", "description": "Pictures that set a mood",
-            "view": {"layout": "board"}
+            "name": "Image board", "icon": "🖼", "description": "Pictures that set a mood"
         })))
         .unwrap();
     let sent = match type_scope(&store, Some(def.id.as_str()), false) {
@@ -420,7 +400,7 @@ fn a_type_prompt_carries_what_the_type_is() {
     match type_scope(&store, Some(def.id.as_str()), true) {
         Some(crate::engine::TypeScope::Typed(context)) => {
             assert_eq!(context.id, def.id);
-            assert!(context.briefing.starts_with(CONTEXT_OPEN) && context.briefing.contains("board layout"));
+            assert!(context.briefing.starts_with(CONTEXT_OPEN) && context.briefing.contains("no app yet") && context.briefing.contains("window.dial"));
         }
         other => panic!("{other:?}"),
     }

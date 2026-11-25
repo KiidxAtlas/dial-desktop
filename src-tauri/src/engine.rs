@@ -15,6 +15,7 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod watch;
 
 /// Engine startup can include model discovery; give it room before calling it failed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -131,12 +132,13 @@ pub enum Command {
     },
     /// Copy a session of this project into a new one and switch to the copy.
     ForkSession(String),
-    /// Write the active session as Markdown to `path`, relative to the project root.
+    /// Write the active session to `path`, relative to the project root: a standalone page when
+    /// the name ends in `.html` or `.htm`, else Markdown.
     Export(String),
     /// Undo the last turn: restore the files it changed and rewind the conversation.
     Undo,
     /// Add guidance to the running turn; the engine takes it at its next step.
-    Steer(String),
+    Steer { text: String, scope: Option<TypeScope> },
     /// Send the last unanswered prompt (a failed or stopped turn) again.
     Retry,
     /// Summarize the conversation so far to free context.
@@ -223,7 +225,27 @@ pub enum Purpose {
     Speak,
 }
 
+/// Dial's `mlx` provider owns both the MLX and GGUF managed runners.
+pub fn managed_local_provider(provider: &str) -> bool {
+    provider == "mlx"
+}
+
+pub fn supports_local_preparation(ready: &Ready) -> bool {
+    ready.raw["features"]["prepare_local_model"].as_bool() == Some(true)
+}
+
 impl Command {
+    /// Optional request fields must be negotiated with this running engine, not its version.
+    pub fn negotiated_request(&self, prepare_local_model_supported: bool) -> (Purpose, &'static str, Value) {
+        let (purpose, method, mut params) = self.request();
+        if prepare_local_model_supported
+            && matches!(self, Self::SetModel { provider, .. } if managed_local_provider(provider))
+        {
+            params["prepare_local_model"] = json!(true);
+        }
+        (purpose, method, params)
+    }
+
     /// The wire request for this command.
     pub fn request(&self) -> (Purpose, &'static str, Value) {
         match self {
@@ -351,13 +373,22 @@ impl Command {
                 json!({ "session_id": session_id, "pinned": pinned }),
             ),
             Self::ForkSession(id) => (Purpose::Fork, "fork_session", json!({ "session_id": id })),
-            Self::Export(path) => (
-                Purpose::Export,
-                "export",
-                json!({ "format": "markdown", "path": path }),
-            ),
+            Self::Export(path) => {
+                let html = std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+                let format = if html { "html" } else { "markdown" };
+                (Purpose::Export, "export", json!({ "format": format, "path": path }))
+            }
             Self::Undo => (Purpose::Undo, "undo", json!({ "turns": 1 })),
-            Self::Steer(text) => (Purpose::Steer, "steer", json!({ "text": text })),
+            Self::Steer { text, scope } => {
+                let text = match scope {
+                    Some(TypeScope::Framed(context)) => crate::types::legacy_prompt(context, text),
+                    _ => text.clone(),
+                };
+                (Purpose::Steer, "steer", json!({ "text": text }))
+            }
             // A retry starts a turn, so its reply settles the turn like `send`'s.
             Self::Retry => (Purpose::Turn, "retry", json!({})),
             Self::Compact => (Purpose::Compact, "compact", json!({ "reason": "manual" })),
@@ -424,6 +455,7 @@ struct Work {
 enum Call {
     Command(Command),
     Rpc(&'static str, Value),
+    Watch { session: String, request: watch::Request },
     Preset { session: String, roles: Value, main: Option<PresetModel> },
 }
 
@@ -528,6 +560,10 @@ impl Engine {
 
     pub fn rpc(&self, method: &'static str, params: Value) -> Result<RpcReply, String> {
         self.with_reply(Call::Rpc(method, params))
+    }
+
+    pub(crate) fn watch(&self, session: String, request: watch::Request) -> Result<RpcReply, String> {
+        self.with_reply(Call::Watch { session, request })
     }
 
     /// Run the steps consecutively on this worker; switching tabs cannot redirect a later step.
@@ -682,6 +718,8 @@ fn run(
             return;
         }
     };
+    let prepare_local_model_supported = supports_local_preparation(client.ready());
+    let mut board = watch::Board::new(client.ready().session_id.clone());
     emit(Update::Connected(Box::new(client.ready().clone())));
     let mut replies = HashMap::new();
     loop {
@@ -692,12 +730,29 @@ fn run(
         loop {
             match commands.try_recv() {
                 Ok(Work { call, reply }) => {
+                    let mut board_read = None;
                     let (command, method, params) = match call {
                         Call::Command(command) => {
-                            let (_, method, params) = command.request();
+                            let (_, method, params) = command.negotiated_request(prepare_local_model_supported);
                             (Some(command), method, params)
                         }
                         Call::Rpc(method, params) => (None, method, params),
+                        Call::Watch { session, request } => {
+                            match board.action(client.ready(), &session, &client.outstanding(), request) {
+                                Ok(watch::Action::Rpc(method, params)) => {
+                                    if method == "task_status" { board_read = Some(board.epoch); }
+                                    (None, method, params)
+                                }
+                                Ok(watch::Action::Cached(view)) => {
+                                    if let Some(reply) = reply { let _ = reply.send(Ok(view)); }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    if let Some(reply) = reply { let _ = reply.send(Err(error)); }
+                                    continue;
+                                }
+                            }
+                        }
                         Call::Preset { session, roles, main } => {
                             let result = apply_preset(&mut |method, params| {
                                 client.call(method, params, Duration::from_secs(30)).map_err(|e| e.to_string())
@@ -718,7 +773,7 @@ fn run(
                     match client.request(method, params) {
                         Ok(id) => {
                             if let Some(reply) = reply {
-                                replies.insert(id, (method, reply));
+                                replies.insert(id, (method, reply, board_read));
                             }
                             if let Some(command) = command {
                                 emit(Update::Requested { command, id });
@@ -745,11 +800,18 @@ fn run(
             }
         }
         if let Some(message) = client.poll(POLL) {
+            board.observe(&message, client.lost_events());
             let ended = matches!(message, Message::Disconnected { .. });
             if let Message::Response { id, result, .. } = &message
-                && let Some((_, reply)) = replies.remove(id)
+                && let Some((_, reply, board_read)) = replies.remove(id)
             {
-                let _ = reply.send(result.clone().map_err(|error| error.message));
+                let answer = match (result, board_read) {
+                    (Err(error), _) => Err(error.message.clone()),
+                    (Ok(_), Some(epoch)) if epoch != board.epoch => Err("The worker board changed. Refresh Activity".into()),
+                    (Ok(value), Some(_)) => board.status_view(value),
+                    (Ok(value), None) => Ok(value.clone()),
+                };
+                let _ = reply.send(answer);
             }
             // A turn reply normally arrives at the end. Confirm an accepted send sooner once
             // this exact request produces observable work, so the composer can take notes.
@@ -761,8 +823,8 @@ fn run(
                 && let Some(id) = event.request_id()
                 && replies
                     .get(&id)
-                    .is_some_and(|(method, _)| *method == "send")
-                && let Some((_, reply)) = replies.remove(&id)
+                    .is_some_and(|(method, _, _)| *method == "send")
+                && let Some((_, reply, _)) = replies.remove(&id)
             {
                 let _ = reply.send(Ok(Value::Null));
             }

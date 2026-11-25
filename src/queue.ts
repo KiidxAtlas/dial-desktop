@@ -1,8 +1,9 @@
 // Per-session follow-up prompt queue: prepare next prompts while a turn runs without interrupting it.
 import { reactive } from "vue";
-import { engine, showToast } from "./bridge";
-import { draftFor, draftRecord } from "./drafts";
-import { DRAFTS, QUEUES, readLocal, writeLocal } from "./localPrompts";
+import { engine, showToast, snapshot } from './bridge';
+import { draftFor, draftRecord } from './drafts';
+import { draftReady, readyForFollowUp, restoreInput } from './draftInput';
+import { DRAFTS, QUEUES, localKeys, readLocal, writeLocal } from './localPrompts';
 import { canRetry } from "./sessionActions";
 import type { Attachment, OpenSnapshot } from "./types";
 import { focusComposer } from "./ui";
@@ -25,8 +26,22 @@ export interface SessionQueue {
 }
 
 const queues = new Map<string, SessionQueue>();
+const queuedKeys = reactive(new Set<string>());
+let queuedIndex: Promise<void> | undefined;
+
+/** Sidebar badges need only keys, not every saved follow-up's attachment bytes. */
+export function hasQueuedFollowUp(root: string, id: string): boolean {
+  const key = JSON.stringify([root, id]);
+  queuedIndex ??= localKeys(QUEUES).then(keys => {
+    for (const k of keys) if (typeof k === 'string') queuedKeys.add(k);
+  }).catch(() => { /* In-memory queues remain visible even without storage. */ });
+  const saved = queuedKeys.has(key);
+  const queue = queues.get(key);
+  return queue && !queue.loading ? queue.items.length > 0 : saved;
+}
 let observedKey: string | undefined;
 let observedRunning = false;
+let turnEpoch = 0;
 let nextId = 0;
 
 function keyOf(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): string {
@@ -42,6 +57,7 @@ async function restore(key: string, queue: SessionQueue) {
     }
     queue.paused = true;
     queue.recovered = true;
+    queuedKeys.add(key);
     queue.items = saved.map(({ text, attachments }) => ({ id: ++nextId, text, attachments }));
   } catch {
     showToast("Could not restore saved follow-ups for this session.");
@@ -54,6 +70,7 @@ async function save(key: string, items: readonly QueuedPrompt[], extra: Record<s
   const saved = items.map(({ text, attachments }) => ({ text, attachments: attachments.map((a) => ({ ...a })) }));
   try {
     await writeLocal(key, { ...extra, [QUEUES]: saved.length ? saved : undefined });
+    if (items.length) queuedKeys.add(key); else queuedKeys.delete(key);
     return true;
   } catch {
     showToast("Could not save changes to the follow-up queue.");
@@ -94,10 +111,10 @@ export async function enqueuePrompt(snap: OpenSnapshot, text: string, attachment
   if (!trimmed && !attachments.length) return false;
   const queue = queueFor(snap);
   if (queue.loading || queue.saving || queue.sending) return false;
-  const wasRunning = observedRunning;
+  const started = turnEpoch;
   const key = keyOf(snap);
   const saved = await changeItems(key, queue, [...queue.items, { id: ++nextId, text: trimmed, attachments: [...attachments] }]);
-  if (saved && (observedKey !== key || (wasRunning && !observedRunning))) queue.paused = true;
+  if (saved && (observedKey !== key || !observedRunning || started !== turnEpoch)) queue.paused = true;
   return saved;
 }
 
@@ -115,21 +132,18 @@ export async function editQueued(snap: OpenSnapshot, id: number): Promise<boolea
   const item = queue?.items.find((entry) => entry.id === id);
   if (!queue || !item || queue.loading || queue.saving || queue.sending) return false;
   const draft = draftFor(snap);
-  if (draft.loading || draft.sending) return false;
-  if (draft.text.trim() || draft.attachments.length) {
+  if (!draftReady(draft)) return false;
+  if (draft.text || draft.attachments.length) {
     showToast("Send or clear your current draft before editing a queued prompt");
     return false;
   }
-  const text = draft.text;
-  const previous = [...draft.attachments];
   const remaining = queue.items.filter((entry) => entry.id !== id);
   draft.sending = true;
   try {
     const saved = await changeItems(key, queue, remaining, { [DRAFTS]: draftRecord(item.text, item.attachments) });
     if (!saved) return false;
     // Preserve input added by another control while the local transaction finished.
-    draft.text = draft.text !== text && draft.text ? `${draft.text}\n\n${item.text}` : item.text;
-    draft.attachments = [...item.attachments, ...draft.attachments.filter((a) => !previous.some((old) => old.key === a.key))];
+    restoreInput(draft, item);
     if (key === observedKey) focusComposer();
     return true;
   } finally {
@@ -139,11 +153,10 @@ export async function editQueued(snap: OpenSnapshot, id: number): Promise<boolea
 
 /** Send the first queued prompt for `snap` when the session is ready. */
 export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
-  if (snap.connection.state !== "live" || snap.turnRunning || !snap.canSend) return false;
   const key = keyOf(snap);
   const queue = queues.get(key);
   if (!queue || queue.loading || queue.saving || queue.sending || !queue.items.length) return false;
-  if (snap.question || snap.approvals.length) {
+  if (!snap.sessionId || !readyForFollowUp(snapshot.value, snap)) {
     queue.paused = true;
     return false;
   }
@@ -180,13 +193,18 @@ export function markTurnAborted(snap: Pick<OpenSnapshot, "workspace" | "sessionI
 /** Observe snapshots so a finished turn advances the queue (or pauses on error/abort). */
 export function syncQueue(snap: OpenSnapshot) {
   const key = keyOf(snap);
-  const finished = key === observedKey && observedRunning && !snap.turnRunning;
-  if (observedKey && key !== observedKey) {
+  const switched = key !== observedKey;
+  const finished = !switched && observedRunning && !snap.turnRunning;
+  if (switched || observedRunning !== snap.turnRunning) turnEpoch++;
+  if (observedKey && switched) {
     const previous = queues.get(observedKey);
-    if (previous?.items.length) previous.paused = true;
+    if (previous?.items.length && !previous.paused) {
+      previous.paused = true;
+      showToast('Follow-ups stay with their conversation. Reopen it to resume the queue.');
+    }
   }
   observedKey = key;
-  if (snap.turnRunning && !observedRunning && !queueFor(snap).items.length) queueFor(snap).paused = false;
+  if (snap.turnRunning && (switched || !observedRunning) && !queueFor(snap).items.length) queueFor(snap).paused = false;
   observedRunning = snap.turnRunning;
   if (!finished) return;
   const queue = queues.get(key);
@@ -196,12 +214,10 @@ export function syncQueue(snap: OpenSnapshot) {
     return;
   }
 
-  if (queue.paused || !snap.canSend || snap.connection.state !== "live" || canRetry(snap) || snap.approvals.length > 0 || !!snap.question) {
+  if (queue.paused || !readyForFollowUp(snapshot.value, snap) || canRetry(snap)) {
     queue.paused = true;
     showToast("Queued follow-up paused; send it when ready");
     return;
   }
-  if (snap.connection.state === "live" && snap.canSend) {
-    void sendQueuedNext(snap);
-  }
+  void sendQueuedNext(snap);
 }

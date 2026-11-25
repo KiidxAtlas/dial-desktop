@@ -8,11 +8,15 @@
 //
 // The backend decides what each target can do (`unsupported`, `missing_runtime`, `failed`) and reports a run
 // open under another target as `openGuestTarget`; this pane follows those fields and never parses message text.
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
   APP_GUEST_TARGETS,
+  GUEST_KEY_COMBOS,
+  MAX_TYPED_TEXT,
   appButton,
+  comboInputs,
+  textInputs,
   appHostApi,
   appRevealRequest,
   appRunnerApi,
@@ -20,6 +24,7 @@ import {
   framePoint,
   fetchPreferredTarget,
   isGuestTarget,
+  importProgressText,
   missingOf,
   parseFramePacket,
   runTargetLabel,
@@ -27,6 +32,7 @@ import {
   type AppFrame,
   type FramePacket,
   type AppGuestTarget,
+  type AppImportProgress,
   type AppInput,
   type AppRunInfo,
   type AppRunTarget,
@@ -35,7 +41,9 @@ import {
   type AppHostSetup,
   type AppVmMachine,
   type AppVmSshLink,
+  type AppVmReadiness,
 } from "../../appRunner";
+import { openMenu, type MenuItem } from "../../ui";
 import Icon from "../Icon.vue";
 import HostSetup from "./HostSetup.vue";
 import VmPicker from "./VmPicker.vue";
@@ -67,6 +75,7 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 // VM mode. The list and the selection belong to one scope; the allowance is the backend's (`state.approvedVmId`).
 const vms = shallowRef<AppVmMachine[]>([]);
 const vmNotices = ref<string[]>([]);
+const vmReadiness = ref<AppVmReadiness[]>([]);
 const vmLoading = ref(false);
 const vmError = ref<string | null>(null);
 /** True once the current scope's list answered; the allowance is only reconciled against a real list. */
@@ -81,6 +90,12 @@ const syncKey = ref(0);
 const sshLinks = shallowRef<Record<string, AppVmSshLink>>({});
 const sshHosts = shallowRef<string[]>([]);
 const sshBusy = ref(false);
+/** The user pressed Cancel on the running SSH setup; its resulting error is not shown. */
+let sshCancelled = false;
+/** Bytes copied of the disk import in flight, from `app_runner_import` events; null when none is running. */
+const importProgress = ref<AppImportProgress | null>(null);
+/** A guest disk removal (with its native confirmation) is in flight. */
+const removing = ref(false);
 
 /** Bumped when the workspace or target changes or the pane unmounts; late answers from an older scope are dropped. */
 let scope = 0;
@@ -144,6 +159,11 @@ const hostLoading = ref(false);
 const hostError = ref<string | null>(null);
 const hostBusy = ref<string | null>(null);
 const hostProgress = ref<Record<string, string>>({});
+/** Every progress line per step, newest last, for HostSetup's **Show log**. */
+const hostLog = ref<Record<string, string[]>>({});
+const hostCancelling = ref(false);
+/** Most log lines kept per step. */
+const HOST_LOG_LINES = 1000;
 /** The setup card shows for the guest this host runs, until a run is open. */
 const showHost = computed(() => mode.value === "app" && !live.value && !!host.value && target.value === host.value.guest);
 
@@ -164,14 +184,32 @@ async function installStep(step: string) {
   hostBusy.value = step;
   hostError.value = null;
   hostProgress.value = { ...hostProgress.value, [step]: "" };
+  hostLog.value = { ...hostLog.value, [step]: [] };
+  hostCancelling.value = false;
   try {
     host.value = await appHostApi.install(step);
   } catch (e) {
     hostError.value = appRunnerMessage(e);
   } finally {
     hostBusy.value = null;
+    hostCancelling.value = false;
   }
   await refresh();
+}
+
+/** Ask the backend to stop the running install; only offered for steps it can stop. */
+async function cancelHostInstall() {
+  if (!hostBusy.value || hostCancelling.value) return;
+  hostCancelling.value = true;
+  try {
+    if (!(await appHostApi.cancel())) {
+      hostCancelling.value = false;
+      hostError.value = "This step cannot be cancelled from Dial; it stops when its installer finishes.";
+    }
+  } catch (e) {
+    hostCancelling.value = false;
+    hostError.value = appRunnerMessage(e);
+  }
 }
 
 async function importHostDisk() {
@@ -334,6 +372,7 @@ async function discoverVms() {
     if (mine !== scope || round !== vmRound) return;
     vms.value = list.machines;
     vmNotices.value = list.notices;
+    vmReadiness.value = list.readiness;
     sshLinks.value = list.sshLinks;
     sshHosts.value = list.sshHosts;
     vmLoaded.value = true;
@@ -342,6 +381,7 @@ async function discoverVms() {
     if (mine !== scope || round !== vmRound) return;
     vms.value = [];
     vmNotices.value = [];
+    vmReadiness.value = [];
     sshLinks.value = {};
     sshHosts.value = [];
     vmLoaded.value = false;
@@ -513,6 +553,17 @@ async function setMode(next: "app" | "vm") {
   }
 }
 
+/** Arrow keys move the App/VM choice like any radio group, then focus follows the choice that took effect. */
+const modeGroup = ref<HTMLElement | null>(null);
+async function onModeKey(e: KeyboardEvent) {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+  e.preventDefault();
+  await setMode(mode.value === "app" ? "vm" : "app");
+  await nextTick();
+  modeGroup.value?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus();
+}
+const accessHintId = `app-access-${useId()}`;
+
 /**
  * A machine the user picked. Changing it first revokes an allowance for the previous one. The selection moves to the
  * new machine only once that revoke is confirmed; otherwise the previous machine stays selected.
@@ -570,17 +621,32 @@ async function setupSsh(user: string, openTerminal: boolean) {
   const mine = scope;
   const root = props.root;
   sshBusy.value = true;
+  sshCancelled = false;
   error.value = null;
   try {
     await appRunnerApi.vmSshSetup(root, runId, user, openTerminal);
   } catch (e) {
-    if (mine === scope) error.value = appRunnerMessage(e);
+    if (mine === scope && !sshCancelled) error.value = appRunnerMessage(e);
   } finally {
+    sshCancelled = false;
     if (mine === scope) {
       await discoverVms();
       await refresh();
     }
     sshBusy.value = false;
+  }
+}
+
+/** Stop waiting on the running SSH setup; the backend notices within a few seconds and the setup call returns. */
+async function cancelSshSetup() {
+  const runId = run.value?.runId;
+  if (!runId || !sshBusy.value) return;
+  sshCancelled = true;
+  try {
+    await appRunnerApi.vmSshSetupCancel(runId);
+  } catch (e) {
+    sshCancelled = false;
+    error.value = appRunnerMessage(e);
   }
 }
 watch(appRevealRequest, consumeReveal);
@@ -704,6 +770,12 @@ function onWheel(e: WheelEvent) {
 }
 
 function onKeyDown(e: KeyboardEvent) {
+  if (fullscreen.value && !nativeFullscreen && e.code === "Escape" && !e.repeat) {
+    // Esc leaves the window-filling screen; Send keys → Esc reaches the guest.
+    e.preventDefault();
+    leaveFullscreen();
+    return;
+  }
   // Keys aimed at the guest never reach Dial's own shortcuts (the template stops propagation).
   e.preventDefault();
   if (e.isComposing || !e.code || !props.active || !frame.value) return;
@@ -734,6 +806,102 @@ function onWindowBlur() {
  * Boot the guest for `guest`, or connect to the VM `vmId`. Only one run per workspace; a VM never shares the
  * project snapshot.
  */
+// ----- Guest screen controls: paste text, key combinations, fullscreen -----
+
+/** Type `text` into the guest as key presses (US layout), through the same queue as the live keyboard. */
+function typeIntoGuest(text: string) {
+  if (!text) return;
+  releaseAll();
+  const { inputs, typed, skipped } = textInputs(text);
+  for (const input of inputs) send(input);
+  const clipped = Array.from(text).length > MAX_TYPED_TEXT;
+  if (skipped || clipped) {
+    error.value = `Typed ${typed} character${typed === 1 ? "" : "s"}.${skipped ? ` ${skipped} had no key on a US keyboard (emoji, accents) and were skipped.` : ""}${clipped ? ` Only the first ${MAX_TYPED_TEXT} characters are typed at once.` : ""}`;
+  }
+  screen.value?.focus();
+}
+
+async function pasteClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) typeIntoGuest(text);
+    else error.value = "The clipboard has no text. Use “Type text…” instead.";
+  } catch {
+    error.value = "Dial could not read the clipboard here. Use “Type text…” and paste into its box.";
+  }
+}
+
+function pasteMenu(event: MouseEvent) {
+  const items: MenuItem[] = [
+    { label: "Paste clipboard text", icon: "copy", run: () => void pasteClipboard() },
+    {
+      label: "Type text…",
+      icon: "keyboard",
+      prompt: {
+        label: "Text to type into the guest (US keyboard layout)",
+        placeholder: "Text to type",
+        maxLength: MAX_TYPED_TEXT,
+        confirm: "Type",
+        submit: (value: string) => typeIntoGuest(value),
+      },
+    },
+  ];
+  openMenu(event, items, event.currentTarget as HTMLElement);
+}
+
+function keysMenu(event: MouseEvent) {
+  const items: MenuItem[] = GUEST_KEY_COMBOS.map((combo) => ({
+    label: combo.label,
+    icon: "keyboard",
+    run: () => {
+      releaseAll();
+      for (const input of comboInputs(combo.codes)) send(input);
+      screen.value?.focus();
+    },
+  }));
+  openMenu(event, items, event.currentTarget as HTMLElement, "Send to the guest");
+}
+
+/** The screen fills the display (Fullscreen API) or, where that is not available, the window. */
+const fullscreen = ref(false);
+let nativeFullscreen = false;
+
+async function toggleFullscreen() {
+  const el = screen.value;
+  if (!el) return;
+  if (fullscreen.value) {
+    leaveFullscreen();
+    return;
+  }
+  try {
+    if (typeof el.requestFullscreen === "function") {
+      await el.requestFullscreen();
+      nativeFullscreen = true;
+    }
+  } catch {
+    nativeFullscreen = false;
+  }
+  fullscreen.value = true;
+  el.focus();
+}
+
+function leaveFullscreen() {
+  if (nativeFullscreen && document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+  nativeFullscreen = false;
+  fullscreen.value = false;
+}
+
+function onFullscreenChange() {
+  if (nativeFullscreen && !document.fullscreenElement) {
+    nativeFullscreen = false;
+    fullscreen.value = false;
+  }
+}
+
+watch(running, (now) => {
+  if (!now && fullscreen.value) leaveFullscreen();
+});
+
 async function launch(guest: AppRunTarget, vmId?: string) {
   if (starting.value || live.value || openOther.value) return;
   const mine = scope;
@@ -774,14 +942,42 @@ async function importDisk() {
   if (!guest || guest === "vm" || openOther.value) return;
   const mine = scope;
   starting.value = true;
+  importProgress.value = null;
   error.value = null;
   try {
     if ((await appRunnerApi.importDisk(props.root, guest)) && mine === scope) await refresh();
   } catch (e) {
     if (mine === scope) error.value = appRunnerMessage(e);
   } finally {
+    importProgress.value = null;
     if (mine === scope) starting.value = false;
   }
+}
+
+/** Stop the disk import in flight; the backend removes the partial disk and the import returns as cancelled. */
+async function cancelImport() {
+  try {
+    await appRunnerApi.cancelImport();
+  } catch (e) {
+    error.value = appRunnerMessage(e);
+  }
+}
+
+/** Delete the selected QEMU guest's imported disk; the backend asks for confirmation and may be cancelled. */
+async function removeDisk() {
+  const guest = target.value;
+  if (!guest || guest === "vm" || guest === "macos" || live.value || removing.value) return;
+  const mine = scope;
+  removing.value = true;
+  error.value = null;
+  try {
+    if ((await appRunnerApi.removeDisk(props.root, guest)) && mine === scope) await refresh();
+  } catch (e) {
+    if (mine === scope) error.value = appRunnerMessage(e);
+  } finally {
+    removing.value = false;
+  }
+  if (mine === scope) void loadHost();
 }
 
 async function stop() {
@@ -837,6 +1033,7 @@ async function setAgentAccess(allowed: boolean) {
 let disposed = false;
 let stopListening: (() => void) | null = null;
 let stopHostListening: (() => void) | null = null;
+let stopImportListening: (() => void) | null = null;
 /** Each attempt to resolve the preference gets a round; only the newest attempt may apply its answer. */
 let prefRound = 0;
 
@@ -871,6 +1068,7 @@ function retryPreference() {
 
 onMounted(async () => {
   window.addEventListener("blur", onWindowBlur);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
   consumeReveal();
   try {
     const off = await appRunnerApi.onEvent(onEvent);
@@ -878,9 +1076,16 @@ onMounted(async () => {
     else stopListening = off;
     const offHost = await appHostApi.onProgress((event) => {
       hostProgress.value = { ...hostProgress.value, [event.step]: event.line };
+      const lines = [...(hostLog.value[event.step] ?? []), event.line].slice(-HOST_LOG_LINES);
+      hostLog.value = { ...hostLog.value, [event.step]: lines };
     });
     if (disposed) offHost();
     else stopHostListening = offHost;
+    const offImport = await appRunnerApi.onImportProgress((event) => {
+      if (starting.value) importProgress.value = event;
+    });
+    if (disposed) offImport();
+    else stopImportListening = offImport;
   } catch (e) {
     error.value = appRunnerMessage(e);
   }
@@ -893,73 +1098,85 @@ onBeforeUnmount(() => {
   forgetInput();
   picture = null;
   window.removeEventListener("blur", onWindowBlur);
+  document.removeEventListener("fullscreenchange", onFullscreenChange);
+  if (fullscreen.value) leaveFullscreen();
   stopListening?.();
   stopHostListening?.();
+  stopImportListening?.();
 });
 </script>
 
 <template>
   <div class="app-pane">
     <div class="bar">
-      <span class="status" :class="run?.status ?? 'idle'">{{ label }}</span>
-      <span v-if="run?.title" class="title">{{ run.title }}</span>
-      <span class="spacer" />
+      <div
+        ref="modeGroup"
+        class="mode"
+        role="radiogroup"
+        aria-label="Run in"
+        @keydown="onModeKey"
+      >
+        <button
+          type="button"
+          role="radio"
+          class="seg"
+          :class="{ on: mode === 'app' }"
+          :aria-checked="mode === 'app'"
+          :tabindex="mode === 'app' ? 0 : -1"
+          title="A private, throwaway guest that Dial runs for this project"
+          @click="setMode('app')"
+        >App</button>
+        <button
+          type="button"
+          role="radio"
+          class="seg"
+          :class="{ on: mode === 'vm' }"
+          :aria-checked="mode === 'vm'"
+          :tabindex="mode === 'vm' ? 0 : -1"
+          title="A VirtualBox or VMware machine you already have"
+          @click="setMode('vm')"
+        >VM</button>
+      </div>
       <select v-if="mode === 'app'" :value="target ?? ''" class="target" aria-label="Guest target" title="Which guest to run" @change="onPick">
         <option v-if="!target" value="" disabled>Choose a guest</option>
         <option v-for="choice in APP_GUEST_TARGETS" :key="choice.value" :value="choice.value">{{ choice.label }}</option>
       </select>
+      <span class="status" :class="run?.status ?? 'idle'">{{ label }}</span>
+      <span v-if="run?.title" class="title">{{ run.title }}</span>
+      <span class="spacer" />
       <label v-if="running && controller" class="access" :title="controller === 'agent' ? 'The agent can see and use this screen. Turn off to block it.' : 'The agent cannot see or use this screen. Turn on to allow it.'">
         <input
           type="checkbox"
           role="switch"
           :checked="controller === 'agent'"
           :aria-checked="controller === 'agent'"
+          :aria-describedby="accessHintId"
           :disabled="accessBusy"
           @change="setAgentAccess(($event.target as HTMLInputElement).checked)"
         />
         <span>Agent access</span>
       </label>
-      <button v-if="live" class="btn danger" :title="stopTitle" @click="stop">
+      <button v-if="live" type="button" class="btn btn-secondary" :title="stopTitle" @click="stop">
         <Icon name="stop" :size="12" /> {{ stopLabel }}
       </button>
-      <button v-if="live && vmRun" class="btn danger" title="Disconnect and ask the VM's OS to shut down" @click="shutDownVm">
+      <button v-if="live && vmRun" type="button" class="btn btn-danger" title="Disconnect and ask the VM's OS to shut down" @click="shutDownVm">
         Shut down
       </button>
-      <div class="mode" role="group" aria-label="App or virtual machine">
-        <button type="button" class="seg" :class="{ on: mode === 'app' }" :aria-pressed="mode === 'app'" @click="setMode('app')">App</button>
-        <button type="button" class="seg" :class="{ on: mode === 'vm' }" :aria-pressed="mode === 'vm'" @click="setMode('vm')">VM</button>
-      </div>
     </div>
     <div v-if="!target && preference === 'pending'" class="waiting" role="status">Checking which guest this machine uses…</div>
     <div v-if="!target && preference === 'unknown'" class="notice" role="alert">
-      <strong>Dial could not tell which guest to use on this machine.</strong>
-      <p>Nothing has started, and no guest was chosen for you. Pick a guest in the selector above, or retry the check.</p>
-      <p v-if="preferenceDetail" class="hint">{{ preferenceDetail }}</p>
-      <button class="btn" @click="retryPreference">Retry check</button>
+      <strong>Choose a guest to continue.</strong>
+      <p>Dial could not tell which guest this machine uses, so nothing was started or chosen for you. Pick one in the selector above, or check again.</p>
+      <details v-if="preferenceDetail" class="tech">
+        <summary>Technical details</summary>
+        <p class="hint">{{ preferenceDetail }}</p>
+      </details>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" @click="retryPreference">Retry check</button>
+      </div>
     </div>
 
-    <div v-if="mode === 'vm'" class="vm-warning" role="note">
-      <strong>This is a real VM with a real disk.</strong>
-      <p>
-        Disk changes you or the agent make in the VM are kept on its disk. The VM's own network, shared folders,
-        clipboard and other settings apply. <strong>Disconnect releases Dial only; the VM stays on.</strong>
-      </p>
-    </div>
-
-    <VmSshLink
-      v-if="mode === 'vm' && sshVm"
-      :vm-id="sshVm.id"
-      :vm-name="sshVm.name"
-      :provider="sshVm.provider"
-      :link="sshLinks[sshVm.id] ?? null"
-      :hosts="sshHosts"
-      :busy="sshBusy"
-      :connected="!!(running && vmRun && run?.vmId === sshVm.id)"
-      @save="linkSsh"
-      @setup="setupSsh"
-    />
-
-    <div v-if="running && controller" class="control">
+    <div v-if="running && controller" :id="accessHintId" class="control">
       <template v-if="controller === 'user'">Agent access is off: the agent cannot see or use the {{ vmRun ? 'VM' : 'guest' }}.</template>
       <template v-else>Agent access is on: the agent can see and use the {{ vmRun ? 'VM' : 'guest' }}. You can still type and click.</template>
     </div>
@@ -971,8 +1188,11 @@ onBeforeUnmount(() => {
       :error="hostError"
       :busy="hostBusy"
       :progress="hostProgress"
+      :log="hostLog"
+      :cancelling="hostCancelling"
       :locked="starting || !!openOther"
       @install="installStep"
+      @cancel="cancelHostInstall"
       @import="importHostDisk"
       @refresh="checkHost"
     />
@@ -981,24 +1201,48 @@ onBeforeUnmount(() => {
 
     <div v-if="missing && mode === 'app' && !showHost" class="notice" role="alert">
       <template v-if="need === 'helper'">
-        <strong>This build has no macOS guest helper.</strong>
-        <p>A virtual Mac needs Dial’s macOS guest helper, and this build does not include it. Importing a disk cannot fix that; use a build that packages the helper. Dial won’t switch to QEMU or run the app on your desktop instead.</p>
+        <strong>This build can’t run a virtual Mac.</strong>
+        <p>It is missing a part a virtual Mac needs. Use a Dial build that includes macOS guest support.</p>
       </template>
       <template v-else-if="need === 'image' && target === 'macos'">
-        <strong>No virtual Mac guest is imported.</strong>
-        <p>Choose the prepared virtual Mac folder. Dial copies its guest image into its local app data and leaves the original unchanged. Nothing is downloaded. The guest also needs the companion files from that folder, and macOS will ask for Screen Recording and Accessibility (privacy/TCC) permission for the guest helper inside the guest.</p>
+        <strong>Import a virtual Mac to get started.</strong>
+        <p>Choose the prepared virtual Mac folder. Dial copies it and leaves your original unchanged.</p>
       </template>
       <template v-else-if="need === 'image'">
-        <strong>The app runner is not available.</strong>
-        <p>Choose a bootable raw disk image for this machine’s architecture. Dial copies it locally and discards guest writes after each run.</p>
+        <strong>Import a guest disk to get started.</strong>
+        <p>Choose a bootable disk image. Dial copies it and throws away any changes after each run.</p>
       </template>
       <template v-else>
-        <strong>The app runner is not available.</strong>
-        <p>This build does not include a usable guest runtime (<code>{{ state?.runtime ?? 'unknown' }}</code>). Use a build packaged with QEMU and firmware. Dial won’t run the app on your desktop instead.</p>
+        <strong>This build can’t run apps in a guest.</strong>
+        <p>It does not include the software that runs guests. Use a Dial build that includes it.</p>
       </template>
-      <button v-if="need === 'image'" class="btn" :disabled="starting || !!openOther" @click="importDisk">{{ starting ? 'Importing…' : target === 'macos' ? 'Import virtual Mac…' : 'Import guest disk…' }}</button>
-      <p v-if="state?.message" class="hint">{{ state.message }}</p>
-      <button class="btn" @click="refresh">Check again</button>
+      <div class="actions">
+        <button v-if="need === 'image'" type="button" class="btn btn-primary" :disabled="starting || !!openOther" @click="importDisk">{{ starting ? 'Importing…' : target === 'macos' ? 'Import virtual Mac…' : 'Import guest disk…' }}</button>
+        <button type="button" class="btn btn-secondary" @click="refresh">Check again</button>
+      </div>
+      <details class="tech">
+        <summary>Technical details</summary>
+        <p v-if="need === 'helper'" class="hint">
+          A virtual Mac needs Dial’s macOS guest helper, and this build does not include it. Importing a disk cannot fix
+          that. Dial won’t switch to QEMU or run the app on your desktop instead.
+        </p>
+        <p v-else-if="need === 'image' && target === 'macos'" class="hint">
+          Dial copies the folder’s guest image into its local app data; nothing is downloaded. The guest also needs the
+          companion files from that folder, and macOS will ask for Screen Recording and Accessibility (privacy/TCC)
+          permission for the guest helper inside the guest.
+        </p>
+        <p v-else-if="need === 'image'" class="hint">
+          Use a disk built for this machine’s architecture. Raw <code>.raw</code> and <code>.img</code> disks are copied.
+          <code>.qcow2</code>, <code>.vmdk</code> and <code>.vdi</code> disks are converted with <code>qemu-img</code>
+          when it is installed (bundled, or QEMU from Homebrew, your package manager or Program Files); otherwise
+          convert first: <code>qemu-img convert -p -O raw input.qcow2 guest.raw</code>.
+        </p>
+        <p v-else class="hint">
+          No usable guest runtime (<code>{{ state?.runtime ?? 'unknown' }}</code>). Use a build packaged with QEMU and
+          firmware. Dial won’t run the app on your desktop instead.
+        </p>
+        <p v-if="state?.message" class="hint">{{ state.message }}</p>
+      </details>
     </div>
     <div v-else-if="missing && mode !== 'app'" class="error" role="alert">{{ state?.message ?? 'The VM connector is not available in this build.' }}</div>
 
@@ -1008,6 +1252,7 @@ onBeforeUnmount(() => {
       :loading="vmLoading"
       :error="vmError"
       :notices="vmNotices"
+      :readiness="vmReadiness"
       :selected="vmSelected"
       :granted="approvedVm"
       :locked="vmLocked"
@@ -1022,37 +1267,100 @@ onBeforeUnmount(() => {
     <div v-else-if="run?.status === 'starting'" class="waiting">
       {{ vmRun ? 'Connecting to the VM… Disconnect releases Dial; the VM stays on.' : 'Starting the guest… Stop cancels the start.' }}
     </div>
-    <div v-else-if="running" ref="screen" class="screen" tabindex="0" aria-label="Guest screen"
+    <template v-else-if="running">
+    <div class="screen-tools" role="toolbar" aria-label="Guest screen controls">
+      <button type="button" class="btn btn-secondary" :disabled="!frame" title="Type the clipboard or some text into the guest" @click="pasteMenu">
+        <Icon name="copy" :size="12" /> Paste text
+      </button>
+      <button type="button" class="btn btn-secondary" :disabled="!frame" title="Send a key combination the host would catch, like Ctrl+Alt+Delete" @click="keysMenu">
+        <Icon name="keyboard" :size="12" /> Send keys
+      </button>
+      <span class="spacer" />
+      <button type="button" class="btn btn-secondary" :disabled="!frame" title="Show the guest screen full screen (Esc leaves)" @click="toggleFullscreen">
+        <Icon name="monitor" :size="12" /> Fullscreen
+      </button>
+    </div>
+    <div ref="screen" class="screen" :class="{ full: fullscreen }" tabindex="0" aria-label="Guest screen"
       @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp"
       @pointercancel="onPointerUp" @wheel.prevent="onWheel" @contextmenu.prevent
       @keydown.stop="onKeyDown" @keyup.stop="onKeyUp" @blur="releaseAll">
       <canvas v-show="frame" ref="canvas" />
       <div v-if="!frame" class="waiting">Waiting for the guest's first frame…</div>
+      <button v-if="fullscreen" type="button" class="btn btn-secondary leave-full" title="Leave full screen (Esc)"
+        @pointerdown.stop @pointerup.stop @click.stop="leaveFullscreen">Exit full screen</button>
     </div>
+    </template>
+
+    <details v-if="mode === 'vm' && sshVm" class="ssh-disclosure">
+      <summary>
+        SSH access for commands
+        <span class="summary-state">{{ sshLinks[sshVm.id] ? `Linked: ${sshLinks[sshVm.id]?.host}` : 'Optional' }}</span>
+      </summary>
+      <VmSshLink
+        :vm-id="sshVm.id"
+        :vm-name="sshVm.name"
+        :provider="sshVm.provider"
+        :link="sshLinks[sshVm.id] ?? null"
+        :hosts="sshHosts"
+        :busy="sshBusy"
+        :connected="!!(running && vmRun && run?.vmId === sshVm.id)"
+        @save="linkSsh"
+        @setup="setupSsh"
+        @cancel="cancelSshSetup"
+      />
+    </details>
 
     <div v-if="openOther && !running" class="notice" role="status">
       <strong>A run is already open for this project: {{ runTargetLabel(openOther) }}.</strong>
       <p>Show it to see and control it, or stop it there before starting this one.</p>
-      <button class="btn" @click="chooseTarget(openOther)">Show {{ runTargetLabel(openOther) }}</button>
+      <div class="actions">
+        <button type="button" class="btn btn-primary" @click="chooseTarget(openOther)">Show {{ runTargetLabel(openOther) }}</button>
+      </div>
     </div>
 
     <div v-if="mode === 'app' && ((state?.status === 'idle' && !error) || run?.status === 'stopped')" class="start">
-      <p class="hint">
-        Ask Dial to run an app here, or start the guest yourself. To include your project, select the snapshot before starting.
-      </p>
+      <p class="hint">Start the guest yourself, or ask Dial to run an app here.</p>
       <label class="share">
         <input v-model="shareProject" type="checkbox" :disabled="starting" />
-        <span>Share a read-only snapshot of committed HEAD (may include secrets); local edits are excluded.</span>
+        <span>Share a read-only copy of this project</span>
       </label>
-      <p v-if="shareProject" class="hint">
-        If the project has a committed <code>.dial/app.json</code>, run its launcher from the guest disc root:
-        <code>python3 -I DIAL-LAUNCH.py .</code> (Windows: <code>py -3 -I DIAL-LAUNCH.py .</code>).
+      <p class="hint" :class="{ caution: shareProject }">
+        Only your last commit is shared, and anything committed, including secrets like API keys, will be visible in
+        the guest. Uncommitted changes are left out.
       </p>
-      <button class="btn" :disabled="starting || !!openOther" @click="start">{{ starting ? "Starting…" : "Start guest" }}</button>
+      <div class="actions">
+        <button type="button" class="btn btn-primary" :disabled="starting || removing || !!openOther" @click="start">{{ starting ? "Starting…" : "Start guest" }}</button>
+        <button
+          v-if="target && target !== 'macos' && target !== 'vm' && need !== 'image'"
+          type="button"
+          class="btn btn-danger"
+          :disabled="starting || removing"
+          title="Delete this guest's imported disk from Dial's app data (asks first)"
+          @click="removeDisk"
+        >
+          {{ removing ? "Removing…" : "Remove guest disk" }}
+        </button>
+      </div>
+      <details class="tech">
+        <summary>Technical details</summary>
+        <p class="hint">
+          The shared copy is a read-only snapshot of committed <code>HEAD</code>; local edits are excluded.
+        </p>
+        <p class="hint">
+          If the project has a committed <code>.dial/app.json</code>, run its launcher from the guest disc root:
+          <code>python3 -I DIAL-LAUNCH.py .</code> (Windows: <code>py -3 -I DIAL-LAUNCH.py .</code>).
+        </p>
+      </details>
+    </div>
+    <div v-if="importProgress" class="waiting import" role="status">
+      <span>Importing guest disk: {{ importProgressText(importProgress) }}</span>
+      <button v-if="target !== 'macos'" type="button" class="btn btn-secondary" @click="cancelImport">Cancel import</button>
     </div>
 
     <div v-if="error" class="error" role="alert">{{ error }}</div>
-    <button v-if="error && !running && !missing" class="btn" @click="refresh">Check again</button>
+    <div v-if="error && !running && !missing" class="actions">
+      <button type="button" class="btn btn-secondary" @click="refresh">Check again</button>
+    </div>
   </div>
 </template>
 
@@ -1076,11 +1384,11 @@ onBeforeUnmount(() => {
   flex: 1;
 }
 .status {
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 .status.running {
-  color: var(--accent);
+  color: var(--success);
 }
 .title {
   font-size: 12px;
@@ -1088,34 +1396,13 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  align-self: flex-start;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-  cursor: pointer;
-}
-.btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.btn.danger {
-  color: var(--danger, #c0392b);
-}
 /* Agent access: a small switch drawn from a checkbox, so it stays keyboard- and screen-reader-operable. */
 .access {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 26px;
-  font-size: 12px;
+  height: 30px;
+  font-size: var(--text-sm);
   color: var(--text);
   cursor: pointer;
   user-select: none;
@@ -1126,7 +1413,7 @@ onBeforeUnmount(() => {
   width: 28px;
   height: 16px;
   margin: 0;
-  border-radius: 8px;
+  border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface);
   cursor: pointer;
@@ -1140,47 +1427,49 @@ onBeforeUnmount(() => {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: var(--text-muted, #999);
+  background: var(--text-muted);
   transition: transform 120ms;
 }
 .access input:checked {
-  background: var(--accent, #d97757);
-  border-color: var(--accent, #d97757);
+  background: var(--accent);
+  border-color: var(--accent);
 }
 .access input:checked::after {
   background: #fff;
   transform: translateX(12px);
 }
 .access input:focus-visible {
-  outline: 2px solid var(--accent, #d97757);
+  outline: 2px solid var(--focus-border);
   outline-offset: 2px;
 }
 .access input:disabled {
   opacity: 0.5;
 }
+/* Run in: App or VM. The first choice on the bar; everything below depends on it. */
 .mode {
   flex: none;
-  margin-left: auto;
   display: inline-flex;
-  border: 1px solid var(--border);
+  padding: 2px;
+  gap: 2px;
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 .seg {
   height: 26px;
-  padding: 0 10px;
+  padding: 0 12px;
   border: none;
-  background: var(--surface);
-  color: var(--text-faint);
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: 500;
   cursor: pointer;
 }
-.seg + .seg {
-  border-left: 1px solid var(--border);
-}
 .seg.on {
+  background: var(--bg);
   color: var(--text);
-  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 .seg:focus-visible {
   outline: 2px solid var(--focus-border);
@@ -1188,26 +1477,63 @@ onBeforeUnmount(() => {
 }
 .control,
 .hint {
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
+.hint {
+  margin: 0;
+}
+.hint.caution {
+  color: var(--warning);
+}
 .notice,
-.error,
-.vm-warning {
-  font-size: 12px;
+.error {
+  font-size: var(--text-sm);
   padding: 8px 10px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
 }
-.notice p,
-.vm-warning p {
-  margin: 4px 0 8px;
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
-.vm-warning {
-  border-color: var(--warning, #b7791f);
+.notice p {
+  margin: 0;
 }
 .error {
-  color: var(--danger, #c0392b);
+  color: var(--danger);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.tech summary,
+.ssh-disclosure summary {
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.tech[open] summary {
+  margin-bottom: 4px;
+}
+.tech .hint + .hint {
+  margin-top: 4px;
+}
+.ssh-disclosure {
+  flex: none;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+.ssh-disclosure[open] summary {
+  margin-bottom: 8px;
+}
+.summary-state {
+  margin-left: 6px;
+  color: var(--text-faint);
 }
 .screen {
   flex: 0 1 auto;
@@ -1228,6 +1554,50 @@ onBeforeUnmount(() => {
   height: auto;
   user-select: none;
 }
+.screen-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.screen-tools .spacer {
+  flex: 1;
+}
+/* Full screen: the Fullscreen API's element, or the window when that API is not available. */
+.screen.full,
+.screen:fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 0;
+  background: #000;
+}
+.screen.full canvas,
+.screen:fullscreen canvas {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+}
+.leave-full {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  opacity: 0.75;
+}
+.leave-full:hover {
+  opacity: 1;
+}
+.waiting.import {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .waiting {
   font-size: 12px;
   color: var(--text-faint);
@@ -1242,17 +1612,17 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 .target {
   flex: none;
   max-width: 180px;
-  height: 26px;
+  height: 30px;
   padding: 0 6px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 </style>

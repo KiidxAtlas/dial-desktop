@@ -143,7 +143,7 @@ input {
   outline: none;
   background: none;
   color: var(--text);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   text-align: center;
 }
 .unit {

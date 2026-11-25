@@ -72,3 +72,36 @@ fn page_info_is_read_whether_or_not_it_is_wrapped() {
     assert_eq!(parse_page(r#"{"url":"u"}"#).unwrap().url, "u");
     assert!(parse_page("null").is_err());
 }
+
+#[test]
+fn searches_use_the_chosen_engine_template() {
+    for (template, query, url) in [
+        ("https://www.google.com/search?q=%s", "rust borrow", "https://www.google.com/search?q=rust+borrow"),
+        ("https://kagi.com/search?q=%s", "a&b=c#d", "https://kagi.com/search?q=a%26b%3Dc%23d"),
+        ("https://search.brave.com/search?q=%s", "ünï", "https://search.brave.com/search?q=%C3%BCn%C3%AF"),
+    ] {
+        assert_eq!(normalize_url_with(query, Some(template)).unwrap(), url, "{template}");
+    }
+    // Addresses are not searched, and no template falls back to DuckDuckGo.
+    assert_eq!(normalize_url_with("example.com", Some("https://g.co/?q=%s")).unwrap(), "https://example.com/");
+    assert_eq!(normalize_url_with("vue", Some("  ")).unwrap(), "https://duckduckgo.com/?q=vue");
+    for bad in ["https://g.co/?q=", "javascript:%s", "file:///%s", "not a url %s"] {
+        assert!(check_search_template(bad).is_err(), "{bad}");
+        assert!(normalize_url_with("words here", Some(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn opening_a_file_serves_its_folder_until_the_page_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("my page.html"), "<p>hi</p>").unwrap();
+    let browser = Browser::default();
+    let url = serve_file(&browser, &dir.path().join("my page.html")).unwrap();
+    assert!(url.starts_with("http://127.0.0.1:") && url.ends_with("/my%20page.html"), "{url}");
+    assert!(allowed(&Url::parse(&url).unwrap()));
+    browser.keep_local_for(&url);
+    assert!(browser.local.lock().unwrap().is_some());
+    browser.keep_local_for("https://example.com/");
+    assert!(browser.local.lock().unwrap().is_none());
+    assert!(serve_file(&browser, dir.path()).is_err());
+}

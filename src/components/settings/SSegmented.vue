@@ -9,6 +9,7 @@ const emit = defineEmits<{ "update:modelValue": [value: string] }>();
     <button
       v-for="o in options"
       :key="o.value"
+      type="button"
       role="radio"
       :aria-checked="modelValue === o.value"
       :class="{ on: modelValue === o.value }"

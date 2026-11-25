@@ -7,6 +7,8 @@ import BackgroundSettings from "./BackgroundSettings.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
 import SSwitch from "./settings/SSwitch.vue";
+import SNumber from "./settings/SNumber.vue";
+import { terminalPrefs, TERMINAL_FONT_SIZE, TERMINAL_SCROLLBACK } from "../terminalPrefs";
 
 const THEMES: { id: Theme; name: string }[] = [
   { id: "system", name: "Match system" },
@@ -57,6 +59,14 @@ const THEMES: { id: Theme; name: string }[] = [
     </SRow>
     <SRow label="Diagrams and charts" description="Mermaid diagrams and charts, added when they help. Off stops asking for them and shows their source.">
       <SSwitch v-model="appearance.diagrams" label="Diagrams and charts" />
+    </SRow>
+  </SGroup>
+  <SGroup title="Terminal">
+    <SRow label="Font size" description="Your own shells in the Terminal panel. Open terminals change at once.">
+      <SNumber v-model="terminalPrefs.fontSize" label="Terminal font size" unit="px" :min="TERMINAL_FONT_SIZE.min" :max="TERMINAL_FONT_SIZE.max" :step="TERMINAL_FONT_SIZE.step" />
+    </SRow>
+    <SRow label="Scrollback" description="Lines each terminal keeps above the screen. More uses more memory.">
+      <SNumber v-model="terminalPrefs.scrollback" label="Terminal scrollback" unit="lines" integer :min="TERMINAL_SCROLLBACK.min" :max="TERMINAL_SCROLLBACK.max" :step="TERMINAL_SCROLLBACK.step" />
     </SRow>
   </SGroup>
   <BackgroundSettings />

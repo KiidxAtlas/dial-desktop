@@ -32,6 +32,15 @@ pub struct Terminals {
     next: u32,
     shells: Arc<Mutex<HashMap<u32, Shell>>>,
 }
+/// The Windows shell: PowerShell 7 (`pwsh`) when installed, else Windows PowerShell.
+pub fn windows_shell(path: Option<&std::ffi::OsStr>) -> String {
+    let found = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .any(|dir| dir.join("pwsh.exe").is_file());
+    if found { "pwsh.exe".into() } else { "powershell.exe".into() }
+}
+
 /// The user's login shell, run in `cwd`.
 pub fn login_shell(cwd: &Path) -> CommandBuilder {
     let program = std::env::var("SHELL")
@@ -39,7 +48,7 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             if cfg!(windows) {
-                "powershell.exe".into()
+                windows_shell(std::env::var_os("PATH").as_deref())
             } else {
                 "/bin/sh".into()
             }
@@ -58,16 +67,23 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Task {
     Slash { command: String },
-    Scheduler,
+    Scheduler {
+        /// Run the entries that are due now, then exit (`schedule run --once`).
+        #[serde(default)]
+        once: bool,
+    },
 }
 
 impl Task {
     pub fn child(self, program: &Path, cwd: &Path) -> Result<CommandBuilder, String> {
         match self {
             Self::Slash { command } => slash_command(program, cwd, &command),
-            Self::Scheduler => {
+            Self::Scheduler { once } => {
                 let mut child = CommandBuilder::new(program);
                 child.args(["schedule", "run"]);
+                if once {
+                    child.arg("--once");
+                }
                 child.cwd(cwd);
                 Ok(child)
             }
@@ -102,10 +118,6 @@ pub fn slash_command(program: &Path, cwd: &Path, text: &str) -> Result<CommandBu
 impl Terminals {
     fn lock_shells(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Shell>> {
         self.shells.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub fn has_shells(&self) -> bool {
-        !self.lock_shells().is_empty()
     }
 
     pub fn open_ids(&self) -> Vec<u32> {
@@ -147,6 +159,25 @@ impl Terminals {
                 child,
             },
         );
+        // ConPTY keeps its output pipe open after the shell exits, until the pseudoconsole
+        // closes; watch the shell and close it (by removing it) so the reader below ends.
+        #[cfg(windows)]
+        {
+            let shells = Arc::clone(&self.shells);
+            let _ = thread::Builder::new()
+                .name(format!("dial-terminal-{id}-exit"))
+                .spawn(move || loop {
+                    thread::sleep(std::time::Duration::from_millis(150));
+                    let mut open = shells.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Some(shell) = open.get_mut(&id) else { break };
+                    if !matches!(shell.child.try_wait(), Ok(None)) {
+                        let ended = open.remove(&id);
+                        drop(open);
+                        drop(ended);
+                        break;
+                    }
+                });
+        }
         let shells = Arc::clone(&self.shells);
         if let Err(e) = thread::Builder::new()
             .name(format!("dial-terminal-{id}"))
@@ -170,7 +201,7 @@ impl Terminals {
                     sink(TerminalEvent::Data { id, data });
                 }
                 // Reap and remove the finished shell before notifying the UI so FDs and
-                // `has_shells()` are already clean when `Exit` arrives.
+                // the list of open terminals are already clean when `Exit` arrives.
                 let ended = shells
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)

@@ -58,7 +58,7 @@ function onKey(event: KeyboardEvent) {
 .tabs button {
   flex: 1 0 auto;
   padding: 6px 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   font: 500 var(--text-sm) / 1.3 var(--font-mono);
   color: var(--text-muted);
   white-space: nowrap;

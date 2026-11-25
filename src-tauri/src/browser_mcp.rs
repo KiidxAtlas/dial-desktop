@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -22,9 +22,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Serve stdin/stdout until stdin closes.
 pub fn run() -> i32 {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
+    let home = crate::launcher::home_dir();
     let directory =
         crate::launcher::app_dir(home.as_deref()).map(|dir| dir.join("browser-endpoints"));
     let workspace = std::env::current_dir().and_then(|p| p.canonicalize()).ok();

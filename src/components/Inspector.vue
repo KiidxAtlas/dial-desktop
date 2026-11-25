@@ -1,29 +1,46 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, watch } from "vue";
-import type { OpenSnapshot, ToolEntry } from "../types";
+import { computed, nextTick, reactive, ref, watch } from "vue";
+import type { Change, OpenSnapshot, ToolEntry } from "../types";
 import { openMenu, ui, type InspectorTab } from "../ui";
-import { addToPrompt, inspectorWidth, mention, setInspectorWidth, showPanel } from "../workspace";
+import { addToPrompt, inspectorWidth, mention, MIN_WIDTH, projectPref, setInspectorWidth, setProjectPref, showPanel } from "../workspace";
+import { changeRows, gitLabel, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
+import { workspaceGitApi, type CommitReview } from "../workspaceGitApi";
+import { showToast } from "../bridge";
+import { aiReviewView, gitLogView, worktreesView } from "../commandRunner";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { needsGitIdentity, paneErrorText } from "../paneErrors";
 import Icon from "./Icon.vue";
 import BrowserPane from "./workspace/BrowserPane.vue";
 import DiffPane from "./workspace/DiffPane.vue";
 import FilesPane from "./workspace/FilesPane.vue";
 import TerminalPane from "./workspace/TerminalPane.vue";
 import AppPane from "./workspace/AppPane.vue";
+import RecordedTurns from './RecordedTurns.vue';
+import JobDiscovery from './JobDiscovery.vue';
+import ActivityWatch from './ActivityWatch.vue';
 
 const props = defineProps<{ snap: OpenSnapshot; open: boolean }>();
 
-const TABS: { id: InspectorTab; label: string; icon: "list" | "diff" | "activity" | "files" | "terminal" | "globe" | "monitor" }[] = [
+const pinned = [
   { id: "plan", label: "Plan", icon: "list" },
   { id: "changes", label: "Changes", icon: "diff" },
+] as const;
+const rosters = [
+  { id: "workers", label: "Workers", icon: "chip" },
+  { id: "peers", label: "Peers", icon: "chat" },
+] as const;
+const auxiliary = [
   { id: "activity", label: "Activity", icon: "activity" },
+  ...rosters,
   { id: "files", label: "Files", icon: "files" },
   { id: "terminal", label: "Terminal", icon: "terminal" },
   { id: "browser", label: "Browser", icon: "globe" },
   { id: "app", label: "App", icon: "monitor" },
-];
-const auxiliary = TABS.slice(2);
+] as const;
+const watchKind = computed(() => ui.inspectorTab === "workers" ? "worker" : ui.inspectorTab === "peers" ? "peer" : null);
 const modifier = navigator.platform.includes("Mac") ? "⌘" : "Ctrl+";
-const hints: Partial<Record<InspectorTab, string>> = { files: `${modifier}⇧E`, terminal: 'Ctrl+`', browser: `${modifier}⇧B` };
+const hints: Partial<Record<InspectorTab, string>> = { files: `${modifier}⇧E`, terminal: modifier === "⌘" ? "⌃`" : "Ctrl+`", browser: `${modifier}⇧B` };
+const panelButton = ref<HTMLButtonElement>();
 function panelMenu(event: MouseEvent) {
   openMenu(event, auxiliary.map(tab => ({ label: tab.label, icon: tab.icon, hint: hints[tab.id], run: () => showPanel(tab.id) })), event.currentTarget as HTMLElement);
 }
@@ -39,12 +56,152 @@ const shown = (tab: InspectorTab) => props.open && !ui.settingsOpen && ui.inspec
 
 const done = computed(() => props.snap.plan.filter((t) => t.status === "completed").length);
 const progress = computed(() => (props.snap.plan.length ? (done.value / props.snap.plan.length) * 100 : 0));
-const tools = computed(() =>
-  props.snap.entries
-    .filter((e): e is ToolEntry => e.kind === "tool")
-    .reverse()
-    .slice(0, 50),
+/** Activity shows the newest calls first, a page at a time. */
+const ACTIVITY_PAGE = 50;
+const activityLimit = ref(ACTIVITY_PAGE);
+const allTools = computed(() => props.snap.entries.filter((e): e is ToolEntry => e.kind === "tool").reverse());
+const tools = computed(() => allTools.value.slice(0, activityLimit.value));
+watch(() => props.snap.workspace.root, () => { activityLimit.value = ACTIVITY_PAGE; });
+
+/** Git status with +/- counts for the Changes list; refreshed when it is shown or a file changes. */
+const gitFiles = ref<GitFileStatus[]>([]);
+/** Whether the project is a git repository; `false` until a status says so. */
+const gitRepo = ref(false);
+/** The checked-out branch from the latest status. */
+const gitBranch = ref<string | null>(null);
+/** Files with something staged, across the whole project (a commit takes them all). */
+const staged = computed(() => stagedCount(gitFiles.value));
+const commitMessage = ref("");
+/** A stage, unstage or commit is running; the controls wait for it. */
+const gitBusy = ref(false);
+const review = ref<CommitReview | null>(null);
+let reviewRevision = 0;
+function dismissReview() {
+  reviewRevision++;
+  review.value = null;
+}
+watch([() => props.snap.workspace.root, () => props.snap.sessionId, commitMessage, () => shown("changes")], dismissReview, { flush: "sync" });
+watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; author.value = null; });
+let gitRequest = 0;
+async function loadGit() {
+  const root = props.snap.workspace.root, id = ++gitRequest;
+  try {
+    const view = await workspaceGitApi.status(root, true);
+    if (id === gitRequest && root === props.snap.workspace.root) {
+      gitFiles.value = view.files;
+      gitRepo.value = view.repo;
+      gitBranch.value = view.branch ?? null;
+    }
+  } catch {
+    if (id === gitRequest) {
+      gitFiles.value = [];
+      gitRepo.value = false;
+      gitBranch.value = null;
+    }
+  }
+}
+
+/** Stage a file whose changes are not all staged; unstage it otherwise. */
+async function toggleStaged(path: string, git: GitFileStatus) {
+  const root = props.snap.workspace.root;
+  dismissReview();
+  gitBusy.value = true;
+  try {
+    await workspaceGitApi.stage([path], stageState(git) !== true, root);
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    gitBusy.value = false;
+    if (root === props.snap.workspace.root) await loadGit();
+  }
+}
+
+/** Read the entire index, including paths untouched by this session. Confirmation is separate. */
+async function reviewStaged() {
+  if (gitBusy.value || !commitMessage.value.trim()) return;
+  const root = props.snap.workspace.root, revision = ++reviewRevision;
+  gitBusy.value = true;
+  try {
+    const result = await workspaceGitApi.review(root);
+    if (revision === reviewRevision) review.value = result;
+  } catch (e) {
+    if (revision === reviewRevision) showToast(paneErrorText(e));
+  } finally {
+    gitBusy.value = false;
+  }
+}
+
+async function commitStaged() {
+  const reviewed = review.value;
+  if (gitBusy.value || !reviewed || !commitMessage.value.trim()) return;
+  const root = props.snap.workspace.root, message = commitMessage.value;
+  gitBusy.value = true;
+  try {
+    const sha = await workspaceGitApi.commit(message, root, reviewed);
+    if (root === props.snap.workspace.root && commitMessage.value === message) commitMessage.value = "";
+    showToast(`Committed ${sha}`);
+  } catch (e) {
+    if (needsGitIdentity(e)) void askAuthor(root);
+    else showToast(paneErrorText(e));
+  } finally {
+    dismissReview();
+    gitBusy.value = false;
+    if (root === props.snap.workspace.root) await loadGit();
+  }
+}
+
+/** Fill the message box with the engine's message for what is staged (`dial commit --dry-run`). */
+const writing = ref(false);
+const aiWarning = ref("");
+watch(commitMessage, () => { if (!writing.value) aiWarning.value = ""; });
+async function writeMessage() {
+  if (writing.value || gitBusy.value || !staged.value) return;
+  if (commitMessage.value.trim() && !(await ask("Replace the message you wrote with one from Dial?", { title: "Write with AI", kind: "warning", okLabel: "Replace" }))) return;
+  const root = props.snap.workspace.root;
+  writing.value = true;
+  try {
+    const preview = await workspaceGitApi.aiMessage(root);
+    if (root !== props.snap.workspace.root) return;
+    commitMessage.value = preview.message;
+    aiWarning.value = preview.warning ?? "";
+  } catch (e) {
+    showToast(`Could not write a message: ${paneErrorText(e)}`);
+  } finally {
+    writing.value = false;
+  }
+}
+
+/** Git refused a commit for want of an author: asked for under the message, then commit again. */
+const author = ref<{ name: string; email: string; everywhere: boolean; saving: boolean; error: string } | null>(null);
+async function askAuthor(root: string) {
+  const known = await workspaceGitApi.identity(root).catch(() => ({ name: "", email: "" }));
+  if (root === props.snap.workspace.root) author.value = { ...known, everywhere: true, saving: false, error: "" };
+}
+async function saveAuthor() {
+  const form = author.value, root = props.snap.workspace.root;
+  if (!form || form.saving || !form.name.trim() || !form.email.trim()) return;
+  form.saving = true;
+  form.error = "";
+  try {
+    const saved = await workspaceGitApi.setIdentity(form.name, form.email, form.everywhere, root);
+    if (author.value === form) author.value = null;
+    showToast(`Commits are now recorded as ${saved.name} <${saved.email}>. Review and commit again.`);
+  } catch (e) {
+    form.error = String(e).replace(/^Error:\s*/, "");
+  } finally {
+    form.saving = false;
+  }
+}
+watch(
+  [() => shown("changes"), () => props.snap.workspace.root, () => props.snap.changes.map((c) => c.revision).join()],
+  ([visible]) => { if (visible) void loadGit(); },
+  { immediate: true },
 );
+/** Session-touched files; those git no longer reports as changed (committed or reverted) last. */
+const rows = computed(() =>
+  changeRows(props.snap.changes, (c: Change) => (c.dir + c.name).replaceAll("\\", "/"), gitFiles.value, gitRepo.value),
+);
+const pending = computed(() => rows.value.filter((r) => !r.settled).length);
 const width = computed(() => inspectorWidth());
 /** Show a tool call in the conversation, opened, and flash it. */
 async function reveal(key: string) {
@@ -58,6 +215,18 @@ async function reveal(key: string) {
   row.classList.add("flash");
 }
 const expanded = computed(() => shown("changes") && !!ui.diffPath && ui.diffExpanded);
+// Opening a diff restores this project's last Expand/Shrink choice.
+watch(
+  () => ui.diffPath,
+  (path, before) => {
+    if (path && !before) ui.diffExpanded = projectPref<boolean>("diffExpanded", props.snap.workspace.root) === true;
+  },
+  { immediate: true },
+);
+function toggleExpanded() {
+  ui.diffExpanded = !ui.diffExpanded;
+  setProjectPref("diffExpanded", props.snap.workspace.root, ui.diffExpanded);
+}
 const fileIndex = computed(() => props.snap.changes.findIndex((file) => file.path === ui.diffPath));
 function moveFile(step: -1 | 1) {
   if (fileIndex.value < 0) return;
@@ -92,38 +261,64 @@ function startResize(event: PointerEvent) {
   handle.addEventListener("pointermove", move);
   handle.addEventListener("pointerup", stop);
 }
+
+/** Arrow keys on the focused edge resize too: Left widens, Right narrows; Shift takes bigger steps. */
+function resizeByKey(event: KeyboardEvent) {
+  const step = event.shiftKey ? 64 : 16;
+  if (event.key === "ArrowLeft") setInspectorWidth(width.value + step);
+  else if (event.key === "ArrowRight") setInspectorWidth(width.value - step);
+  else if (event.key === "Home") setInspectorWidth(MIN_WIDTH);
+  else if (event.key === "End") setInspectorWidth(Number.MAX_SAFE_INTEGER);
+  else return;
+  event.preventDefault();
+}
 </script>
 
 <template>
   <aside class="inspector" :class="{ 'wide-review': expanded }" :style="{ '--inspector-width': `${width}px` }">
-    <div v-if="!expanded" class="resize" title="Drag to resize" @pointerdown="startResize" />
+    <div
+      v-if="!expanded"
+      class="resize"
+      role="separator"
+      tabindex="0"
+      aria-orientation="vertical"
+      aria-label="Resize the panel"
+      :aria-valuenow="width"
+      :aria-valuemin="MIN_WIDTH"
+      title="Drag or use the arrow keys to resize"
+      @pointerdown="startResize"
+      @keydown="resizeByKey"
+    />
     <div class="drag" data-tauri-drag-region />
     <div class="tabs" role="group" aria-label="Workspace panels">
       <button
-        v-for="tab in TABS.slice(0, 2)"
+        v-for="tab in pinned"
         :key="tab.id"
         :title="tab.label"
         :aria-label="tab.label"
         :aria-pressed="ui.inspectorTab === tab.id"
         :class="{ active: ui.inspectorTab === tab.id }"
-        @click="ui.inspectorTab = tab.id"
+        @click="showPanel(tab.id)"
       >
         {{ tab.label }}
         <span v-if="tab.id === 'changes' && snap.changes.length" class="badge">{{ snap.changes.length }}</span>
       </button>
-      <button aria-haspopup="menu" :class="{ active: auxiliary.some(t => t.id === ui.inspectorTab) }" @click="panelMenu">
+      <button aria-haspopup="menu" :aria-expanded="ui.menu?.anchor === panelButton" ref="panelButton" :class="{ active: auxiliary.some(t => t.id === ui.inspectorTab) }" @click="panelMenu">
         {{ auxiliary.find(t => t.id === ui.inspectorTab)?.label ?? 'Panels' }} <Icon name="chevronDown" :size="12" />
       </button>
     </div>
 
     <div v-show="['files', 'terminal', 'browser', 'app'].includes(ui.inspectorTab)" class="panel">
       <FilesPane v-if="visited.has('files')" v-show="ui.inspectorTab === 'files'" :snap="snap" />
-      <TerminalPane
-        v-if="visited.has('terminal')"
-        v-show="ui.inspectorTab === 'terminal'"
-        :snap="snap"
-        :active="shown('terminal')"
-      />
+      <KeepAlive>
+        <TerminalPane
+          v-if="visited.has('terminal')"
+          :key="snap.workspace.root"
+          v-show="ui.inspectorTab === 'terminal'"
+          :snap="snap"
+          :active="shown('terminal')"
+        />
+      </KeepAlive>
       <BrowserPane v-if="visited.has('browser')" v-show="ui.inspectorTab === 'browser'" :active="shown('browser')" />
       <AppPane v-if="visited.has('app')" v-show="ui.inspectorTab === 'app'" :root="snap.workspace.root" :active="shown('app')" />
     </div>
@@ -131,12 +326,13 @@ function startResize(event: PointerEvent) {
     <div v-if="ui.inspectorTab === 'changes' && ui.diffPath" class="panel">
       <DiffPane
         :path="ui.diffPath" :root="snap.workspace.root" :expanded="expanded"
+        :revision="snap.changes[fileIndex]?.revision"
         :position="fileIndex < 0 ? null : { index: fileIndex, total: snap.changes.length }"
-        @back="ui.diffPath = null" @expand="ui.diffExpanded = !ui.diffExpanded" @move="moveFile"
+        @back="ui.diffPath = null" @expand="toggleExpanded" @move="moveFile"
       />
     </div>
 
-    <div v-else-if="['plan', 'changes', 'activity'].includes(ui.inspectorTab)" class="body">
+    <div v-else-if="watchKind || ['plan', 'changes', 'activity'].includes(ui.inspectorTab)" class="body">
       <!-- Plan -->
       <template v-if="ui.inspectorTab === 'plan'">
         <div v-if="!snap.plan.length" class="empty">
@@ -164,35 +360,123 @@ function startResize(event: PointerEvent) {
 
       <!-- Changes -->
       <template v-else-if="ui.inspectorTab === 'changes'">
+        <RecordedTurns v-if="shown('changes') && snap.connection.state === 'live' && snap.sessionId && !snap.turnRunning && !snap.historyLoading" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" :session="snap.sessionId" />
         <div v-if="!snap.changes.length" class="empty">
           <strong>No changes yet</strong>
           <span>Files Dial edits in this session appear here.</span>
         </div>
         <template v-else>
           <div class="head">
-            <span class="section-label">{{ snap.changes.length }} {{ snap.changes.length === 1 ? "file" : "files" }} changed</span>
+            <span class="section-label">{{ snap.changes.length }} {{ snap.changes.length === 1 ? "file" : "files" }} edited</span>
             <button class="btn btn-secondary" @click="addToPrompt('Review the changes to these files for bugs and missing tests:\n' + snap.changes.map(c => mention(c.path)).join('\n'))">Review files</button>
           </div>
-          <p class="faint">Files touched in this session. Diffs show current changes, not just Dial’s edits.</p>
-          <button
-            v-for="change in snap.changes"
-            :key="change.path"
-            class="file"
-            :title="change.path"
-            @click="ui.diffPath = change.path"
-          >
-            <Icon name="file" :size="14" />
-            <div class="file-text">
-              <div class="mono truncate">{{ change.name }}</div>
-              <div class="faint truncate">{{ change.dir || "./" }}</div>
-            </div>
-            <Icon name="chevronRight" :size="13" />
-          </button>
+          <p class="faint">
+            Files Dial edited in this session<template v-if="gitRepo && pending < snap.changes.length">; {{ pending }} still {{ pending === 1 ? "differs" : "differ" }} from the last commit</template>.
+            Diffs show every current change to a file, not just Dial’s.
+          </p>
+          <div v-for="{ item: change, git, settled } in rows" :key="change.path" class="file-row">
+            <input
+              v-if="git"
+              type="checkbox"
+              class="stage"
+              :checked="stageState(git) === true"
+              :indeterminate="stageState(git) === 'mixed'"
+              :disabled="gitBusy"
+              :aria-label="`${stageState(git) === true ? 'Unstage' : 'Stage'} ${change.path}`"
+              :title="stageState(git) === true ? 'Staged for the next commit; click to unstage' : stageState(git) === 'mixed' ? 'Partly staged; click to stage all of it' : 'Stage for the next commit'"
+              @change="toggleStaged((change.dir + change.name).replaceAll('\\', '/'), git)"
+            />
+            <span v-else class="stage" />
+            <button
+              class="file"
+              :class="{ settled }"
+              :title="settled ? `${change.path}: no uncommitted changes (committed or reverted since)` : change.path"
+              @click="ui.diffPath = change.path"
+            >
+              <Icon name="file" :size="14" />
+              <div class="file-text">
+                <div class="mono truncate">{{ change.name }}</div>
+                <div class="faint truncate">{{ change.dir || "./" }}</div>
+              </div>
+              <span v-if="git" class="change-stat" :title="gitLabel(git.status)">
+                <template v-if="git.added !== undefined"><b v-if="git.added || !git.removed" class="add">+{{ git.added }}</b> <b v-if="git.removed" class="del">−{{ git.removed }}</b></template>
+                <span class="code" :class="'code-' + git.status">{{ git.status }}</span>
+              </span>
+              <span v-else-if="settled" class="change-stat faint">no changes</span>
+              <Icon name="chevronRight" :size="13" />
+            </button>
+          </div>
         </template>
+        <form v-if="gitRepo" class="commit" @submit.prevent="!review && reviewStaged()">
+          <div class="commit-head">
+            <span class="section-label">Commit</span>
+            <span v-if="gitBranch" class="faint mono truncate" :title="`Current branch: ${gitBranch}`">to {{ gitBranch }}</span>
+            <span class="commit-ai">
+              <button type="button" class="s-link" title="Dial reads your uncommitted changes with the current model and reports; nothing is changed" @click="aiReviewView()">AI review</button>
+              <button type="button" class="s-link" title="Recent commits on this branch" @click="gitLogView()">History</button>
+              <button type="button" class="s-link" :disabled="gitBusy || writing || !staged" :title="staged ? 'Dial reads the staged changes and writes a message here; nothing is committed until you review it' : 'Stage files first'" @click="writeMessage">{{ writing ? "Writing…" : "Write with AI" }}</button>
+              <button type="button" class="s-link" title="Branches checked out in other folders" @click="worktreesView()">Worktrees</button>
+            </span>
+          </div>
+          <textarea
+            v-model="commitMessage"
+            class="commit-message"
+            rows="2"
+            aria-label="Commit message"
+            placeholder="Commit message"
+            spellcheck="true"
+            @keydown.meta.enter.prevent="!review && reviewStaged()"
+            @keydown.ctrl.enter.prevent="!review && reviewStaged()"
+          />
+          <p v-if="aiWarning" class="faint commit-warning">Dial’s check of this message: {{ aiWarning }}</p>
+          <div v-if="author" class="author" role="group" aria-label="Commit author">
+            <strong>Git needs your name and email</strong>
+            <span class="faint">Git records them on each commit you make. They are saved in Git’s own settings on this computer.</span>
+            <input v-model="author.name" class="s-input" aria-label="Your name" placeholder="Your name" autocomplete="name" @keydown.enter.prevent="saveAuthor" />
+            <input v-model="author.email" class="s-input" type="email" aria-label="Email address" placeholder="you@example.com" autocomplete="email" spellcheck="false" @keydown.enter.prevent="saveAuthor" />
+            <label class="author-scope faint"><input v-model="author.everywhere" type="checkbox" /> Use for all my repositories</label>
+            <p v-if="author.error" role="alert" class="s-error">{{ author.error }}</p>
+            <div class="commit-foot">
+              <button type="button" class="btn btn-secondary" :disabled="author.saving" @click="author = null">Not now</button>
+              <button type="button" class="btn btn-primary" :disabled="author.saving || !author.name.trim() || !author.email.trim()" @click="saveAuthor">{{ author.saving ? "Saving…" : "Save author" }}</button>
+            </div>
+          </div>
+          <template v-if="review">
+            <strong>Review {{ review.paths.length }} staged {{ review.paths.length === 1 ? 'path' : 'paths' }}<template v-if="review.branch"> on {{ review.branch }}</template></strong>
+            <span class="faint">Includes files staged outside this session. Only staged changes will be committed.</span>
+            <ul aria-label="Staged paths" class="staged-paths mono"><li v-for="path in review.paths" :key="path"><bdi>{{ /[\u0000-\u001f\u007f]/.test(path) ? JSON.stringify(path) : path }}</bdi></li></ul>
+            <div class="commit-foot">
+              <button type="button" class="btn btn-secondary" :disabled="gitBusy" @click="dismissReview">Cancel</button>
+              <button type="button" class="btn btn-primary" :disabled="gitBusy" @click="commitStaged">Commit staged</button>
+            </div>
+          </template>
+          <div v-else class="commit-foot">
+            <span class="faint">{{ staged ? `${staged} ${staged === 1 ? "file" : "files"} staged in the project` : "Tick files to stage them" }}</span>
+            <button type="submit" class="btn btn-primary" :disabled="gitBusy || !commitMessage.trim()">Review staged files</button>
+          </div>
+        </form>
       </template>
 
-      <!-- Activity -->
+      <template v-else-if="watchKind">
+        <ActivityWatch
+          v-if="shown(ui.inspectorTab) && snap.connection.state === 'live' && snap.sessionId"
+          :key="JSON.stringify([watchKind, snap.workspace.root, snap.sessionId])"
+          :kind="watchKind" :root="snap.workspace.root" :session-id="snap.sessionId"
+        />
+        <div v-else-if="shown(ui.inspectorTab)" class="empty">
+          <strong>{{ watchKind === 'worker' ? 'Session workers' : 'Project peers' }}</strong>
+          <span>Connect to a live session to see {{ watchKind === 'worker' ? 'its workers' : 'other sessions on this project' }}.</span>
+        </div>
+      </template>
+
+      <!-- /watch opens Activity; the two rosters are independent destinations. -->
       <template v-else>
+        <nav class="rosters" aria-label="Coordination panels">
+          <button v-for="tab in rosters" :key="tab.id" class="btn btn-secondary" @click="showPanel(tab.id)">
+            <Icon :name="tab.icon" :size="14" />{{ tab.label }}<Icon name="chevronRight" :size="12" />
+          </button>
+        </nav>
+        <JobDiscovery v-if="shown('activity') && snap.connection.state === 'live'" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" />
         <div class="stats">
           <div class="stat"><span class="dot running" /><b>{{ snap.stats.running }}</b> running</div>
           <div class="stat"><span class="dot ok" /><b>{{ snap.stats.succeeded }}</b> done</div>
@@ -215,6 +499,9 @@ function startResize(event: PointerEvent) {
             />
             <span class="activity-label">{{ tool.label }}</span>
             <span class="mono faint truncate">{{ tool.target }}</span>
+          </button>
+          <button v-if="allTools.length > tools.length" class="btn btn-secondary more" @click="activityLimit += ACTIVITY_PAGE">
+            Show more ({{ allTools.length - tools.length }} older)
           </button>
         </template>
       </template>
@@ -406,19 +693,78 @@ function startResize(event: PointerEvent) {
   background: var(--active);
   color: var(--code-inline);
 }
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 -8px;
+}
+.file-row .stage {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0 0 0 6px;
+  accent-color: var(--accent);
+}
 .file {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: calc(100% + 16px);
-  padding: 6px 8px;
-  margin: 0 -8px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px 6px 4px;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
   text-align: left;
 }
+.commit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--border);
+}
+.commit-head,
+.commit-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.commit-ai { display: flex; gap: 10px; margin-left: auto; flex: none; }
+.commit-ai .s-link { color: var(--accent); font-size: var(--text-sm); }
+.commit-ai .s-link:disabled { color: var(--text-faint); cursor: default; }
+.commit-warning { margin: 0; font-size: var(--text-xs); }
+.staged-paths { overflow: auto; max-height: 12rem; padding-left: 1.4rem; overflow-wrap: anywhere; font-size: var(--text-sm); }
+.author { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-sm); }
+.author .s-input { width: 100%; max-width: 100%; }
+.author-scope { display: flex; align-items: center; gap: 6px; }
+.commit-message {
+  width: 100%;
+  min-height: 44px;
+  resize: vertical;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  outline: none;
+}
+.commit-message:focus {
+  border-color: var(--focus-border);
+}
+.resize:focus-visible {
+  outline: none;
+  background: var(--accent);
+}
 .file:hover {
   background: var(--surface);
+}
+.file.settled .file-text {
+  color: var(--text-faint);
 }
 .file-text {
   flex: 1;
@@ -427,13 +773,15 @@ function startResize(event: PointerEvent) {
   font-size: 13px;
   line-height: 1.4;
 }
+.rosters { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--space-md); }
 .stats {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-bottom: var(--space-lg);
 }
 .stat {
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -483,5 +831,34 @@ function startResize(event: PointerEvent) {
 }
 .activity-label {
   white-space: nowrap;
+}
+.more {
+  margin-top: 6px;
+}
+.change-stat {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.change-stat .add {
+  color: var(--success);
+}
+.change-stat .del {
+  color: var(--danger);
+}
+.change-stat .code {
+  font-family: var(--font-mono);
+  color: var(--warning);
+}
+.change-stat .code-A,
+.change-stat .code-U {
+  color: var(--success);
+}
+.change-stat .code-D,
+.change-stat .code-C {
+  color: var(--danger);
 }
 </style>

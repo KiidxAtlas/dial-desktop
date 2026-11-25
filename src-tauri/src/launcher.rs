@@ -5,9 +5,11 @@
 //! `dial` (often in `~/.local/bin`) and provider keys (`ANTHROPIC_API_KEY`) would be missing.
 //! [`import_shell_env`] copies them in, the way editors such as VS Code do.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -18,13 +20,13 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Recent folders kept for the welcome screen and the folder menu.
 const MAX_RECENTS: usize = 12;
 /// Where `dial` is commonly installed when the PATH does not say.
-const FALLBACK_DIRS: [&str; 5] = [
-    "~/.local/bin",
-    "~/.cargo/bin",
-    "~/bin",
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-];
+fn fallback_dirs(os: &str) -> &'static [&'static str] {
+    match os {
+        "macos" => &["~/.local/bin", "~/.cargo/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin"],
+        "linux" => &["~/.local/bin", "~/.cargo/bin", "~/bin", "/usr/local/bin"],
+        _ => &["~/.local/bin", "~/.cargo/bin", "~/bin"],
+    }
+}
 /// Variables that describe the probe shell itself, not the user's environment.
 const SKIP_VARS: [&str; 5] = ["PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID"];
 
@@ -82,13 +84,23 @@ pub fn import_shell_env() {
         return;
     }
     let Some(shell) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) else {
+        warn("SHELL is not set, so the login shell's PATH and API keys were not imported.".into());
         return;
     };
-    let Some(output) = run_with_timeout(
-        Command::new(shell).args(["-l", "-i", "-c", "env -0"]),
+    let name = Path::new(&shell)
+        .file_name()
+        .map_or_else(|| shell.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    let output = match run_detailed(
+        Command::new(&shell).args(["-l", "-i", "-c", "env -0"]),
         SHELL_TIMEOUT,
-    ) else {
-        return;
+    ) {
+        Ok(output) => output,
+        Err(why) => {
+            warn(format!(
+                "Could not import the environment of your login shell ({name} {why}); Dial may miss `dial` or API keys set in your shell profile."
+            ));
+            return;
+        }
     };
     let current: Vec<(String, String)> = std::env::vars().collect();
     for (key, value) in env_changes(&current, &parse_env(&output)) {
@@ -116,6 +128,11 @@ pub(crate) fn without_console(command: &mut Command) -> &mut Command {
 /// foreground (`zsh: suspended (tty output)`) and, if the probe is then killed, leaves the terminal
 /// owned by a dead process group. A new session detaches it from the terminal entirely.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
+    run_detailed(command, timeout).ok()
+}
+
+/// [`run_with_timeout`], saying why there is no output ("timed out after 5 s").
+fn run_detailed(command: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -137,8 +154,8 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
+        .map_err(|error| format!("could not start: {error}"))?;
+    let mut stdout = child.stdout.take().ok_or("has no output")?;
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut stdout, &mut out).map(|_| out)
@@ -146,12 +163,18 @@ pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return reader.join().ok()?.ok(),
-            Ok(Some(_)) | Err(_) => return None,
+            Ok(Some(status)) if status.success() => {
+                return reader
+                    .join()
+                    .map_err(|_| "output could not be read".to_owned())?
+                    .map_err(|error| format!("output could not be read: {error}"));
+            }
+            Ok(Some(status)) => return Err(format!("exited with {status}")),
+            Err(error) => return Err(format!("could not be waited on: {error}")),
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(format!("timed out after {} s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
@@ -169,6 +192,24 @@ pub fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
 pub const DIAL_NAME: &str = if cfg!(windows) { "dial.exe" } else { "dial" };
 pub const ENGINE_SELECTION: &str = "engine-selection";
 
+/// For a known executable name (including `.exe` on Windows), reject directories
+/// and Unix files with no execute bit before they can shadow a later candidate.
+pub(crate) fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else { return false };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Only completed installations are selected; an interrupted install never shadows PATH.
 pub fn desktop_engine(app_dir: &Path) -> Option<PathBuf> {
     let name = std::fs::read_to_string(app_dir.join(ENGINE_SELECTION)).ok()?;
@@ -177,27 +218,189 @@ pub fn desktop_engine(app_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     let binary = app_dir.join(name).join(DIAL_NAME);
-    binary.is_file().then_some(binary)
+    is_executable(&binary).then_some(binary)
+}
+
+/// How the engine binary was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EngineOrigin {
+    /// `--dial PATH`.
+    Flag,
+    /// `$DIAL_BIN`.
+    Env,
+    /// A binary picked in Settings › Updates ("Use a different engine…").
+    Choice,
+    /// The copy Desktop installed and selected.
+    Desktop,
+    /// Found on PATH.
+    Path,
+    /// Found in one of the usual installation folders.
+    Fallback,
+    /// Nowhere: the bare name, which fails to start.
+    Missing,
+}
+
+/// The engine picked in Settings › Updates, kept in [`ENGINE_CHOICE`] in the app's folder. It
+/// ranks below `--dial` and `DIAL_BIN` and above the usual order; `None` (no file) is that order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum EngineChoice {
+    /// This binary. One that is gone or not executable is skipped, with a startup warning.
+    Custom { path: PathBuf },
+    /// The first `dial` on PATH, ahead of Desktop's own copy.
+    Path,
+    /// Desktop's installed copy (also the usual first pick when it exists).
+    Desktop,
+}
+
+pub const ENGINE_CHOICE: &str = "engine-choice.json";
+
+/// The saved choice; `None` when there is none or the file is unreadable.
+pub fn load_choice(app_dir: Option<&Path>) -> Option<EngineChoice> {
+    let bytes = std::fs::read(app_dir?.join(ENGINE_CHOICE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Save `choice`, or remove the file for the usual order.
+pub fn save_choice(app_dir: &Path, choice: Option<&EngineChoice>) -> Result<(), String> {
+    let file = app_dir.join(ENGINE_CHOICE);
+    let Some(choice) = choice else {
+        return match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        };
+    };
+    std::fs::create_dir_all(app_dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(choice).map_err(|e| e.to_string())?;
+    let partial = file.with_extension("json.partial");
+    std::fs::write(&partial, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &file).map_err(|e| e.to_string())
+}
+
+/// Why a saved choice did not pick the engine, for the startup warnings; `None` when it did or
+/// when `--dial`/`DIAL_BIN` outranked it.
+pub fn choice_ignored(choice: Option<&EngineChoice>, origin: EngineOrigin) -> Option<String> {
+    match (choice?, origin) {
+        (_, EngineOrigin::Flag | EngineOrigin::Env) => None,
+        (EngineChoice::Custom { path }, o) if o != EngineOrigin::Choice => Some(format!(
+            "The engine chosen in Settings › Updates ({}) is missing or not executable; using the usual one instead.",
+            path.display()
+        )),
+        (EngineChoice::Path, o) if o != EngineOrigin::Path => {
+            Some("Settings › Updates asks for the engine on PATH, but there is none; using the usual one instead.".into())
+        }
+        (EngineChoice::Desktop, o) if o != EngineOrigin::Desktop => {
+            Some("Settings › Updates asks for Desktop's own engine, but it is not installed; using the usual one instead.".into())
+        }
+        _ => None,
+    }
+}
+
+/// `program --version`: the first line it prints, or why it does not run.
+pub fn engine_version(program: &Path) -> Result<String, String> {
+    if !is_executable(program) {
+        return Err(format!("{} is not an executable file", program.display()));
+    }
+    let out = run_detailed(Command::new(program).arg("--version"), Duration::from_secs(10))
+        .map_err(|error| format!("{} {error}", program.display()))?;
+    let text = String::from_utf8_lossy(&out);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.is_empty() {
+        return Err(format!("{} printed no version", program.display()));
+    }
+    Ok(line.to_owned())
 }
 
 /// An explicit override wins, then the user's Desktop install, then PATH and the usual folders.
 pub fn find_dial(explicit: Option<OsString>, path: Option<&OsStr>, home: Option<&Path>) -> PathBuf {
-    if let Some(explicit) = explicit.filter(|p| !p.is_empty()) {
-        return PathBuf::from(explicit);
+    locate_dial(explicit, None, None, path, home).0
+}
+
+/// [`find_dial`], telling a `--dial` `flag` from `$DIAL_BIN` (`env`), honouring the Settings
+/// `choice` below both, and saying which rule won.
+pub fn locate_dial(
+    flag: Option<OsString>,
+    env: Option<OsString>,
+    choice: Option<&EngineChoice>,
+    path: Option<&OsStr>,
+    home: Option<&Path>,
+) -> (PathBuf, EngineOrigin) {
+    if let Some(flag) = flag.filter(|p| !p.is_empty()) {
+        return (PathBuf::from(flag), EngineOrigin::Flag);
     }
-    if let Some(installed) = app_dir(home).and_then(|dir| desktop_engine(&dir)) {
-        return installed;
+    if let Some(env) = env.filter(|p| !p.is_empty()) {
+        return (PathBuf::from(env), EngineOrigin::Env);
     }
     let name = DIAL_NAME;
-    let on_path = path.into_iter().flat_map(std::env::split_paths);
-    let fallback = FALLBACK_DIRS
-        .iter()
-        .map(|dir| expand_home(Path::new(dir), home));
-    on_path
-        .chain(fallback)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| PathBuf::from(name))
+    let found = |dirs: &mut dyn Iterator<Item = PathBuf>| {
+        dirs.map(|dir| dir.join(name)).find(|candidate| is_executable(candidate))
+    };
+    let on_path = || found(&mut path.into_iter().flat_map(std::env::split_paths));
+    match choice {
+        Some(EngineChoice::Custom { path }) if is_executable(path) => {
+            return (path.clone(), EngineOrigin::Choice);
+        }
+        Some(EngineChoice::Path) => {
+            if let Some(on_path) = on_path() {
+                return (on_path, EngineOrigin::Path);
+            }
+        }
+        _ => {}
+    }
+    if let Some(installed) = app_dir(home).and_then(|dir| desktop_engine(&dir)) {
+        return (installed, EngineOrigin::Desktop);
+    }
+    if let Some(on_path) = on_path() {
+        return (on_path, EngineOrigin::Path);
+    }
+    let mut fallback = fallback_dirs(std::env::consts::OS).iter().filter_map(|dir| {
+        let path = Path::new(dir);
+        if path.starts_with("~") && home.is_none() { None } else { Some(expand_home(path, home)) }
+    });
+    match found(&mut fallback) {
+        Some(usual) => (usual, EngineOrigin::Fallback),
+        None => (PathBuf::from(name), EngineOrigin::Missing),
+    }
+}
+
+/// What happened while starting, for Settings › Updates: the engine chosen and any warnings
+/// (the shell environment, the agent's browser tools) that would otherwise only reach stderr.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Startup {
+    pub engine: Option<PathBuf>,
+    pub origin: Option<EngineOrigin>,
+    pub warnings: Vec<String>,
+}
+
+static STARTUP: Mutex<Startup> = Mutex::new(Startup {
+    engine: None,
+    origin: None,
+    warnings: Vec::new(),
+});
+
+/// Record the engine chosen at start.
+pub fn note_engine(program: &Path, origin: EngineOrigin) {
+    let mut startup = STARTUP.lock().unwrap_or_else(PoisonError::into_inner);
+    startup.engine = Some(program.to_owned());
+    startup.origin = Some(origin);
+}
+
+/// Record a startup problem the user should be able to see (and copy).
+pub fn warn(message: String) {
+    let mut startup = STARTUP.lock().unwrap_or_else(PoisonError::into_inner);
+    if !startup.warnings.contains(&message) {
+        startup.warnings.push(message);
+    }
+}
+
+/// Everything recorded so far.
+pub fn startup() -> Startup {
+    STARTUP
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Whether `cwd` is a folder the user meant to work in. A Finder launch starts in `/`, and
@@ -311,18 +514,31 @@ impl Recents {
     }
 }
 
+/// Prefer HOME when usable, then the native profile on Windows. Never use the working directory.
+pub fn home_dir() -> Option<PathBuf> {
+    [std::env::var_os("HOME"), cfg!(windows).then(|| std::env::var_os("USERPROFILE")).flatten()]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .find(|p| p.is_absolute())
+}
+
 /// The app's per-user folder (recent folders, the browser's endpoint for the agent).
 pub fn app_dir(home: Option<&Path>) -> Option<PathBuf> {
-    let home = home?;
-    Some(if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/dev.dial.desktop")
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map_or_else(|| home.join("AppData/Roaming"), PathBuf::from)
-            .join("dev.dial.desktop")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map_or_else(|| home.join(".config"), PathBuf::from)
-            .join("dial-desktop")
-    })
+    let base = match std::env::consts::OS {
+        "windows" => std::env::var_os("APPDATA"),
+        "linux" => std::env::var_os("XDG_CONFIG_HOME"),
+        _ => None,
+    };
+    app_dir_from(std::env::consts::OS, home, base.as_deref().map(Path::new))
+}
+
+fn app_dir_from(os: &str, home: Option<&Path>, config: Option<&Path>) -> Option<PathBuf> {
+    let home = home.filter(|p| p.is_absolute());
+    let config = config.filter(|p| p.is_absolute()).map(Path::to_owned);
+    match os {
+        "macos" => Some(home?.join("Library/Application Support/dev.dial.desktop")),
+        "windows" => Some(config.or_else(|| home.map(|p| p.join("AppData/Roaming")))?.join("dev.dial.desktop")),
+        _ => Some(config.or_else(|| home.map(|p| p.join(".config")))?.join("dial-desktop")),
+    }
 }

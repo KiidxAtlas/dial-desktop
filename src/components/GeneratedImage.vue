@@ -39,7 +39,10 @@ watch(
     }
     try {
       const loaded = await load;
-      if (current) image.value = loaded;
+      if (!current) return;
+      // An empty reply would otherwise leave the placeholder shimmering for good.
+      if (loaded?.url) image.value = loaded;
+      else error.value = "the file could not be read";
     } catch (failure) {
       if (current) error.value = String(failure);
     }
@@ -126,13 +129,20 @@ img {
   max-width: 160px;
   object-fit: cover;
 }
-.compact .loading {
+.compact .loading,
+.compact .missing {
   width: 72px;
   height: 72px;
 }
 .compact .missing {
+  display: grid;
+  place-items: center;
   margin: 0;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 0 0 1px var(--border);
   font-size: 11px;
+  text-align: center;
 }
 @media (prefers-reduced-motion: reduce) {
   img, .loading { animation: none; }

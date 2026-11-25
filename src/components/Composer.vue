@@ -8,6 +8,7 @@ import { clipboardAction, MAX_ATTACHMENTS, MAX_FILE_BYTES } from '../attachmentF
 import { viewAttachment } from "../imageViewer";
 import { openMenu, ui } from "../ui";
 import { beginSend, draftFor } from "../drafts";
+import { draftReady, readingFiles, restoreInput } from '../draftInput';
 import { canCompact, promptHistory } from "../sessionActions";
 import { sendInType, typeIdFor, typeSessionOnScreen, types } from "../savedTypes";
 import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
@@ -18,13 +19,14 @@ import CommandPanel from "./CommandPanel.vue";
 import { editQueued, enqueuePrompt, markTurnAborted, queueFor, removeQueued, sendQueuedNext } from "../queue";
 import { mention } from "../workspace";
 import { isLegacyFunctionKey, normalizeArrowKey, sanitizeEditable } from "../macKeys";
+import { inTerminal } from "../keysGuard";
+import { denyKeyLabel, isDenyKey, mayAnswerFrom } from "../approvalKeys";
 import Icon from "./Icon.vue";
 import ModelPicker from "./ModelPicker.vue";
 import ApprovalMenu from "./ApprovalMenu.vue";
 import QuestionCard from "./QuestionCard.vue";
 import ContextMeter from "./ContextMeter.vue";
 import VoicePanel from "./VoicePanel.vue";
-import { imageBoardAt } from "./types/BoardView.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 const input = ref<HTMLTextAreaElement | null>(null);
@@ -86,21 +88,24 @@ const typedName = computed(() => {
   if (draft.value.attachments.length || !text.startsWith("/") || /^\/\S*$/.test(text)) return "";
   return typedCommand(text, engineCommands.value)?.name ?? "";
 });
+/** Esc closed the menu for this text; typing again opens it. */
+const slashDismissed = ref(false);
 // Only a lone `/word` opens the menu; `/word ` (with a space) is text to send, so a custom
 // command or skill with its task goes to the engine, which expands it.
 const slash = computed(() => {
   const text = draft.value.text;
-  if (draft.value.attachments.length || !/^\/\S*$/.test(text)) return [];
+  if (slashDismissed.value || !draftReady(draft.value) || draft.value.attachments.length || !/^\/\S*$/.test(text)) return [];
   return matchSlash(allCommands.value, text).slice(0, 60);
 });
 /** Voice misheard: the request was stopped, so put what was heard in the box to fix and send. */
 function editHeard(text: string) {
-  draft.value.text = text;
+  restoreInput(draft.value, { text, attachments: [] });
   focus();
 }
 const attachmentHelp = `Choose, paste or drop up to ${MAX_ATTACHMENTS} files (${MAX_FILE_BYTES / (1024 * 1024)} MiB each). Copies may be saved in this project when you send.`;
 const hasContent = computed(() => !!draft.value.text.trim() || draft.value.attachments.length > 0);
-const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && !draft.value.sending && !queue.value.loading && !queue.value.saving && !queue.value.sending && hasContent.value);
+const ready = computed(() => draftReady(draft.value) && draft.value.attachments.length <= MAX_ATTACHMENTS);
+const canQueue = computed(() => props.snap.connection.state === "live" && !!props.snap.sessionId && props.snap.turnRunning && ready.value && !queue.value.loading && !queue.value.saving && !queue.value.sending && hasContent.value);
 async function queueDraft() {
   if (!canQueue.value) return;
   const target = draft.value;
@@ -119,7 +124,18 @@ async function queueDraft() {
 const steering = computed(
   () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
 );
-const canSend = computed(() => !draft.value.sending && (slash.value.length > 0 || steering.value || (
+const queueKey = computed(() => (props.snap.platform === "macos" ? "⌘ Enter" : "Ctrl+Enter"));
+/** What Enter does while a turn runs: a note now, or (with files, which a note cannot carry) a
+ *  queued prompt. Kept short: the bar shows one hint; the rest is in its tooltip and the ⌘/ sheet. */
+const runningHint = computed(() => {
+  if (!props.snap.turnRunning || draft.value.sending || !hasContent.value || slash.value.length || paths.value.length) return "";
+  if (draft.value.attachments.length) return canQueue.value ? "queue" : "";
+  return steering.value ? "add note" : "";
+});
+const runningTitle = computed(() => draft.value.attachments.length
+  ? "Enter queues this for the next turn: files can't go in a note"
+  : `Enter adds a note to this turn; ${queueKey.value} queues it for the next turn instead`);
+const canSend = computed(() => ready.value && (slash.value.length > 0 || steering.value || (
   props.snap.canSend && hasContent.value
 )));
 /** Files are being dragged over the window. */
@@ -134,13 +150,19 @@ const caption = computed(() => {
     case "preview":
       return "Design preview · prompts are not sent";
     case "failed":
-      if (c.problem === "missing") return "No Dial engine found; install it from the sidebar";
-      if (c.problem === "incompatible") return "This Dial engine is too old or too new for the app; update from the sidebar";
-      return "The Dial engine could not start; see the status in the sidebar";
+      if (c.problem === "missing") return "No Dial engine found; install it from the message above the conversation";
+      if (c.problem === "incompatible") return "This Dial engine is too old or too new for the app; update it from the message above the conversation";
+      return "The Dial engine could not start. Your draft is kept.";
     case "ended":
-      return "The Dial engine stopped; reconnect from the sidebar";
+      return "The Dial engine stopped. Your draft is kept.";
   }
   return "";
+});
+/** The engine is down: the composer looks unavailable, and Reconnect sits right under it when it can help. */
+const offline = computed(() => props.snap.connection.state === "failed" || props.snap.connection.state === "ended");
+const canReconnect = computed(() => {
+  const c = props.snap.connection;
+  return c.state === "ended" || (c.state === "failed" && c.problem !== "missing" && c.problem !== "incompatible");
 });
 
 function resize() {
@@ -208,7 +230,7 @@ async function send() {
 async function chooseFiles() {
   const target = draft.value;
   try {
-    await attachments.addPaths(target, await files.chooseFiles());
+    await readingFiles(target, async () => attachments.addPaths(target, await files.chooseFiles()));
   } catch (error) {
     showToast(`Could not open the file picker: ${error}`);
   }
@@ -218,11 +240,14 @@ async function chooseFiles() {
 async function paste(action: ReturnType<typeof clipboardAction>) {
   const target = draft.value;
   const before = target.attachments.length;
-  if (action.kind === 'files') {
-    if (action.hasDirectory) showToast('Folders cannot be attached. Choose the files inside instead.');
-    await attachments.addBlobs(target, action.files);
-  } else if (action.kind === 'macImage') await attachments.addNativeClipboardImage(target);
-  else if (action.kind === 'nativeFiles') await attachments.addNativeClipboardFiles(target, props.snap.platform);
+  const platform = props.snap.platform;
+  await readingFiles(target, async () => {
+    if (action.kind === 'files') {
+      if (action.hasDirectory) showToast('Folders cannot be attached. Choose the files inside instead.');
+      await attachments.addBlobs(target, action.files);
+    } else if (action.kind === 'macImage') await attachments.addNativeClipboardImage(target);
+    else if (action.kind === 'nativeFiles') await attachments.addNativeClipboardFiles(target, platform);
+  });
   if (!unmounted && target === draft.value && target.attachments.length > before) focus();
 }
 
@@ -252,11 +277,11 @@ onMounted(async () => {
   document.addEventListener('paste', onPaste);
   const unlisten = await getCurrentWebview()
     .onDragDropEvent(({ payload }) => {
-      const overBoard = payload.type !== "leave" && imageBoardAt(payload.position);
-      dropping.value = !overBoard && !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
-      if (!overBoard && payload.type === "drop" && payload.paths.length && !ui.settingsOpen) {
+      dropping.value = !ui.settingsOpen && (payload.type === "enter" || payload.type === "over");
+      if (payload.type === "drop" && payload.paths.length && !ui.settingsOpen) {
         const target = draft.value;
-        void attachments.addPaths(target, payload.paths).then(() => {
+        const paths = payload.paths;
+        void readingFiles(target, () => attachments.addPaths(target, paths)).then(() => {
           if (target === draft.value) focus();
         });
       }
@@ -289,6 +314,10 @@ function onKey(event: KeyboardEvent) {
   }
   if (token.value !== null && key === "Escape") {
     event.stopPropagation(); event.preventDefault(); caret.value = -1; return;
+  }
+  // Esc closes the command menu first; it does not also stop the running turn.
+  if (slash.value.length && key === "Escape") {
+    event.stopPropagation(); event.preventDefault(); slashDismissed.value = true; return;
   }
   if (key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -349,11 +378,84 @@ const requestedFolder = computed(() => {
 });
 function decide(decision: Decision) {
   if (!approval.value) return;
+  const answeredByKey = !!allowButton.value?.closest(".approval")?.contains(document.activeElement);
   // Never send a reusable answer the engine would read as "no".
   engine.approve(approval.value.approvalId, oneTime.value && decision !== "deny" ? "allow" : decision);
+  // The card goes away with its buttons; keep the keyboard in the composer.
+  if (answeredByKey && props.snap.approvals.length <= 1) focus();
 }
+/** Allow every waiting request once (none "always"): the list above names them. */
+function allowAll() {
+  const answeredByKey = !!allowButton.value?.closest(".approval")?.contains(document.activeElement);
+  for (const each of props.snap.approvals) engine.approve(each.approvalId, "allow");
+  if (answeredByKey) focus();
+}
+/** Plain words for what a request lets Dial do; tools not listed keep their own name. */
+const TOOL_ACTIONS: Record<string, string> = {
+  bash: "run a command", run: "run a command", shell: "run a command", bg: "start a background job",
+  edit: "edit files", write: "write a file", ast_edit: "edit code", delete: "delete files", move: "move files",
+  web: "use the web", fetch: "fetch a web page", web_search: "search the web", batch: "run several tools at once",
+};
+const approvalAction = computed(() => (approval.value ? TOOL_ACTIONS[approval.value.tool.toLowerCase()] ?? null : null));
+/** The lasting answers sit in a menu, so the card shows one clear yes and one clear no. */
+function scopeMenu(event: MouseEvent) {
+  openMenu(event, [
+    { label: "Always allow in this project", run: () => decide("project") },
+    { label: "Always allow everywhere", run: () => decide("always") },
+  ], event.currentTarget as HTMLElement);
+}
+/** While a turn runs: the note goes now by default; queueing waits in this menu. */
+function noteMenu(event: MouseEvent) {
+  openMenu(event, [
+    { label: "Send note now", hint: "Enter", disabled: !canSend.value, run: () => void send() },
+    { label: "Queue for next turn", hint: queueKey.value, disabled: !canQueue.value, run: () => void queueDraft() },
+  ], event.currentTarget as HTMLElement);
+}
+const mac = computed(() => props.snap.platform === "macos");
+const denyKey = computed(() => denyKeyLabel(mac.value));
+/** ⌘⌫ / Ctrl+Backspace denies the request on screen, unless text is being edited or a terminal has the keys. */
+function onApprovalKey(event: KeyboardEvent) {
+  if (!approval.value || event.defaultPrevented || !isDenyKey(event, mac.value)) return;
+  const active = document.activeElement;
+  if (inTerminal(active) || !mayAnswerFrom(active instanceof HTMLElement ? active as HTMLElement & { value?: string } : null)) return;
+  if (ui.settingsOpen || ui.paletteOpen || ui.menu) return;
+  event.preventDefault();
+  event.stopPropagation();
+  decide("deny");
+}
+// Capture, so the sidebar's ⌫ (delete the picked sessions) never sees it.
+onMounted(() => window.addEventListener("keydown", onApprovalKey, true));
+onUnmounted(() => window.removeEventListener("keydown", onApprovalKey, true));
 
-watch(() => draft.value.text, () => { selected.value = 0; nextTick(resize); });
+/** With a type open whose own conversation is not the one on screen, where a prompt goes. */
+const sendingTo = computed(() => {
+  if (!ui.typeOpen) return null;
+  const open = types.list.find((t) => t.id === ui.typeOpen);
+  if (!open || (ui.typeMode === "chat" && typeSessionOnScreen())) return null;
+  return `${open.icon ?? ""} ${open.name}`.trim();
+});
+/** First line of an approval's summary, for the list of requests still waiting. */
+function firstLine(text: string) {
+  return text.split("\n").find((line) => line.trim())?.trim() ?? "";
+}
+/**
+ * A new request takes keyboard focus to its Allow button, so it can be answered without the mouse;
+ * not from a terminal, or from a field with text being typed (Enter there must not approve).
+ */
+const allowButton = ref<HTMLButtonElement | null>(null);
+watch(() => approval.value?.approvalId, (id, was) => {
+  if (!id || id === was) return;
+  const active = document.activeElement;
+  if (inTerminal(active)) return;
+  if ((active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) && active.value.trim()) return;
+  if (active instanceof HTMLElement && active.isContentEditable) return;
+  void nextTick(() => allowButton.value?.focus({ preventScroll: true }));
+});
+// While a request waits the empty prompt box shrinks to one line, so the request and the
+// conversation keep the room; it grows back as soon as there's text or the request is answered.
+watch(() => !!approval.value, () => nextTick(resize));
+
+watch(() => draft.value.text, () => { selected.value = 0; slashDismissed.value = false; nextTick(resize); });
 watch(() => ui.focusComposer, focus);
 onMounted(focus);
 </script>
@@ -362,27 +464,39 @@ onMounted(focus);
   <footer class="dock">
     <div class="column">
       <Transition name="pop">
-        <section v-if="approval" :key="approval.approvalId" class="card approval">
-          <div class="card-head">
+        <section v-if="approval" :key="approval.approvalId" class="card approval" aria-label="Permission request">
+          <div class="card-head" role="alert" aria-live="assertive">
             <span class="card-icon"><Icon name="shield" :size="14" /></span>
             <span v-if="requestedFolder">{{ approval.tool === 'request_sensitive_directory' ? 'Allow protected-file access in' : 'Give Dial access to' }} <strong class="mono">{{ requestedFolder }}</strong>?</span>
+            <span v-else-if="approvalAction">Allow Dial to <strong>{{ approvalAction }}</strong>? <span class="tool-id mono">{{ approval.tool }}</span></span>
             <span v-else>Allow <strong>{{ approval.tool }}</strong>?</span>
             <span v-if="snap.approvals.length > 1" class="more">+{{ snap.approvals.length - 1 }} more waiting</span>
           </div>
           <pre v-if="approval.summary" class="summary">{{ approval.summary }}</pre>
+          <details v-if="snap.approvals.length > 1" class="waiting">
+            <summary>Show the {{ snap.approvals.length - 1 === 1 ? "other request" : `${snap.approvals.length - 1} other requests` }}</summary>
+            <ol>
+              <li v-for="other in snap.approvals.slice(1)" :key="other.approvalId" :title="other.summary">
+                <strong>{{ other.tool }}</strong> <span class="truncate">{{ firstLine(other.summary) }}</span>
+              </li>
+            </ol>
+          </details>
           <div class="actions">
-            <button class="btn btn-primary" @click="decide('allow')">{{ oneTime ? "Allow" : "Allow once" }}</button>
-            <template v-if="!oneTime">
-              <button class="btn btn-secondary" title="Allow this kind of call from now on" @click="decide('always')">
-                Always allow
-              </button>
-              <button class="btn btn-secondary" title="Allow this kind of call in this project" @click="decide('project')">
-                Allow for project
-              </button>
-            </template>
+            <button ref="allowButton" class="btn btn-primary" title="Allow this request (Enter while the button has focus)" @click="decide('allow')">{{ oneTime ? "Allow" : "Allow once" }}<kbd class="key" aria-hidden="true">↩</kbd></button>
+            <button v-if="snap.approvals.length > 1" class="btn btn-secondary" :title="`Allow each of the ${snap.approvals.length} waiting requests once`" @click="allowAll">
+              Allow all {{ snap.approvals.length }} once
+            </button>
+            <button
+              v-if="!oneTime"
+              class="btn btn-secondary"
+              title="Keep allowing this kind of call, in this project or everywhere"
+              aria-haspopup="menu"
+              @click="scopeMenu"
+            >
+              Always allow…
+            </button>
             <span v-else class="once-note">Applies to this request only</span>
-            <span class="grow" />
-            <button class="btn btn-danger" @click="decide('deny')">Deny</button>
+            <button class="btn btn-danger deny" :title="`Deny this request (${denyKey})`" :aria-keyshortcuts="mac ? 'Meta+Backspace' : 'Control+Backspace'" @click="decide('deny')">Deny<kbd class="key" aria-hidden="true">{{ denyKey }}</kbd></button>
           </div>
         </section>
       </Transition>
@@ -393,17 +507,19 @@ onMounted(focus);
       <section v-if="queue.items.length" class="queue card" aria-label="Follow-up queue">
         <strong>{{ queue.paused ? 'Queue paused' : 'Queued follow-ups' }}</strong>
         <p v-if="queue.recovered" class="faint queue-recovery">Restored after restart. Check the transcript before sending a follow-up that may already have been sent.</p>
+        <p v-else class="faint queue-recovery">{{ queue.paused ? 'Check the conversation before continuing this queue.' : 'Follow-ups send after this turn while this conversation is open. Switching conversations pauses the queue.' }}</p>
         <div v-for="item in queue.items" :key="item.id" class="queue-row">
           <span class="truncate" :title="item.text">{{ item.text || 'File prompt' }}{{ item.attachments.length ? ` · ${item.attachments.length} file${item.attachments.length === 1 ? '' : 's'}` : '' }}</span>
-          <button class="icon-btn" title="Edit queued prompt" aria-label="Edit queued prompt" :disabled="queue.saving || queue.sending || draft.sending" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
+          <button class="icon-btn" title="Edit queued prompt" aria-label="Edit queued prompt" :disabled="queue.saving || queue.sending || !ready" @click="editQueued(snap, item.id)"><Icon name="pencil" :size="14" /></button>
           <button class="icon-btn" title="Remove queued prompt" aria-label="Remove queued prompt" :disabled="queue.saving || queue.sending" @click="removeQueued(snap, item.id)"><Icon name="cross" :size="14" /></button>
         </div>
         <button v-if="!snap.turnRunning" class="btn btn-secondary" :disabled="queue.loading || queue.saving || queue.sending || !snap.canSend" @click="sendQueuedNext(snap)">Send next</button>
+        <button v-else-if="queue.paused" class="btn btn-secondary" :disabled="queue.loading || queue.saving || queue.sending || snap.connection.state !== 'live'" @click="queue.paused = false; queue.recovered = false">Resume after this turn</button>
       </section>
       <Transition name="pop">
         <VoicePanel v-if="snap.voice.phase !== 'off'" :voice="snap.voice" :turn-running="snap.turnRunning" @edit="editHeard" />
       </Transition>
-      <div class="composer" :class="{ dropping }" @click="input?.focus()">
+      <div class="composer" :class="{ dropping, offline }" @click="input?.focus()">
         <div v-if="dropping" class="drop-hint"><Icon name="file" :size="16" /> Drop files to attach</div>
         <Transition name="pop">
           <div v-if="slash.length" class="slash" @click.stop>
@@ -439,8 +555,11 @@ onMounted(focus);
           ref="input"
           v-model="draft.text"
           aria-label="Prompt"
-          rows="2"
+          data-prompt
+          :rows="approval ? 1 : 2"
           spellcheck="true"
+          autocorrect="off"
+          autocapitalize="off"
           :placeholder="draft.pending ? 'Write your next message…' : snap.turnRunning ? 'Add a note for Dial while it works…' : ui.typeOpen ? `Ask Dial to change ${types.list.find((t) => t.id === ui.typeOpen)?.name ?? 'this type'}…` : snap.entries.length ? 'Message Dial…' : 'What would you like to do in this project?'"
           :readonly="draft.sending && !draft.pending"
           @keydown="onKey"
@@ -457,9 +576,18 @@ onMounted(focus);
           </button>
           <ModelPicker ref="modelPicker" :snap="snap" />
           <ApprovalMenu ref="approvalMenu" :snap="snap" />
-          <span class="grow" />
-          <span v-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
-          <span v-else-if="!draft.sending && !snap.turnRunning && hasContent && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> send <kbd>⇧ Enter</kbd> new line</span>
+          <span v-if="sendingTo" class="sending-to" :title="`Prompts go to ${sendingTo}'s own conversation, not the chat that was on screen`">
+            Sending to <strong class="truncate">{{ sendingTo }}</strong>
+          </span>
+          <!-- One short hint in leftover room (the rest is in its tooltip and the ⌘/ sheet); when it doesn't fit it wraps out of sight instead of pushing the send button onto its own row. -->
+          <span class="hint-slot">
+            <span v-if="draft.loading" class="keyhint status" role="status">Restoring draft…</span>
+            <span v-else-if="draft.reading" class="keyhint status" role="status">Preparing attachments…</span>
+            <span v-else-if="draft.attachments.length > MAX_ATTACHMENTS" class="keyhint status" role="status">Remove files to send {{ MAX_ATTACHMENTS }} or fewer.</span>
+            <span v-else-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
+            <span v-else-if="!draft.sending && !snap.turnRunning && hasContent && !slash.length && !paths.length" class="keyhint" title="Enter sends; Shift+Enter starts a new line"><kbd>⇧ Enter</kbd> new line</span>
+            <span v-else-if="runningHint" class="keyhint always" role="status" :title="runningTitle"><kbd>Enter</kbd> {{ runningHint }}</span>
+          </span>
           <ContextMeter
             v-if="snap.context"
             :context="snap.context"
@@ -476,24 +604,48 @@ onMounted(focus);
           >
             <Icon name="mic" :size="16" />
           </button>
-          <button v-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'" class="btn btn-secondary" :disabled="!canQueue" :title="draft.attachments.length ? 'Queue for the next turn (Enter)' : 'Queue for the next turn (⌘/Ctrl+Enter)'" @click="queueDraft">Queue for next turn</button>
-          <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" @click.stop="markTurnAborted(snap); engine.abort()">
+          <button v-if="snap.turnRunning" class="send stop" title="Stop the running turn (Esc)" aria-label="Stop the running turn" @click.stop="markTurnAborted(snap); engine.abort()">
             <Icon name="stop" :size="14" />
           </button>
+          <span v-if="snap.turnRunning && steering" class="split">
+            <button class="send labeled" :disabled="!canSend" title="Send note now (Enter)" @click.stop="send">Send note</button>
+            <button
+              class="send caret"
+              :disabled="!canQueue"
+              :title="`More ways to send (queue: ${queueKey})`"
+              aria-label="More ways to send"
+              aria-haspopup="menu"
+              @click.stop="noteMenu"
+            >
+              <Icon name="chevronDown" :size="12" />
+            </button>
+          </span>
           <button
-            v-if="!snap.turnRunning || steering"
+            v-else-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'"
+            class="send labeled"
+            :disabled="!canQueue"
+            title="Queue for the next turn (Enter): files can't go in a note"
+            @click.stop="queueDraft"
+          >
+            Queue for next turn
+          </button>
+          <button
+            v-else-if="!snap.turnRunning"
             class="send"
-            :class="{ labeled: steering }"
             :disabled="!canSend"
-            :title="snap.turnRunning ? 'Send note (Enter)' : 'Send (Enter)'"
-            :aria-label="snap.turnRunning ? 'Send note now' : 'Send'"
+            title="Send (Enter)"
+            aria-label="Send"
             @click.stop="send"
           >
-            <span v-if="steering">Send note now</span><Icon v-else name="arrowUp" :size="16" />
+            <Icon name="arrowUp" :size="16" />
           </button>
         </div>
       </div>
-      <div v-if="snap.connection.state !== 'live'" class="caption truncate">{{ caption }}</div>
+      <div v-if="draft.sending && !snap.turnRunning" class="caption" role="status">Submitting prompt…</div>
+      <div v-if="snap.connection.state !== 'live'" class="caption" :class="{ offline }" :role="offline ? 'status' : undefined">
+        <span class="truncate">{{ caption }}</span>
+        <button v-if="canReconnect" class="btn btn-secondary reconnect" @click="engine.reconnect()"><Icon name="refresh" :size="13" /> Reconnect</button>
+      </div>
     </div>
     <CommandPanel />
   </footer>
@@ -513,7 +665,7 @@ onMounted(focus);
   gap: var(--space-sm);
 }
 .card {
-  padding: 14px 16px;
+  padding: 12px 14px;
   border-radius: var(--radius-lg);
   background: var(--glass);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -523,6 +675,26 @@ onMounted(focus);
 .card.approval {
   border-color: color-mix(in srgb, var(--warning) 45%, var(--border-strong));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 10%, transparent), 0 8px 28px rgb(0 0 0 / 22%);
+}
+/* A request right above the prompt box joins it as one panel: no gap, one shared edge, so the
+   two read as "answer this, or type instead" and take less height than two floating cards. */
+.card.approval:has(+ .composer) {
+  margin-bottom: calc(-1 * var(--space-sm));
+  border-bottom: none;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  box-shadow: none;
+}
+.card.approval + .composer {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border-strong));
+  border-top-color: var(--border);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  padding-top: 10px;
+}
+.card.approval + .composer:focus-within {
+  border-color: var(--focus-border);
+  border-top-color: var(--border);
 }
 .card-icon {
   display: grid;
@@ -550,9 +722,39 @@ onMounted(focus);
   color: var(--text-faint);
 }
 .once-note { align-self: center; font-size: var(--text-sm); color: var(--text-faint); }
+.actions .key {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 0;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  color: inherit;
+  font-size: 10.5px;
+  opacity: 0.7;
+}
+.sending-to {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  margin-left: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.sending-to strong { min-width: 0; color: var(--accent); font-weight: 600; }
+.waiting { margin-top: 8px; font-size: var(--text-sm); color: var(--text-muted); }
+.waiting summary { cursor: pointer; color: var(--text-faint); }
+.waiting summary:hover { color: var(--text); }
+.waiting ol { margin: 6px 0 0; padding: 0; list-style: none; max-height: 120px; overflow-y: auto; }
+.waiting li { display: flex; gap: 6px; min-width: 0; }
+.waiting li strong { flex: none; font-weight: 600; color: var(--text); }
 .card-head .mono { font-family: var(--font-mono); font-weight: 500; overflow-wrap: anywhere; }
+.card-head .tool-id { margin-left: 4px; font-size: var(--text-xs); color: var(--text-faint); }
 .summary {
-  margin: 10px 0 0;
+  margin: 8px 0 0;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
   background: var(--bubble);
@@ -568,11 +770,12 @@ onMounted(focus);
 .actions {
   display: flex;
   gap: 6px;
-  margin-top: 12px;
+  margin-top: 10px;
   flex-wrap: wrap;
 }
-.grow {
-  flex: 1;
+/* Right-aligned on whichever line it lands, so a wrapped Deny doesn't sit under Allow. */
+.actions .deny {
+  margin-left: auto;
 }
 .composer {
   position: relative;
@@ -584,7 +787,13 @@ onMounted(focus);
   border: 1px solid var(--border-strong);
   box-shadow: 0 4px 20px rgb(0 0 0 / 18%);
   cursor: text;
-  transition: border-color 140ms var(--ease);
+  transition:
+    border-color 140ms var(--ease),
+    opacity 160ms var(--ease);
+}
+.composer.offline {
+  opacity: 0.6;
+  border-style: dashed;
 }
 .composer.dropping {
   border-color: var(--accent);
@@ -640,7 +849,7 @@ onMounted(focus);
   background: var(--raised);
   border: 1px solid var(--border-strong);
   color: var(--text-muted);
-  opacity: 0;
+  opacity: 0.75;
   transition: opacity 120ms var(--ease);
 }
 .thumb:hover .remove,
@@ -709,18 +918,43 @@ onMounted(focus);
   color: var(--text-muted);
 }
 .file-row .mono { color: var(--text); font-size: var(--text-mono); }
+.hint-slot {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  overflow: hidden;
+}
+/* Shares the first line with the hint; a hint wider than what's left wraps to the clipped second line. */
+.hint-slot::before {
+  content: "";
+  flex: 1 0 0;
+  height: 32px;
+}
 .keyhint {
   display: none;
   align-items: center;
   gap: 4px;
+  height: 32px;
   margin-right: 8px;
   font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
-.keyhint kbd:last-of-type { margin-left: 6px; }
-.composer:focus-within .keyhint { display: inline-flex; }
-@media (max-width: 880px) { .composer:focus-within .keyhint { display: none; } }
+/* Status lines stay visible however narrow the bar: they come first and end in an ellipsis. */
+.keyhint.status {
+  display: block;
+  order: -1;
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+  line-height: 32px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer:focus-within .keyhint:not(.status), .keyhint.always { display: inline-flex; }
 .slash, .queue { max-height: 30vh; overflow-y: auto; }
 .queue-recovery { margin: 3px 0 6px; }
 .queue-row { display: flex; align-items: center; gap: 6px; }
@@ -791,12 +1025,16 @@ textarea::placeholder {
 }
 .bar {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   /* Pulls the first 28px button out so its icon, not its hover box, lines up with the text. */
   margin: 8px 0 0 -6px;
   cursor: default;
+  /* ModelPicker drops its effort label when this gets narrow. */
+  container: composer-bar / inline-size;
+}
+.bar > :not(.hint-slot):not(.picker):not(.sending-to) {
+  flex: none;
 }
 .send {
   display: grid;
@@ -812,6 +1050,9 @@ textarea::placeholder {
     transform 90ms var(--ease);
 }
 .send.labeled { width: auto; padding: 0 10px; font-size: var(--text-sm); }
+.split { display: inline-flex; gap: 1px; }
+.split .send.labeled { border-radius: var(--radius-md) 0 0 var(--radius-md); }
+.split .send.caret { width: 22px; border-radius: 0 var(--radius-md) var(--radius-md) 0; }
 .send:active:not(:disabled) {
   transform: scale(0.92);
 }
@@ -828,10 +1069,30 @@ textarea::placeholder {
 .send.stop:hover {
   background: var(--text-strong);
 }
+/* Status under the composer. Over a background it sits on a soft glass pill so it stays legible
+ * on a busy picture; on a plain window the pill is invisible. */
 .caption {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  width: fit-content;
+  margin-inline: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   font-size: var(--text-sm);
-  color: var(--text-faint);
+  color: var(--text-muted);
+}
+.caption.offline {
+  color: var(--text);
+}
+.caption .reconnect {
+  flex: none;
 }
 .pop-enter-active,
 .pop-leave-active {

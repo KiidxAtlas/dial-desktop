@@ -1,14 +1,17 @@
-//! Types: collections the user saves things into, each drawn as its own small app.
+//! Types: collections the user saves things into, each one its own small web app.
 //!
-//! A type is a blueprint ([`TypeDef`]: the shape of one item, the layout that draws the items and
-//! a look) plus its saved [`Item`]s. The UI draws the blueprint with built-in layouts (a book, a
-//! checklist, a board, a wheel, a calendar, cards, a table) or, for a `custom` layout, the blueprint's own
-//! HTML in a sandboxed frame. The agent designs blueprints and saves items through the
-//! `types_*` tools (`agent_browser`); the user saves answers from the conversation.
+//! A type is a [`TypeDef`] (a name, an icon, the shape of its items), the app that shows them (a
+//! whole HTML document the agent writes, in `app.html`), its saved [`Item`]s and a JSON `state`
+//! the app keeps for itself (settings, game progress). There are no built-in layouts: a recipe
+//! type becomes a cookbook, a weather type a live forecast, because the agent builds that app.
+//! The UI runs it in a sandboxed frame from the `dialtype:` scheme ([`custom_page`]), with the
+//! `window.dial` runtime (`types/runtime.js`) injected; the agent designs, edits, opens, inspects
+//! and exercises it through the `types_*` tools (`agent_browser`, `types::live`).
 //!
-//! Types belong to the user, not to a project: they live in the app's folder,
-//! `types/<id>/type.json`, `types/<id>/items.json` and `types/<id>/assets/`. Every write is atomic
-//! and every input, from the UI or the agent, goes through [`normalize`] or [`sanitize_fields`].
+//! Types live in the app's folder, or in a project's `.dial/types`: `<id>/type.json`,
+//! `<id>/app.html`, `<id>/items.json`, `<id>/state.json` and `<id>/assets/`. Every write is
+//! atomic and every input, from the UI or the agent, goes through [`normalize`] or
+//! [`sanitize_fields`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -18,18 +21,24 @@ use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tauri::{AppHandle, Emitter, State};
 
+pub mod live;
 #[cfg(test)]
 mod tests;
 
-pub const VERSION: u32 = 1;
-/// List invalidation (`null`), a changed id, or an agent design commit with its saved choices.
+pub const VERSION: u32 = 2;
+/// List invalidation (`null`), a changed id, or an agent build step with its progress.
 pub const CHANGED: &str = "types-changed";
-const MAX_FIELDS: usize = 24;
+const MAX_FIELDS: usize = 32;
 const MAX_ITEMS: usize = 5_000;
 const MAX_LIST: usize = 200;
 const MAX_SHORT: usize = 2_000;
 const MAX_LONG: usize = 40_000;
-const MAX_CUSTOM: usize = 256 * 1024;
+/// A free-form item (a type with no fields) keeps at most this many keys.
+const MAX_FREE_KEYS: usize = 64;
+/// The app's HTML document.
+pub const MAX_APP: usize = 1024 * 1024;
+/// The app's own JSON state.
+pub const MAX_STATE: usize = 512 * 1024;
 const MAX_IMAGE: u64 = 25 * 1024 * 1024;
 const MAX_TYPES: usize = 200;
 
@@ -52,6 +61,8 @@ pub enum FieldKind {
     Tags,
     Rating,
     Toggle,
+    /// Any JSON value the app needs (coordinates, a nested structure), at most 40 KB.
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -60,85 +71,6 @@ pub struct Field {
     pub key: String,
     pub label: String,
     pub kind: FieldKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Layout {
-    Book,
-    Checklist,
-    Board,
-    Wheel,
-    Calendar,
-    #[default]
-    Cards,
-    Table,
-    Custom,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct View {
-    pub layout: Layout,
-    #[serde(alias = "title_field")]
-    pub title_field: Option<String>,
-    #[serde(alias = "subtitle_field")]
-    pub subtitle_field: Option<String>,
-    #[serde(alias = "image_field")]
-    pub image_field: Option<String>,
-    #[serde(alias = "time_field")]
-    pub time_field: Option<String>,
-    /// Items with a time can remind the user before it (a checklist's bell).
-    pub reminders: bool,
-    /// Minutes before an item's time to remind; `0` is "at the time".
-    #[serde(alias = "lead_minutes")]
-    pub lead_minutes: Vec<u32>,
-    /// Checked items uncheck the next day: a routine, not a one-off list.
-    #[serde(alias = "daily_reset")]
-    pub daily_reset: bool,
-    /// A line under the title: a book's cover, a board's header.
-    pub tagline: String,
-    /// A layout's variant: for a book `cookbook`, `journal` or `guide` (each its own pages);
-    /// empty lets the UI pick one from the fields.
-    pub style: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Font {
-    #[default]
-    Sans,
-    Serif,
-    Mono,
-    Hand,
-    Display,
-    Rounded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Texture {
-    #[default]
-    None,
-    Paper,
-    Linen,
-    Grid,
-    Dots,
-    Noise,
-}
-
-/// Colours are `#rgb` or `#rrggbb`; an empty one follows the app's theme.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Theme {
-    pub accent: String,
-    /// The page colour.
-    pub paper: String,
-    /// The text colour on the page.
-    pub ink: String,
-    pub font: Font,
-    pub texture: Texture,
-    pub radius: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -150,21 +82,25 @@ pub struct TypeDef {
     pub description: String,
     /// An emoji or a short glyph.
     pub icon: String,
+    /// `#rgb` or `#rrggbb`, for the sidebar; empty follows the app's theme.
+    pub accent: String,
     pub created: i64,
     pub updated: i64,
+    /// The keys items use, each in its kind's shape. None: items keep any keys (free-form).
     pub fields: Vec<Field>,
-    pub view: View,
-    pub theme: Theme,
-    /// A `custom` layout's page: HTML with inline CSS and JS, run in a sandboxed frame that
-    /// receives the items by `postMessage` (see `CustomView.vue`).
-    #[serde(alias = "custom_html")]
-    pub custom_html: String,
-    /// The agent has chosen this type's layout, fields and look; a type made from the sidebar
-    /// with only a name has not, and the first save designs it.
-    pub designed: bool,
-    /// The type's own conversation in each project (workspace root to session id): where it is
-    /// designed and where saves to it are added. These sessions stay out of the session list.
+    /// The app: a whole HTML document, kept in `app.html` beside `type.json`. Read from a legacy
+    /// `customHtml` member once, then moved there.
+    #[serde(skip_serializing, alias = "customHtml", alias = "custom_html")]
+    pub html: String,
+    /// The type's own conversation per project (workspace root to session id): where its app is
+    /// built and where saves to it are added. These sessions stay out of the session list.
     pub sessions: std::collections::BTreeMap<String, String>,
+}
+
+impl TypeDef {
+    pub fn has_app(&self) -> bool {
+        !self.html.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -184,10 +120,6 @@ pub struct Item {
     pub updated: i64,
     pub fields: Map<String, Value>,
     pub done: bool,
-    /// The local day (`YYYY-MM-DD`) it was checked, for a daily reset.
-    pub done_on: Option<String>,
-    /// Remind about this item before its time.
-    pub remind: bool,
     pub source: Option<Source>,
 }
 
@@ -198,9 +130,6 @@ pub struct ItemPatch {
     /// Merged over the item's fields; a `null` member clears that field.
     pub fields: Option<Map<String, Value>>,
     pub done: Option<bool>,
-    #[serde(alias = "done_on")]
-    pub done_on: Option<String>,
-    pub remind: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -210,11 +139,11 @@ pub struct Summary {
     pub name: String,
     pub icon: String,
     pub description: String,
-    pub layout: Layout,
     pub accent: String,
     pub count: usize,
     pub updated: i64,
-    pub designed: bool,
+    /// The agent has built its app.
+    pub has_app: bool,
     /// Where the type is kept.
     pub scope: Scope,
     /// The ids of the type's own sessions (see [`TypeDef::sessions`]).
@@ -225,9 +154,24 @@ pub struct Summary {
 #[serde(rename_all = "camelCase")]
 pub struct Full {
     pub def: TypeDef,
+    pub has_app: bool,
+    /// Changes exactly when the app's HTML does: the frame reloads on it, and the agent's tools
+    /// wait for the frame to show it.
+    pub app_version: String,
     pub items: Vec<Item>,
+    /// The app's own saved state (`{}` until it saves some).
+    pub state: Value,
     /// The folder item images are in; an image field holds a file name in it.
     pub assets: String,
+}
+
+/// A short fingerprint of an app's HTML.
+pub fn app_version(html: &str) -> String {
+    Sha256::digest(html.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -279,45 +223,7 @@ pub fn valid_asset(name: &str) -> bool {
         && matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
-/// Fields a layout starts with when the blueprint names none.
-fn default_fields(layout: Layout) -> Vec<Field> {
-    let f = |key: &str, label: &str, kind| Field {
-        key: key.into(),
-        label: label.into(),
-        kind,
-    };
-    match layout {
-        Layout::Book => vec![
-            f("title", "Title", FieldKind::Text),
-            f("image", "Image", FieldKind::Image),
-            f("body", "Page", FieldKind::Markdown),
-        ],
-        Layout::Checklist => vec![
-            f("title", "Task", FieldKind::Text),
-            f("time", "Time", FieldKind::Time),
-            f("notes", "Notes", FieldKind::Longtext),
-        ],
-        Layout::Board => vec![
-            f("image", "Image", FieldKind::Image),
-            f("title", "Caption", FieldKind::Text),
-        ],
-        Layout::Wheel => vec![
-            f("title", "Option", FieldKind::Text),
-            f("notes", "Notes", FieldKind::Longtext),
-        ],
-        Layout::Calendar => vec![
-            f("title", "Title", FieldKind::Text),
-            f("when", "When", FieldKind::Datetime),
-            f("notes", "Notes", FieldKind::Longtext),
-        ],
-        Layout::Cards | Layout::Table | Layout::Custom => vec![
-            f("title", "Title", FieldKind::Text),
-            f("body", "Notes", FieldKind::Markdown),
-        ],
-    }
-}
-
-/// Check and tidy a blueprint from the UI or the agent. Keeps `id` and `created`.
+/// Check and tidy a type from the UI or the agent. Keeps `id` and `created`.
 pub fn normalize(mut def: TypeDef, now: i64) -> Result<TypeDef, String> {
     def.version = VERSION;
     def.name = clip(&def.name, 60);
@@ -333,6 +239,10 @@ pub fn normalize(mut def: TypeDef, now: i64) -> Result<TypeDef, String> {
         def.created = now;
     }
     def.updated = now;
+    def.accent = def.accent.trim().to_owned();
+    if !valid_color(&def.accent) {
+        def.accent.clear();
+    }
 
     let mut fields: Vec<Field> = Vec::new();
     for mut field in std::mem::take(&mut def.fields) {
@@ -354,116 +264,15 @@ pub fn normalize(mut def: TypeDef, now: i64) -> Result<TypeDef, String> {
             break;
         }
     }
-    if fields.is_empty() {
-        fields = default_fields(def.view.layout);
-    }
-    // A calendar places items by a date: name one, from a date-like text field if need be.
-    if def.view.layout == Layout::Calendar
-        && !fields
-            .iter()
-            .any(|f| matches!(f.kind, FieldKind::Date | FieldKind::Datetime))
-    {
-        let named = def
-            .view
-            .time_field
-            .as_deref()
-            .map(slug_key)
-            .filter(|k| fields.iter().any(|f| &f.key == k));
-        let guess = named.or_else(|| {
-            ["when", "date", "day", "start", "starts", "time", "at"]
-                .iter()
-                .find(|k| {
-                    fields.iter().any(|f| {
-                        f.key == **k && !matches!(f.kind, FieldKind::Image | FieldKind::Images)
-                    })
-                })
-                .map(|k| (*k).to_owned())
-        });
-        match guess.and_then(|k| fields.iter().position(|f| f.key == k)) {
-            Some(at) => fields[at].kind = FieldKind::Datetime,
-            None => {
-                if fields.len() == MAX_FIELDS {
-                    fields.pop();
-                }
-                fields.push(Field {
-                    key: "when".into(),
-                    label: "When".into(),
-                    kind: FieldKind::Datetime,
-                });
-            }
-        }
-    }
     def.fields = fields;
 
-    let has = |key: &Option<String>, kinds: &[FieldKind]| {
-        key.as_ref().map(|k| slug_key(k)).filter(|k| {
-            def.fields
-                .iter()
-                .any(|f| &f.key == k && (kinds.is_empty() || kinds.contains(&f.kind)))
-        })
-    };
-    let first = |kinds: &[FieldKind]| {
-        def.fields
-            .iter()
-            .find(|f| kinds.contains(&f.kind))
-            .map(|f| f.key.clone())
-    };
-    let titles = [FieldKind::Text, FieldKind::Url];
-    let images = [FieldKind::Image, FieldKind::Images];
-    let times = [FieldKind::Time, FieldKind::Datetime, FieldKind::Date];
-    let dates = [FieldKind::Datetime, FieldKind::Date];
-    def.view.title_field = has(&def.view.title_field, &[]).or_else(|| first(&titles));
-    def.view.subtitle_field = has(&def.view.subtitle_field, &[]);
-    def.view.image_field = has(&def.view.image_field, &images).or_else(|| first(&images));
-    def.view.time_field = if def.view.layout == Layout::Calendar {
-        has(&def.view.time_field, &dates).or_else(|| first(&dates))
-    } else {
-        has(&def.view.time_field, &times).or_else(|| first(&times))
-    };
-    def.view.tagline = clip(&def.view.tagline, 160);
-    def.view.style = match def.view.style.trim().to_ascii_lowercase().as_str() {
-        s @ ("cookbook" | "journal" | "guide") if def.view.layout == Layout::Book => s.to_owned(),
-        _ => String::new(),
-    };
-    let mut leads: Vec<u32> = def
-        .view
-        .lead_minutes
-        .iter()
-        .map(|m| (*m).min(1_440))
-        .collect();
-    leads.sort_unstable_by(|a, b| b.cmp(a));
-    leads.dedup();
-    leads.truncate(4);
-    if leads.is_empty() {
-        leads = vec![15, 0];
-    }
-    def.view.lead_minutes = leads;
-
-    for color in [
-        &mut def.theme.accent,
-        &mut def.theme.paper,
-        &mut def.theme.ink,
-    ] {
-        *color = color.trim().to_owned();
-        if !valid_color(color) {
-            color.clear();
-        }
-    }
-    def.theme.radius = def.theme.radius.min(28);
     def.sessions
         .retain(|root, id| !root.is_empty() && root.len() <= 4096 && !id.is_empty() && id.len() <= 200);
     if def.sessions.len() > 64 {
         return Err("This type already has conversations in 64 projects".into());
     }
-
-    if def.custom_html.len() > MAX_CUSTOM {
-        return Err(format!(
-            "A custom view holds at most {} KB of HTML",
-            MAX_CUSTOM / 1024
-        ));
-    }
-    if def.view.layout == Layout::Custom && def.custom_html.trim().is_empty() {
-        return Err("A custom layout needs its customHtml page".into());
+    if def.html.len() > MAX_APP {
+        return Err(format!("A type's app holds at most {} KB of HTML", MAX_APP / 1024));
     }
     Ok(def)
 }
@@ -513,9 +322,26 @@ fn as_list(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Keep only the blueprint's fields, each in its kind's shape. Images must already be assets.
+/// Keep only the type's fields, each in its kind's shape. Images must already be assets. A type
+/// without fields keeps any keys, each value at most [`MAX_LONG`] bytes of JSON.
 pub fn sanitize_fields(def: &TypeDef, fields: &Map<String, Value>) -> Map<String, Value> {
     let mut out = Map::new();
+    if def.fields.is_empty() {
+        for (key, value) in fields {
+            let key = slug_key(key);
+            if key.is_empty() || value.is_null() || out.contains_key(&key) {
+                continue;
+            }
+            if serde_json::to_string(value).map_or(true, |s| s.len() > MAX_LONG) {
+                continue;
+            }
+            out.insert(key, value.clone());
+            if out.len() == MAX_FREE_KEYS {
+                break;
+            }
+        }
+        return out;
+    }
     for field in &def.fields {
         let Some(value) = fields.get(&field.key).filter(|v| !v.is_null()) else {
             continue;
@@ -562,6 +388,10 @@ pub fn sanitize_fields(def: &TypeDef, fields: &Map<String, Value>) -> Map<String
                 .as_bool()
                 .or_else(|| value.as_str().map(|s| matches!(s, "true" | "yes" | "1")))
                 .map(Value::Bool),
+            FieldKind::Json => serde_json::to_string(value)
+                .ok()
+                .filter(|s| s.len() <= MAX_LONG)
+                .map(|_| value.clone()),
         };
         match clean {
             Some(Value::String(s)) if s.is_empty() => {}
@@ -602,9 +432,19 @@ fn random_suffix() -> String {
     crate::agent_browser::new_token()[..8].to_owned()
 }
 
+/// Write a type's files: `type.json`, and its app in `app.html` (removed when it has none).
 fn write_def_in(dir: &Path, def: &TypeDef) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(def).map_err(|e| e.to_string())?;
-    write_atomic(&dir.join("type.json"), &bytes)
+    write_atomic(&dir.join("type.json"), &bytes)?;
+    let app = dir.join("app.html");
+    if def.has_app() {
+        write_atomic(&app, def.html.as_bytes())
+    } else {
+        match std::fs::remove_file(&app) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Where a type is kept: with the app (every project sees it) or in one project's folder.
@@ -778,10 +618,24 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+
+    /// Type `id`'s blueprint and, when `with_app`, its app's HTML.
+    fn read_def_with(&self, id: &str, with_app: bool) -> Result<(TypeDef, bool), String> {
+        let dir = self.dir(id)?;
+        let bytes = std::fs::read(dir.join("type.json")).map_err(|_| format!("No type `{id}`"))?;
+        let mut def: TypeDef =
+            serde_json::from_slice(&bytes).map_err(|e| format!("Type `{id}` is damaged: {e}"))?;
+        let app = dir.join("app.html");
+        let has_file = std::fs::metadata(&app).is_ok_and(|m| m.is_file() && m.len() > 0);
+        if with_app && has_file {
+            def.html = std::fs::read_to_string(&app).map_err(|e| e.to_string())?;
+        }
+        let has_app = has_file || def.has_app();
+        Ok((def, has_app))
+    }
+
     fn read_def(&self, id: &str) -> Result<TypeDef, String> {
-        let path = self.dir(id)?.join("type.json");
-        let bytes = std::fs::read(&path).map_err(|_| format!("No type `{id}`"))?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("Type `{id}` is damaged: {e}"))
+        self.read_def_with(id, true).map(|(def, _)| def)
     }
 
     fn write_def(&self, def: &TypeDef) -> Result<(), String> {
@@ -800,6 +654,14 @@ impl Store {
     fn write_items(&self, id: &str, items: &[Item]) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?;
         write_atomic(&self.dir(id)?.join("items.json"), &bytes)
+    }
+
+    fn read_state(&self, id: &str) -> Value {
+        self.dir(id)
+            .ok()
+            .and_then(|dir| std::fs::read(dir.join("state.json")).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| Value::Object(Map::new()))
     }
 
     pub fn list(&self) -> Result<Vec<Summary>, String> {
@@ -822,7 +684,7 @@ impl Store {
                 if !seen.insert(id.clone()) {
                     continue;
                 }
-                let Ok(def) = self.read_def(&id) else {
+                let Ok((def, has_app)) = self.read_def_with(&id, false) else {
                     continue;
                 };
                 let count = self.read_items(&id).map(|i| i.len()).unwrap_or(0);
@@ -831,11 +693,10 @@ impl Store {
                     name: def.name,
                     icon: def.icon,
                     description: def.description,
-                    layout: def.view.layout,
-                    accent: def.theme.accent,
+                    accent: def.accent,
                     count,
                     updated: def.updated,
-                    designed: def.designed,
+                    has_app,
                     scope,
                     sessions: def.sessions.into_values().collect(),
                 });
@@ -845,13 +706,26 @@ impl Store {
         Ok(out)
     }
 
+    /// Everything but the app's HTML, which the `dialtype:` scheme serves.
     pub fn get(&self, id: &str) -> Result<Full, String> {
         let _guard = self.guard();
+        let (mut def, has_app) = self.read_def_with(id, true)?;
+        let app_version = app_version(&def.html);
+        def.html.clear();
         Ok(Full {
-            def: self.read_def(id)?,
+            def,
+            has_app,
+            app_version,
             items: self.read_items(id)?,
+            state: self.read_state(id),
             assets: self.dir(id)?.join("assets").to_string_lossy().into_owned(),
         })
+    }
+
+    /// Type `id`'s app, its HTML document; empty when it has none yet.
+    pub fn app_html(&self, id: &str) -> Result<String, String> {
+        let _guard = self.guard();
+        self.read_def(id).map(|def| def.html)
     }
 
     /// The id of the type named `which` (its id, or its name in any case).
@@ -893,7 +767,8 @@ impl Store {
         Ok(def)
     }
 
-    /// Merge `patch` (members of a blueprint) over type `id`; its items stay.
+    /// Replace members of type `id` (`name`, `description`, `icon`, `accent`, `fields`, `html`,
+    /// `sessions`); its items and state stay.
     pub fn update(&self, id: &str, patch: &Value) -> Result<TypeDef, String> {
         let _guard = self.guard();
         let current = self.read_def(id)?;
@@ -901,24 +776,15 @@ impl Store {
         let (Value::Object(base), Value::Object(patch)) = (&mut merged, patch) else {
             return Err("A change to a type is an object".into());
         };
+        let mut html = None;
         for (key, value) in patch {
-            let key = match key.as_str() {
-                "custom_html" => "customHtml",
-                other => other,
-            };
-            if matches!(key, "id" | "created" | "updated" | "version") {
-                continue;
-            }
-            match (base.get_mut(key), value) {
-                (Some(Value::Object(inner)), Value::Object(more))
-                    if !matches!(key, "fields" | "sessions") =>
-                {
-                    for (k, v) in more {
-                        inner.insert(k.clone(), v.clone());
-                    }
+            match key.as_str() {
+                "id" | "created" | "updated" | "version" => {}
+                "html" | "customHtml" | "custom_html" => {
+                    html = Some(value.as_str().ok_or("`html` is a string")?.to_owned());
                 }
-                _ => {
-                    base.insert(key.to_owned(), value.clone());
+                other => {
+                    base.insert(other.to_owned(), value.clone());
                 }
             }
         }
@@ -926,6 +792,7 @@ impl Store {
             serde_json::from_value(merged).map_err(|e| format!("Not a type: {e}"))?;
         def.id = current.id;
         def.created = current.created;
+        def.html = html.unwrap_or(current.html);
         let def = normalize(def, crate::time::now())?;
         self.write_def(&def)?;
         Ok(def)
@@ -948,6 +815,17 @@ impl Store {
             return Err(format!("No type `{id}`"));
         }
         std::fs::remove_dir_all(dir).map_err(|e| e.to_string())
+    }
+
+    /// Replace the app's own saved state.
+    pub fn set_state(&self, id: &str, state: &Value) -> Result<(), String> {
+        let _guard = self.guard();
+        self.read_def_with(id, false)?;
+        let bytes = serde_json::to_vec(state).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_STATE {
+            return Err(format!("A type's state holds at most {} KB", MAX_STATE / 1024));
+        }
+        write_atomic(&self.dir(id)?.join("state.json"), &bytes)
     }
 
     /// Copy the image at `path` into type `id`'s assets; returns its file name there.
@@ -1050,7 +928,7 @@ impl Store {
         self.add_item_with(id, fields, source, true)
     }
 
-    /// Save a new item; when `allow_import` is false (e.g. a sandboxed custom view), local image
+    /// Save a new item; when `allow_import` is false (the type's own sandboxed app), local image
     /// paths are never read from disk and only existing asset names are kept.
     pub fn add_item_with(
         &self,
@@ -1060,7 +938,7 @@ impl Store {
         allow_import: bool,
     ) -> Result<(Item, Vec<String>), String> {
         let _guard = self.guard();
-        let def = self.read_def(id)?;
+        let (def, _) = self.read_def_with(id, false)?;
         let problems = if allow_import {
             self.import_field_images(&def, &mut fields)
         } else {
@@ -1072,6 +950,9 @@ impl Store {
         }
         let fields = sanitize_fields(&def, &fields);
         if fields.is_empty() {
+            if def.fields.is_empty() {
+                return Err("Nothing to save: `fields` is empty".into());
+            }
             return Err(format!(
                 "Nothing to save: give at least one of the fields {}",
                 def.fields
@@ -1087,7 +968,6 @@ impl Store {
             created: now,
             updated: now,
             fields,
-            remind: def.view.reminders,
             source: source.map(|s| Source {
                 text: clip(&s.text, MAX_LONG),
                 ..s
@@ -1111,7 +991,7 @@ impl Store {
         allow_import: bool,
     ) -> Result<Item, String> {
         let _guard = self.guard();
-        let def = self.read_def(id)?;
+        let (def, _) = self.read_def_with(id, false)?;
         let mut items = self.read_items(id)?;
         let item = items
             .iter_mut()
@@ -1133,10 +1013,6 @@ impl Store {
         }
         if let Some(done) = patch.done {
             item.done = done;
-            item.done_on = done.then(|| clip(patch.done_on.as_deref().unwrap_or(""), 10));
-        }
-        if let Some(remind) = patch.remind {
-            item.remind = remind;
         }
         item.updated = crate::time::now();
         let item = item.clone();
@@ -1173,22 +1049,25 @@ fn changed(app: &AppHandle, id: Option<&str>) {
     let _ = app.emit(CHANGED, id);
 }
 
-/// Report only choices this patch actually committed, not defaults present since creation.
-/// A single atomic blueprint update can settle several checklist rows at once.
-fn design_change(def: &TypeDef, patch: &Value) -> Value {
-    use serde_json::json;
+/// An agent build step on type `id`, for the UI's progress while a type gets its first app:
+/// `fields` (their labels), `app` (its size in KB), `saved` (items saved) or `checked`.
+pub fn progress(app: &AppHandle, id: &str, choices: Value) {
+    let _ = app.emit(CHANGED, serde_json::json!({"id": id, "choices": choices}));
+}
 
+/// The build steps a type change commits: only members the patch actually set.
+fn build_step(def: &TypeDef, patch: &Value) -> Value {
     let mut choices = Map::new();
-    if patch.pointer("/view/layout").is_some() || patch.pointer("/view/style").is_some() {
-        choices.insert("layout".into(), json!({"kind": def.view.layout, "style": def.view.style}));
-    }
     if patch.get("fields").is_some() {
-        choices.insert("fields".into(), json!(def.fields.iter().map(|f| &f.label).collect::<Vec<_>>()));
+        choices.insert(
+            "fields".into(),
+            Value::from(def.fields.iter().map(|f| f.label.clone()).collect::<Vec<_>>()),
+        );
     }
-    if patch.get("theme").and_then(Value::as_object).is_some_and(|t| !t.is_empty()) {
-        choices.insert("look".into(), json!({"font": def.theme.font, "texture": def.theme.texture, "accent": def.theme.accent}));
+    if ["html", "customHtml", "custom_html"].iter().any(|k| patch.get(*k).is_some()) && def.has_app() {
+        choices.insert("app".into(), Value::from(def.html.len().div_ceil(1024)));
     }
-    json!({"id": def.id, "choices": choices})
+    Value::Object(choices)
 }
 
 #[tauri::command]
@@ -1238,8 +1117,9 @@ pub fn types_update(
     id: String,
     patch: Value,
 ) -> Result<TypeDef, String> {
-    let def = store.update(&id, &patch)?;
+    let mut def = store.update(&id, &patch)?;
     changed(&app, Some(&id));
+    def.html.clear();
     Ok(def)
 }
 
@@ -1310,6 +1190,20 @@ pub fn types_move_item(
     Ok(())
 }
 
+/// The app saves its own state (`dial.setState`).
+#[tauri::command]
+pub fn types_set_state(
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    state: Value,
+) -> Result<(), String> {
+    // No change event: the app already holds this state, and a reload of it would re-render the
+    // app from its own write.
+    let _ = app;
+    store.set_state(&id, &state)
+}
+
 #[tauri::command]
 pub fn types_import_image(
     store: State<'_, Store>,
@@ -1358,26 +1252,11 @@ pub async fn types_open_asset(
     .map_err(|e| e.to_string())?
 }
 
+
 // The agent's side: the `types_*` MCP tools.
 
-/// How the blueprint format reads to the agent; shared by the tool descriptions.
-pub const BLUEPRINT_GUIDE: &str = "Blueprint: {name, description, icon (one emoji), fields: [{key, label, kind}], \
-view: {layout, titleField, subtitleField, imageField, timeField, style, reminders, leadMinutes, dailyReset, tagline}, \
-theme: {accent, paper, ink (#hex), font, texture, radius (0–28)}, customHtml}. \
-Kinds: text, longtext, markdown, list, steps, image, images, time (HH:MM), date (YYYY-MM-DD), \
-datetime (YYYY-MM-DD HH:MM), number, url, tags, rating (0–5), toggle. \
-Layouts: book (one item per page; style cookbook, journal or guide), checklist (tasks/routines), \
-board (image gallery), wheel (random picker), calendar (month and agenda), cards, table, custom. \
-Calendar uses a date/datetime timeField; checklist uses a time. Reminders add an opt-in bell; \
-leadMinutes controls when it alerts. dailyReset clears checklist ticks each day. \
-Fonts: sans, serif, mono, hand, display, rounded. Textures: none, paper, linen, grid, dots, noise. \
-Prefer built-in layouts. customHtml is a self-contained HTML document (no network or external files); \
-it receives {type:'dial-type', def, items, images} (asset name to data URL) and can post \
-{type:'dial-type-update', itemId, fields|done}. \
-Conversations inside a Type are tied to it by the app; 'this' means the Type. Use types_update for \
-design, types_add_item for saves, and types_items to confirm data. Populate each board item with \
-its own image, title and optional note. Reuse any attached file's absolute path; never substitute a \
-different image. If no image is available, leave it empty unless the user wants an illustration.";
+/// How to build a Type's app: the `types_guide` tool, and the briefing of a Type with no app yet.
+pub const APP_GUIDE: &str = include_str!("types/guide.md");
 
 fn args_object(args: &Value) -> Result<&Map<String, Value>, String> {
     args.as_object()
@@ -1391,37 +1270,41 @@ fn arg_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, Strin
         .ok_or_else(|| format!("`{key}` is required"))
 }
 
-fn describe(def: &TypeDef, count: usize) -> String {
+fn kind_name(kind: FieldKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn describe_with(def: &TypeDef, has_app: bool, count: usize) -> String {
     let fields: Vec<String> = def
         .fields
         .iter()
-        .map(|f| {
-            format!(
-                "{} ({})",
-                f.key,
-                serde_json::to_value(f.kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            )
-        })
+        .map(|f| format!("{} ({})", f.key, kind_name(f.kind)))
         .collect();
-    let layout = serde_json::to_value(def.view.layout)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default();
-    let design = if def.designed {
-        ""
+    let fields = if fields.is_empty() {
+        "free-form (any keys)".to_owned()
     } else {
-        " NOT DESIGNED YET: choose its layout, fields, icon and theme with types_update."
+        fields.join(", ")
+    };
+    let app = if has_app {
+        if def.html.is_empty() {
+            "has its app".to_owned()
+        } else {
+            format!("app {} KB", def.html.len().div_ceil(1024))
+        }
+    } else {
+        "NO APP YET: build it (types_guide, then types_update with html)".to_owned()
     };
     format!(
-        "{} {} [id {}] — {layout} layout, {count} item(s). Fields: {}.{design}",
-        def.icon,
-        def.name,
-        def.id,
-        fields.join(", ")
+        "{} {} [id {}] — {app}; {count} item(s). Fields: {fields}.",
+        def.icon, def.name, def.id
     )
+}
+
+fn describe(def: &TypeDef, count: usize) -> String {
+    describe_with(def, def.has_app(), count)
 }
 
 /// Marks the Type's own briefing in a prompt, so the UI can leave it out of the transcript.
@@ -1431,7 +1314,7 @@ const CONTEXT_CLOSE: &str = "</type-context>";
 /// What the agent is told about the Type a conversation belongs to.
 fn context(def: &TypeDef, count: usize, scope: Scope) -> String {
     let purpose = if def.description.trim().is_empty() {
-        "not described yet; infer it from the name and the items".to_owned()
+        "not described yet; infer it from the name, the items and the user".to_owned()
     } else {
         def.description.trim().to_owned()
     };
@@ -1439,17 +1322,25 @@ fn context(def: &TypeDef, count: usize, scope: Scope) -> String {
         Scope::App => "in the app, shared by every project",
         Scope::Project => "in this project's .dial/types folder",
     };
+    let task = if def.has_app() {
+        "Change the app with types_edit (read it first with types_source) or rewrite it with \
+         types_update; call types_guide if you need the window.dial API or the quality bar."
+            .to_owned()
+    } else {
+        format!("It has no app yet: build it now, following this guide.\n{APP_GUIDE}")
+    };
     format!(
         "{CONTEXT_OPEN}\n\
-         The user is inside their Type “{} {}” (id {}), opened as its own little app in Dial Desktop. \
-         This conversation is about that Type, not about the project's code. Purpose: {purpose}.\n\
+         The user is inside their Type “{} {}” (id {}), which Dial Desktop shows as its own small web \
+         app that you build and keep improving. This conversation is about that Type, not about the \
+         project's code. Purpose: {purpose}.\n\
          Now: {}\n\
-         Kept {kept}; the types_* tools own its files, so never edit them directly. Do what the user \
-         asks with the tools: types_update to change the layout, fields or look, types_add_item and \
-         types_update_item for items, and types_items to check saved data. On macOS, use \
-         types_screenshot to inspect the visible design after a visual change. Do not read, search \
-         or edit the project's files or run project commands for this, unless the user names a project file. Keep replies \
-         to a sentence or two.\n\
+         {task}\n\
+         Always look at your work: after every visual change take types_screenshot (and use types_run \
+         to click through interactions and read console errors), then fix what is off before you \
+         finish. Kept {kept}; the types_* tools own its files, so never edit them directly. You may use \
+         the web and image generation when the app needs them; leave the project's files alone unless \
+         the user names one. Keep replies to a sentence or two.\n\
          {CONTEXT_CLOSE}",
         def.icon,
         def.name,
@@ -1479,12 +1370,65 @@ pub fn legacy_prompt(context: &crate::engine::TypeContext, text: &str) -> String
 
 /// The Type's id and its briefing, when the Type is saved.
 fn framing(store: &Store, id: &str) -> Option<(String, String)> {
-    let full = store.get(id).ok()?;
+    let def = {
+        let _guard = store.guard();
+        store.read_def(id).ok()?
+    };
+    let count = store.get(id).ok()?.items.len();
     let scope = store.locate(id).map(|(scope, _)| scope).unwrap_or_default();
-    Some((id.to_owned(), context(&full.def, full.items.len(), scope)))
+    Some((id.to_owned(), context(&def, count, scope)))
 }
 
-/// Run one `types_*` tool for the agent.
+/// The app's HTML from `html` or from the file at `htmlFile` (an absolute path), if given.
+fn html_arg(args: &Map<String, Value>) -> Result<Option<String>, String> {
+    if let Some(path) = args.get("htmlFile").and_then(Value::as_str) {
+        let path = Path::new(path.trim());
+        if !path.is_absolute() {
+            return Err("`htmlFile` must be an absolute path".into());
+        }
+        let meta = std::fs::metadata(path).map_err(|_| format!("No file at {}", path.display()))?;
+        if !meta.is_file() || meta.len() as usize > MAX_APP {
+            return Err(format!("{} is not a file under {} KB", path.display(), MAX_APP / 1024));
+        }
+        return std::fs::read_to_string(path).map(Some).map_err(|e| e.to_string());
+    }
+    Ok(args.get("html").and_then(Value::as_str).map(str::to_owned))
+}
+
+/// Apply exact find/replace `edits` to `html`, all or none.
+pub fn apply_edits(html: &str, edits: &[Value]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("`edits` is empty".into());
+    }
+    let mut out = html.to_owned();
+    for (n, edit) in edits.iter().enumerate() {
+        let n = n + 1;
+        let find = edit.get("find").and_then(Value::as_str).filter(|f| !f.is_empty())
+            .ok_or_else(|| format!("Edit {n} needs a non-empty `find`"))?;
+        let replace = edit.get("replace").and_then(Value::as_str)
+            .ok_or_else(|| format!("Edit {n} needs `replace`"))?;
+        let all = edit.get("all").and_then(Value::as_bool).unwrap_or(false);
+        let found = out.matches(find).count();
+        if found == 0 {
+            return Err(format!("Edit {n}: `find` does not occur in the app (nothing was changed). Read it with types_source and copy the text exactly."));
+        }
+        if found > 1 && !all {
+            return Err(format!("Edit {n}: `find` occurs {found} times (nothing was changed); add surrounding text to make it unique, or set `all`."));
+        }
+        out = out.replace(find, replace);
+    }
+    Ok(out)
+}
+
+fn item_list(args: &Map<String, Value>) -> Result<Vec<Map<String, Value>>, String> {
+    match (args.get("items"), args.get("fields")) {
+        (Some(Value::Array(list)), _) => Ok(list.iter().filter_map(|v| v.as_object().cloned()).collect()),
+        (_, Some(Value::Object(fields))) => Ok(vec![fields.clone()]),
+        _ => Err("`fields` (an object) or `items` (a list of them) is required".into()),
+    }
+}
+
+/// Run one `types_*` tool for the agent (`types_screenshot` is `agent_browser`'s).
 pub fn agent_call(
     app: &AppHandle,
     store: &Store,
@@ -1493,6 +1437,7 @@ pub fn agent_call(
 ) -> Result<String, String> {
     let args = args_object(args)?;
     match tool {
+        "types_guide" => Ok(APP_GUIDE.to_owned()),
         "types_list" => {
             let list = store.list()?;
             if list.is_empty() {
@@ -1501,58 +1446,111 @@ pub fn agent_call(
             let mut lines = Vec::new();
             for s in list {
                 let def = store.get(&s.id)?.def;
-                lines.push(describe(&def, s.count));
+                lines.push(describe_with(&def, s.has_app, s.count));
             }
             Ok(lines.join("\n"))
         }
         "types_create" => {
-            let blueprint = args.get("blueprint").unwrap_or(&Value::Null);
-            let blueprint = if blueprint.is_object() {
-                blueprint.clone()
-            } else {
-                Value::Object(args.clone())
+            let source = match args.get("blueprint") {
+                Some(Value::Object(blueprint)) => blueprint,
+                _ => args,
             };
-            let mut def: TypeDef =
-                serde_json::from_value(blueprint).map_err(|e| format!("Not a blueprint: {e}"))?;
-            def.designed = true;
+            let mut members = source.clone();
+            for key in ["htmlFile", "blueprint", "sessions", "type"] {
+                members.remove(key);
+            }
+            let mut def: TypeDef = serde_json::from_value(Value::Object(members))
+                .map_err(|e| format!("Not a type: {e}"))?;
+            if let Some(html) = html_arg(source)? {
+                def.html = html;
+            }
             def.sessions.clear();
             let def = store.create(def)?;
             changed(app, Some(&def.id));
             Ok(format!(
-                "Created {}. The user sees it under Types in the sidebar. Save items with types_add_item.",
+                "Created {}. It shows under Types in the sidebar; types_open shows it to the user.",
                 describe(&def, 0)
             ))
         }
         "types_update" => {
             let id = store.find(arg_str(args, "type")?)?;
-            let mut patch = args
-                .get("changes")
-                .filter(|v| v.is_object())
-                .cloned()
-                .ok_or("`changes` (an object of blueprint members) is required")?;
-            if let Value::Object(members) = &mut patch {
-                // The UI owns which sessions belong to the type.
-                members.remove("sessions");
-                members.insert("designed".into(), Value::Bool(true));
+            let mut patch = match args.get("changes") {
+                Some(Value::Object(changes)) => changes.clone(),
+                None => Map::new(),
+                Some(_) => return Err("`changes` is an object of type members".into()),
+            };
+            // The UI owns which sessions belong to the type.
+            patch.remove("sessions");
+            if let Some(html) = html_arg(args)? {
+                patch.insert("html".into(), Value::String(html));
             }
+            if patch.is_empty() {
+                return Err("Nothing to change: give `changes` or `htmlFile`".into());
+            }
+            let patch = Value::Object(patch);
             let def = store.update(&id, &patch)?;
-            let _ = app.emit(CHANGED, design_change(&def, &patch));
+            progress(app, &id, build_step(&def, &patch));
             let count = store.get(&id)?.items.len();
-            Ok(format!("Updated {}", describe(&def, count)))
+            Ok(format!("Updated {}. Look at it with types_screenshot.", describe(&def, count)))
+        }
+        "types_edit" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            let edits = args.get("edits").and_then(Value::as_array).ok_or("`edits` (a list of {find, replace}) is required")?;
+            let current = store.app_html(&id)?;
+            if current.trim().is_empty() {
+                return Err("This type has no app yet; write one with types_update".into());
+            }
+            let html = apply_edits(&current, edits)?;
+            let patch = serde_json::json!({"html": html});
+            let def = store.update(&id, &patch)?;
+            progress(app, &id, build_step(&def, &patch));
+            Ok(format!(
+                "Applied {} edit(s); the app is {} KB. Look at it with types_screenshot.",
+                edits.len(),
+                def.html.len().div_ceil(1024)
+            ))
+        }
+        "types_source" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            let html = store.app_html(&id)?;
+            if html.trim().is_empty() {
+                return Ok("This type has no app yet.".into());
+            }
+            let lines: Vec<&str> = html.lines().collect();
+            let line = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as usize);
+            let start = line("startLine").unwrap_or(1).max(1);
+            let end = line("endLine").unwrap_or(lines.len()).min(lines.len());
+            if start > end {
+                return Err(format!("The app has {} lines", lines.len()));
+            }
+            let mut text = String::new();
+            let mut last = start - 1;
+            for l in &lines[start - 1..end] {
+                if text.len() + l.len() > 60_000 {
+                    break;
+                }
+                text.push_str(l);
+                text.push('\n');
+                last += 1;
+            }
+            let more = if last < end {
+                format!("\n[Stopped at line {last}; read on with startLine {}.]", last + 1)
+            } else {
+                String::new()
+            };
+            Ok(format!("app.html, lines {start}–{last} of {}:\n{text}{more}", lines.len()))
+        }
+        "types_open" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            live::open(app, &id)
+        }
+        "types_run" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            live::run(app, &id, arg_str(args, "script")?)
         }
         "types_add_item" => {
             let id = store.find(arg_str(args, "type")?)?;
-            let items: Vec<Map<String, Value>> = match (args.get("items"), args.get("fields")) {
-                (Some(Value::Array(list)), _) => {
-                    list.iter().filter_map(|v| v.as_object().cloned()).collect()
-                }
-                (_, Some(Value::Object(fields))) => vec![fields.clone()],
-                _ => {
-                    return Err(
-                        "`fields` (an object) or `items` (a list of them) is required".into(),
-                    );
-                }
-            };
+            let items = item_list(args)?;
             let source = args
                 .get("source")
                 .and_then(Value::as_str)
@@ -1572,8 +1570,11 @@ pub fn agent_call(
                 }
             }
             changed(app, Some(&id));
-            let name = store.get(&id)?.def.name;
-            let mut out = format!("Saved {saved} item(s) to {name}.");
+            let full = store.get(&id)?;
+            if saved > 0 {
+                progress(app, &id, serde_json::json!({"saved": full.items.len()}));
+            }
+            let mut out = format!("Saved {saved} item(s) to {}.", full.def.name);
             if !notes.is_empty() {
                 out.push_str("\nNot kept: ");
                 out.push_str(&notes.join("; "));
@@ -1586,7 +1587,7 @@ pub fn agent_call(
         "types_items" => {
             let id = store.find(arg_str(args, "type")?)?;
             let full = store.get(&id)?;
-            let mut out = describe(&full.def, full.items.len());
+            let mut out = describe_with(&full.def, full.has_app, full.items.len());
             for item in full.items.iter().take(200) {
                 out.push_str(&format!(
                     "\n- [{}]{} {}",
@@ -1603,20 +1604,36 @@ pub fn agent_call(
             let patch = ItemPatch {
                 fields: args.get("fields").and_then(Value::as_object).cloned(),
                 done: args.get("done").and_then(Value::as_bool),
-                ..ItemPatch::default()
             };
             store.update_item(&id, item_id, patch)?;
             changed(app, Some(&id));
             Ok(format!("Updated item {item_id}."))
         }
+        "types_remove_item" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            let item_id = arg_str(args, "item")?;
+            store.remove_item(&id, item_id)?;
+            changed(app, Some(&id));
+            Ok(format!("Removed item {item_id}."))
+        }
+        "types_state" => {
+            let id = store.find(arg_str(args, "type")?)?;
+            if let Some(state) = args.get("state") {
+                store.set_state(&id, state)?;
+                changed(app, Some(&id));
+                return Ok("Replaced the app's state.".into());
+            }
+            Ok(clip(&serde_json::to_string_pretty(&store.get(&id)?.state).unwrap_or_default(), 30_000))
+        }
         other => Err(format!("Unknown tool `{other}`")),
     }
 }
 
+
 /// The `types_*` tools, in the MCP tool-list shape.
 pub fn tools() -> Vec<Value> {
     use serde_json::json;
-    let tool = |name: &str, title: &str, read_only: bool, description: String, schema: Value| {
+    let tool = |name: &str, title: &str, read_only: bool, description: &str, schema: Value| {
         json!({
             "name": name,
             "title": title,
@@ -1625,56 +1642,118 @@ pub fn tools() -> Vec<Value> {
             "annotations": {"title": title, "readOnlyHint": read_only, "openWorldHint": false}
         })
     };
-    let which = json!({"type": "string", "description": "The type's name or id"});
+    let which = || json!({"type": "string", "description": "The type's name or id"});
+    let fields = json!({"type": "array", "description": "The keys items use: [{key, label, kind}]. Kinds: text, longtext, markdown, list, steps, image, images, time, date, datetime, number, url, tags, rating, toggle, json. Omit for free-form items.", "items": {"type": "object"}});
+    let html = json!({"type": "string", "description": "The whole app: one HTML document"});
+    let html_file = json!({"type": "string", "description": "Instead of html: absolute path of an .html file you wrote"});
     vec![
         tool(
-            "types_screenshot",
-            "Inspect the open Type",
-            false,
-            "Take a PNG of the requested Type's visible canvas on macOS. The user must have that Type open. This does not open or change the Type. Use it to check the rendered design, not to list items."
-                .into(),
-            json!({"type":"object", "properties":{"type":which}, "required":["type"]}),
+            "types_guide",
+            "How to build a Type's app",
+            true,
+            "The guide to building a Type's app: the window.dial runtime (items, state, images), what \
+             the sandbox allows (https APIs and CDNs), the quality bar and the build-and-check loop. \
+             Read it before building or substantially changing a Type's app.",
+            json!({"type": "object", "properties": {}}),
         ),
         tool(
             "types_list",
             "List the user's Types",
             true,
-            "List the user's Types (saved collections in Dial Desktop) with their fields. Check it \
-             before creating a type or when the user asks to save something somewhere."
-                .into(),
+            "List the user's Types: things they keep (recipes, places, plans, scores) that Dial Desktop \
+             opens as their own small web apps. Check it before creating a type or when the user asks \
+             to save something somewhere.",
             json!({"type": "object", "properties": {}}),
         ),
         tool(
             "types_create",
             "Create a Type",
             false,
-            format!(
-                "Create a Type when the user asks for a place to keep things (a cookbook, a \
-                 routine, a moodboard, a decider). {BLUEPRINT_GUIDE}"
-            ),
-            json!({"type": "object", "properties": {"blueprint": {"type": "object", "description": "The blueprint"}}, "required": ["blueprint"]}),
+            "Create a Type when the user wants a place to keep or use something (a cookbook, a \
+             weather app for their cities, a reading list, a game). Give it a name, a one-line \
+             description, an emoji icon, an accent (#hex), its fields and, ideally, its app (html or \
+             htmlFile; see types_guide). Then save items with types_add_item, show it with types_open \
+             and check it with types_screenshot.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string"}, "description": {"type": "string"}, "icon": {"type": "string"},
+                "accent": {"type": "string"}, "fields": fields.clone(), "html": html.clone(), "htmlFile": html_file.clone()
+            }, "required": ["name"]}),
         ),
         tool(
             "types_update",
-            "Change a Type's design",
+            "Change a Type or replace its app",
             false,
-            format!(
-                "Restyle or reshape a Type; its items stay. `changes` holds the blueprint members to \
-                 replace (view and theme merge member by member; fields replace the list). {BLUEPRINT_GUIDE}"
-            ),
-            json!({"type": "object", "properties": {"type": which, "changes": {"type": "object"}}, "required": ["type", "changes"]}),
+            "Change a Type: `changes` holds the members to replace (name, description, icon, accent, \
+             fields, html); items and state stay. Pass htmlFile to load the app from a file you wrote. \
+             For small changes to the app prefer types_edit. Take types_screenshot afterwards.",
+            json!({"type": "object", "properties": {
+                "type": which(),
+                "changes": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "icon": {"type": "string"}, "accent": {"type": "string"}, "fields": fields, "html": html}},
+                "htmlFile": html_file
+            }, "required": ["type"]}),
+        ),
+        tool(
+            "types_edit",
+            "Edit a Type's app",
+            false,
+            "Edit a Type's app in place with exact find/replace pairs, applied in order, all or \
+             none. Each `find` must occur exactly once unless `all` is true. Read the app first with \
+             types_source; take types_screenshot afterwards.",
+            json!({"type": "object", "properties": {
+                "type": which(),
+                "edits": {"type": "array", "items": {"type": "object", "properties": {
+                    "find": {"type": "string"}, "replace": {"type": "string"}, "all": {"type": "boolean"}
+                }, "required": ["find", "replace"]}}
+            }, "required": ["type", "edits"]}),
+        ),
+        tool(
+            "types_source",
+            "Read a Type's app",
+            true,
+            "Read a Type's app (its HTML), optionally only lines startLine to endLine.",
+            json!({"type": "object", "properties": {
+                "type": which(), "startLine": {"type": "integer"}, "endLine": {"type": "integer"}
+            }, "required": ["type"]}),
+        ),
+        tool(
+            "types_open",
+            "Show a Type",
+            false,
+            "Open a Type's app in Dial Desktop, in place of the conversation, and wait until it has \
+             loaded, so types_screenshot and types_run can see it. The user's conversations are \
+             inside a Type already when they talk to it; use this for one created from elsewhere.",
+            json!({"type": "object", "properties": {"type": which()}, "required": ["type"]}),
+        ),
+        tool(
+            "types_screenshot",
+            "Look at a Type's app",
+            false,
+            "A PNG of the Type's app as the user sees it (macOS), with the console errors and \
+             warnings it logged since it loaded. The Type must be open (types_open). Use it after \
+             every visual change and fix what looks wrong.",
+            json!({"type": "object", "properties": {"type": which()}, "required": ["type"]}),
+        ),
+        tool(
+            "types_run",
+            "Try a Type's app",
+            false,
+            "Run JavaScript inside the open Type's app and return its result as JSON, with console \
+             output logged meanwhile. `script` is an async function body (use return); `dial` and the \
+             DOM are in scope. Use it to click buttons, fill inputs, read the DOM, check layout sizes \
+             or test the app's logic; take types_screenshot after visible changes. The Type must be \
+             open (types_open).",
+            json!({"type": "object", "properties": {"type": which(), "script": {"type": "string"}}, "required": ["type", "script"]}),
         ),
         tool(
             "types_add_item",
             "Save to a Type",
             false,
-            "Save one item (`fields`) or several (`items`) to a Type, filling its fields by key \
-             from what the user wants to keep: lists as arrays of strings, steps in order, \
-             images as absolute local paths (use the path supplied with a file attachment, or a saved \
-             generated/downloaded image). `source` holds the original text."
-                .into(),
+            "Save one item (`fields`) or several (`items`) to a Type, by field key: lists as arrays of \
+             strings, steps in order, images as absolute local paths (an attachment's path, or a \
+             generated or downloaded image), which become asset names. `source` holds the original \
+             text. The open app updates by itself.",
             json!({"type": "object", "properties": {
-                "type": which,
+                "type": which(),
                 "fields": {"type": "object"},
                 "items": {"type": "array", "items": {"type": "object"}},
                 "source": {"type": "string"}
@@ -1684,46 +1763,89 @@ pub fn tools() -> Vec<Value> {
             "types_items",
             "Read a Type's items",
             true,
-            "Read what is saved in a Type, with item ids.".into(),
-            json!({"type": "object", "properties": {"type": which}, "required": ["type"]}),
+            "Read what is saved in a Type, with item ids.",
+            json!({"type": "object", "properties": {"type": which()}, "required": ["type"]}),
         ),
         tool(
             "types_update_item",
             "Change a saved item",
             false,
-            "Change fields of a saved item (by id from types_items) or tick it done.".into(),
+            "Change fields of a saved item (by id from types_items; a null field clears it) or mark it done.",
             json!({"type": "object", "properties": {
-                "type": which,
+                "type": which(),
                 "item": {"type": "string"},
                 "fields": {"type": "object"},
                 "done": {"type": "boolean"}
             }, "required": ["type", "item"]}),
         ),
+        tool(
+            "types_remove_item",
+            "Remove a saved item",
+            false,
+            "Remove a saved item (by id from types_items).",
+            json!({"type": "object", "properties": {"type": which(), "item": {"type": "string"}}, "required": ["type", "item"]}),
+        ),
+        tool(
+            "types_state",
+            "Read or replace a Type app's state",
+            false,
+            "Read the JSON state a Type's app keeps for itself (dial.state: settings, progress, \
+             caches), or replace it with `state`.",
+            json!({"type": "object", "properties": {"type": which(), "state": {}}, "required": ["type"]}),
+        ),
     ]
 }
 
-/// The scheme a `custom` layout's page loads from, in a sandboxed frame of the types view.
+/// The scheme a type's app loads from, in a sandboxed frame of the types view.
 pub const CUSTOM_SCHEME: &str = "dialtype";
-/// A custom page runs only its own inline code: no network, no other files, no forms.
-pub const CUSTOM_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; \
-style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; \
+/// A type's app runs its own code and may use the web over https (APIs with CORS, CDNs, fonts),
+/// in a frame without same-origin access: it cannot reach the app, its files or its IPC.
+pub const CUSTOM_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https: blob:; \
+style-src 'unsafe-inline' https:; img-src data: blob: https:; font-src data: https:; \
+media-src data: blob: https:; connect-src https: wss:; worker-src blob:; \
 form-action 'none'; base-uri 'none'; frame-ancestors *";
 
-/// Answer `dialtype://localhost/<id>`: type `id`'s custom page under [`CUSTOM_CSP`].
+/// The `window.dial` runtime injected into every app.
+const RUNTIME: &str = include_str!("types/runtime.js");
+
+/// `html` with the runtime's script first in its head, before any of the app's own scripts.
+pub fn with_runtime(html: &str) -> String {
+    let script = format!("<script>{RUNTIME}</script>");
+    let lower = html.to_ascii_lowercase();
+    let after_tag = |name: &str| -> Option<usize> {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(name) {
+            let at = from + at;
+            let next = lower.as_bytes().get(at + name.len()).copied();
+            if matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r')) {
+                return lower[at..].find('>').map(|end| at + end + 1);
+            }
+            from = at + name.len();
+        }
+        None
+    };
+    let at = after_tag("<head")
+        .or_else(|| after_tag("<html"))
+        .or_else(|| after_tag("<!doctype"))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(html.len() + script.len());
+    out.push_str(&html[..at]);
+    out.push_str(&script);
+    out.push_str(&html[at..]);
+    out
+}
+
+/// Answer `dialtype://localhost/<id>`: type `id`'s app under [`CUSTOM_CSP`], with the runtime.
 pub fn custom_page(store: &Store, path: &str) -> tauri::http::Response<Vec<u8>> {
     let id = path
         .trim_start_matches('/')
         .split(['/', '?'])
         .next()
         .unwrap_or("");
-    let page = store
-        .get(id)
-        .ok()
-        .filter(|full| full.def.view.layout == Layout::Custom)
-        .map(|full| full.def.custom_html);
+    let page = store.app_html(id).ok().filter(|html| !html.trim().is_empty());
     let (status, body) = match page {
-        Some(html) => (200, html.into_bytes()),
-        None => (404, b"No custom page".to_vec()),
+        Some(html) => (200, with_runtime(&html).into_bytes()),
+        None => (404, b"This type has no app yet".to_vec()),
     };
     tauri::http::Response::builder()
         .status(status)

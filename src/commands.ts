@@ -1,12 +1,14 @@
 // Everything the palette (⌘K) can do, and the shortcut list. Keys here are the ones App.vue handles.
 
 import { ref } from "vue";
-import { engine, files, folders } from "./bridge";
+import { engine, files, folders, showToast } from "./bridge";
+import { aiReviewView, experienceView, gitLogView, importSessions, learningStatus, runInTerminal, runTyped, sessionTreeView, shareView, understandingView, worktreesView } from "./commandRunner";
+import { addToPrompt } from "./workspace";
 import { recentProjects } from "./projects";
 import type { OpenSnapshot } from "./types";
 import { focusComposer, ui, type SettingsTab } from "./ui";
 import { appearance, zoomBy, type Theme } from "./appearance";
-import { showPanel, workspace } from "./workspace";
+import { showPanel, showSidebar, sidebarShown, toggleSidebar, workspace } from "./workspace";
 import { checkApp, checkEngine } from "./updates";
 import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "./taskRecipes";
 import { markTurnAborted } from "./queue";
@@ -91,6 +93,10 @@ export function commands(snap: OpenSnapshot): Command[] {
       },
       live && snap.entries.length > 0,
     );
+    add(
+      { id: "export-html", group: "Session", label: "Export as HTML…", icon: "download", keywords: "export page web share standalone /export --html", run: () => engine.exportSession(snap.workspace.root, session.title, "html") },
+      live && snap.entries.length > 0,
+    );
   }
   add(
     {
@@ -114,10 +120,10 @@ export function commands(snap: OpenSnapshot): Command[] {
   );
   add({ id: "stop", group: "Session", label: "Stop the turn", icon: "stop", hint: "Esc", run: () => { markTurnAborted(snap); return engine.abort(); } }, snap.turnRunning);
   add({ id: "find", group: "Session", label: "Find in conversation", icon: "search", hint: "⌘F", run: openConversationFind }, snap.entries.length > 0);
-  add({ id: "focus-composer", group: "Session", label: "Focus the message box", icon: "pencil", hint: "⌘L", keywords: "type prompt input", run: () => { ui.settingsOpen = false; focusComposer(); } });
+  add({ id: "focus-composer", group: "Session", label: "Focus the message box", icon: "chat", hint: "⌘L", keywords: "type prompt input", run: () => { ui.settingsOpen = false; focusComposer(); } });
   add({ id: "next-session", group: "Session", label: "Next session", icon: "arrowDown", hint: "⇧⌘]", keywords: "switch down", run: () => stepSession(snap, 1) }, sessionOrder(snap).length > 1);
   add({ id: "prev-session", group: "Session", label: "Previous session", icon: "arrowUp", hint: "⇧⌘[", keywords: "switch up", run: () => stepSession(snap, -1) }, sessionOrder(snap).length > 1);
-  add({ id: "search-sessions", group: "Session", label: "Search sessions", icon: "search", hint: "⇧⌘F", keywords: "filter find sidebar", run: () => { ui.sidebarOpen = true; ui.focusSearch++; } });
+  add({ id: "search-sessions", group: "Session", label: "Search sessions", icon: "search", hint: "⇧⌘F", keywords: "filter find sidebar", run: () => { showSidebar(); ui.focusSearch++; } });
 
   if (canUseTaskRecipes(snap)) {
     for (const recipe of taskRecipes()) {
@@ -145,7 +151,7 @@ export function commands(snap: OpenSnapshot): Command[] {
     },
   });
 
-  add({ id: "sidebar", group: "View", label: ui.sidebarOpen ? "Hide sidebar" : "Show sidebar", icon: "panelLeft", hint: "⌘B", run: () => (ui.sidebarOpen = !ui.sidebarOpen) });
+  add({ id: "sidebar", group: "View", label: sidebarShown() ? "Hide sidebar" : "Show sidebar", icon: "panelLeft", hint: "⌘B", run: toggleSidebar });
   add({
     id: "inspector",
     group: "View",
@@ -160,6 +166,9 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "quick-open", group: "View", label: "Quick-open project file", icon: "file", hint: "⌘P", run: () => { ui.filePalette = true; ui.paletteOpen = true; } });
   add({ id: "terminal", group: "View", label: "Open the terminal", icon: "terminal", hint: "⌃`", keywords: "shell console commands run", run: () => showPanel("terminal") });
   add({ id: "changes", group: "View", label: "Show changed files", icon: "diff", keywords: "diff review edits", run: () => showPanel("changes") });
+  add({ id: "activity", group: "View", label: "Open Activity", icon: "activity", keywords: "watch jobs tool calls /watch", run: () => showPanel("activity") });
+  add({ id: "workers", group: "View", label: "Open Workers", icon: "chip", keywords: "session tasks messages", run: () => showPanel("workers") });
+  add({ id: "peers", group: "View", label: "Open Peers", icon: "chat", keywords: "project sessions messages", run: () => showPanel("peers") });
   add({
     id: "auto-previews",
     group: "View",
@@ -181,6 +190,9 @@ export function commands(snap: OpenSnapshot): Command[] {
   const page = (tab: SettingsTab) => () => { ui.settingsTab = tab; ui.settingsOpen = true; };
   add({ id: "roles", group: "Project", label: "Model roles & presets", icon: "gear", keywords: "roles presets small task coach tester memory /modelpreset", run: page("roles") }, live);
   add({ id: "library", group: "App", label: "Model library", icon: "gear", keywords: "download local models mlx gguf hugging face delete", run: page("library") });
+  add({ id: "providers", group: "App", label: "Providers & sign-in", icon: "gear", keywords: "login account api key provider settings", run: page("providers") });
+  add({ id: "images", group: "App", label: "Image generation settings", icon: "gear", keywords: "image model picture flux", run: page("images") });
+  add({ id: "appearance", group: "App", label: "Appearance settings", icon: "gear", keywords: "theme background zoom cards diagrams", run: page("appearance") });
   add({ id: "usage", group: "Project", label: "Usage limits & stats", icon: "gear", keywords: "usage cost tokens stats limits context /usage /stats /cost", run: page("usage") }, live);
   add({ id: "memory", group: "Project", label: "What Dial remembers", icon: "gear", keywords: "memory facts remember forget /memory", run: page("memory") }, live);
   add({ id: "skills", group: "Project", label: "Skills", icon: "gear", keywords: "skills install enable /skills", run: page("skills") }, live);
@@ -188,6 +200,51 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "checks", group: "Project", label: "Checks after edits", icon: "gear", keywords: "checks tests lint verify /checks", run: page("checks") }, live);
   add({ id: "folders", group: "Project", label: "Extra folders", icon: "gear", keywords: "dirs add-dir directories folders /dirs", run: page("folders") }, live);
   add({ id: "schedules", group: "Project", label: "Schedules", icon: "gear", keywords: "schedule cron recurring timer /schedule", run: page("schedules") }, live);
+  add({ id: "permissions", group: "Project", label: "Permission rules", icon: "gear", keywords: "permissions allow deny rules approval always never /permissions", run: page("permissions") }, live);
+  // Workflows the engine serves in its own terminal UI; they open in the Terminal panel.
+  const inTerminal = (command: string) => () => runInTerminal(command);
+  add({ id: "ai-commit", group: "Git", label: "Write a commit message with AI", icon: "diff", keywords: "commit message generate git dry run /commit", run: () => { ui.settingsOpen = false; ui.inspectorOpen = true; showPanel("changes"); showToast("Stage files, then choose Write with AI above the message box"); } }, live);
+  add({ id: "ai-commit-push", group: "Git", label: "Commit and push with AI", icon: "diff", keywords: "commit push automatic git /commit --push", run: inTerminal("/commit --push") }, live);
+  add({ id: "ai-review-base", group: "Git", label: "Review changes since a branch…", icon: "diff", keywords: "review base branch pull request diff /review", run: () => { ui.settingsOpen = false; addToPrompt("/review base "); } }, live);
+  add({ id: "ai-review", group: "Git", label: "Review uncommitted changes with AI", icon: "diff", keywords: "review code diff git /review", run: () => void aiReviewView() }, live);
+  add({ id: "worktrees", group: "Git", label: "Worktrees", icon: "folder", keywords: "worktree branch git create switch remove /wt", run: () => { ui.settingsOpen = false; void worktreesView(); } }, live);
+  add({ id: "git-log", group: "Git", label: "Git log", icon: "list", keywords: "history commits log git /git", run: () => void gitLogView() }, live);
+  add({ id: "import-claude", group: "Session", label: "Import a Claude Code session…", icon: "download", keywords: "import claude code transcript history migrate --from-claude", run: () => { ui.settingsOpen = false; void importSessions("claude"); } }, live);
+  add({ id: "import-codex", group: "Session", label: "Import a Codex session…", icon: "download", keywords: "import codex openai transcript history migrate --from-codex", run: () => { ui.settingsOpen = false; void importSessions("codex"); } }, live);
+  add({ id: "session-tree", group: "Session", label: "Browse session branches", icon: "list", keywords: "tree forks branches labels /tree", run: () => { ui.settingsOpen = false; void sessionTreeView(); } }, live);
+  add({ id: "share-link", group: "Session", label: "Share this session…", icon: "external", keywords: "share upload link gist export /share", run: () => void shareView() }, live);
+  add({ id: "anonymize", group: "Session", label: "Write an anonymized copy", icon: "shield", keywords: "anonymize redact private copy /anonymize", run: inTerminal("/anonymize") }, live);
+  add({ id: "shake", group: "Session", label: "Drop heavy content from context", icon: "refresh", keywords: "shake context tool results images thinking trim /shake", run: inTerminal("/shake") }, live);
+  add({ id: "fresh", group: "Session", label: "Reset the provider stream", icon: "refresh", keywords: "fresh stream state cache reset /fresh", run: inTerminal("/fresh") }, live);
+  add({ id: "ssh-hosts", group: "Integrations", label: "SSH hosts", icon: "globe", keywords: "ssh remote host add remove list /ssh", run: page("integrations") }, live);
+  add({ id: "hooks", group: "Integrations", label: "Lifecycle hooks", icon: "list", keywords: "hooks lifecycle scripts events /hooks", run: page("integrations") }, live);
+  add({ id: "relay-status", group: "Integrations", label: "Collaboration relay status", icon: "chat", keywords: "relay collab local server status /relay", run: page("integrations") }, live);
+  add({ id: "relay-start", group: "Integrations", label: "Start the collaboration relay", icon: "chat", keywords: "relay collab local server start /relay", run: page("integrations") }, live);
+  add({ id: "relay-stop", group: "Integrations", label: "Stop the collaboration relay", icon: "stop", keywords: "relay collab local server stop /relay", run: page("integrations") }, live);
+  add({ id: "profile", group: "Integrations", label: "Choose a capability profile", icon: "shield", keywords: "profile capability tools restrict /profile", run: page("integrations") }, live);
+  add({ id: "security", group: "Integrations", label: "Security review", icon: "shield", keywords: "security scan plan review audit /security", run: inTerminal("/security") }, live);
+  // Commands that take a task: start them in the message box for the user to finish.
+  const startTyping = (text: string) => () => { ui.settingsOpen = false; addToPrompt(text); };
+  add({ id: "contract", group: "Autonomy", label: "Start a task as a contract…", icon: "check", keywords: "contract goal constraints done when deliverables /contract", run: startTyping("/contract ") }, live);
+  add({ id: "loop", group: "Autonomy", label: "Repeat a prompt in a loop…", icon: "refresh", keywords: "loop repeat count duration until while /loop", run: startTyping("/loop ") }, live);
+  add({ id: "plan-review", group: "Autonomy", label: "Re-open the submitted plan", icon: "list", keywords: "plan review approve /plan-review", run: inTerminal("/plan-review") }, live);
+  add({ id: "computer-status", group: "Autonomy", label: "Computer use: check status and permissions", icon: "monitor", keywords: "computer use desktop control screenshots input permission /computer", run: page("integrations") }, live);
+  add({ id: "computer-on", group: "Autonomy", label: "Computer use: turn on", icon: "monitor", keywords: "computer use desktop control enable /computer", run: page("integrations") }, live);
+  add({ id: "computer-off", group: "Autonomy", label: "Computer use: turn off", icon: "monitor", keywords: "computer use desktop control disable /computer", run: page("integrations") }, live);
+  add({ id: "learn", group: "Learning", label: "Learning panel", icon: "activity", keywords: "learn train self improvement versions rollback jobs /learn", run: inTerminal("/learn panel") }, live);
+  add({ id: "learn-status", group: "Learning", label: "Learning status", icon: "activity", keywords: "learn status jobs cycle /learn", run: () => { ui.settingsOpen = false; void learningStatus(); } }, live);
+  add({ id: "understanding", group: "Learning", label: "How this project fits together", icon: "brain", keywords: "understanding architecture components map /understanding", run: () => void understandingView() }, live);
+  add({ id: "understanding-build", group: "Learning", label: "Build the project understanding", icon: "brain", keywords: "understanding build index notes /understanding", run: inTerminal("/understanding build") }, live);
+  add({ id: "experience", group: "Learning", label: "Learned recipes and failures", icon: "list", keywords: "experience ledger recipes failures /experience", run: () => void experienceView() }, live);
+  add({ id: "autoresearch", group: "Learning", label: "Benchmark experiments (autoresearch)", icon: "activity", keywords: "autoresearch experiments branch benchmark /autoresearch", run: inTerminal("/autoresearch status") }, live);
+  add({ id: "learn-candidates", group: "Learning", label: "Learned versions and candidates to evaluate", icon: "activity", keywords: "learn research candidate evaluate promote version held-out", run: () => { ui.settingsOpen = false; void learningStatus(); } }, live);
+  add({ id: "workers-list", group: "Autonomy", label: "Workers: status and cancel", icon: "chip", keywords: "workers agents subagents tasks cancel stop /workers /cancel", run: () => { ui.settingsOpen = false; runTyped(snap, "workers", "", []); } }, live);
+  add({ id: "worker-start", group: "Autonomy", label: "Start a worker…", icon: "chip", keywords: "worker spawn delegate parallel task /worker", run: startTyping("/worker ") }, live);
+  add({ id: "benchmark-open", group: "Learning", label: "Open Benchmarks", icon: "activity", keywords: "benchmark suite agents compare results /benchmark", run: () => runTyped(snap, "benchmark", "open", []) }, live);
+  add({ id: "benchmark-status", group: "Learning", label: "Benchmark status", icon: "activity", keywords: "benchmark status running /benchmark", run: () => runTyped(snap, "benchmark", "status", []) }, live);
+  add({ id: "benchmark-stop", group: "Learning", label: "Stop the benchmark", icon: "stop", keywords: "benchmark stop cancel /benchmark", run: () => runTyped(snap, "benchmark", "stop", []) }, live);
+  add({ id: "health", group: "App", label: "Health & setup", icon: "shield", keywords: "doctor setup install capability language server voice path terminal /doctor /setup", run: page("health") });
+  add({ id: "maintenance", group: "App", label: "Storage & running processes", icon: "chip", keywords: "storage disk clean gc cache images purge processes ps stop compute rules /gc /images /compute", run: page("maintenance") });
   add({
     id: "updates",
     group: "App",
@@ -293,7 +350,7 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
     group: "General",
     keys: [
       ["⌘K", "Command palette"],
-      ["⌘/Ctrl+P", "Quick-open project file"],
+      ["⌘P", "Quick-open project file"],
       ["⌘N", "New session"],
       ["⌘,", "Settings"],
       ["⌘/", "Keyboard shortcuts"],
@@ -312,24 +369,26 @@ export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
       ["Enter", "Send (while Dial works: add a note)"],
       ["⇧Enter", "New line"],
       ["⌥⌘↑ / ⌥⌘↓", "Previous / next prompt you sent"],
-      ["⌘/Ctrl+Enter", "Queue a follow-up during a turn"],
+      ["⌘Enter", "Queue a follow-up during a turn"],
       ["@", "Find and insert a project file path"],
       ["⌘F", "Find in conversation"],
       ["↑  ↓", "Earlier prompts (in an empty box)"],
-      ["Esc", "Stop the turn"],
+      ["Esc", "Stop the turn (an open menu closes first; not from the terminal or other fields)"],
       ["⇧⌘M", "Change model"],
       ["⇧⌘V", "Voice: start talking, stop recording, or interrupt a spoken reply"],
       ["/", "Slash commands"],
+      ["Enter  ⌘⌫", "Approval card: allow once (Allow has focus) / deny"],
     ],
   },
   {
     group: "Sessions",
     keys: [
       ["⌘-click  ⇧-click", "Select several"],
-      ["⌘A", "Select all (with a selection)"],
-      ["⌫", "Delete the selected"],
-      ["⌘1 … ⌘9", "Open a session by position (hold ⌘ to see numbers)"],
-      ["⇧⌘[  ⇧⌘]", "Previous or next session (also ⌃⇧Tab, ⌃Tab)"],
+      ["⌘A", "Select all (in the session list with a selection)"],
+      ["⌫", "Move selected to Recently Deleted"],
+      ["⌘1 … ⌘9", "Open a session by position (hold the modifier to see numbers)"],
+      ["⇧⌘[  ⇧⌘]", "Previous or next session"],
+      ["⌃⇧Tab  ⌃Tab", "Cycle sessions backward or forward"],
       ["⇧⌘F", "Search sessions (Esc clears)"],
       ["F2  double-click", "Rename"],
       ["Right-click", "Session actions"],

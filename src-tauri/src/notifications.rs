@@ -1,7 +1,7 @@
 //! Opt-in native session alerts. The OS sees generic text, never prompts or project names.
 use crate::tabs::{NoticeKind, SessionNotice};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(not(target_os = "windows"))]
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -10,18 +10,35 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const LIFETIME: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
-pub struct Notifications(AtomicBool);
+pub struct Notifications(AtomicU8);
+
+fn flag(kind: NoticeKind) -> u8 {
+    match kind {
+        NoticeKind::Approval => 1,
+        NoticeKind::Question => 2,
+        NoticeKind::Finished => 4,
+    }
+}
 
 #[tauri::command]
 pub async fn set_notifications(
     state: State<'_, Notifications>,
     enabled: bool,
     interactive: bool,
+    approval: bool,
+    question: bool,
+    finished: bool,
 ) -> Result<(), String> {
     if enabled {
         authorize(interactive).await?;
     }
-    state.0.store(enabled, Ordering::Relaxed);
+    let mut mask = 0;
+    if enabled {
+        for (on, kind) in [(approval, NoticeKind::Approval), (question, NoticeKind::Question), (finished, NoticeKind::Finished)] {
+            if on { mask |= flag(kind); }
+        }
+    }
+    state.0.store(mask, Ordering::Relaxed);
     Ok(())
 }
 
@@ -84,7 +101,7 @@ pub async fn type_reminder(
 }
 
 pub fn publish(app: &AppHandle, workspace_root: &str, notices: Vec<SessionNotice>) {
-    if notices.is_empty() || !app.state::<Notifications>().0.load(Ordering::Relaxed) {
+    if notices.is_empty() || app.state::<Notifications>().0.load(Ordering::Relaxed) == 0 {
         return;
     }
     let app = app.clone();
@@ -97,6 +114,9 @@ pub fn publish(app: &AppHandle, workspace_root: &str, notices: Vec<SessionNotice
             return;
         }
         for notice in notices {
+            if app.state::<Notifications>().0.load(Ordering::Relaxed) & flag(notice.kind) == 0 {
+                continue;
+            }
             let body = match notice.kind {
                 NoticeKind::Approval => "A session needs your approval.",
                 NoticeKind::Question => "A session has a question for you.",

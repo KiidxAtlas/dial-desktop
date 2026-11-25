@@ -15,6 +15,7 @@ use super::{
 pub(crate) mod inventory;
 mod shutdown;
 pub(crate) mod ssh;
+mod readiness;
 mod ssh_setup;
 mod vbox;
 mod vmware;
@@ -125,6 +126,8 @@ pub(crate) struct VmList {
     inventory: inventory::Inventory,
     ssh_links: std::collections::BTreeMap<String, ssh::SshLink>,
     ssh_hosts: Vec<String>,
+    /// What each provider still needs before Dial can open its console.
+    readiness: Vec<readiness::Check>,
 }
 
 #[tauri::command]
@@ -149,10 +152,12 @@ pub(crate) async fn app_runner_vms(
             })
             .collect();
         active_project(&app, &workspace_root)?;
+        let readiness = readiness::readiness(&inventory);
         Ok(VmList {
             inventory,
             ssh_links,
             ssh_hosts: aliases,
+            readiness,
         })
     })
     .await

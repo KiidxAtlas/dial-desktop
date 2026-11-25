@@ -473,6 +473,8 @@ impl AppRunner {
         open_terminal: bool,
     ) -> Result<SetupDone, AppRunError> {
         let fail = |m: &str| AppRunError::new("ssh_setup_failed", m);
+        // Forget a cancel left from an earlier setup of this run.
+        crate::app::ssh_setup_cancelled(run_id);
         if !valid_user(user) {
             return Err(fail("Enter the user name you log in with inside the VM (letters, digits, . _ -)."));
         }
@@ -534,10 +536,16 @@ impl AppRunner {
         actions.push(Action::Type { text: command });
         self.user_actions(workspace, run_id, &actions)?;
 
-        // 4. Wait until SSH answers with the key.
+        // 4. Wait until SSH answers with the key, or the user cancels or disconnects.
         let deadline = Instant::now() + READY_TIMEOUT;
         let mut reported = None;
         let (address, port) = loop {
+            if crate::app::ssh_setup_cancelled(run_id) || self.table().exact(workspace, run_id).is_err() {
+                return Err(AppRunError::new(
+                    "ssh_setup_cancelled",
+                    "SSH setup was cancelled. The command may still finish in the VM; press Set up SSH again to link it.",
+                ));
+            }
             if reported.is_none() {
                 reported = listener.as_ref().and_then(ReportListener::poll);
             }

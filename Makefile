@@ -16,7 +16,7 @@ APP_ARGS = $(if $(DIAL),--dial $(DIAL)) $(DIR) $(if $(ARGS),-- $(ARGS))
 DEBUG_BIN = target/debug/dial-desktop
 
 .DEFAULT_GOAL := help
-.PHONY: help install run preview preview-empty preview-question app open release test check clean
+.PHONY: help install run preview preview-empty preview-question preview-ui app open release test check clean
 
 help: ## Show the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-17s %s\n", $$1, $$2}'
@@ -38,6 +38,9 @@ preview-empty: node_modules ## Design preview of an empty session
 
 preview-question: node_modules ## Design preview waiting on a question
 	npm run dev -- -- -- --preview=question $(or $(DIR),$(CURDIR))
+
+preview-ui: node_modules ## The design preview in a browser, any state and width (no Tauri build)
+	npm run preview:ui
 
 app: node_modules ## Build the debug app (no bundle)
 	node packaging/macos-guest/tauri.mjs build --debug --no-bundle

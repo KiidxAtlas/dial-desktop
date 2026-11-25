@@ -26,6 +26,7 @@ use crate::browser::{self, Browser};
 
 #[cfg(target_os = "macos")]
 mod screenshot;
+mod desktop;
 #[cfg(test)]
 mod tests;
 
@@ -114,9 +115,16 @@ VM, run shell commands and read files in that VM with the ssh tool (host ssh.hos
 typing into its screen; keep frame and input for graphical apps. If setup or project files are \
 missing, explain what is needed. Never download a guest or launch the app on the host as a \
 fallback. Ordinary non-GUI build and test commands are unchanged. The types_* tools keep the \
-user's Types: saved collections (a cookbook, a routine, a moodboard, a decider) that Dial Desktop \
-opens as their own small apps. When the user wants to keep something the conversation produced, \
-check types_list, save it with types_add_item, and offer types_create for a fitting new Type.";
+user's Types: things they keep (recipes, cities, books, scores) that Dial Desktop opens as small \
+web apps you build for them: a cookbook, a live weather app, a bookshelf, a game. When the user \
+wants to keep something the conversation produced, check types_list and save it with \
+types_add_item, or offer types_create for a fitting new Type. Read types_guide before building \
+an app, and look at every change with types_screenshot and types_run. The desktop_* tools are \
+Dial Desktop itself: desktop_view shows what the window shows (add screenshot for a picture), \
+desktop_commands lists every palette action (sessions, panels, settings pages, theme, zoom, \
+projects) and desktop_run runs one; desktop_settings reads Dial's settings and \
+desktop_set_setting changes one, except permission and credential settings, which stay the \
+user's. Use them when the user asks you to show, open, switch or change something in the app.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -265,6 +273,7 @@ pub fn tools() -> Value {
         ),
     ]);
     if let Value::Array(items) = &mut list {
+        items.extend(desktop::tools());
         items.extend(crate::types::tools());
     }
     list
@@ -829,6 +838,9 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
                 let store = app.state::<crate::types::Store>();
                 return crate::types::agent_call(app, &store, tool, args).map(Reply::text);
             }
+            if desktop::TOOLS.contains(&tool) {
+                return desktop::call(app, tool, args);
+            }
             let _ = app.emit(
                 "agent-browser",
                 json!({"kind": "activity", "text": describe_call(tool, args), "busy": true}),
@@ -1143,18 +1155,25 @@ fn capture(_app: &AppHandle) -> Result<Reply, String> {
 fn capture_type(app: &AppHandle, args: &Value) -> Result<Reply, String> {
     use base64::Engine;
     let id = app.state::<crate::types::Store>().find(string_arg(args, "type")?)?;
+    crate::types::live::wait_loaded(app, &id, Duration::from_secs(10))?;
+    // Let web fonts, images and entrance animations settle.
+    thread::sleep(Duration::from_millis(400));
     let view = app.get_webview("main").ok_or("The Dial window is not open")?;
     let png = screenshot::capture_type(&view, &id)?;
+    crate::types::progress(app, &id, json!({"checked": true}));
     Ok(Reply {
         ok: true,
-        text: format!("Screenshot of Type {id}"),
+        text: format!(
+            "Screenshot of Type {id}'s app.\n{}",
+            crate::types::live::console(app, &id, false)
+        ),
         image: Some(base64::engine::general_purpose::STANDARD.encode(png)),
     })
 }
 
 #[cfg(not(target_os = "macos"))]
 fn capture_type(_app: &AppHandle, _args: &Value) -> Result<Reply, String> {
-    Err("Type screenshots are currently supported on macOS only".into())
+    Err("Type screenshots are supported on macOS only; inspect the app with types_run instead (read the DOM, sizes and computed styles)".into())
 }
 
 /// The `mcp.dial_desktop` entry that runs `exe` as the bridge, as a TOML inline table.

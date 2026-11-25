@@ -49,9 +49,3 @@ export function viewImage(path: string) {
       : path;
   viewedImage.value = { path: shown, absolute, root };
 }
-
-/** Open a saved Type asset image in the lightbox (works for both app-scoped and project-scoped Types). */
-export function viewTypeImage(absolute: string, label?: string) {
-  const name = label?.trim() || absolute.split(/[\\/]/).pop() || absolute;
-  viewedImage.value = { path: name, absolute, root: null, asset: true };
-}

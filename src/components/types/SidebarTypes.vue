@@ -86,21 +86,22 @@ function menu(event: MouseEvent, t: Summary) {
   <section class="types" aria-label="Types">
     <div class="head">
       <button class="fold" :aria-expanded="open" @click="toggle">
-        <Icon :name="open ? 'chevronDown' : 'chevronRight'" :size="11" />
         Types
+        <Icon :name="open ? 'chevronDown' : 'chevronRight'" :size="11" />
       </button>
       <button class="add" title="New type" aria-label="New type" @click="startNaming()">
         <Icon name="plus" :size="13" />
       </button>
     </div>
     <div v-if="open" class="rows">
+      <button v-if="types.listError" class="row" @click="refreshTypes">Couldn’t load Types · Retry</button>
       <div v-if="naming && !naming.id" class="row naming">
         <span class="glyph">✦</span>
         <input ref="field" class="name-field" placeholder="Name it — Cookbook, Routine…" aria-label="Type name" maxlength="60" :disabled="busy" @keydown="onKey" @blur="finishNaming" />
       </div>
-      <button v-else-if="types.loaded && !types.list.length" class="row hint" @click="startNaming()">
+      <button v-else-if="types.loaded && !types.list.length" class="row hint" title="Keep things in a place of their own: a cookbook, a routine, a reading list…" @click="startNaming()">
         <span class="glyph">✦</span>
-        <span class="truncate">New type — a cookbook, a routine…</span>
+        <span class="truncate">New type…</span>
       </button>
       <template v-for="t in types.list" :key="t.id">
         <div v-if="naming?.id === t.id" class="row naming">
@@ -134,7 +135,9 @@ function menu(event: MouseEvent, t: Summary) {
   display: flex;
   align-items: center;
   height: 24px;
-  padding: 0 4px 0 6px;
+  /* The heading text lines up with the Pinned and Recents labels (10px in); the fold chevron
+     follows the word instead of pushing it right. */
+  padding: 0 4px 0 10px;
 }
 .fold {
   flex: 1;

@@ -56,6 +56,11 @@ pub(in crate::app_runner) struct Console {
     viewer: rfb::Viewer,
 }
 
+/// Whether the VM's `.vmx` declares the loopback VNC console Dial connects to. Read-only.
+pub(super) fn vnc_ready(locator: &str) -> Result<(), String> {
+    vmx::load(Path::new(locator)).map(|_| ())
+}
+
 impl Console {
     /// Connect to the console of one inventoried VM. Refuses unless the VM's `.vmx` enables VNC,
     /// the VNC port is bound to loopback, and the listener belongs to that VM's process.

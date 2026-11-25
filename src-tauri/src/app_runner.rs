@@ -546,6 +546,10 @@ impl AppRunner {
         }
     }
 
+    pub(crate) fn open_count(&self) -> usize {
+        self.table().entries().count()
+    }
+
     /// Stop every run (called when the app exits).
     pub fn stop_all(&self) {
         let runs = self.table().drain();

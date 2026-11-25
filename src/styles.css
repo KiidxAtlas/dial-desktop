@@ -48,7 +48,7 @@
   --focus-border: rgb(31 30 29 / 28%);
   --text: #1f1e1d;
   --text-muted: #57564f;
-  --text-faint: #8a8880;
+  --text-faint: #6b6962;
   --text-strong: #000000;
   --accent: #c96442;
   --accent-hover: #b5583a;
@@ -91,7 +91,11 @@
     monospace;
   --text-xs: 11px;
   --text-sm: 12.5px;
+  --text-base: 13px; /* buttons, inputs, group headings */
+  --text-ui: 13.5px; /* setting labels, list rows */
   --text-md: 14px;
+  --text-lg: 16px; /* figures in stat tiles */
+  --text-title: 26px; /* Settings page titles */
   --text-mono: 12.5px;
 
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -122,6 +126,30 @@
    Full screen has no window buttons, so nothing is reserved there (App.vue). */
 .mac.no-sidebar:not(.fullscreen) .topbar {
   padding-left: 84px;
+}
+
+/* Below the space needed for an inspector and a conversation side by side, open the panel
+   below the title bar. Its toggle stays accessible and saved wide-screen widths stay intact. */
+@media (max-width: 799px) {
+  .shell { --sidebar-width: 208px; }
+  .shell > .inspector,
+  .shell > .inspector.wide-review {
+    position: absolute;
+    inset: var(--topbar) 0 0 auto;
+    width: min(460px, 92vw);
+    z-index: 8;
+    box-shadow: -8px 4px 24px rgb(0 0 0 / 16%);
+  }
+  .shell > .inspector > .resize { display: none; }
+  .shell > .main > .disconnect { flex-wrap: wrap; }
+  .shell > .main > .disconnect .disconnect-text { min-width: 50%; }
+}
+
+/* Settings already has its own navigation. Don't squeeze its forms between two sidebars. */
+@media (max-width: 960px) {
+  .shell:has(> .settings) > .sidebar { display: none; }
+  .shell.mac:not(.fullscreen) > .settings .head { padding-left: 84px; }
+  .shell > .settings .nav, .welcome-settings > .settings .nav { width: 170px; }
 }
 
 * {
@@ -232,7 +260,7 @@ kbd {
   height: 30px;
   padding: 0 var(--space-md);
   border-radius: var(--radius-sm);
-  font-size: 13px;
+  font-size: var(--text-base);
   font-weight: 500;
   white-space: nowrap;
   transition:

@@ -13,8 +13,9 @@ Opens the Dial desktop app on WORKSPACE. Without one it uses the current directo
 from a project in a terminal, else the most recently opened folder, else it asks for a folder.
 
 Options:
-  --dial PATH         Dial engine binary (default: $DIAL_BIN, else the selected Desktop copy,
-                      else `dial` on PATH or in the usual installation folders)
+  --dial PATH         Dial engine binary (default: $DIAL_BIN, else the engine chosen in
+                      Settings › Updates, else the selected Desktop copy, else `dial` on
+                      PATH or in the usual installation folders)
   --preview[=KIND]    Show the design preview without an engine; KIND is `session` (default),
                       `question` or `empty`
   -h, --help          Show this help

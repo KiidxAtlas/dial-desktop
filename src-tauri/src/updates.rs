@@ -102,6 +102,39 @@ pub fn classify_failure(error: &str) -> EngineProblem {
     }
 }
 
+/// The next step for a connect error whose cause the operating system named: the engine file
+/// exists but may not or cannot run. `None` when the error text does not say. `windows` picks
+/// that platform's error codes, which mean other things elsewhere.
+pub fn failure_hint(error: &str, windows: bool) -> Option<&'static str> {
+    let lower = error.to_ascii_lowercase();
+    if !lower.starts_with("could not start") {
+        return None;
+    }
+    let code = |n: u32| lower.contains(&format!("(os error {n})"));
+    let blocked = lower.contains("application control policy")
+        || lower.contains("blocked by group policy")
+        || (windows && (code(4551) || code(1260)));
+    let foreign = lower.contains("not a valid win32 application")
+        || lower.contains("exec format error")
+        || lower.contains("bad cpu type")
+        || if windows { code(193) || code(216) } else { code(8) || code(86) };
+    let elevation = lower.contains("requires elevation") || (windows && code(740));
+    let denied = lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || if windows { code(5) } else { code(13) };
+    if blocked {
+        Some("Windows blocked this engine before it could run (Smart App Control or an application control policy). Install the signed release in Settings → Updates, or ask whoever manages this computer to allow it.")
+    } else if foreign {
+        Some("This engine was built for a different kind of computer. Install the one for this computer in Settings → Updates.")
+    } else if elevation {
+        Some("This engine asks for administrator rights, which Dial never uses. Choose another engine in Settings → Updates.")
+    } else if denied {
+        Some("The system refused to run the engine file. Check that it is allowed to run, or install a fresh copy in Settings → Updates.")
+    } else {
+        None
+    }
+}
+
 /// Fold the outcome of `dial update --check --json` into what the UI shows.
 pub fn parse_check(outcome: Result<RunOutput, String>) -> EngineUpdateView {
     let output = match outcome {
@@ -195,9 +228,9 @@ fn install_separate(
         .map_err(|e| e.to_string())?;
     let log = install(directory.path())?;
     let binary = directory.path().join(DIAL_NAME);
-    if !binary.is_file() {
+    if !crate::launcher::is_executable(&binary) {
         return Err(format!(
-            "The installer did not create {}.\n{log}",
+            "The installer did not create an executable at {}.\n{log}",
             binary.display()
         ));
     }

@@ -779,8 +779,8 @@ dependencies = [
 
 [[package]]
 name = "dial-client"
-version = "0.3.10"
-source = "git+https://github.com/KiidxAtlas/dial.git?rev=f5bf3d77c21c05325f4d0e8526b881a96338659d#f5bf3d77c21c05325f4d0e8526b881a96338659d"
+version = "0.3.17"
+source = "git+https://github.com/KiidxAtlas/dial.git?rev=ec9cc3c29eee54a36d9ac324d95522a04136bb28#ec9cc3c29eee54a36d9ac324d95522a04136bb28"
 dependencies = [
  "dial-protocol",
  "serde_json",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "dial-desktop"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "base64 0.23.1",
  "block2",
@@ -822,8 +822,8 @@ dependencies = [
 
 [[package]]
 name = "dial-protocol"
-version = "0.3.10"
-source = "git+https://github.com/KiidxAtlas/dial.git?rev=f5bf3d77c21c05325f4d0e8526b881a96338659d#f5bf3d77c21c05325f4d0e8526b881a96338659d"
+version = "0.3.17"
+source = "git+https://github.com/KiidxAtlas/dial.git?rev=ec9cc3c29eee54a36d9ac324d95522a04136bb28#ec9cc3c29eee54a36d9ac324d95522a04136bb28"
 
 [[package]]
 name = "digest"

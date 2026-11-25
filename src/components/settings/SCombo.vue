@@ -193,7 +193,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", outside, true));
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--text-base);
 }
 .list {
   max-height: 300px;
@@ -202,7 +202,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", outside, true));
 }
 .heading {
   padding: 8px 8px 4px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
   color: var(--text-faint);
 }
@@ -214,7 +214,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", outside, true));
   min-height: 30px;
   padding: 0 8px;
   border-radius: 6px;
-  font-size: 13px;
+  font-size: var(--text-base);
   color: var(--text);
   text-align: left;
 }

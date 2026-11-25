@@ -1,7 +1,7 @@
 //! Native file-manager copies, for paste events that expose no DOM files. Never parse clipboard
 //! text as paths or take ownership of the clipboard data.
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, unix, test))]
 fn read_list(
     count: usize,
     path_at: impl FnMut(usize) -> Result<String, String>,
@@ -124,14 +124,69 @@ pub(crate) fn read() -> Result<Vec<String>, String> {
     })
 }
 
+/// Linux file managers put copied files on the clipboard as a `text/uri-list` target (not as
+/// plain text). Read that target through the session's clipboard tool; none installed, or no
+/// file list on the clipboard, is simply "no files".
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn read() -> Result<Vec<String>, String> {
+    use std::process::Command;
+    use std::time::Duration;
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let mut tools: Vec<(&str, &[&str])> = vec![
+        ("wl-paste", &["--no-newline", "--type", "text/uri-list"]),
+        ("xclip", &["-selection", "clipboard", "-t", "text/uri-list", "-o"]),
+    ];
+    if !wayland {
+        tools.reverse();
+    }
+    for (tool, args) in tools {
+        let out = crate::launcher::run_with_timeout(Command::new(tool).args(args), Duration::from_secs(2));
+        if let Some(out) = out {
+            let paths = uri_list_paths(&String::from_utf8_lossy(&out));
+            return read_list(paths.len(), |index| Ok(paths[index].clone()));
+        }
+    }
     Ok(Vec::new())
+}
+
+/// The local absolute paths in a `text/uri-list` (RFC 2483): `file://` URIs with an empty or
+/// `localhost` host, percent-decoded. Comments, other schemes and remote hosts are skipped.
+#[cfg(any(test, not(any(windows, target_os = "macos"))))]
+fn uri_list_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("file://")?;
+            let path = rest.strip_prefix("localhost").filter(|p| p.starts_with('/')).unwrap_or(rest);
+            if !path.starts_with('/') {
+                return None;
+            }
+            let bytes = path.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    let hex = path.get(i + 1..i + 3)?;
+                    out.push(u8::from_str_radix(hex, 16).ok()?);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8(out).ok().filter(|p| !p.contains('\0'))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::read_list;
+    #[test]
+    fn uri_lists_yield_only_local_file_paths() {
+        let text = "# copied\r\nfile:///home/a/My%20File.png\r\nfile://localhost/tmp/x\nfile://server/share/y\nhttps://example.com/z\nfile:///bad%zz\n/plain/text\n";
+        assert_eq!(super::uri_list_paths(text), ["/home/a/My File.png", "/tmp/x"]);
+    }
+
 
     #[test]
     fn excess_files_are_rejected_before_reading_any_paths() {

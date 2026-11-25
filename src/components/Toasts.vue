@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { dismissToast, holdToast, releaseToast, toasts } from "../bridge";
+import { dismissToast, holdToast, releaseToast, runToastAction, toasts } from "../bridge";
 import Icon from "./Icon.vue";
 
 /** The colour a message reads as: problems red, confirmations green, the rest neutral. */
@@ -24,6 +24,7 @@ function tone(message: string) {
       >
         <span class="dot" />
         <span class="message">{{ t.message }}</span>
+        <button v-if="t.action" class="action" @click="runToastAction(t.id)">{{ t.action.label }}</button>
         <button class="close" aria-label="Dismiss" title="Dismiss" @click="dismissToast(t.id)">
           <Icon name="cross" :size="12" />
         </button>
@@ -77,6 +78,17 @@ function tone(message: string) {
   flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+.action {
+  flex: none;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-weight: 600;
+}
+.action:hover,
+.action:focus-visible {
+  background: var(--hover);
 }
 .close {
   display: grid;

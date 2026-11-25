@@ -36,7 +36,7 @@ function openUpdates() {
     <span class="truncate" :title="updates.appStatus || text">{{ updates.appStatus || (busy ? "Updating…" : text) }}</span>
     <button class="link" :disabled="busy" @click="update">{{ updates.app ? updates.appAction : "Update" }}</button>
     <button class="link muted" @click="openUpdates">Details</button>
-    <button class="close" aria-label="Hide until the next release" @click="updates.dismissed = bannerKey()">
+    <button class="close" title="Hide until the next release" aria-label="Hide until the next release" @click="updates.dismissed = bannerKey()">
       <Icon name="cross" :size="12" />
     </button>
   </div>

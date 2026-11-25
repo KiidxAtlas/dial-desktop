@@ -1,13 +1,30 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
+import { models } from "../bridge";
+import { needsModelSetup } from "../setupState";
 import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes";
 import Logo from "./Logo.vue";
+import Icon from "./Icon.vue";
 import { ui } from "../ui";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
 const enabled = computed(() => canUseTaskRecipes(props.snap));
+
+/** Dismissing setup for one project should not hide onboarding in a new one. */
+const dismissalKey = computed(() => `dial.setupCardDismissed:${props.snap.workspace.root}`);
+const dismissed = ref(false);
+watch(dismissalKey, (key) => { dismissed.value = localStorage.getItem(key) === "1"; }, { immediate: true });
+const setup = computed(() => !dismissed.value && needsModelSetup(props.snap.connection.state === "live", props.snap.model, models.value));
+function dismiss() {
+  dismissed.value = true;
+  localStorage.setItem(dismissalKey.value, "1");
+}
+function providers() {
+  ui.settingsTab = "providers";
+  ui.settingsOpen = true;
+}
 </script>
 
 <template>
@@ -15,6 +32,17 @@ const enabled = computed(() => canUseTaskRecipes(props.snap));
     <div class="hero">
       <h2><Logo :size="30" /> {{ snap.workspace.name }}</h2>
       <p class="mono">{{ snap.workspace.display }}</p>
+    </div>
+    <div v-if="setup" class="setup" role="region" aria-label="Finish setup">
+      <div class="setup-text">
+        <b>Finish setup</b>
+        <span>{{ snap.model ? `Couldn’t confirm setup for ${snap.model.label}. Check its provider or choose another model.` : 'Choose a model to start. Connect a provider if needed.' }}</span>
+      </div>
+      <div class="setup-actions">
+        <button class="btn btn-primary" @click="providers">Set up a provider</button>
+        <button class="btn btn-secondary" @click="ui.modelPickerOpen = true">Choose a model</button>
+        <button class="dismiss" title="Hide for this project" aria-label="Hide setup for this project" @click="dismiss"><Icon name="cross" :size="12" /></button>
+      </div>
     </div>
     <div class="chips">
       <button
@@ -63,11 +91,65 @@ h2 {
   color: var(--text);
   text-shadow: var(--hero-shadow);
 }
+/* The path and the shortcuts link sit on a soft glass pill: a text shadow alone leaves them
+   unreadable over a bright or busy background picture. */
 p {
   margin: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
   font-size: 12.5px;
+  color: var(--text-muted);
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  max-width: min(560px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.setup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  max-width: 560px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: rise 360ms var(--ease) both;
+}
+.setup-text {
+  display: flex;
+  flex: 1 1 240px;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.setup-text b {
+  font-weight: 600;
+  color: var(--text);
+}
+.setup-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dismiss {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   color: var(--text-faint);
-  text-shadow: var(--hero-shadow);
+}
+.dismiss:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 .chips {
   display: flex;
@@ -106,16 +188,15 @@ p {
   opacity: 0.45;
 }
 .tips {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px 16px;
-  max-width: 560px;
+  padding: 4px 12px;
+  border-radius: 999px;
   font-size: var(--text-xs);
   color: var(--text-muted);
-  opacity: 0.85;
-  text-shadow: var(--hero-shadow);
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   animation: rise 420ms 260ms var(--ease) both;
+  transition: color 120ms var(--ease), background 120ms var(--ease);
 }
-.tips:hover { color: var(--text); text-decoration: underline; }
+.tips:hover { color: var(--text); background: var(--hover); }
 </style>

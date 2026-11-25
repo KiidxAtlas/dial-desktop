@@ -1,6 +1,6 @@
 [package]
 name = "dial-desktop"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "MIT"
 description = "Native desktop interface for the Dial coding agent"
@@ -21,7 +21,7 @@ tauri-build = { version = "2", features = [] }
 # The only link to Dial: the versioned `dial rpc` wire protocol through its Rust client. Pinned to
 # a commit of Dial's main branch; bump `rev` deliberately. To develop against a local Dial checkout,
 # see "Developing against a local Dial" in README.md.
-dial-client = { git = "https://github.com/KiidxAtlas/dial.git", rev = "f5bf3d77c21c05325f4d0e8526b881a96338659d" }
+dial-client = { git = "https://github.com/KiidxAtlas/dial.git", rev = "ec9cc3c29eee54a36d9ac324d95522a04136bb28" }
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
@@ -38,9 +38,12 @@ portable-pty = "0.9"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
+# Signals to child processes (`scheduler::end`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The Browser panel's screenshot for the agent (`agent_browser::screenshot`): WebKit's own snapshot.
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 objc2 = "0.6"
 block2 = "0.6"
 mac-usernotifications = { version = "0.3.1", default-features = false }

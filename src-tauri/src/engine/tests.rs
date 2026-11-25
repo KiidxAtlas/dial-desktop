@@ -64,7 +64,7 @@ fn commands_map_to_documented_wire_requests() {
     assert_eq!(Command::Abort.request().1, "abort");
     assert_eq!(Command::Recover.request().1, "recovery_snapshot");
 
-    let (purpose, method, params) = Command::Steer("use the v2 API".into()).request();
+    let (purpose, method, params) = Command::Steer { text: "use the v2 API".into(), scope: None }.request();
     assert_eq!((purpose, method), (Purpose::Steer, "steer"));
     assert_eq!(params, json!({"text": "use the v2 API"}));
     // A retry is a turn, settled by its own reply.
@@ -76,6 +76,13 @@ fn commands_map_to_documented_wire_requests() {
         Command::Compact.request(),
         (Purpose::Compact, "compact", json!({"reason": "manual"}))
     );
+
+    // The file name picks the export format; the path goes through unchanged.
+    for (path, format) in [("notes/s1.md", "markdown"), ("s1.html", "html"), ("out/S1.HTM", "html"), ("s1", "markdown")] {
+        let (purpose, method, params) = Command::Export(path.into()).request();
+        assert_eq!((purpose, method), (Purpose::Export, "export"));
+        assert_eq!(params, json!({"format": format, "path": path}));
+    }
 }
 
 #[test]

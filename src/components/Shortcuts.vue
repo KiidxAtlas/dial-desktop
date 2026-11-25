@@ -2,7 +2,10 @@
 // The keyboard shortcuts sheet (⌘/).
 import { ui } from "../ui";
 import { SHORTCUTS } from "../commands";
+import { shortcutLabel } from "../keysGuard";
 import Icon from "./Icon.vue";
+
+const mac = navigator.platform.toLowerCase().includes("mac");
 
 function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") {
@@ -35,7 +38,7 @@ function onKey(event: KeyboardEvent) {
             <h3>{{ group.group }}</h3>
             <div v-for="[keys, what] in group.keys" :key="what" class="row">
               <span>{{ what }}</span>
-              <kbd>{{ keys }}</kbd>
+              <kbd>{{ shortcutLabel(keys, mac) }}</kbd>
             </div>
           </section>
         </div>

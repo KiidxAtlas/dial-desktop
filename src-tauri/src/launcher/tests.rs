@@ -1,5 +1,33 @@
 use super::*;
 
+fn write_engine(dir: &Path) {
+    let path = dir.join(DIAL_NAME);
+    std::fs::write(&path, b"test engine").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+fn private_state_never_uses_workspace_relative_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let config = root.path().join("config");
+    for (os, name, fallback) in [
+        ("linux", "dial-desktop", ".config"),
+        ("windows", "dev.dial.desktop", "AppData/Roaming"),
+    ] {
+        assert_eq!(app_dir_from(os, None, Some(&config)), Some(config.join(name)));
+        for bad in [Path::new(""), Path::new("relative")] {
+            assert_eq!(app_dir_from(os, Some(&home), Some(bad)), Some(home.join(fallback).join(name)));
+            assert_eq!(app_dir_from(os, Some(bad), Some(bad)), None);
+        }
+    }
+    assert_eq!(app_dir_from("macos", None, Some(&config)), None);
+}
+
 #[test]
 fn env_output_parses_nul_separated_pairs() {
     let out = b"PATH=/usr/bin:/bin\0ANTHROPIC_API_KEY=sk=1\0MULTI=a\nb\0junk\0\0";
@@ -70,17 +98,25 @@ fn dial_is_found_on_path_then_in_install_folders() {
     let local = root.join(".local/bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&local).unwrap();
-    std::fs::write(local.join("dial"), "").unwrap();
+    write_engine(&local);
+    #[cfg(unix)]
+    {
+        // A present but non-executable file on PATH must not shadow the fallback.
+        use std::os::unix::fs::PermissionsExt;
+        let plain = bin.join(DIAL_NAME);
+        std::fs::write(&plain, b"notes").unwrap();
+        std::fs::set_permissions(plain, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let path = std::env::join_paths([&bin]).unwrap();
 
     // Not on PATH: the ~/.local/bin fallback.
     assert_eq!(
         find_dial(None, Some(&path), Some(&root)),
-        local.join("dial")
+        local.join(DIAL_NAME)
     );
     // On PATH wins.
-    std::fs::write(bin.join("dial"), "").unwrap();
-    assert_eq!(find_dial(None, Some(&path), Some(&root)), bin.join("dial"));
+    write_engine(&bin);
+    assert_eq!(find_dial(None, Some(&path), Some(&root)), bin.join(DIAL_NAME));
     // Explicit wins over everything; an empty value is ignored.
     assert_eq!(
         find_dial(Some("/opt/x/dial".into()), Some(&path), Some(&root)),
@@ -88,9 +124,130 @@ fn dial_is_found_on_path_then_in_install_folders() {
     );
     assert_eq!(
         find_dial(Some("".into()), Some(&path), Some(&root)),
-        bin.join("dial")
+        bin.join(DIAL_NAME)
     );
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn engine_origin_names_the_rule_that_chose_it() {
+    let root = std::env::temp_dir().join(format!("dial-desktop-origin-{}", std::process::id()));
+    let bin = root.join("bin");
+    let local = root.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    write_engine(&local);
+    let path = std::env::join_paths([&bin]).unwrap();
+    let at = |flag: Option<&str>, env: Option<&str>| {
+        locate_dial(flag.map(Into::into), env.map(Into::into), None, Some(&path), Some(&root)).1
+    };
+
+    assert_eq!(at(None, None), EngineOrigin::Fallback);
+    write_engine(&bin);
+    assert_eq!(at(None, None), EngineOrigin::Path);
+    assert_eq!(at(None, Some("/opt/x/dial")), EngineOrigin::Env);
+    assert_eq!(at(Some("/opt/y/dial"), Some("/opt/x/dial")), EngineOrigin::Flag);
+    assert_eq!(at(Some(""), Some("")), EngineOrigin::Path);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn settings_choice_ranks_below_flag_and_env_but_above_the_usual_order() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let bin = home.join("bin");
+    let custom = home.join("custom");
+    let desktop = app_dir(Some(home)).unwrap();
+    let copy = desktop.join("engine-1");
+    for dir in [&bin, &custom, &copy] {
+        std::fs::create_dir_all(dir).unwrap();
+        write_engine(dir);
+    }
+    std::fs::write(desktop.join(ENGINE_SELECTION), "engine-1").unwrap();
+    let path = std::env::join_paths([&bin]).unwrap();
+    let picked = custom.join(DIAL_NAME);
+    let at = |flag: Option<&str>, env: Option<&str>, choice: Option<EngineChoice>| {
+        locate_dial(flag.map(Into::into), env.map(Into::into), choice.as_ref(), Some(&path), Some(home))
+    };
+    let custom_choice = || Some(EngineChoice::Custom { path: picked.clone() });
+
+    // The usual order: Desktop's copy, then PATH.
+    assert_eq!(at(None, None, None), (copy.join(DIAL_NAME), EngineOrigin::Desktop));
+    // A chosen binary beats Desktop's copy and PATH, but not DIAL_BIN or --dial.
+    assert_eq!(at(None, None, custom_choice()), (picked.clone(), EngineOrigin::Choice));
+    assert_eq!(at(None, Some("/opt/x/dial"), custom_choice()).1, EngineOrigin::Env);
+    assert_eq!(at(Some("/opt/y/dial"), None, custom_choice()).1, EngineOrigin::Flag);
+    // "Use the one on PATH" skips Desktop's copy; "Desktop's copy" is the usual first pick.
+    assert_eq!(at(None, None, Some(EngineChoice::Path)), (bin.join(DIAL_NAME), EngineOrigin::Path));
+    assert_eq!(at(None, None, Some(EngineChoice::Desktop)).1, EngineOrigin::Desktop);
+    assert_eq!(choice_ignored(custom_choice().as_ref(), EngineOrigin::Choice), None);
+    assert_eq!(choice_ignored(custom_choice().as_ref(), EngineOrigin::Env), None);
+
+    // A chosen binary that is gone falls back to the usual order, with a warning.
+    let gone = Some(EngineChoice::Custom { path: home.join("missing/dial") });
+    let (_, origin) = at(None, None, gone.clone());
+    assert_eq!(origin, EngineOrigin::Desktop);
+    assert!(choice_ignored(gone.as_ref(), origin).is_some());
+    // PATH asked for but empty: the usual order, with a warning.
+    let empty = std::env::join_paths([home.join("nothing")]).unwrap();
+    let origin = locate_dial(None, None, Some(&EngineChoice::Path), Some(&empty), Some(home)).1;
+    assert_eq!(origin, EngineOrigin::Desktop);
+    assert!(choice_ignored(Some(&EngineChoice::Path), origin).is_some());
+}
+
+#[test]
+fn engine_choice_round_trips_and_clears() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("app");
+    assert_eq!(load_choice(Some(&dir)), None);
+    for choice in [
+        EngineChoice::Custom { path: PathBuf::from("/opt/dial/bin/dial") },
+        EngineChoice::Path,
+        EngineChoice::Desktop,
+    ] {
+        save_choice(&dir, Some(&choice)).unwrap();
+        assert_eq!(load_choice(Some(&dir)), Some(choice));
+    }
+    // The file the UI writes through serde: `{"kind":"custom","path":…}`.
+    std::fs::write(dir.join(ENGINE_CHOICE), br#"{"kind":"custom","path":"/x/dial"}"#).unwrap();
+    assert_eq!(load_choice(Some(&dir)), Some(EngineChoice::Custom { path: "/x/dial".into() }));
+    std::fs::write(dir.join(ENGINE_CHOICE), b"not json").unwrap();
+    assert_eq!(load_choice(Some(&dir)), None);
+    save_choice(&dir, None).unwrap();
+    save_choice(&dir, None).unwrap();
+    assert!(!dir.join(ENGINE_CHOICE).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn engine_version_reads_the_first_line_or_says_why_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("dial");
+    std::fs::write(&script, "#!/bin/sh\necho\necho 'dial 9.9.9'\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(engine_version(&script).unwrap(), "dial 9.9.9");
+    std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+    assert!(engine_version(&script).unwrap_err().contains("exited"));
+    assert!(engine_version(&root.path().join("none")).unwrap_err().contains("not an executable"));
+}
+
+#[test]
+fn windows_fallbacks_never_search_unix_system_directories() {
+    assert!(fallback_dirs("windows").iter().all(|dir| dir.starts_with("~/")));
+    assert!(!fallback_dirs("linux").contains(&"/opt/homebrew/bin"));
+    assert!(fallback_dirs("macos").contains(&"/opt/homebrew/bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_probe_says_why() {
+    let failed = run_detailed(Command::new("/bin/sh").args(["-c", "exit 3"]), SHELL_TIMEOUT);
+    assert!(failed.unwrap_err().starts_with("exited with"));
+    let slow = run_detailed(Command::new("/bin/sh").args(["-c", "sleep 5"]), Duration::from_millis(100));
+    assert_eq!(slow.unwrap_err(), "timed out after 0 s");
+    let missing = run_detailed(&mut Command::new("/nonexistent/dial-probe"), SHELL_TIMEOUT);
+    assert!(missing.unwrap_err().starts_with("could not start"));
 }
 
 #[test]

@@ -1,34 +1,24 @@
-// Types: the user's saved collections, each opened as its own small app. Mirrors
-// `src-tauri/src/types.rs`; the Rust side owns the files and checks every value.
+// Types: things the user keeps, each opened as its own small web app that the agent builds.
+// Mirrors `src-tauri/src/types.rs`; the Rust side owns the files and checks every value.
 
 import { reactive } from "vue";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { engine, showToast, snapshot } from "./bridge";
+import { engine, showToast, snapshot, type ImageFile } from "./bridge";
 import { focusComposer, openMenu, ui, type MenuItem } from "./ui";
 import type { OpenSnapshot } from "./types";
-import {
-  isDone, occurrence, today, markdownImages,
-  type Field, type Fields, type Layout, type TypeView,
-} from "./typeExtract";
+import { markdownImages } from "./typeExtract";
 
-export type { Field, FieldKind, Fields, Layout, TypeView } from "./typeExtract";
+export type FieldKind =
+  | "text" | "longtext" | "markdown" | "list" | "steps" | "image" | "images"
+  | "time" | "date" | "datetime" | "number" | "url" | "tags" | "rating" | "toggle" | "json";
 
-export type Font = "sans" | "serif" | "mono" | "hand" | "display" | "rounded";
+export interface Field { key: string; label: string; kind: FieldKind }
 
-export type Texture = "none" | "paper" | "linen" | "grid" | "dots" | "noise";
+export type Fields = Record<string, unknown>;
 
 export type TypeScope = "app" | "project";
 export interface TypeLocation { saveIn: TypeScope; project: string | null }
-
-export interface Theme {
-  accent: string;
-  paper: string;
-  ink: string;
-  font: Font;
-  texture: Texture;
-  radius: number;
-}
 
 export interface TypeDef {
   version: number;
@@ -36,14 +26,11 @@ export interface TypeDef {
   name: string;
   description: string;
   icon: string;
+  accent: string;
   created: number;
   updated: number;
+  /** The keys items use; none for free-form items. */
   fields: Field[];
-  view: TypeView;
-  theme: Theme;
-  customHtml: string;
-  /** Dial has chosen its layout and look; a type named in the sidebar has not yet. */
-  designed: boolean;
   /** The type's own conversation per project: workspace root to session id. */
   sessions: Record<string, string>;
 }
@@ -56,8 +43,6 @@ export interface Item {
   updated: number;
   fields: Fields;
   done: boolean;
-  doneOn: string | null;
-  remind: boolean;
   source: Source | null;
 }
 
@@ -66,19 +51,20 @@ export interface Summary {
   name: string;
   icon: string;
   description: string;
-  layout: Layout;
   accent: string;
   count: number;
   updated: number;
-  designed: boolean;
+  /** The agent has built its app. */
+  hasApp: boolean;
   /** Kept with the app (every project sees it) or in the open project. */
   scope: TypeScope;
   sessions: string[];
 }
 
-export interface Full { def: TypeDef; items: Item[]; assets: string }
+/** A type without its app's HTML, which the `dialtype:` scheme serves to its frame. */
+export interface Full { def: TypeDef; hasApp: boolean; appVersion: string; items: Item[]; state: unknown; assets: string }
 
-export interface ItemPatch { fields?: Fields; done?: boolean; doneOn?: string; remind?: boolean }
+export interface ItemPatch { fields?: Fields; done?: boolean }
 
 export const typeApi = {
   list: () => invoke<Summary[]>("types_list"),
@@ -92,19 +78,34 @@ export const typeApi = {
     invoke<Item>("types_update_item", { id, itemId, patch, allowImport }),
   removeItem: (id: string, itemId: string) => invoke<void>("types_remove_item", { id, itemId }),
   moveItem: (id: string, itemId: string, to: number) => invoke<void>("types_move_item", { id, itemId, to }),
-  importImage: (id: string, path: string) => invoke<string>("types_import_image", { id, path }),
+  setState: (id: string, state: unknown) => invoke<void>("types_set_state", { id, state }),
   importImageData: (id: string, data: string) => invoke<string>("types_import_image_data", { id, data }),
   openAsset: (path: string) => invoke<void>("types_open_asset", { path }).catch((error) => showToast(String(error))),
-  allowReminders: () => invoke<void>("type_reminders_allow"),
+  allowNotifications: () => invoke<void>("type_reminders_allow"),
   location: () => invoke<TypeLocation>("types_location"),
   setLocation: (saveIn: TypeScope) => invoke<TypeLocation>("types_set_location", { saveIn }),
-  remind: (typeId: string, title: string, body: string) => invoke<void>("type_reminder", { typeId, title, body }),
+  notify: (typeId: string, title: string, body: string) => invoke<void>("type_reminder", { typeId, title, body }),
 };
+
+// Assets are named by their hash and never rewritten, so a path's image is read once.
+const assetCache = new Map<string, Promise<ImageFile>>();
+
+/** An image saved in a type, by absolute path, as something a page can show. */
+export function loadAsset(path: string): Promise<ImageFile> {
+  let load = assetCache.get(path);
+  if (!load) {
+    load = import("./bridge").then(({ files }) => files.readImage(path));
+    assetCache.set(path, load);
+    load.catch(() => assetCache.delete(path));
+  }
+  return load;
+}
 
 /** The sidebar's list, and a counter per type that views reload on. */
 export const types = reactive({
   list: [] as Summary[],
   loaded: false,
+  listError: false,
   revision: {} as Record<string, number>,
 });
 
@@ -115,13 +116,17 @@ let listVersion = 0;
 export async function refreshTypes() {
   if (!isTauri()) return;
   const version = ++listVersion;
+  types.listError = false;
   try {
     const list = await typeApi.list();
     if (version !== listVersion) return;
     types.list = list;
     types.loaded = true;
-    Object.assign(typeLocation, await typeApi.location());
+    const location = await typeApi.location();
+    if (version === listVersion) Object.assign(typeLocation, location);
   } catch (error) {
+    if (version !== listVersion) return;
+    types.listError = !types.loaded;
     showToast(`Could not load your types: ${error}`);
   }
 }
@@ -144,20 +149,25 @@ export async function setTypeLocation(saveIn: TypeScope) {
 // types in a row never races several new sessions. The session is claimed as the type's before
 // the first prompt goes out, so it never shows in the list as an ordinary one.
 
-/** Values reported by a successful agent types_update, after native normalization. */
-export interface DesignChoices {
-  layout?: { kind: Layout; style: string };
+/** What the agent has done so far while building a type's first app (`types::progress`). */
+export interface BuildSteps {
+  /** The labels of the fields it chose. */
   fields?: string[];
-  look?: Pick<Theme, 'font' | 'texture' | 'accent'>;
+  /** The app's size in KB, once written. */
+  app?: number;
+  /** Items saved. */
+  saved?: number;
+  /** It has looked at the app. */
+  checked?: boolean;
 }
-export type TypeChange = string | null | { id: string; choices: DesignChoices };
+export type TypeChange = string | null | { id: string; choices: BuildSteps };
 
 export const typeState = reactive({
   returnTo: null as string | null,
   /** The type whose new conversation is starting: the next session on screen is its own. */
   pending: null as string | null,
   /** First saves currently being handed to Dial, including the new type's session startup. */
-  firstSaves: new Map<string, DesignChoices>(),
+  firstSaves: new Map<string, BuildSteps>(),
 });
 
 
@@ -325,6 +335,7 @@ export async function sendInType(id: string, text: string, attachments: Paramete
 export function followTypeSession(root: string | undefined, id: string | null, previousRoot: string | undefined, previousId: string | null) {
   if (root !== previousRoot && isTauri()) {
     types.loaded = false;
+    types.list = [];
     void refreshTypes();
   }
   const open = ui.typeOpen;
@@ -338,7 +349,7 @@ export function followTypeSession(root: string | undefined, id: string | null, p
   if (typeState.pending === open) return;
   ui.typeOpen = null;
 }
-/** Make a type from its name. A first save supplies the design brief; no second prompt is needed. */
+/** Make a type from its name. A first save supplies what the app is for; no second prompt is needed. */
 export async function createType(name: string, save?: PendingSave): Promise<boolean> {
   try {
     if (save && (save.workspace !== snapshot.value?.workspace?.root || save.sessionId !== snapshot.value?.sessionId)) {
@@ -369,38 +380,9 @@ export async function deleteType(id: string): Promise<void> {
   await typeApi.remove(id);
   await refreshTypes();
   if (sessionId && snapshot.value?.sessionId !== sessionId) {
-    await invoke("delete_sessions", { sessionIds: [sessionId] }).catch(() => {});
+    await invoke("delete_sessions", { workspaceRoot: root, sessionIds: [sessionId] }).catch(() => {});
   }
 }
-/** The absolute path of asset `name` of a type. */
-export function assetPath(full: Full, name: unknown): string | null {
-  return typeof name === "string" && name ? `${full.assets.replace(/[\\/]+$/, "")}/${name}` : null;
-}
-
-/** Text of a field for a line of UI: lists joined, numbers as written. */
-export function fieldText(value: unknown): string {
-  if (Array.isArray(value)) return value.join(", ");
-  if (value === null || value === undefined) return "";
-  return String(value);
-}
-
-/** The title of an item: its title field, or its first text. */
-export function itemTitle(def: TypeDef, item: Item): string {
-  const key = def.view.titleField;
-  const title = key ? fieldText(item.fields[key]) : "";
-  if (title) return title;
-  const first = def.fields.find((f) => ["text", "longtext", "markdown"].includes(f.kind) && item.fields[f.key]);
-  return first ? fieldText(item.fields[first.key]).split("\n")[0].replace(/^#+\s*/, "").slice(0, 120) : "Untitled";
-}
-
-/** A 12- or 24-hour label for `HH:MM`, as the system shows times. */
-export function timeLabel(value: unknown): string {
-  const at = occurrence(value);
-  if (!at) return fieldText(value);
-  const full = /^\d{4}-/.test(String(value));
-  return at.toLocaleString(undefined, full ? { dateStyle: "medium", timeStyle: "short" } : { timeStyle: "short" });
-}
-
 export interface PendingSave {
   text: string;
   /** Absolute image paths the answer showed or produced. */
@@ -416,9 +398,9 @@ export function pendingSave(text: string, images: string[], workspace: string | 
 }
 
 /** What Dial is asked when an answer is saved to `def`. */
-function savePrompt(def: TypeDef, save: PendingSave): string {
+function savePrompt(def: TypeDef, hasApp: boolean, save: PendingSave): string {
   const lines = [
-    `Save this to “${def.name}”.${def.designed ? '' : ' Design it from this answer: choose the layout, fields and look. Apply choices with types_update as they are ready, then save the first item with types_add_item.'}`,
+    `Save this to “${def.name}”.${hasApp ? ' Save it with types_add_item; if the app does not show it well, improve the app and look at it again.' : ' This type has no app yet: choose its fields, save this as its first item with types_add_item, then build its app (types_guide) and look at it with types_screenshot.'}`,
     "",
     save.text.trim(),
   ];
@@ -439,8 +421,8 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
   }
   const root = snap.workspace.root;
   try {
-    const { def } = await typeApi.get(id);
-    const prompt = savePrompt(def, save);
+    const { def, hasApp } = await typeApi.get(id);
+    const prompt = savePrompt(def, hasApp, save);
     const session = def.sessions[root];
     if (session && session === snap.sessionId) {
       return await engine.send(prompt, [], { workspaceRoot: root, sessionId: session, typeId: def.id });
@@ -450,13 +432,13 @@ export async function saveTo(id: string, save: PendingSave): Promise<boolean> {
       showToast(`Dial is adding it to ${def.icon} ${def.name}`);
       return true;
     }
-    if (!def.designed) typeState.firstSaves.set(id, {});
+    if (!hasApp) typeState.firstSaves.set(id, {});
     try {
       await openType(id);
       if (ui.typeOpen !== id) return false;
       // The prompt names its type, so it is sent as it is.
       const sent = await sendInType(id, prompt);
-      if (sent && !def.designed && !(await typeApi.get(id)).items.length) {
+      if (sent && !hasApp && !(await typeApi.get(id)).items.length) {
         showToast(`No item was saved to ${def.name}. Open its Chat to see what happened.`);
         return false;
       }
@@ -486,63 +468,7 @@ export function saveMenu(event: MouseEvent, save: PendingSave, anchor?: HTMLElem
   openMenu(event, items, anchor, 'Save to a type');
 }
 
-// Reminders: while the app runs, items whose type has reminders on notify ahead of their time.
-
-const FIRED_KEY = "dial.type-reminders-fired";
-const TICK = 20_000;
-/** A reminder that comes due while the app sleeps still shows if it is this recent. */
-const LATE = 5 * 60_000;
-
-function firedToday(): Set<string> {
-  try {
-    const saved = JSON.parse(localStorage.getItem(FIRED_KEY) ?? "{}") as { day?: string; keys?: string[] };
-    return new Set(saved.day === today() ? saved.keys ?? [] : []);
-  } catch {
-    return new Set();
-  }
-}
-
-let reminderTypes: Full[] = [];
-
-async function loadReminderTypes() {
-  const out: Full[] = [];
-  for (const summary of types.list) {
-    if (summary.layout === "custom" || summary.count === 0) continue;
-    try {
-      const full = await typeApi.get(summary.id);
-      if (full.def.view.reminders && full.def.view.timeField) out.push(full);
-    } catch {
-      // A damaged type shows its own error when opened.
-    }
-  }
-  reminderTypes = out;
-}
-
-async function remindDue() {
-  const now = new Date();
-  const fired = firedToday();
-  let changed = false;
-  for (const { def, items } of reminderTypes) {
-    for (const item of items) {
-      if (!item.remind || isDone(item, def.view.dailyReset, now)) continue;
-      const at = occurrence(item.fields[def.view.timeField!], now);
-      if (!at) continue;
-      for (const lead of def.view.leadMinutes) {
-        const due = at.getTime() - lead * 60_000;
-        const key = `${def.id}/${item.id}/${at.getTime()}/${lead}`;
-        if (now.getTime() < due || now.getTime() - due > LATE || fired.has(key)) continue;
-        fired.add(key);
-        changed = true;
-        const title = itemTitle(def, item);
-        const body = lead === 0 ? `${title} — now` : `${title} in ${lead >= 60 && lead % 60 === 0 ? `${lead / 60} h` : `${lead} min`} (${timeLabel(item.fields[def.view.timeField!])})`;
-        typeApi.remind(def.id, `${def.icon} ${def.name}`, body).catch((error) => console.warn("reminder", error));
-      }
-    }
-  }
-  if (changed) localStorage.setItem(FIRED_KEY, JSON.stringify({ day: today(now), keys: [...fired] }));
-}
-
-/** Keep first-save decisions across navigation, but never create progress for another type. */
+/** Keep build progress across navigation, but never create progress for another type. */
 export function applyTypeChange(change: TypeChange) {
   const id = typeof change === 'object' && change !== null ? change.id : change;
   if (!id) return;
@@ -553,18 +479,14 @@ export function applyTypeChange(change: TypeChange) {
 
 let started = false;
 
-/** Load the list, follow changes from the agent and the views, and run reminders. */
+/** Load the list, and follow changes from the agent and the apps. */
 export async function startTypes() {
   if (started || !isTauri()) return;
   started = true;
   await listen<TypeChange>('types-changed', async ({ payload }) => {
     applyTypeChange(payload);
     await refreshTypes();
-    await loadReminderTypes();
   });
   await listen<string>("type-open", ({ payload }) => openType(payload));
   await refreshTypes();
-  await loadReminderTypes();
-  setInterval(() => void remindDue(), TICK);
-  void remindDue();
 }

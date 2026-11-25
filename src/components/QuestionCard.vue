@@ -44,9 +44,10 @@ function toggle(item: QuestionItem, label: string) {
   }
 }
 
+/** Whether `item` can be sent: a single choice needs a pick or text; "any that apply" may be none. */
 function done(item: QuestionItem) {
   const pick = picks[item.id];
-  return !!pick && (pick.selected.length > 0 || pick.custom.trim() !== "");
+  return !!pick && (item.multi || pick.selected.length > 0 || pick.custom.trim() !== "");
 }
 
 const canSubmit = computed(() => answerable.value && !sent.value && props.question.items.every(done));
@@ -121,6 +122,7 @@ function onKey(event: KeyboardEvent) {
             v-model="picks[item.id].custom"
             class="custom"
             type="text"
+            data-prose
             :disabled="sent"
             :aria-label="item.text"
             :placeholder="item.options.length ? 'Or type your own answer…' : 'Type your answer…'"

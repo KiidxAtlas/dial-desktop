@@ -57,16 +57,58 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 | `browser_eval(script)` | Run a function body (async; `await` works) and return JSON |
 | `browser_screenshot()` | PNG of the panel, returned as an MCP image block |
 | `app_desktop(action, runId?, frameSeq?, token?, actions?)` | Launch graphical apps in a configured private guest or a connected VM. `state` checks readiness; `start` opens the guest in the App panel; `frame` returns the screen and a token; `input` runs a batch of up to 64 actions (`click` with `count`, `double_click`, `move`, `drag`, `scroll`, `press` with combos like `ctrl+c`, `type` with whole strings, `wait`) on that frame with one token and replies with the screen after it, plus the next token. Agent access is the user's switch in the App panel. |
+| `desktop_view(screenshot?)` | What the Dial Desktop window shows, as JSON (project, session, model, approval mode, pending approvals, plan, changes, sessions, open panels and settings page, appearance, notices); `screenshot` adds a PNG of the window (macOS) |
+| `desktop_commands(query?)` | Every command-palette action available now, with ids; filtered like the palette |
+| `desktop_run(id)` | Run one palette action as if the user picked it; the user sees a "Dial: …" notice |
+| `desktop_settings(query?, tab?, changed?)` | Dial's settings as the Settings page shows them; credentials hidden |
+| `desktop_set_setting(key, value \| reset, scope?)` | Change or reset one setting (default scope: the layer that sets it, else `project`) |
 
 Reads, waits, scrolls and screenshots declare `readOnlyHint`, and the entry sets
 `trust_read_only_hint`, so they run without approval. Everything else follows the session's
 approval mode.
+
+### The app itself (`desktop_*`)
+
+The agent sees and works the app through the same lists the user does, so a new feature needs no
+separate agent wiring:
+
+- **Actions** are the command palette's (`src/commands.ts`), with the same availability rules.
+  `src/agentDesktop.ts` answers `window.__dialDesktop.call(...)`; the backend
+  (`agent_browser/desktop.rs`) runs that one fixed call in the main webview with JSON arguments,
+  never agent code. **To make a feature agent-controllable, give it a palette command.**
+- **Settings** come from the engine's settings reference, as on the Settings page.
+- **The user's alone:** approvals, Agent access, VM grants and provider sign-in are not palette
+  commands and are not reachable. Settings that govern the agent (`approval`, `sandbox`, `shell`,
+  `escalation`, `mcp`, `hooks`, `tools`, `providers`, `keys`, `secrets`, browser and image
+  `allow_*`, and any key naming a token, password or API key) are readable but refused by
+  `desktop_set_setting` (`desktop::protected`). Redacted values are never shown.
 
 ## What the user sees
 
 The panel opens on `browser_open` and shows each step. A "Dial: Clicking [4]" line sits above
 the page while a tool runs (`agent-browser` events, `workspace.agentActivity`). The user can take
 over at any time; it is one shared browser.
+
+The panel's own controls, beside the address bar:
+
+- **Recent pages** lists the pages shown in this panel session; pick one to open it again.
+- **⋯** opens a menu with **Open file…**, the viewport and the search engine:
+  - **Open file…** picks a local HTML file in a native dialog. The webview still opens only web
+    pages, so Dial serves that file's folder on `127.0.0.1` at a random port under a random path
+    prefix (`browser/local.rs`): `GET` only, a `Host` check, nothing outside the folder (no `..`,
+    no links that lead out). The server stops when the panel opens another address or file, or
+    closes.
+  - **Viewport**: Fit panel, Phone 390×844, Tablet 820×1180 or Desktop 1280×800. A preset sizes the
+    page inside a frame, shrinking to the panel when it is smaller; the choice is remembered.
+  - **Search engine**: DuckDuckGo (default), Google, Bing, Brave Search, Kagi, or a custom
+    `https://…%s` address. It applies to what the user types in the address bar
+    (`browser_set_search`) and is kept in the frontend's local storage; the agent's `browser_open`
+    still searches DuckDuckGo.
+- **Inspect** opens Web Inspector for the page. Only builds compiled with it (debug builds) show
+  the button.
+
+The page is a native view drawn above the app, so it hides while a menu, the palette or settings
+is open; the panel says so in its place (no snapshot is drawn).
 
 ## Native apps in the private guest
 
@@ -85,7 +127,7 @@ download an image or fall back to the host. This guidance does not redirect ordi
   or two minutes. `type` uses a US keyboard layout (printable ASCII, `\n`, `\t`).
 - **Project files** are never shared by an agent start. The user's own start in the App panel can
   attach a read-only snapshot of committed HEAD (the share option), and only for that start.
-- **Guest target:** Omit `guestTarget` on `state` or `start` to use Windows on Windows, Linux on Linux, or a virtual Mac on Apple Silicon. Other hosts prefer the unlabelled QEMU disk. An explicit `default` always requests that unlabelled disk. `macos`, `linux`, and `windows` select only that target. A virtual Mac requires its own imported base and guest companion. Never substitute another guest or the host. Windows guest boot is unverified.
+- **Guest target:** Omit `guestTarget` on `state` or `start` to use Windows on Windows, Linux on Linux, or a virtual Mac on Apple Silicon. Other hosts prefer the QEMU disk with no OS label. An explicit `default` always requests that disk with no OS label. `macos`, `linux`, and `windows` select only that target. A virtual Mac requires its own imported base and guest companion. Never substitute another guest or the host. Windows guest boot is unverified.
 - **Project recipe:** With an explicitly shared project containing a committed `.dial/app.json`, run `python3 -I DIAL-LAUNCH.py .` from the mounted project disc **inside the guest** (`py -3 -I DIAL-LAUNCH.py .` on Windows). A failure is not permission to download dependencies or run it on the host.
 
 ### Using an existing VirtualBox or VMware VM

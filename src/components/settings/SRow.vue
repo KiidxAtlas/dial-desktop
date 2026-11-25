@@ -14,6 +14,10 @@ defineProps<{
   /** Hover text for the label (the config key, the default). */
   hint?: string;
   resetTitle?: string;
+  /** The saved layer that sets the value ("This project", "Everywhere"). */
+  badge?: { label: string; title?: string } | null;
+  /** A short state after saving ("Saved", "Restart needed"); `kind` colours it. */
+  status?: { text: string; kind?: "ok" | "warn" | "bad" } | null;
 }>();
 const emit = defineEmits<{ reset: [] }>();
 const expanded = ref(false);
@@ -27,11 +31,13 @@ const LONG = 150;
         <span>{{ label }}</span>
         <i v-if="modified" class="s-dot" title="Changed from the default" />
         <span v-if="restart" class="s-tag" title="Takes effect the next time Dial starts">Restart</span>
+        <span v-if="badge" class="s-tag scope" :title="badge.title">{{ badge.label }}</span>
+        <span v-if="status" class="s-tag" :class="status.kind" role="status">{{ status.text }}</span>
         <button
           v-if="modified"
           class="reset"
           :title="resetTitle ?? 'Reset to the default'"
-          aria-label="Reset to the default"
+          :aria-label="resetTitle ?? 'Reset to the default'"
           @click="emit('reset')"
         >
           <Icon name="undo" :size="12" />
@@ -70,6 +76,10 @@ const LONG = 150;
 .reset:hover {
   background: var(--hover);
   color: var(--text);
+}
+.s-tag.scope {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 .s-desc.clamp {
   display: -webkit-box;

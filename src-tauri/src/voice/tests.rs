@@ -378,6 +378,7 @@ fn a_user_set_style_is_not_overridden_and_a_running_turn_must_finish_first() {
             crate::model::SavedSetting {
                 value: json!("Talk like a pirate"),
                 redacted: false,
+                scope: None,
             },
         )]
         .into(),
