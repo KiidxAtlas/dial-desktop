@@ -10,6 +10,13 @@ export interface PaneError {
   hint?: string;
 }
 
+const NO_AUTHOR = /please tell me who you are|author identity unknown|unable to auto-detect email|empty ident name/i;
+
+/** Git refused a commit because it has no author name or email; the Changes panel asks for them. */
+export function needsGitIdentity(error: unknown): boolean {
+  return NO_AUTHOR.test(rawText(error));
+}
+
 const RULES: { test: RegExp; title: string; hint?: string }[] = [
   {
     test: /could not run git|git: (command )?not found|'git' is not recognized|xcrun: error/i,
@@ -22,9 +29,9 @@ const RULES: { test: RegExp; title: string; hint?: string }[] = [
     hint: "Diffs and reverts need Git. Run git init in the project folder to start tracking changes.",
   },
   {
-    test: /please tell me who you are|author identity unknown|unable to auto-detect email|empty ident name/i,
+    test: NO_AUTHOR,
     title: "Git doesn't know who you are",
-    hint: 'Set your name and email once in a terminal: git config --global user.name "Your Name" and git config --global user.email you@example.com, then commit again.',
+    hint: "Enter your name and email under the commit message in the Changes panel, then commit again.",
   },
   {
     test: /nothing is staged|nothing to commit|no changes added to commit/i,

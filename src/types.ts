@@ -4,7 +4,7 @@ export type Connection =
   | { state: "starting" }
   | { state: "live"; model: string; engineVersion: string | null }
   | { state: "preview" }
-  | { state: "failed"; error: string; problem: EngineProblem }
+  | { state: "failed"; error: string; problem: EngineProblem; /** The next step, when the system named why the engine may not run. */ hint?: string | null }
   | { state: "ended" };
 
 /** What the UI can offer for a failed connection; mirrors `updates::EngineProblem`. */

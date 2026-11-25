@@ -42,10 +42,11 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
       :class="current?.mode"
       :disabled="!usable || !current"
       :title="current ? `${current.label}: ${current.detail}` : 'Approval mode'"
+      :aria-label="`Approval mode: ${current?.label ?? 'not set'}`"
       @click.stop="open = !open"
     >
       <Icon name="shield" :size="13" />
-      <span>{{ current?.label ?? "Approvals" }}</span>
+      <span class="mode-label">{{ current?.label ?? "Approvals" }}</span>
       <Icon name="chevronDown" :size="12" />
     </button>
     <Transition name="pop">
@@ -85,6 +86,10 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 }
 .trigger.auto {
   color: var(--warning);
+}
+/* In a narrow composer the shield and its color carry the mode; the name is in the tooltip. */
+@container composer-bar (max-width: 440px) {
+  .mode-label { display: none; }
 }
 .menu {
   position: absolute;

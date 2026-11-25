@@ -111,15 +111,22 @@ export const viewport = reactive({ width: typeof window === "undefined" ? 1200 :
 if (typeof window !== "undefined") window.addEventListener("resize", () => (viewport.width = window.innerWidth));
 
 /** Whether the sidebar shows: the user's choice, except that it steps aside while the inspector
- *  is open in a window too narrow for both beside the conversation (the choice is kept). */
+ *  is open in a window too narrow for both beside the conversation (the choice is kept). A wide
+ *  panel needs more room than a list, so the sidebar steps aside for it sooner. */
 export function sidebarShown(): boolean {
-  return ui.sidebarOpen && sidebarFits(viewport.width, ui.inspectorOpen && !ui.settingsOpen);
+  return ui.sidebarOpen && sidebarFits(viewport.width, ui.inspectorOpen && !ui.settingsOpen, isWide());
+}
+
+/** Whether the open inspector floats over the conversation as a drawer (the `max-width: 799px`
+ *  rule in styles.css) rather than sitting beside it. */
+export function inspectorFloats(): boolean {
+  return ui.inspectorOpen && !ui.settingsOpen && viewport.width < 800;
 }
 
 /** Show the sidebar; in a window too narrow for it and the inspector, the inspector closes. */
 export function showSidebar() {
   ui.sidebarOpen = true;
-  if (!sidebarFits(viewport.width, ui.inspectorOpen && !ui.settingsOpen)) ui.inspectorOpen = false;
+  if (!sidebarFits(viewport.width, ui.inspectorOpen && !ui.settingsOpen, isWide())) ui.inspectorOpen = false;
 }
 
 export function toggleSidebar() {

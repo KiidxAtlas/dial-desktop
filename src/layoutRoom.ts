@@ -3,15 +3,19 @@
 
 /** Narrowest the inspector gets. */
 export const MIN_WIDTH = 260;
+/** Narrowest a wide panel (terminal, browser, app, an open file or diff) is worth showing at:
+ *  below it the sidebar steps aside rather than squeezing the panel. */
+export const WIDE_MIN = 420;
 /** Room the conversation keeps beside the inspector (and the sidebar's, while it shows). */
 export const CONVERSATION_MIN = 540;
 /** The sidebar's width plus its margin. */
 export const SIDEBAR = 280;
 
-/** Whether the sidebar fits beside an open inspector in a window `width` CSS pixels wide.
- *  When it does not, the sidebar steps aside while the inspector is open. */
-export function sidebarFits(width: number, inspectorOpen: boolean): boolean {
-  return !inspectorOpen || width >= SIDEBAR + CONVERSATION_MIN + MIN_WIDTH;
+/** Whether the sidebar fits beside an open inspector in a window `width` CSS pixels wide, the
+ *  inspector showing a wide panel when `wide`. When it does not, the sidebar steps aside while
+ *  the inspector is open. */
+export function sidebarFits(width: number, inspectorOpen: boolean, wide = false): boolean {
+  return !inspectorOpen || width >= SIDEBAR + CONVERSATION_MIN + (wide ? WIDE_MIN : MIN_WIDTH);
 }
 
 /** The widest the inspector may get, leaving the conversation (and a shown sidebar) their room. */

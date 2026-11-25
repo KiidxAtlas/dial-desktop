@@ -235,6 +235,25 @@ fn stale_session_pages_cannot_replace_a_newer_refresh() {
 }
 
 #[test]
+fn opening_a_session_does_not_reorder_the_list() {
+    let mut model = Model::starting();
+    let list = |model: &mut Model, n: u64, rows: Value| {
+        let (id, _) = requested(model, Command::ListSessions, n);
+        respond(model, id, "list_sessions", json!({"sessions": rows}));
+        model.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+    };
+    let row = |id: &str, messages: u64| json!({"session_id": id, "messages": messages});
+    assert_eq!(list(&mut model, 1, json!([row("a", 4), row("b", 2), row("c", 9)])), ["a", "b", "c"]);
+    // The engine moved `c` up only because it was opened: the order stays.
+    assert_eq!(list(&mut model, 2, json!([row("c", 9), row("a", 4), row("b", 2)])), ["a", "b", "c"]);
+    // A new session and one that gained messages take the engine's places.
+    assert_eq!(
+        list(&mut model, 3, json!([row("new", 1), row("b", 3), row("c", 9), row("a", 4)])),
+        ["new", "b", "a", "c"]
+    );
+}
+
+#[test]
 fn switching_sessions_waits_for_the_running_turn() {
     // The app opens a busy engine's other sessions in a second engine; should one still refuse,
     // the reason reads plainly.
@@ -676,20 +695,28 @@ fn steering_retrying_and_compacting_follow_the_turn() {
     model.apply(Update::Connected(Box::new(ready("s1"))));
     assert!(model.retry().is_err(), "no prompt yet");
     assert!(model.compact().is_err(), "nothing to compact");
-    assert!(model.steer("more").is_err(), "no turn to steer");
+    assert!(model.steer("more", None).is_err(), "no turn to steer");
 
     // Guidance goes to the running turn only.
     let (turn, _) = requested(&mut model, prompt("refactor", 0), 1);
     assert_eq!(
-        model.steer("  keep the API  "),
-        Ok(Command::Steer("keep the API".into()))
+        model.steer("  keep the API  ", None),
+        Ok(Command::Steer { text: "keep the API".into(), scope: None })
     );
-    assert!(model.steer("   ").is_err());
+    assert!(model.steer("   ", None).is_err());
     assert!(
         model.retry().is_err() && model.compact().is_err(),
         "not mid-turn"
     );
-    let (id, _) = requested(&mut model, Command::Steer("keep the API".into()), 2);
+    let rows = model.conversation.entries().len();
+    let note = model.steer("also check tests", None).unwrap();
+    let (accepted, _) = requested(&mut model, note, 4);
+    respond(&mut model, accepted, "steer", json!({"queued": true}));
+    assert!(matches!(model.conversation.entries().last(), Some(Entry::Notice(note))
+        if note.kind.as_deref() == Some("steer") && note.message == "also check tests"));
+    assert!(model.conversation.turn_running());
+    let note = model.steer("keep the API", None).unwrap();
+    let (id, _) = requested(&mut model, note, 2);
     model.apply(Update::Message(Message::Response {
         id,
         method: "steer".into(),
@@ -702,6 +729,7 @@ fn steering_retrying_and_compacting_follow_the_turn() {
         model.toast.take().as_deref(),
         Some("Dial finished before your note arrived; send it as a new prompt")
     );
+    assert_eq!(model.conversation.entries().len(), rows + 1, "only accepted guidance is shown");
     respond(&mut model, turn, "send", json!({"outcome": "aborted"}));
 
     // A retry runs as a turn until its own reply arrives.

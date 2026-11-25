@@ -380,7 +380,7 @@ function onKey(event: KeyboardEvent) {
           <span class="truncate name">{{ snap.workspace.name }}</span>
           <span class="truncate state" :class="status.tone" :title="status.text"><i />{{ status.text }}</span>
         </span>
-        <Icon name="chevronDown" :size="13" />
+        <Icon class="project-chevron" name="chevronDown" :size="13" />
       </button>
       <!-- With the conversation showing, its banner carries the engine error and its buttons;
            here they are only offered while settings cover that banner. -->
@@ -698,22 +698,36 @@ function onKey(event: KeyboardEvent) {
 .activity.waiting {
   background: var(--warning);
 }
+/* The "…" button floats over the end of the row instead of taking room from it, so hovering a
+   row never re-truncates its title; the title fades out under the button instead. */
 .row-btn {
-  display: none;
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  display: grid;
   place-items: center;
   width: 22px;
   height: 22px;
-  flex: none;
   border-radius: var(--radius-sm);
   color: var(--text-faint);
-}
-.row-btn:last-child {
-  margin-right: -6px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
 }
 .session:hover .row-btn,
-.session.selected .row-btn,
 .session:focus-within .row-btn {
-  display: grid;
+  opacity: 1;
+  pointer-events: auto;
+}
+.session:hover .truncate,
+.session:focus-within .truncate {
+  -webkit-mask-image: linear-gradient(to left, transparent 0, transparent 22px, #000 40px);
+  mask-image: linear-gradient(to left, transparent 0, transparent 22px, #000 40px);
+}
+/* Status marks sit where the button appears; the button replaces them while it shows. */
+.session:is(:hover, :focus-within) :is(small, .activity, .jump-hint) {
+  visibility: hidden;
 }
 .row-btn:hover {
   background: var(--hover);
@@ -740,6 +754,15 @@ function onKey(event: KeyboardEvent) {
 }
 .project-btn:hover {
   background: var(--hover);
+}
+/* The menu opens above the button: point there, and back down while it is open. */
+.project-chevron {
+  flex: none;
+  transform: rotate(180deg);
+  transition: transform 160ms var(--ease);
+}
+.project-btn[aria-expanded="true"] .project-chevron {
+  transform: none;
 }
 .avatar {
   display: grid;

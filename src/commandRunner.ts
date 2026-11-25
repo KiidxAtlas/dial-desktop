@@ -5,13 +5,17 @@
 
 import { ref } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { engine, showToast, snapshot, type TerminalTask } from "./bridge";
-import { applySaved, engineCall, loadModes, readable, setMode, setPlanMode, type EngineCommand } from "./engineTools";
+import { engine, folders, openExternal, sessionToolsApi, setupApi, showToast, snapshot, type TerminalTask } from "./bridge";
+import { workspaceGitApi, type ReviewTarget } from "./workspaceGitApi";
+import { copyText } from "./sessionActions";
+import { addToPrompt } from "./workspace";
+import { applySaved, engineCall, loadModes, noteGoal, readable, setMode, setPlanMode, type EngineCommand } from "./engineTools";
 import { openSession, startRename } from "./sessionActions";
 import { editQueued, queueFor, removeQueued } from "./queue";
 import { showPanel, showSidebar } from "./workspace";
 import { ui, type SettingsTab } from "./ui";
 import { saveSchedule, typedSchedule } from "./schedules";
+import { collabView, contextView, costView, statusView } from "./commandViews";
 import type { OpenSnapshot } from "./types";
 
 // ── The command panel ─────────────────────────────────────────────────────────
@@ -96,6 +100,8 @@ function textOf(reply: any): string {
 
 /** A slash command for a dedicated engine PTY, never input to the user's shell. */
 export const terminalRequest = ref<{ task: TerminalTask; root: string } | null>(null);
+/** A server `/mcp login <server>` named; the Extensions page signs in to it and clears this. */
+export const mcpLoginRequest = ref("");
 
 export function openTaskTerminal(task: TerminalTask, root: string) {
   if (terminalRequest.value) return showToast("A command is already opening");
@@ -213,6 +219,233 @@ async function sideAnswer(title: string) {
   }
 }
 
+/** Side questions as rows; an answered one can become its own session. */
+function sideThreads() {
+  const title = "Side questions";
+  return call(title, "side_thread", { action: "list" }, (r) => {
+    const threads: any[] = r.threads ?? [];
+    if (!threads.length) return { text: "No side questions yet. Ask one with /btw <question>; it does not interrupt the main conversation." };
+    return {
+      rows: threads.map((t) => {
+        const last = t.exchanges?.[t.exchanges.length - 1];
+        const promoted = typeof t.promoted_session === "string" ? t.promoted_session : "";
+        return {
+          title: t.title || t.id,
+          detail: typeof last?.answer === "string" ? last.answer.slice(0, 160) : undefined,
+          actions: [promoted
+            ? { label: "Open session", run: () => { commandResult.value = null; engine.resume(promoted); } }
+            : { label: "Open as session", run: () => void promoteSide(t.id) }],
+        };
+      }),
+    };
+  });
+}
+
+async function promoteSide(threadId: string) {
+  try {
+    const reply = await engineCall<{ session_id: string }>("side_promote", { thread_id: threadId });
+    commandResult.value = null;
+    engine.resume(reply.session_id);
+  } catch (error) {
+    showToast(`Could not open it as a session: ${readable(error)}`);
+  }
+}
+
+/** Claude Code or Codex transcripts for this project; one becomes a new Dial session. */
+export function importSessions(source: "claude" | "codex") {
+  const label = source === "claude" ? "Claude Code" : "Codex";
+  const title = `Import from ${label}`;
+  return call(title, "import_candidates", { source }, (r) => {
+    const found: any[] = r.candidates ?? [];
+    if (!found.length) return { text: `No ${label} sessions were recorded for this project.` };
+    return {
+      rows: found.map((c) => ({
+        title: c.title || c.id,
+        detail: [c.modified ? new Date(c.modified * 1000).toLocaleString() : "", c.id].filter(Boolean).join(" · "),
+        actions: [{ label: "Import", run: () => void importOne(source, c.path, title) }],
+      })),
+    };
+  });
+}
+
+async function importOne(source: "claude" | "codex", path: string, title: string) {
+  showResult({ title, busy: true, text: "Importing…" });
+  try {
+    const reply = await engineCall<{ session_id: string; skipped?: string }>("import_session", { source, path });
+    commandResult.value = null;
+    engine.resume(reply.session_id);
+    showToast(reply.skipped ? `Imported. Not carried over: ${reply.skipped}` : "Imported as a new session");
+  } catch (error) {
+    showResult({ title, error: `Could not import it: ${readable(error)}` });
+  }
+}
+
+/** The repository's worktrees; another one opens as its own project. */
+export function worktreesView() {
+  return call("Worktrees", "list_worktrees", {}, (r) => {
+    if (!r.repository) return { text: "This project is not in a git repository." };
+    const trees: any[] = r.worktrees ?? [];
+    return {
+      rows: trees.map((t) => ({
+        title: `${t.branch ?? (t.detached ? "detached HEAD" : "(no branch)")}${t.current ? " · this project" : ""}`,
+        detail: [t.path, String(t.head ?? "").slice(0, 8), t.primary ? "main checkout" : "", t.locked ? "locked" : ""].filter(Boolean).join(" · "),
+        actions: t.current || t.bare ? [] : [{ label: "Open", run: () => { commandResult.value = null; void folders.open(t.path); } }],
+      })),
+    };
+  });
+}
+
+// ── Git, session and learning sheets ─────────────────────────────────────────
+
+/** Run `work` with a busy sheet titled `title`; a newer sheet wins over a late reply. */
+async function sheet<T>(title: string, work: () => Promise<T>, render: (value: T) => Partial<CommandResult>) {
+  showResult({ title, busy: true });
+  try {
+    const value = await work();
+    if (commandResult.value?.title === title) showResult({ title, data: value, ...render(value) });
+    return value;
+  } catch (error) {
+    if (commandResult.value?.title === title) showResult({ title, error: readable(error) });
+    return null;
+  }
+}
+
+function reviewLabel(target: ReviewTarget) {
+  if (target.kind === "uncommitted") return "uncommitted changes";
+  return target.kind === "base" ? `changes since ${target.value}` : `commit ${target.value.slice(0, 8)}`;
+}
+
+/** `dial review`, read-only: the engine reads the diff with the current model and reports. */
+export async function aiReviewView(target: ReviewTarget = { kind: "uncommitted" }, focus = "") {
+  const root = snapshot.value?.workspace?.root;
+  if (!root) return showToast("Open a project first");
+  const what = reviewLabel(target);
+  if (!(await confirm(`Review the ${what} with the current model? It reads the diff and reports; nothing is changed. This uses the model like a turn does.`, "AI review", "Review"))) return;
+  ui.settingsOpen = false;
+  return sheet(`AI review · ${what}`, () => workspaceGitApi.aiReview(root, target, focus), (text) => ({
+    text,
+    rows: [{ title: "Discuss this review", detail: "Puts the report in the message box", actions: [{ label: "Add to message", run: () => { commandResult.value = null; addToPrompt(`Review of the ${what}:\n\n${text}`); } }] }],
+  }));
+}
+
+/** The current branch's newest commits; any one can be reviewed. */
+export function gitLogView() {
+  const root = snapshot.value?.workspace?.root;
+  if (!root) return showToast("Open a project first");
+  ui.settingsOpen = false;
+  return sheet("Git history", () => workspaceGitApi.log(root, 100), (log) => {
+    if (!log.length) return { text: "No commits yet." };
+    return {
+      rows: log.map((c) => ({
+        title: c.subject || "(no message)",
+        detail: [c.sha.slice(0, 8), c.author, new Date(c.date).toLocaleString(), c.refs].filter(Boolean).join(" · "),
+        actions: [
+          { label: "Copy hash", run: () => void copyText(c.sha, "Commit hash copied") },
+          { label: "Review", run: () => void aiReviewView({ kind: "commit", value: c.sha }) },
+        ],
+      })),
+    };
+  });
+}
+
+const TREE_KIND: Record<string, string> = { user: "You", assistant: "Answer", summary: "Summary", other: "Entry" };
+
+/** The session's branches (`/tree`): every prompt and labeled entry, forks indented. */
+export function sessionTreeView() {
+  ui.settingsOpen = false;
+  return call("Session branches", "session_tree", {}, (r) => {
+    const nodes: any[] = r.nodes ?? [];
+    if (!nodes.length) return { text: "Nothing to navigate yet: send a message first." };
+    return {
+      text: "Continue from any earlier prompt or labeled point. Nothing is deleted: the path you leave stays here as a branch.",
+      rows: nodes.map((n) => ({
+        title: `${"   ".repeat(Math.min(n.depth ?? 0, 8))}${n.depth ? "↳ " : ""}${TREE_KIND[n.kind] ?? "Entry"}: ${n.text || "…"}`,
+        detail: [n.label ? `“${n.label}”` : "", n.current ? "you are here" : n.on_active_branch ? "on this path" : "other branch", n.children > 1 ? `${n.children} branches` : "", n.ts ? new Date(n.ts).toLocaleString() : ""].filter(Boolean).join(" · "),
+        actions: n.current ? [] : [{ label: n.kind === "user" ? "Edit from here" : "Continue here", run: () => void navigateTree(n.id) }],
+      })),
+    };
+  });
+}
+
+async function navigateTree(entryId: string) {
+  const snap = snapshot.value;
+  if (!snap?.workspace) return;
+  try {
+    const reply = await engineCall<{ moved: boolean; prefill?: string | null }>("tree_navigate", { entry_id: entryId });
+    commandResult.value = null;
+    if (!reply.moved) return showToast("Already there; the conversation is unchanged");
+    await sessionToolsApi.reload(snap.workspace.root, snap.sessionId ?? null);
+    if (reply.prefill) {
+      addToPrompt(reply.prefill);
+      showToast("Moved here. The message is in the message box to edit and send again.");
+    } else showToast("Moved here. The previous path is kept as a branch.");
+  } catch (error) {
+    showToast(`Could not move there: ${readable(error)}`);
+  }
+}
+
+/** Share this session as an encrypted link (or a secret gist), after saying what leaves the machine. */
+export function shareView() {
+  const snap = snapshot.value;
+  const sessionId = snap?.sessionId, root = snap?.workspace?.root;
+  if (!root || !sessionId) return showToast("Open a saved session first");
+  ui.settingsOpen = false;
+  const create = async (gist: boolean) => {
+    if (!(await confirm(gist
+      ? "Upload this conversation's current path, encrypted, as a secret GitHub gist with the gh command? Anyone with the full link can read it."
+      : "Upload this conversation's current path, encrypted, to the configured share server? Anyone with the full link can read it.", "Share session", "Share"))) return;
+    void sheet("Share link", () => sessionToolsApi.share(root, sessionId, gist), (link) => ({
+      text: [link.url, ...link.notes].join("\n"),
+      rows: [{ title: link.url, detail: "The key is only in the part after #; keep the whole link private.", actions: [
+        { label: "Copy link", run: () => void copyText(link.url, "Share link copied") },
+        { label: "Open", run: () => openExternal(link.url) },
+      ] }],
+    }));
+  };
+  showResult({
+    title: "Share this session",
+    text: "Dial encrypts the conversation's current path (abandoned branches stay private), uploads it, and gives you a link that holds the key. Large images and outputs may be trimmed to fit.",
+    rows: [
+      { title: "Encrypted link", detail: "Through the share server in your settings (share.server_url).", actions: [{ label: "Create link", run: () => void create(false) }] },
+      { title: "Secret GitHub gist", detail: "Through the gh command, signed in to your GitHub account.", actions: [{ label: "Create gist", run: () => void create(true) }] },
+    ],
+  });
+}
+
+/** Saved project understanding (`dial understanding`): architecture, findings and gaps; no model runs. */
+export function understandingView(query = "") {
+  ui.settingsOpen = false;
+  return sheet(query ? `Understanding · ${query}` : "How this project fits together", () => setupApi.report<any>("understanding", { target: query || undefined }), (r) => {
+    if (typeof r === "string") return { text: r };
+    const a = r.architecture ?? {};
+    const lines = [a.summary, r.indexed_files != null ? `${r.indexed_files} files indexed · ${r.saved_findings ?? 0} saved findings${r.coverage_partial ? " · partial" : ""}` : ""].filter(Boolean);
+    const rows: ResultRow[] = [
+      ...(a.components ?? []).slice(0, 40).map((c: any) => ({ title: c.name ?? c.path ?? String(c), detail: [c.path, c.responsibility ?? c.summary].filter((x: unknown) => typeof x === "string" && x).join(" · ") || undefined })),
+      ...(r.findings ?? []).slice(0, 40).map((f: any) => ({ title: f.title ?? f.summary ?? f.text ?? "Finding", detail: [f.path, f.detail ?? f.body].filter((x: unknown) => typeof x === "string" && x).join(" · ") || undefined })),
+      ...(a.gaps ?? []).map((g: string) => ({ title: "Not known yet", detail: g })),
+    ];
+    if (r.synthesis?.status === "missing") rows.push({ title: "Build the understanding", detail: "Dial reads the project and records how it fits together. This runs the model.", actions: [{ label: "Build", run: () => { commandResult.value = null; runInTerminal("/understanding build"); } }] });
+    return { text: lines.join("\n"), rows };
+  });
+}
+
+/** Learned recipes and observed tool outcomes (`dial experience`); no model runs. */
+export function experienceView() {
+  ui.settingsOpen = false;
+  return sheet("Learned recipes and outcomes", () => setupApi.report<any>("experience"), (r) => {
+    if (typeof r === "string") return { text: r };
+    const entries: any[] = r.entries ?? [], outcomes: any[] = r.tool_outcomes ?? [];
+    if (!entries.length && !outcomes.length) return { text: `Nothing learned for this project yet. Dial records recipes and failures as it works.\n\n${r.scope ?? ""}`.trim() };
+    return {
+      text: r.scope,
+      rows: [
+        ...entries.slice(0, 80).map((e) => ({ title: e.title ?? e.summary ?? e.kind ?? "Entry", detail: [e.kind, e.detail ?? e.text, e.uses != null ? `used ${e.uses}×` : ""].filter((x) => typeof x === "string" && x).join(" · ") || undefined })),
+        ...outcomes.slice(0, 40).map((o) => ({ title: o.tool ?? o.name ?? "Tool", detail: describe(o).replace(/\n/g, " · ").slice(0, 200) })),
+      ],
+    };
+  });
+}
+
 function skills(): Handler {
   return async ({ args, rest }) => {
     const [action = "list", ...more] = args;
@@ -258,6 +491,56 @@ function checks(): Handler {
   };
 }
 
+/** This session's workers as rows; a running one can be cancelled. */
+function workerRows() {
+  const title = "Workers";
+  return call(title, "task_status", {}, (r) => {
+    const list: any[] = Array.isArray(r) ? r : [];
+    if (!list.length) return { text: "No workers in this session. Start one with /worker <task>; it works alongside the main conversation." };
+    return {
+      rows: list.map((w) => ({
+        title: `${w.name || w.id} · ${w.status ?? "unknown"}`,
+        detail: [w.id, w.agent, w.model, typeof w.task === "string" ? w.task.slice(0, 140) : ""].filter(Boolean).join(" · "),
+        actions: w.id && (w.status === "running" || w.status === "queued")
+          ? [{
+              label: "Cancel",
+              danger: true,
+              run: async () => {
+                if (!(await confirm(`Cancel the worker ${w.name || w.id}? Its unfinished work is dropped.`, "Cancel worker", "Cancel worker"))) return;
+                try { await engineCall("task_cancel", { id: w.id }); } catch (error) { showToast(`Could not cancel it: ${readable(error)}`); }
+                void workerRows();
+              },
+            }]
+          : undefined,
+      })),
+    };
+  });
+}
+
+/** Learned versions (`/learn status`); a pending candidate can be evaluated, which may activate it. */
+export function learningStatus() {
+  return call("Learning", "research_status", {}, (r) => {
+    const learning = r.learning ?? {};
+    const candidates: any[] = (Array.isArray(learning.versions) ? learning.versions : []).filter((v: any) => v?.status === "candidate" && v.id > 0);
+    const text = describe({ model: r.model, initialized: learning.initialized, active: learning.active, session_version: r.session_version });
+    if (!candidates.length) return { text: `${text}\n\nNo candidate is waiting for evaluation.` };
+    return {
+      text,
+      rows: candidates.map((v) => ({
+        title: `Candidate ${v.id}`,
+        detail: [v.kind, v.note, v.created_at].filter((x) => typeof x === "string" && x).join(" · ") || undefined,
+        actions: [{
+          label: "Evaluate",
+          run: async () => {
+            if (!(await confirm(`Evaluate candidate ${v.id}? Dial unloads the running model, runs the held-out checks, and makes the candidate the active version if it passes. This can take a long time.`, "Evaluate candidate", "Evaluate"))) return;
+            void call(`Learning · evaluate candidate ${v.id}`, "research_action", { action: "evaluate", candidate: v.id, confirm: true }, (reply) => ({ text: textOf(reply) }));
+          },
+        }],
+      })),
+    };
+  });
+}
+
 function extension(op: string, id: string, extra: Record<string, unknown> = {}) {
   return call(`MCP · ${op.replace(/_mcp$/, "")} ${id}`, "extension_action", { intent: { op, id, ...extra }, confirm: true }, (r) => ({
     text: [r.message, r.apply_settings ? "Applied to this session." : ""].filter(Boolean).join("\n"),
@@ -265,11 +548,15 @@ function extension(op: string, id: string, extra: Record<string, unknown> = {}) 
 }
 
 function mcp(): Handler {
-  return async ({ args, rest, name }) => {
+  return async ({ args }) => {
     const [action = "list", id] = args;
     if (["list", "add", "help"].includes(action)) return settingsAt("extensions");
     if (action === "reload" || action === "reconnect") return call("MCP · reconnect", "apply_settings", { reconnect: true }, (r) => ({ text: r.reconnected ? "Every MCP server reconnected." : describe(r) }));
-    if (action === "login") return runInTerminal(`/${name} ${rest}`);
+    if (action === "login") {
+      if (!id) return usage("mcp", "login <server>");
+      mcpLoginRequest.value = id;
+      return settingsAt("extensions");
+    }
     if (!id) return usage("mcp", `${action} <server>`);
     if (action === "logout") return call(`MCP · sign out of ${id}`, "mcp_logout", { server: id });
     if (action === "test") return extension("test_mcp", id);
@@ -327,7 +614,7 @@ function goalCommand(): Handler {
   return async ({ args, rest }) => {
     const [action = "show"] = args;
     const text = after(rest, 1);
-    const show = (r: any) => ({ text: textOf(r.goal ?? r) });
+    const show = (r: any) => (noteGoal(r), { text: textOf(r.goal ?? r) });
     switch (action) {
       case "show":
       case "get":
@@ -354,7 +641,7 @@ function goalCommand(): Handler {
 function collab(): Handler {
   return async ({ args }) => {
     const [action = "status", link] = args;
-    if (["status", "view", "list"].includes(action)) return call("Collaboration", "collaboration_status");
+    if (["status", "view", "list"].includes(action)) return call("Collaboration", "collaboration_status", {}, collabView);
     if (action === "start") {
       if (!(await confirm("Host this conversation in an encrypted room? Guests can read it (read-only).", "Share this session", "Start"))) return;
       return call("Collaboration", "collaboration_start", { confirm: true, read_only: true });
@@ -362,7 +649,16 @@ function collab(): Handler {
     if (action === "stop" || action === "abort") return call("Collaboration", "collaboration_stop");
     if (action === "leave") return call("Collaboration", "collaboration_leave");
     if (action === "join") return link ? joinRoom(link) : usage("collab", "join <link>");
-    usage("collab", "[start|status|stop|join <link>|leave]");
+    if (action === "invite" || action === "link") {
+      if (!(await confirm("Show the invite link? Anyone who has it can enter this room.", "Invite link", "Show link"))) return;
+      return call("Collaboration · invite link", "collaboration_invite", { confirm: true }, (r) => ({ text: `${r.link}\n\n${r.read_only ? "Guests can read only." : "Guests can steer, within your approval settings."} Use Copy above to share it.` }));
+    }
+    if (action === "answer") {
+      const option = Number(link);
+      if (!Number.isInteger(option) || option < 1) return usage("collab", "answer <option number>");
+      return call("Collaboration · answer", "collaboration_answer", { option }, () => ({ text: `Sent option ${option} to the host.` }));
+    }
+    usage("collab", "[start|status|invite|stop|join <link>|answer <n>|leave]");
   };
 }
 
@@ -505,10 +801,10 @@ const HANDLERS: Record<string, Handler> = {
       })),
     }));
   },
-  cost: () => call("Cost", "get_session_stats"),
-  context: () => call("Context", "get_session_stats"),
+  cost: () => call("Cost", "get_session_stats", {}, costView),
+  context: ({ snap }) => call("Context", "get_session_stats", {}, (r) => contextView(r, snap.context)),
   tools: () => call("Tools", "state", {}, (r) => ({ text: describe(r.tools ?? r) })),
-  status: () => call("Status", "state"),
+  status: () => call("Status", "state", {}, statusView),
 
   // Workers and side questions.
   worker: ({ snap, rest }) => {
@@ -517,7 +813,7 @@ const HANDLERS: Record<string, Handler> = {
     if (!snap.turnRunning) return void engine.send(task, [], { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId });
     return call("Worker", "task_start", { task, agent: "worker", name: task.slice(0, 48), solution_space: "Free: any approach that completes the assignment." }, (r) => ({ text: textOf(r) }));
   },
-  workers: ({ args }) => call("Workers", "task_status", args[0] ? { id: args[0] } : {}, (r) => ({ text: textOf(r) })),
+  workers: ({ args }) => (args[0] ? call("Workers", "task_status", { id: args[0] }, (r) => ({ text: textOf(r) })) : workerRows()),
   agents: ({ args }) => call("Agents", "task_status", args[0] ? { id: args[0] } : {}, (r) => ({ text: textOf(r) })),
   message: ({ args, rest }) => {
     const text = after(rest, 1);
@@ -527,10 +823,11 @@ const HANDLERS: Record<string, Handler> = {
   cancel: ({ args }) => (args[0] ? call("Cancel worker", "task_cancel", { id: args[0] }, () => ({ text: `Cancelled ${args[0]}.` })) : usage("cancel", "<id>")),
   btw: async ({ rest }) => {
     const question = rest.trim();
-    if (!question) return call("Side questions", "side_thread", { action: "list" });
+    if (!question) return sideThreads();
     const title = `By the way: ${question.slice(0, 60)}`;
     if (await call(title, "side_thread", { action: "ask", question }, () => ({ busy: true, text: "Thinking…" }))) await sideAnswer(title);
   },
+  permissions: () => settingsAt("permissions"),
   goal: goalCommand(),
   "guided-goal": ({ rest }) => (rest.trim() ? call("Goal", "goal", { action: "guided", idea: rest.trim() }, (r) => ({ text: textOf(r.goal ?? r) })) : usage("guided-goal", "<idea>")),
 
@@ -633,11 +930,32 @@ const HANDLERS: Record<string, Handler> = {
   },
   theme: () => settingsAt("appearance"),
   changes: () => { ui.diffPath = null; showPanel("changes"); },
-  tree: () => { showSidebar(); },
+  // Terminal-only in the engine; Desktop draws them as Settings pages.
+  doctor: () => settingsAt("health"),
+  setup: () => settingsAt("health"),
+  gc: () => settingsAt("maintenance"),
+  images: () => settingsAt("maintenance"),
+  compute: () => settingsAt("maintenance"),
+  rules: () => settingsAt("maintenance"),
+  // Served by `list_hooks`/`ssh_hosts`; an engine without them still sends these to the terminal.
+  hooks: () => settingsAt("integrations"),
+  ssh: () => settingsAt("integrations"),
+  tree: () => sessionTreeView(),
+  share: ({ args }) => (args.length ? runInTerminal(`/share ${args.join(" ")}`) : shareView()),
+  review: ({ args, rest }) => {
+    if (!args.length || args[0] === "uncommitted") return aiReviewView({ kind: "uncommitted" }, args.slice(1).join(" "));
+    if ((args[0] === "base" || args[0] === "commit") && args[1]) return aiReviewView({ kind: args[0], value: args[1] }, args.slice(2).join(" "));
+    return aiReviewView({ kind: "uncommitted" }, rest);
+  },
+  understanding: ({ args, rest }) => (args[0] === "build" ? runInTerminal(`/understanding ${rest}`) : understandingView(rest.trim())),
+  experience: () => experienceView(),
+  // `/wt list` is a sheet; creating, switching and removing worktrees stay in the terminal.
+  wt: ({ args, rest }) => (args[0] && args[0] !== "list" ? runInTerminal(`/wt ${rest}`) : worktreesView()),
 };
 
 /** Desktop-only names the engine lists as terminal-only but the desktop shows its own way. */
-const DESKTOP_TERMINAL = new Set(["changes", "tree", "watch", "modelpreset", "login", "schedule"]);
+// `/tree` is served by `session_tree` on engines that have it; older ones report it terminal-only.
+const DESKTOP_TERMINAL = new Set(["changes", "wt", "share", "review", "understanding", "experience", "watch", "modelpreset", "login", "schedule", "doctor", "setup", "gc", "images", "compute", "rules"]);
 
 /** Whether `name` has an argument-aware desktop handler. */
 export function hasHandler(name: string) {

@@ -70,7 +70,8 @@ fn tools_are_listed_only_while_the_app_runs() {
             .clone()
     };
     let tools = list(true);
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 32);
+    assert!(tools.iter().any(|tool| tool["name"] == "desktop_view"));
     assert!(tools.iter().any(|tool| tool["name"] == "types_screenshot"));
     assert!(list(false).is_empty());
 }

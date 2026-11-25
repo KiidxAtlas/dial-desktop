@@ -9,7 +9,8 @@
     "typecheck": "vue-tsc --noEmit",
     "tauri": "node packaging/macos-guest/tauri.mjs",
     "dev": "tauri dev",
-    "build": "node packaging/macos-guest/tauri.mjs build"
+    "build": "node packaging/macos-guest/tauri.mjs build",
+    "preview:ui": "node scripts/ui-preview.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

@@ -150,7 +150,10 @@ struct Inventory {
 impl Inventory {
     fn current(app: &AppHandle) -> Self {
         let shared = app.state::<Shared>();
-        let sessions = shared.lock().tabs.active_session_count();
+        let sessions = {
+            let inner = shared.lock();
+            inner.tabs.active_session_count() + inner.parked.values().map(|tabs| tabs.active_session_count()).sum::<usize>()
+        };
         let shells = shared.terminals().open_ids().len();
         Self {
             sessions,

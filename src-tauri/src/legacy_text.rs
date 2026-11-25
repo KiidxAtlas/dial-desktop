@@ -26,10 +26,10 @@ pub fn project_user_message(message: &mut Value) {
             }
         }
         Value::Array(parts) => {
-            if let Some(part) = parts.iter_mut().find(|part| part["type"] == "text") {
-                if let Some(body) = part["text"].as_str().and_then(strip) {
-                    part["text"] = json!(body);
-                }
+            if let Some(part) = parts.iter_mut().find(|part| part["type"] == "text")
+                && let Some(body) = part["text"].as_str().and_then(strip)
+            {
+                part["text"] = json!(body);
             }
         }
         _ => {}

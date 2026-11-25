@@ -26,6 +26,7 @@ use crate::browser::{self, Browser};
 
 #[cfg(target_os = "macos")]
 mod screenshot;
+mod desktop;
 #[cfg(test)]
 mod tests;
 
@@ -118,7 +119,12 @@ user's Types: things they keep (recipes, cities, books, scores) that Dial Deskto
 web apps you build for them: a cookbook, a live weather app, a bookshelf, a game. When the user \
 wants to keep something the conversation produced, check types_list and save it with \
 types_add_item, or offer types_create for a fitting new Type. Read types_guide before building \
-an app, and look at every change with types_screenshot and types_run.";
+an app, and look at every change with types_screenshot and types_run. The desktop_* tools are \
+Dial Desktop itself: desktop_view shows what the window shows (add screenshot for a picture), \
+desktop_commands lists every palette action (sessions, panels, settings pages, theme, zoom, \
+projects) and desktop_run runs one; desktop_settings reads Dial's settings and \
+desktop_set_setting changes one, except permission and credential settings, which stay the \
+user's. Use them when the user asks you to show, open, switch or change something in the app.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -267,6 +273,7 @@ pub fn tools() -> Value {
         ),
     ]);
     if let Value::Array(items) = &mut list {
+        items.extend(desktop::tools());
         items.extend(crate::types::tools());
     }
     list
@@ -830,6 +837,9 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
             if tool.starts_with("types_") {
                 let store = app.state::<crate::types::Store>();
                 return crate::types::agent_call(app, &store, tool, args).map(Reply::text);
+            }
+            if desktop::TOOLS.contains(&tool) {
+                return desktop::call(app, tool, args);
             }
             let _ = app.emit(
                 "agent-browser",

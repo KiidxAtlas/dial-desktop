@@ -76,7 +76,7 @@ function openDiff(path: string) {
         <Icon v-else-if="tone === 'succeeded'" name="check" :size="12" />
         <span v-else class="dot" />
       </span>
-      <span class="summary" aria-live="polite">{{ headline }}</span>
+      <span class="summary" aria-live="polite" :title="headline">{{ headline }}</span>
       <span class="pips" aria-hidden="true">
         <span
           v-for="t in run.tools.slice(-PIPS)"
@@ -180,8 +180,13 @@ function openDiff(path: string) {
 }
 .status .spinner { width: 10px; height: 10px; }
 .status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tone); }
+/* The headline gives way (ending in "…", full text on hover) so the failure badge never runs
+   off the edge of a narrow column. */
 .summary {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text);
   font-weight: 560;
   white-space: nowrap;

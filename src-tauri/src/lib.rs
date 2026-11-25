@@ -15,6 +15,7 @@ pub mod browser;
 pub mod browser_mcp;
 pub mod cli;
 pub mod engine;
+pub mod engine_cli;
 pub mod files;
 pub mod launcher;
 pub mod model;

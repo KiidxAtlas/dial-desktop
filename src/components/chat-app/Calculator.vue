@@ -137,7 +137,7 @@ input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px 
 }
 .number input:focus { outline: none; border-color: var(--accent); }
 .segments { display: flex; flex-wrap: wrap; gap: 2px; padding: 3px; border-radius: var(--radius-md); background: var(--hover); box-shadow: inset 0 0 0 1px var(--border); }
-.segments button { flex: 1 0 auto; padding: 4px 10px; border-radius: 7px; font: 500 var(--text-xs) / 1.4 var(--font-mono); color: var(--text-muted); }
+.segments button { flex: 1 0 auto; padding: 4px 10px; border-radius: var(--radius-sm); font: 500 var(--text-xs) / 1.4 var(--font-mono); color: var(--text-muted); }
 .segments button:hover { color: var(--text); }
 .segments button.on { color: var(--on-accent); background: var(--accent); }
 .switch { position: relative; width: 34px; height: 20px; border-radius: 999px; background: var(--border-strong); transition: background 0.15s var(--ease); }

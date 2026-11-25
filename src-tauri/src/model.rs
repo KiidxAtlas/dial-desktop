@@ -107,6 +107,34 @@ pub fn first_line(text: &str, max: usize) -> String {
     }
 }
 
+/// `fresh` (the engine's list, newest activity first) with the rows that did not change since
+/// `previous` kept in their `previous` order. Opening a session can bump its timestamp in the
+/// engine without adding anything to it; without this the clicked row would jump to the top.
+/// Rows that are new or gained messages keep the engine's position, so real activity still
+/// floats up.
+pub fn keep_session_order(
+    previous: &[SessionSummary],
+    fresh: Vec<SessionSummary>,
+) -> Vec<SessionSummary> {
+    let before: HashMap<&str, (usize, u64)> = previous
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), (i, s.messages)))
+        .collect();
+    let unchanged = |s: &SessionSummary| {
+        before
+            .get(s.id.as_str())
+            .is_some_and(|(_, messages)| *messages == s.messages)
+    };
+    let mut kept: Vec<SessionSummary> = fresh.iter().filter(|s| unchanged(s)).cloned().collect();
+    kept.sort_by_key(|s| before[s.id.as_str()].0);
+    let mut kept = kept.into_iter();
+    fresh
+        .into_iter()
+        .map(|s| if unchanged(&s) { kept.next().unwrap_or(s) } else { s })
+        .collect()
+}
+
 /// Counts of tool calls by state, for the activity summary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolStats {
@@ -283,6 +311,8 @@ pub struct Model {
     /// when the engine predates that listing.
     pub image_models: Option<Vec<Value>>,
     pending: HashMap<RequestId, Purpose>,
+    /// User-visible guidance awaiting engine acknowledgement, without legacy Type framing.
+    pending_notes: HashMap<RequestId, String>,
     pub(crate) recovering: bool,
     /// The open question already acknowledged as presented; the engine refuses a second ack.
     presented: Option<String>,
@@ -482,8 +512,17 @@ impl Model {
         Ok(Command::Undo)
     }
 
+    /// Reload the open conversation from the engine, after a change made outside a turn (a move
+    /// through the session tree). Refused while a turn runs.
+    pub fn reload(&self) -> Result<Command, String> {
+        if self.conversation.turn_running() {
+            return Err("Stop the running turn (Esc) first".into());
+        }
+        Ok(Command::Recover)
+    }
+
     /// The request that adds `text` to the running turn; refused when no turn runs.
-    pub fn steer(&self, text: &str) -> Result<Command, String> {
+    pub fn steer(&self, text: &str, scope: Option<crate::engine::TypeScope>) -> Result<Command, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err("Type the guidance to add".into());
@@ -491,7 +530,7 @@ impl Model {
         if !self.conversation.turn_running() {
             return Err("Dial is not working on a turn; send this as a new prompt".into());
         }
-        Ok(Command::Steer(text.to_owned()))
+        Ok(Command::Steer { text: text.to_owned(), scope })
     }
 
     /// The request that sends the last prompt again; the engine refuses it unless that prompt
@@ -666,6 +705,7 @@ impl Model {
                     self.model_progress = None;
                 }
                 match &command {
+                    Command::Steer { text, .. } => { self.pending_notes.insert(id, text.clone()); }
                     Command::ListSessions => {
                         self.session_pages.clear();
                         self.session_page = Some((id, 0));
@@ -768,6 +808,7 @@ impl Model {
         self.conversation.new_connection(ready);
         if self.conversation.entries().is_empty() { self.received_from.clear(); }
         self.pending.clear();
+        self.pending_notes.clear();
         self.recovering = false;
         self.ready_image_input = ready.raw["image_input"].as_bool();
         self.type_context_supported = ready.raw["features"]["type_context"].as_bool() == Some(true);
@@ -787,12 +828,14 @@ impl Model {
             && matches!(message, Message::Event(e) if e.kind == "active_session")
         {
             self.received_from.clear();
+            self.pending_notes.clear();
         }
         match message {
             Message::Response { id, result, .. } => {
                 let Some(purpose) = self.pending.remove(id) else {
                     return;
                 };
+                if result.is_err() { self.pending_notes.remove(id); }
                 if purpose == Purpose::Models {
                     self.discovering = false;
                 }
@@ -819,10 +862,11 @@ impl Model {
                                 } else {
                                     self.session_page = None;
                                     let mut seen = HashSet::new();
-                                    self.sessions = std::mem::take(&mut self.session_pages)
+                                    let fresh = std::mem::take(&mut self.session_pages)
                                         .into_iter()
                                         .filter(|s| !self.deleted.contains(&s.id) && seen.insert(s.id.clone()))
                                         .collect();
+                                    self.sessions = keep_session_order(&self.sessions, fresh);
                                 }
                             }
                             Err(error) => {
@@ -955,8 +999,15 @@ impl Model {
                     (Purpose::Compact, Ok(_)) => {
                         follow.extend([Command::Recover, Command::ListSessions]);
                     }
-                    // The engine takes the guidance at the running turn's next step.
-                    (Purpose::Steer, Ok(_)) => {}
+                    // A steer is a note inside the current turn, not a new prompt to undo or retry.
+                    (Purpose::Steer, Ok(_)) => {
+                        if let Some(text) = self.pending_notes.remove(id) {
+                            self.conversation.apply_event(&dial_client::Event {
+                                kind: "notice".into(),
+                                body: json!({"kind":"steer", "lane":"user", "message":text}),
+                            });
+                        }
+                    }
                     (Purpose::Steer, Err(error))
                         if error.code.as_deref() == Some("not_pending") =>
                     {
@@ -1052,6 +1103,7 @@ impl Model {
             }
             Message::Disconnected { .. } => {
                 self.pending.clear();
+                self.pending_notes.clear();
                 self.recovering = false;
                 self.voice.reset();
                 self.connection = Some(Connection::Ended);
@@ -1192,7 +1244,7 @@ fn describe(command: &Command) -> &'static str {
         Command::ForkSession(_) => "duplicate the session",
         Command::Export(_) => "export the session",
         Command::Undo => "undo the last turn",
-        Command::Steer(_) => "add to the running turn",
+        Command::Steer { .. } => "add to the running turn",
         Command::Retry => "retry the prompt",
         Command::Compact => "compact the conversation",
         Command::LiveStart { .. } => "start voice mode",

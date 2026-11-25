@@ -98,7 +98,7 @@ const ask = (text: string) => void sendInType(props.id, text);
   display: flex;
   flex-direction: column;
   margin: 0 12px;
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   overflow: hidden;
   background: var(--surface);
   box-shadow: 0 0 0 1px var(--border);

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { engine } from "../bridge";
+import { ui } from "../ui";
 import type { VoiceView } from "../types";
 import Icon from "./Icon.vue";
 
@@ -37,6 +38,13 @@ const action = computed(() => {
   }
   return null;
 });
+/** The problem names a missing speech tool: offer the page that installs it. */
+const needsSetup = computed(() => props.voice.phase === "paused" && !!props.voice.problem?.includes("Health & setup"));
+function openSetup() {
+  void engine.voiceStop();
+  ui.settingsTab = "health";
+  ui.settingsOpen = true;
+}
 </script>
 
 <template>
@@ -58,6 +66,7 @@ const action = computed(() => {
       <div v-if="voice.heard" class="heard truncate" :title="voice.heard">“{{ voice.heard }}”</div>
       <div v-else class="heard hint">Speak, then pause; Dial answers out loud.</div>
     </div>
+    <button v-if="needsSetup" class="btn btn-secondary" title="Install the speech tools voice mode uses" @click="openSetup">Set up voice…</button>
     <div v-if="misheardChance" class="misheard">
       <button class="btn btn-secondary" title="Stop this request; tap the orb to talk again" @click="engine.voiceCancel()">Cancel</button>
       <button class="btn btn-secondary" title="Stop this request and fix the text in the message box" @click="editHeard">Edit</button>

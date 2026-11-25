@@ -429,6 +429,10 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   min-width: 0;
   flex-shrink: 3;
 }
+/* In a narrow composer the level goes first, so the model name keeps its room rather than both clipping. */
+@container composer-bar (max-width: 500px) {
+  .level { display: none; }
+}
 .mode-chip {
   height: 22px;
   margin-left: 2px;
@@ -606,7 +610,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   align-items: center;
   height: 18px;
   padding: 0 6px;
-  border-radius: 9px;
+  border-radius: 999px;
   background: var(--surface);
   font-size: var(--text-xs);
   color: var(--text-faint);
@@ -632,7 +636,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .chip {
   height: 24px;
   padding: 0 9px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   font-size: var(--text-sm);
   color: var(--text-muted);

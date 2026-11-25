@@ -1413,7 +1413,7 @@ onBeforeUnmount(() => {
   width: 28px;
   height: 16px;
   margin: 0;
-  border-radius: 8px;
+  border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--surface);
   cursor: pointer;

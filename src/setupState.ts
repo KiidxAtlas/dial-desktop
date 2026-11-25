@@ -32,7 +32,7 @@ export function welcomeSteps(engine: EngineUpdateView | null, checking: boolean)
   return [
     { id: "engine", title: "Dial engine", detail, state },
     { id: "folder", title: "Open a project folder", detail: "Dial works on the code in that folder.", state: ready || state === "problem" ? "next" : "later" },
-    { id: "provider", title: "Connect a model", detail: "Then sign in to a provider or add an API key in Settings › Providers, or download a local model.", state: "later" },
+    { id: "provider", title: "Connect a model", detail: "Sign in to a provider or add an API key with Connect a model (before or after opening a folder), or download a local model.", state: "later" },
   ];
 }
 

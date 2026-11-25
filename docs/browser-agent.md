@@ -57,10 +57,31 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 | `browser_eval(script)` | Run a function body (async; `await` works) and return JSON |
 | `browser_screenshot()` | PNG of the panel, returned as an MCP image block |
 | `app_desktop(action, runId?, frameSeq?, token?, actions?)` | Launch graphical apps in a configured private guest or a connected VM. `state` checks readiness; `start` opens the guest in the App panel; `frame` returns the screen and a token; `input` runs a batch of up to 64 actions (`click` with `count`, `double_click`, `move`, `drag`, `scroll`, `press` with combos like `ctrl+c`, `type` with whole strings, `wait`) on that frame with one token and replies with the screen after it, plus the next token. Agent access is the user's switch in the App panel. |
+| `desktop_view(screenshot?)` | What the Dial Desktop window shows, as JSON (project, session, model, approval mode, pending approvals, plan, changes, sessions, open panels and settings page, appearance, notices); `screenshot` adds a PNG of the window (macOS) |
+| `desktop_commands(query?)` | Every command-palette action available now, with ids; filtered like the palette |
+| `desktop_run(id)` | Run one palette action as if the user picked it; the user sees a "Dial: …" notice |
+| `desktop_settings(query?, tab?, changed?)` | Dial's settings as the Settings page shows them; credentials hidden |
+| `desktop_set_setting(key, value \| reset, scope?)` | Change or reset one setting (default scope: the layer that sets it, else `project`) |
 
 Reads, waits, scrolls and screenshots declare `readOnlyHint`, and the entry sets
 `trust_read_only_hint`, so they run without approval. Everything else follows the session's
 approval mode.
+
+### The app itself (`desktop_*`)
+
+The agent sees and works the app through the same lists the user does, so a new feature needs no
+separate agent wiring:
+
+- **Actions** are the command palette's (`src/commands.ts`), with the same availability rules.
+  `src/agentDesktop.ts` answers `window.__dialDesktop.call(...)`; the backend
+  (`agent_browser/desktop.rs`) runs that one fixed call in the main webview with JSON arguments,
+  never agent code. **To make a feature agent-controllable, give it a palette command.**
+- **Settings** come from the engine's settings reference, as on the Settings page.
+- **The user's alone:** approvals, Agent access, VM grants and provider sign-in are not palette
+  commands and are not reachable. Settings that govern the agent (`approval`, `sandbox`, `shell`,
+  `escalation`, `mcp`, `hooks`, `tools`, `providers`, `keys`, `secrets`, browser and image
+  `allow_*`, and any key naming a token, password or API key) are readable but refused by
+  `desktop_set_setting` (`desktop::protected`). Redacted values are never shown.
 
 ## What the user sees
 

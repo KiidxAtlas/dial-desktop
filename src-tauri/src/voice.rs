@@ -288,9 +288,18 @@ fn hint(error: &str) -> String {
         "Didn't catch that. Tap to talk again".into()
     } else if lower.contains("no microphone audio") || lower.contains("permission") {
         "No microphone audio. Check the input device and Dial's microphone permission".into()
+    } else if needs_setup(&lower) {
+        "Voice needs a speech tool that is not installed. Set it up in Settings → Health & setup".into()
     } else {
         error.to_owned()
     }
+}
+
+/// Whether a (lowercased) voice failure reads as a missing speech-to-text or read-aloud tool.
+fn needs_setup(lower: &str) -> bool {
+    let tool = ["whisper", "piper", "espeak", "ffmpeg", "sox", "speech-to-text", "transcrib"].iter().any(|t| lower.contains(t));
+    let missing = ["not installed", "not found", "no such file", "missing", "cannot find", "is not set up"].iter().any(|m| lower.contains(m));
+    tool && missing
 }
 
 /// The same words, ignoring case and punctuation.
@@ -303,4 +312,17 @@ fn same_words(a: &str, b: &str) -> bool {
     };
     let a = words(a);
     !a.is_empty() && a == words(b)
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::hint;
+
+    #[test]
+    fn a_missing_speech_tool_points_at_health_and_setup() {
+        assert!(hint("whisper-cli not found on PATH").contains("Health & setup"));
+        assert!(hint("Piper is not installed").contains("Health & setup"));
+        assert_eq!(hint("the model file was not found"), "the model file was not found");
+        assert!(hint("no speech detected").contains("Tap to talk"));
+    }
 }

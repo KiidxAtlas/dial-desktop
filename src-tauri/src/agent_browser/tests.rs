@@ -5,8 +5,11 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 32);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for name in desktop::TOOLS {
+        assert!(names.contains(&name), "{name} is listed");
+    }
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool["description"].as_str().unwrap().len() > 10);
@@ -284,4 +287,104 @@ fn calls_are_described_for_the_user() {
         describe_call("browser_type", &json!({"name": "Email"})),
         "Typing into \"Email\""
     );
+}
+
+fn setting(key: &str, source: Option<&str>, redacted: bool) -> crate::settings::SettingView {
+    crate::settings::SettingView {
+        key: key.into(),
+        label: format!("Label of {key}"),
+        description: String::new(),
+        tab: "Common".into(),
+        section: "General".into(),
+        control: crate::settings::Control::Toggle,
+        value: json!(true),
+        default: json!(false),
+        modified: true,
+        redacted,
+        restart: false,
+        source: source.map(Into::into),
+    }
+}
+
+#[test]
+fn desktop_settings_that_govern_the_agent_are_the_users() {
+    for key in [
+        "approval",
+        "sandbox.mode",
+        "sandbox",
+        "shell.git_guard",
+        "mcp",
+        "keys",
+        "browser.allow_install",
+        "memory.hindsight.api_key_env",
+        "integrations.github_token",
+        // A table that holds a protected key.
+        "browser",
+        "image",
+        " Approval ",
+        "",
+    ] {
+        assert!(desktop::protected(key), "{key:?} is protected");
+    }
+    for key in [
+        "ui.autocomplete_items",
+        "compaction.max_tokens",
+        "memory.autolearn",
+        "browser.auto_localhost",
+        "sandboxed",
+        "approvals_ui",
+    ] {
+        assert!(!desktop::protected(key), "{key:?} is open to the agent");
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn desktop_set_setting_checks_the_row_and_picks_a_scope() {
+    let rows = [
+        setting("memory.autolearn", None, false),
+        setting("ui.theme", Some("global"), false),
+        setting("voice.secret_thing", None, true),
+        setting("sandbox.mode", None, false),
+    ];
+    let plan =
+        |key: &str, args: Value, reset: bool| desktop::plan_change(&rows, key, &args, reset);
+    assert_eq!(
+        plan("memory.autolearn", json!({"value": false}), false).unwrap(),
+        ("project", Some(json!(false)))
+    );
+    assert_eq!(
+        plan("ui.theme", json!({"value": "x"}), false).unwrap(),
+        ("global", Some(json!("x")))
+    );
+    assert_eq!(
+        plan("ui.theme", json!({"scope": "project"}), true).unwrap(),
+        ("project", None)
+    );
+    assert!(plan("memory.autolearn", json!({}), false).unwrap_err().contains("value"));
+    assert!(plan("memory.autolearn", json!({"value": 1, "scope": "everywhere"}), false).is_err());
+    assert!(plan("nope", json!({"value": 1}), false).unwrap_err().contains("No setting"));
+    assert!(plan("voice.secret_thing", json!({"value": 1}), false).unwrap_err().contains("credential"));
+    assert!(plan("sandbox.mode", json!({"value": "off"}), false).unwrap_err().contains("only the user"));
+}
+
+#[test]
+fn desktop_settings_list_filters_and_hides_credentials() {
+    let rows = [
+        setting("memory.autolearn", None, false),
+        setting("voice.secret_thing", Some("project"), true),
+        setting("sandbox.mode", None, false),
+    ];
+    let all = desktop::list_settings(&rows, &json!({}));
+    assert!(all.contains("memory.autolearn = true (default false)"));
+    assert!(all.contains("voice.secret_thing = (hidden)"));
+    assert!(all.contains("saved in project"));
+    assert!(all
+        .lines()
+        .find(|l| l.starts_with("sandbox.mode"))
+        .is_some_and(|l| l.ends_with("user only")));
+    let some = desktop::list_settings(&rows, &json!({"query": "autolearn"}));
+    assert_eq!(some.lines().count(), 1);
+    assert!(desktop::list_settings(&rows, &json!({"tab": "nowhere"}))
+        .starts_with("No setting matches. Tabs: Common"));
 }

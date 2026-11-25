@@ -597,6 +597,9 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
             </div>
           </template>
 
+          <div v-else-if="entry.kind === 'notice' && entry.noticeKind === 'steer'" class="user" aria-label="Your mid-turn note">
+            <div class="bubble user-text"><FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template></div>
+          </div>
           <div v-else-if="entry.kind === 'notice' && entry.lane === 'alert'" class="alert">
             <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template>
           </div>
@@ -802,6 +805,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   align-items: flex-end;
   max-width: 80%;
 }
+.k-notice > .user { margin-inline-start: auto; }
 .bubble {
   max-width: 100%;
   padding: 10px 16px;
@@ -866,27 +870,31 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 .error .copy-error:hover {
   opacity: 1;
 }
+/* The round button keeps to the right edge of the column, low in the gap above the composer,
+   so it covers the ends of at most a line or two instead of the middle of what's being read.
+   The "new replies" pill stays centred: it's a notice worth seeing. */
 .jump {
   position: sticky;
-  bottom: 14px;
+  bottom: 8px;
   display: flex;
-  justify-content: center;
+  justify-content: flex-end;
   height: 0;
   overflow: visible;
   pointer-events: none;
 }
+.jump:has(.wide) {
+  justify-content: center;
+}
 .jump button {
   display: grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
-  margin-top: -48px;
+  width: 32px;
+  height: 32px;
+  margin-top: -40px;
   border-radius: 50%;
-  background: var(--glass);
-  -webkit-backdrop-filter: var(--glass-blur);
-  backdrop-filter: var(--glass-blur);
+  background: var(--raised);
   color: var(--text);
-  box-shadow: var(--shadow-pop);
+  box-shadow: var(--shadow-pop), inset 0 0 0 1px var(--border);
   pointer-events: auto;
   animation: rise 160ms var(--ease) both;
   transition: transform 120ms var(--ease), background 120ms var(--ease);
@@ -933,7 +941,7 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   100% { box-shadow: inset 0 0 0 1px var(--border); }
 }
 .jump button:hover {
-  background: var(--raised);
+  background: color-mix(in srgb, var(--raised) 88%, var(--text));
   transform: translateY(-1px);
 }
 .user-text {

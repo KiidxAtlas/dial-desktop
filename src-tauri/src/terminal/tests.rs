@@ -50,7 +50,7 @@ fn a_shell_streams_output_and_reports_its_exit() {
     assert!(output.contains("dial-42"), "{output:?}");
     assert!(exited);
     assert!(
-        !terminals.has_shells(),
+        terminals.open_ids().is_empty(),
         "exited shell must be removed before Exit is reported"
     );
     assert!(terminals.write(id, "x").is_err());
@@ -72,4 +72,14 @@ fn slash_command_preserves_literal_argument_and_configured_program() {
             "{invalid:?}"
         );
     }
+}
+
+#[test]
+fn windows_prefers_powershell_7_when_it_is_on_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::env::join_paths([dir.path()]).unwrap();
+    assert_eq!(windows_shell(Some(&path)), "powershell.exe");
+    assert_eq!(windows_shell(None), "powershell.exe");
+    std::fs::write(dir.path().join("pwsh.exe"), b"").unwrap();
+    assert_eq!(windows_shell(Some(&path)), "pwsh.exe");
 }

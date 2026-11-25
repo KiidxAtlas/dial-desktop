@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(value["steps"][1]["action"]["kind"], "install");
         assert_eq!(value["steps"][1]["action"]["admin"], false);
         assert_eq!(value["steps"][1]["action"]["cancellable"], true);
-        assert_eq!(install("Install", true).unwrap().cancellable, false);
+        assert!(!install("Install", true).unwrap().cancellable);
         assert_eq!(value["steps"][2]["status"], "blocked");
     }
 

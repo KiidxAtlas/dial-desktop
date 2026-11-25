@@ -91,11 +91,21 @@ h2 {
   color: var(--text);
   text-shadow: var(--hero-shadow);
 }
+/* The path and the shortcuts link sit on a soft glass pill: a text shadow alone leaves them
+   unreadable over a bright or busy background picture. */
 p {
   margin: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
   font-size: 12.5px;
-  color: var(--text-faint);
-  text-shadow: var(--hero-shadow);
+  color: var(--text-muted);
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  max-width: min(560px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .setup {
   display: flex;
@@ -104,7 +114,7 @@ p {
   gap: 12px 16px;
   max-width: 560px;
   padding: 12px 14px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--glass-soft);
   -webkit-backdrop-filter: var(--glass-blur);
   backdrop-filter: var(--glass-blur);
@@ -178,16 +188,15 @@ p {
   opacity: 0.45;
 }
 .tips {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px 16px;
-  max-width: 560px;
+  padding: 4px 12px;
+  border-radius: 999px;
   font-size: var(--text-xs);
   color: var(--text-muted);
-  opacity: 0.85;
-  text-shadow: var(--hero-shadow);
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   animation: rise 420ms 260ms var(--ease) both;
+  transition: color 120ms var(--ease), background 120ms var(--ease);
 }
-.tips:hover { color: var(--text); text-decoration: underline; }
+.tips:hover { color: var(--text); background: var(--hover); }
 </style>

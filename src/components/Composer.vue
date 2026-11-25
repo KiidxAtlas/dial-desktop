@@ -125,12 +125,16 @@ const steering = computed(
   () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
 );
 const queueKey = computed(() => (props.snap.platform === "macos" ? "⌘ Enter" : "Ctrl+Enter"));
-/** What Enter does while a turn runs: a note now, or (with files, which a note cannot carry) a queued prompt. */
+/** What Enter does while a turn runs: a note now, or (with files, which a note cannot carry) a
+ *  queued prompt. Kept short: the bar shows one hint; the rest is in its tooltip and the ⌘/ sheet. */
 const runningHint = computed(() => {
   if (!props.snap.turnRunning || draft.value.sending || !hasContent.value || slash.value.length || paths.value.length) return "";
-  if (draft.value.attachments.length) return canQueue.value ? "queue for the next turn (files can't go in a note)" : "";
-  return steering.value ? "add a note to this turn" : "";
+  if (draft.value.attachments.length) return canQueue.value ? "queue" : "";
+  return steering.value ? "add note" : "";
 });
+const runningTitle = computed(() => draft.value.attachments.length
+  ? "Enter queues this for the next turn: files can't go in a note"
+  : `Enter adds a note to this turn; ${queueKey.value} queues it for the next turn instead`);
 const canSend = computed(() => ready.value && (slash.value.length > 0 || steering.value || (
   props.snap.canSend && hasContent.value
 )));
@@ -447,6 +451,9 @@ watch(() => approval.value?.approvalId, (id, was) => {
   if (active instanceof HTMLElement && active.isContentEditable) return;
   void nextTick(() => allowButton.value?.focus({ preventScroll: true }));
 });
+// While a request waits the empty prompt box shrinks to one line, so the request and the
+// conversation keep the room; it grows back as soon as there's text or the request is answered.
+watch(() => !!approval.value, () => nextTick(resize));
 
 watch(() => draft.value.text, () => { selected.value = 0; slashDismissed.value = false; nextTick(resize); });
 watch(() => ui.focusComposer, focus);
@@ -489,8 +496,7 @@ onMounted(focus);
               Always allow…
             </button>
             <span v-else class="once-note">Applies to this request only</span>
-            <span class="grow" />
-            <button class="btn btn-danger" :title="`Deny this request (${denyKey})`" :aria-keyshortcuts="mac ? 'Meta+Backspace' : 'Control+Backspace'" @click="decide('deny')">Deny<kbd class="key" aria-hidden="true">{{ denyKey }}</kbd></button>
+            <button class="btn btn-danger deny" :title="`Deny this request (${denyKey})`" :aria-keyshortcuts="mac ? 'Meta+Backspace' : 'Control+Backspace'" @click="decide('deny')">Deny<kbd class="key" aria-hidden="true">{{ denyKey }}</kbd></button>
           </div>
         </section>
       </Transition>
@@ -550,8 +556,10 @@ onMounted(focus);
           v-model="draft.text"
           aria-label="Prompt"
           data-prompt
-          rows="2"
+          :rows="approval ? 1 : 2"
           spellcheck="true"
+          autocorrect="off"
+          autocapitalize="off"
           :placeholder="draft.pending ? 'Write your next message…' : snap.turnRunning ? 'Add a note for Dial while it works…' : ui.typeOpen ? `Ask Dial to change ${types.list.find((t) => t.id === ui.typeOpen)?.name ?? 'this type'}…` : snap.entries.length ? 'Message Dial…' : 'What would you like to do in this project?'"
           :readonly="draft.sending && !draft.pending"
           @keydown="onKey"
@@ -571,13 +579,15 @@ onMounted(focus);
           <span v-if="sendingTo" class="sending-to" :title="`Prompts go to ${sendingTo}'s own conversation, not the chat that was on screen`">
             Sending to <strong class="truncate">{{ sendingTo }}</strong>
           </span>
-          <span class="grow" />
-          <span v-if="draft.loading" class="keyhint always" role="status">Restoring draft…</span>
-          <span v-else-if="draft.reading" class="keyhint always" role="status">Preparing attachments…</span>
-          <span v-else-if="draft.attachments.length > MAX_ATTACHMENTS" class="keyhint always" role="status">Remove files to send {{ MAX_ATTACHMENTS }} or fewer.</span>
-          <span v-else-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
-          <span v-else-if="!draft.sending && !snap.turnRunning && hasContent && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> send <kbd>⇧ Enter</kbd> new line</span>
-          <span v-else-if="runningHint" class="keyhint always" role="status"><kbd>Enter</kbd> {{ runningHint }}<template v-if="!draft.attachments.length && canQueue"> <kbd>{{ queueKey }}</kbd> queue for next turn</template></span>
+          <!-- One short hint in leftover room (the rest is in its tooltip and the ⌘/ sheet); when it doesn't fit it wraps out of sight instead of pushing the send button onto its own row. -->
+          <span class="hint-slot">
+            <span v-if="draft.loading" class="keyhint status" role="status">Restoring draft…</span>
+            <span v-else-if="draft.reading" class="keyhint status" role="status">Preparing attachments…</span>
+            <span v-else-if="draft.attachments.length > MAX_ATTACHMENTS" class="keyhint status" role="status">Remove files to send {{ MAX_ATTACHMENTS }} or fewer.</span>
+            <span v-else-if="typedName && !slash.length && !paths.length" class="keyhint"><kbd>Enter</kbd> run /{{ typedName }}</span>
+            <span v-else-if="!draft.sending && !snap.turnRunning && hasContent && !slash.length && !paths.length" class="keyhint" title="Enter sends; Shift+Enter starts a new line"><kbd>⇧ Enter</kbd> new line</span>
+            <span v-else-if="runningHint" class="keyhint always" role="status" :title="runningTitle"><kbd>Enter</kbd> {{ runningHint }}</span>
+          </span>
           <ContextMeter
             v-if="snap.context"
             :context="snap.context"
@@ -655,7 +665,7 @@ onMounted(focus);
   gap: var(--space-sm);
 }
 .card {
-  padding: 14px 16px;
+  padding: 12px 14px;
   border-radius: var(--radius-lg);
   background: var(--glass);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -665,6 +675,26 @@ onMounted(focus);
 .card.approval {
   border-color: color-mix(in srgb, var(--warning) 45%, var(--border-strong));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 10%, transparent), 0 8px 28px rgb(0 0 0 / 22%);
+}
+/* A request right above the prompt box joins it as one panel: no gap, one shared edge, so the
+   two read as "answer this, or type instead" and take less height than two floating cards. */
+.card.approval:has(+ .composer) {
+  margin-bottom: calc(-1 * var(--space-sm));
+  border-bottom: none;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  box-shadow: none;
+}
+.card.approval + .composer {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border-strong));
+  border-top-color: var(--border);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  padding-top: 10px;
+}
+.card.approval + .composer:focus-within {
+  border-color: var(--focus-border);
+  border-top-color: var(--border);
 }
 .card-icon {
   display: grid;
@@ -724,7 +754,7 @@ onMounted(focus);
 .card-head .mono { font-family: var(--font-mono); font-weight: 500; overflow-wrap: anywhere; }
 .card-head .tool-id { margin-left: 4px; font-size: var(--text-xs); color: var(--text-faint); }
 .summary {
-  margin: 10px 0 0;
+  margin: 8px 0 0;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
   background: var(--bubble);
@@ -740,11 +770,12 @@ onMounted(focus);
 .actions {
   display: flex;
   gap: 6px;
-  margin-top: 12px;
+  margin-top: 10px;
   flex-wrap: wrap;
 }
-.grow {
-  flex: 1;
+/* Right-aligned on whichever line it lands, so a wrapped Deny doesn't sit under Allow. */
+.actions .deny {
+  margin-left: auto;
 }
 .composer {
   position: relative;
@@ -887,18 +918,43 @@ onMounted(focus);
   color: var(--text-muted);
 }
 .file-row .mono { color: var(--text); font-size: var(--text-mono); }
+.hint-slot {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  overflow: hidden;
+}
+/* Shares the first line with the hint; a hint wider than what's left wraps to the clipped second line. */
+.hint-slot::before {
+  content: "";
+  flex: 1 0 0;
+  height: 32px;
+}
 .keyhint {
   display: none;
   align-items: center;
   gap: 4px;
+  height: 32px;
   margin-right: 8px;
   font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
-.keyhint kbd:last-of-type { margin-left: 6px; }
-.composer:focus-within .keyhint, .keyhint.always { display: inline-flex; }
-@media (max-width: 880px) { .composer:focus-within .keyhint:not(.always) { display: none; } }
+/* Status lines stay visible however narrow the bar: they come first and end in an ellipsis. */
+.keyhint.status {
+  display: block;
+  order: -1;
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+  line-height: 32px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer:focus-within .keyhint:not(.status), .keyhint.always { display: inline-flex; }
 .slash, .queue { max-height: 30vh; overflow-y: auto; }
 .queue-recovery { margin: 3px 0 6px; }
 .queue-row { display: flex; align-items: center; gap: 6px; }
@@ -969,12 +1025,16 @@ textarea::placeholder {
 }
 .bar {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   /* Pulls the first 28px button out so its icon, not its hover box, lines up with the text. */
   margin: 8px 0 0 -6px;
   cursor: default;
+  /* ModelPicker drops its effort label when this gets narrow. */
+  container: composer-bar / inline-size;
+}
+.bar > :not(.hint-slot):not(.picker):not(.sending-to) {
+  flex: none;
 }
 .send {
   display: grid;
@@ -1009,17 +1069,27 @@ textarea::placeholder {
 .send.stop:hover {
   background: var(--text-strong);
 }
+/* Status under the composer. Over a background it sits on a soft glass pill so it stays legible
+ * on a busy picture; on a plain window the pill is invisible. */
 .caption {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
   min-width: 0;
+  max-width: 100%;
+  width: fit-content;
+  margin-inline: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--glass-soft);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   font-size: var(--text-sm);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 .caption.offline {
-  color: var(--text-muted);
+  color: var(--text);
 }
 .caption .reconnect {
   flex: none;

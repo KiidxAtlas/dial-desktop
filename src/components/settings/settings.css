@@ -63,7 +63,7 @@
 }
 .s-card {
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--surface);
 }
 /* Not clipped, so pickers can open over the next card; children keep the corners instead. */
@@ -168,7 +168,7 @@
   margin: 0 0 18px;
   padding: 10px 14px;
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   font-size: var(--text-sm);
   line-height: 1.5;
@@ -269,7 +269,7 @@
   display: inline-flex;
   flex: none;
   padding: 2px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--active);
 }
 .s-seg button {
@@ -324,7 +324,7 @@
 .s-tile .art {
   width: 100%;
   aspect-ratio: 16 / 10;
-  border-radius: 9px;
+  border-radius: var(--radius-md);
   box-shadow: 0 0 0 1px var(--border-strong);
   overflow: hidden;
   object-fit: cover;

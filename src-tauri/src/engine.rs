@@ -132,12 +132,13 @@ pub enum Command {
     },
     /// Copy a session of this project into a new one and switch to the copy.
     ForkSession(String),
-    /// Write the active session as Markdown to `path`, relative to the project root.
+    /// Write the active session to `path`, relative to the project root: a standalone page when
+    /// the name ends in `.html` or `.htm`, else Markdown.
     Export(String),
     /// Undo the last turn: restore the files it changed and rewind the conversation.
     Undo,
     /// Add guidance to the running turn; the engine takes it at its next step.
-    Steer(String),
+    Steer { text: String, scope: Option<TypeScope> },
     /// Send the last unanswered prompt (a failed or stopped turn) again.
     Retry,
     /// Summarize the conversation so far to free context.
@@ -372,13 +373,22 @@ impl Command {
                 json!({ "session_id": session_id, "pinned": pinned }),
             ),
             Self::ForkSession(id) => (Purpose::Fork, "fork_session", json!({ "session_id": id })),
-            Self::Export(path) => (
-                Purpose::Export,
-                "export",
-                json!({ "format": "markdown", "path": path }),
-            ),
+            Self::Export(path) => {
+                let html = std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+                let format = if html { "html" } else { "markdown" };
+                (Purpose::Export, "export", json!({ "format": format, "path": path }))
+            }
             Self::Undo => (Purpose::Undo, "undo", json!({ "turns": 1 })),
-            Self::Steer(text) => (Purpose::Steer, "steer", json!({ "text": text })),
+            Self::Steer { text, scope } => {
+                let text = match scope {
+                    Some(TypeScope::Framed(context)) => crate::types::legacy_prompt(context, text),
+                    _ => text.clone(),
+                };
+                (Purpose::Steer, "steer", json!({ "text": text }))
+            }
             // A retry starts a turn, so its reply settles the turn like `send`'s.
             Self::Retry => (Purpose::Turn, "retry", json!({})),
             Self::Compact => (Purpose::Compact, "compact", json!({ "reason": "manual" })),

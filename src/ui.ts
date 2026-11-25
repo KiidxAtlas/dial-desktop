@@ -42,6 +42,8 @@ const layout = storedLayout();
 export type SettingsTab =
   | ""
   | "updates"
+  | "health"
+  | "maintenance"
   | "library"
   | "providers"
   | "roles"
@@ -53,7 +55,9 @@ export type SettingsTab =
   | "checks"
   | "folders"
   | "memory"
-  | "schedules";
+  | "schedules"
+  | "permissions"
+  | "integrations";
 
 export const ui = reactive({
   /** Bumped to move keyboard focus to the composer. */

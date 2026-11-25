@@ -26,9 +26,17 @@ const showSteps = computed(() => !recent.value.length || steps.value[0].state !=
       <button class="btn btn-primary open" @click="folders.choose()">
         <Icon name="folder" :size="16" /> Open folder…
       </button>
-      <button class="btn btn-secondary settings" title="Appearance, notifications and updates (⌘,)" @click="ui.settingsOpen = true">
-        <Icon name="gear" :size="14" /> Settings
-      </button>
+      <div class="quick">
+        <button class="btn btn-secondary" title="Sign in to a provider or add an API key; no project needed" @click="ui.settingsTab = 'providers'; ui.settingsOpen = true">
+          <Icon name="globe" :size="14" /> Connect a model
+        </button>
+        <button class="btn btn-secondary" title="What Dial can use on this computer, and the dial command for your terminal" @click="ui.settingsTab = 'health'; ui.settingsOpen = true">
+          <Icon name="shield" :size="14" /> Check setup
+        </button>
+        <button class="btn btn-secondary" title="Appearance, notifications and updates (⌘,)" @click="ui.settingsOpen = true">
+          <Icon name="gear" :size="14" /> Settings
+        </button>
+      </div>
       <ol v-if="showSteps" class="steps" aria-label="Getting started">
         <li v-for="(s, i) in steps" :key="s.id" :class="s.state">
           <span class="num" aria-hidden="true">
@@ -44,7 +52,7 @@ const showSteps = computed(() => !recent.value.length || steps.value[0].state !=
       <div v-if="updates.engine?.state === 'missing'" class="engine-missing">
         <p>
           Dial Desktop couldn’t find an engine. Install a signed copy for Desktop to use.
-          On macOS and Linux, this copy stays private to Desktop and isn’t added to your terminal’s PATH.
+          On macOS and Linux, this copy stays private to Desktop; Settings › Health &amp; setup can add it to your terminal’s PATH afterwards.
         </p>
         <button class="btn btn-secondary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine()">
           <Icon name="download" :size="14" /> {{ updates.engineBusy ? "Installing…" : "Install Desktop copy" }}
@@ -108,8 +116,11 @@ h1 {
   height: 40px;
   font-size: 14px;
 }
-.settings {
-  align-self: center;
+.quick {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
 }
 .recent {
   display: flex;

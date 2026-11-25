@@ -6,7 +6,9 @@ import { addToPrompt, inspectorWidth, mention, MIN_WIDTH, projectPref, setInspec
 import { changeRows, gitLabel, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
 import { workspaceGitApi, type CommitReview } from "../workspaceGitApi";
 import { showToast } from "../bridge";
-import { paneErrorText } from "../paneErrors";
+import { aiReviewView, gitLogView, worktreesView } from "../commandRunner";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { needsGitIdentity, paneErrorText } from "../paneErrors";
 import Icon from "./Icon.vue";
 import BrowserPane from "./workspace/BrowserPane.vue";
 import DiffPane from "./workspace/DiffPane.vue";
@@ -79,7 +81,7 @@ function dismissReview() {
   review.value = null;
 }
 watch([() => props.snap.workspace.root, () => props.snap.sessionId, commitMessage, () => shown("changes")], dismissReview, { flush: "sync" });
-watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; });
+watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; author.value = null; });
 let gitRequest = 0;
 async function loadGit() {
   const root = props.snap.workspace.root, id = ++gitRequest;
@@ -139,11 +141,55 @@ async function commitStaged() {
     if (root === props.snap.workspace.root && commitMessage.value === message) commitMessage.value = "";
     showToast(`Committed ${sha}`);
   } catch (e) {
-    showToast(paneErrorText(e));
+    if (needsGitIdentity(e)) void askAuthor(root);
+    else showToast(paneErrorText(e));
   } finally {
     dismissReview();
     gitBusy.value = false;
     if (root === props.snap.workspace.root) await loadGit();
+  }
+}
+
+/** Fill the message box with the engine's message for what is staged (`dial commit --dry-run`). */
+const writing = ref(false);
+const aiWarning = ref("");
+watch(commitMessage, () => { if (!writing.value) aiWarning.value = ""; });
+async function writeMessage() {
+  if (writing.value || gitBusy.value || !staged.value) return;
+  if (commitMessage.value.trim() && !(await ask("Replace the message you wrote with one from Dial?", { title: "Write with AI", kind: "warning", okLabel: "Replace" }))) return;
+  const root = props.snap.workspace.root;
+  writing.value = true;
+  try {
+    const preview = await workspaceGitApi.aiMessage(root);
+    if (root !== props.snap.workspace.root) return;
+    commitMessage.value = preview.message;
+    aiWarning.value = preview.warning ?? "";
+  } catch (e) {
+    showToast(`Could not write a message: ${paneErrorText(e)}`);
+  } finally {
+    writing.value = false;
+  }
+}
+
+/** Git refused a commit for want of an author: asked for under the message, then commit again. */
+const author = ref<{ name: string; email: string; everywhere: boolean; saving: boolean; error: string } | null>(null);
+async function askAuthor(root: string) {
+  const known = await workspaceGitApi.identity(root).catch(() => ({ name: "", email: "" }));
+  if (root === props.snap.workspace.root) author.value = { ...known, everywhere: true, saving: false, error: "" };
+}
+async function saveAuthor() {
+  const form = author.value, root = props.snap.workspace.root;
+  if (!form || form.saving || !form.name.trim() || !form.email.trim()) return;
+  form.saving = true;
+  form.error = "";
+  try {
+    const saved = await workspaceGitApi.setIdentity(form.name, form.email, form.everywhere, root);
+    if (author.value === form) author.value = null;
+    showToast(`Commits are now recorded as ${saved.name} <${saved.email}>. Review and commit again.`);
+  } catch (e) {
+    form.error = String(e).replace(/^Error:\s*/, "");
+  } finally {
+    form.saving = false;
   }
 }
 watch(
@@ -264,12 +310,15 @@ function resizeByKey(event: KeyboardEvent) {
 
     <div v-show="['files', 'terminal', 'browser', 'app'].includes(ui.inspectorTab)" class="panel">
       <FilesPane v-if="visited.has('files')" v-show="ui.inspectorTab === 'files'" :snap="snap" />
-      <TerminalPane
-        v-if="visited.has('terminal')"
-        v-show="ui.inspectorTab === 'terminal'"
-        :snap="snap"
-        :active="shown('terminal')"
-      />
+      <KeepAlive>
+        <TerminalPane
+          v-if="visited.has('terminal')"
+          :key="snap.workspace.root"
+          v-show="ui.inspectorTab === 'terminal'"
+          :snap="snap"
+          :active="shown('terminal')"
+        />
+      </KeepAlive>
       <BrowserPane v-if="visited.has('browser')" v-show="ui.inspectorTab === 'browser'" :active="shown('browser')" />
       <AppPane v-if="visited.has('app')" v-show="ui.inspectorTab === 'app'" :root="snap.workspace.root" :active="shown('app')" />
     </div>
@@ -362,6 +411,12 @@ function resizeByKey(event: KeyboardEvent) {
           <div class="commit-head">
             <span class="section-label">Commit</span>
             <span v-if="gitBranch" class="faint mono truncate" :title="`Current branch: ${gitBranch}`">to {{ gitBranch }}</span>
+            <span class="commit-ai">
+              <button type="button" class="s-link" title="Dial reads your uncommitted changes with the current model and reports; nothing is changed" @click="aiReviewView()">AI review</button>
+              <button type="button" class="s-link" title="Recent commits on this branch" @click="gitLogView()">History</button>
+              <button type="button" class="s-link" :disabled="gitBusy || writing || !staged" :title="staged ? 'Dial reads the staged changes and writes a message here; nothing is committed until you review it' : 'Stage files first'" @click="writeMessage">{{ writing ? "Writing…" : "Write with AI" }}</button>
+              <button type="button" class="s-link" title="Branches checked out in other folders" @click="worktreesView()">Worktrees</button>
+            </span>
           </div>
           <textarea
             v-model="commitMessage"
@@ -373,6 +428,19 @@ function resizeByKey(event: KeyboardEvent) {
             @keydown.meta.enter.prevent="!review && reviewStaged()"
             @keydown.ctrl.enter.prevent="!review && reviewStaged()"
           />
+          <p v-if="aiWarning" class="faint commit-warning">Dial’s check of this message: {{ aiWarning }}</p>
+          <div v-if="author" class="author" role="group" aria-label="Commit author">
+            <strong>Git needs your name and email</strong>
+            <span class="faint">Git records them on each commit you make. They are saved in Git’s own settings on this computer.</span>
+            <input v-model="author.name" class="s-input" aria-label="Your name" placeholder="Your name" autocomplete="name" @keydown.enter.prevent="saveAuthor" />
+            <input v-model="author.email" class="s-input" type="email" aria-label="Email address" placeholder="you@example.com" autocomplete="email" spellcheck="false" @keydown.enter.prevent="saveAuthor" />
+            <label class="author-scope faint"><input v-model="author.everywhere" type="checkbox" /> Use for all my repositories</label>
+            <p v-if="author.error" role="alert" class="s-error">{{ author.error }}</p>
+            <div class="commit-foot">
+              <button type="button" class="btn btn-secondary" :disabled="author.saving" @click="author = null">Not now</button>
+              <button type="button" class="btn btn-primary" :disabled="author.saving || !author.name.trim() || !author.email.trim()" @click="saveAuthor">{{ author.saving ? "Saving…" : "Save author" }}</button>
+            </div>
+          </div>
           <template v-if="review">
             <strong>Review {{ review.paths.length }} staged {{ review.paths.length === 1 ? 'path' : 'paths' }}<template v-if="review.branch"> on {{ review.branch }}</template></strong>
             <span class="faint">Includes files staged outside this session. Only staged changes will be committed.</span>
@@ -664,7 +732,14 @@ function resizeByKey(event: KeyboardEvent) {
   justify-content: space-between;
   gap: 8px;
 }
+.commit-ai { display: flex; gap: 10px; margin-left: auto; flex: none; }
+.commit-ai .s-link { color: var(--accent); font-size: var(--text-sm); }
+.commit-ai .s-link:disabled { color: var(--text-faint); cursor: default; }
+.commit-warning { margin: 0; font-size: var(--text-xs); }
 .staged-paths { overflow: auto; max-height: 12rem; padding-left: 1.4rem; overflow-wrap: anywhere; font-size: var(--text-sm); }
+.author { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: var(--text-sm); }
+.author .s-input { width: 100%; max-width: 100%; }
+.author-scope { display: flex; align-items: center; gap: 6px; }
 .commit-message {
   width: 100%;
   min-height: 44px;

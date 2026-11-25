@@ -93,6 +93,23 @@ fn connect_failures_name_their_fix() {
 }
 
 #[test]
+fn launch_refusals_the_system_names_get_a_next_step() {
+    let hint = |error, windows| failure_hint(error, windows).unwrap_or_default();
+    assert!(hint("could not start dial.exe: An Application Control policy has blocked this file. (os error 4551)", true).contains("Smart App Control"));
+    assert!(hint("could not start dial.exe: %1 is not a valid Win32 application. (os error 193)", true).contains("different kind of computer"));
+    assert!(hint("could not start dial: Exec format error (os error 8)", false).contains("different kind of computer"));
+    assert!(hint("could not start dial: Bad CPU type in executable (os error 86)", false).contains("different kind of computer"));
+    assert!(hint("could not start dial.exe: The requested operation requires elevation. (os error 740)", true).contains("administrator"));
+    assert!(hint("could not start dial: Permission denied (os error 13)", false).contains("refused to run"));
+    assert!(hint("could not start dial.exe: Access is denied. (os error 5)", true).contains("refused to run"));
+    // The same numbers mean other things on the other platform, and on a running engine.
+    assert_eq!(failure_hint("could not start dial: Input/output error (os error 5)", false), None);
+    assert_eq!(failure_hint("could not start dial.exe: The data is invalid. (os error 13)", true), None);
+    assert_eq!(failure_hint("handshake failed: Permission denied (os error 13)", false), None);
+    assert_eq!(failure_hint("could not start dial: No such file or directory (os error 2)", false), None);
+}
+
+#[test]
 fn the_installer_is_the_signed_release_installer_for_each_platform() {
     let (program, args) = install_command(false);
     assert_eq!(program, "sh");

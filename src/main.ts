@@ -8,10 +8,14 @@ import { IMAGE_EXT, viewImage } from "./imageViewer";
 import { startNotifications } from "./notifications";
 import { startTypes } from "./savedTypes";
 import { installLegacyKeyGuard } from "./macKeys";
+import { installTextInputDefaults } from "./textInputs";
+import { installAgentDesktop } from "./agentDesktop";
 import "./styles.css";
 
 installLegacyKeyGuard();
+installTextInputDefaults();
 startAppearance();
+installAgentDesktop();
 createApp(App).mount("#app");
 
 void connect();

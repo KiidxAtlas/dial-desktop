@@ -718,6 +718,104 @@ pub fn commit(root: &Path, message: &str, reviewed: &CommitReview) -> Result<Str
     Ok(String::from_utf8_lossy(&sha.stdout).trim().to_owned())
 }
 
+/// Who Git records as the author of a commit made in `root`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+/// `git config --get key`; empty when unset (Git exits 1 for that, which is an answer).
+fn config_value(root: &Path, key: &str) -> Result<String, String> {
+    let output = git_in(root, &["config", "--get", key])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// One commit of the current branch's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogEntry {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Committer date, ISO 8601.
+    pub date: String,
+    /// Branch and tag names pointing here, as `git log --decorate` shows them.
+    pub refs: String,
+}
+
+/// Fields of one `git log` record, separated by the unit separator (never in a subject).
+const LOG_FORMAT: &str = "--format=%H%x1f%an%x1f%cI%x1f%D%x1f%s%x1e";
+
+/// Parse records written with [`LOG_FORMAT`].
+pub fn parse_log(text: &str) -> Vec<LogEntry> {
+    text.split('\u{1e}')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches(['\n', '\r']).splitn(5, '\u{1f}');
+            let sha = fields.next()?.trim();
+            if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(LogEntry {
+                sha: sha.to_owned(),
+                author: fields.next()?.to_owned(),
+                date: fields.next()?.to_owned(),
+                refs: fields.next()?.to_owned(),
+                subject: fields.next()?.trim_end().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The newest `limit` commits reachable from HEAD; empty before the first commit.
+pub fn log(root: &Path, limit: usize) -> Result<Vec<LogEntry>, String> {
+    if git_prefix(root).is_none() {
+        return Err("This project is not a Git repository".into());
+    }
+    let head = git_in(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    if !head.status.success() {
+        return Ok(Vec::new());
+    }
+    let count = format!("--max-count={}", limit.clamp(1, 500));
+    let output = git_in(root, &["log", &count, "--no-color", LOG_FORMAT, "HEAD", "--"])?;
+    if !output.status.success() {
+        return Err(format!("git log failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(parse_log(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The configured `user.name` and `user.email`; a part Git has no value for is empty.
+pub fn identity(root: &Path) -> Result<GitIdentity, String> {
+    Ok(GitIdentity {
+        name: config_value(root, "user.name")?,
+        email: config_value(root, "user.email")?,
+    })
+}
+
+/// Save the commit author for this repository, or with `everywhere` for every repository of this
+/// user (`git config --global`). Answers with what Git now reports.
+pub fn set_identity(root: &Path, name: &str, email: &str, everywhere: bool) -> Result<GitIdentity, String> {
+    let (name, email) = (name.trim(), email.trim());
+    let plain = |text: &str| {
+        !text.is_empty()
+            && !text.starts_with('-')
+            && !text.chars().any(|c| c.is_control() || matches!(c, '<' | '>'))
+    };
+    if !plain(name) {
+        return Err("Enter the name to record on your commits".into());
+    }
+    if !plain(email) || !email.contains('@') || email.contains(char::is_whitespace) {
+        return Err("Enter an email address such as you@example.com".into());
+    }
+    let scope = if everywhere { "--global" } else { "--local" };
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        let output = git_in(root, &["config", scope, key, value])?;
+        if !output.status.success() {
+            return Err(format!("git config failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+    }
+    identity(root)
+}
+
 /// Longest line text a content search returns.
 const GREP_TEXT: usize = 200;
 /// Most matching lines a content search returns from one file.

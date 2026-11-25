@@ -94,6 +94,35 @@ export async function setPlanMode(enabled: boolean) {
   return done !== null;
 }
 
+// ── Goal ──────────────────────────────────────────────────────────────────────
+
+/** The session's persistent goal; `status` is active, paused, budget-limited, complete or dropped. */
+export interface Goal { id: string; objective: string; status: string; token_budget: number | null; tokens_used: number; time_used_secs: number }
+
+export const goal = ref<Goal | null>(null);
+
+/** Keep the goal from any `goal` reply (`{goal: {goal: …}}`). */
+export function noteGoal(reply: any) {
+  const state = reply?.goal;
+  if (state && typeof state === "object" && "goal" in state) goal.value = (state.goal as Goal | null) ?? null;
+}
+
+export async function loadGoal() {
+  try {
+    noteGoal(await engineCall("goal", { action: "get" }));
+  } catch {
+    goal.value = null;
+  }
+}
+
+/** Pause, resume, drop, set or re-budget the goal; resuming or setting one starts a turn. */
+export async function goalAction(params: Record<string, unknown>) {
+  const reply = await tryEngine("goal", params, "Could not change the goal");
+  if (reply !== null) noteGoal(reply);
+  else await loadGoal();
+  return reply !== null;
+}
+
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 
 export interface Job { name: string; command: string; status: string; running: boolean; stop_requested: boolean; terminal: boolean }

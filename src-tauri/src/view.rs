@@ -78,6 +78,8 @@ pub enum ConnectionView {
         error: String,
         /// What the UI offers to fix it: install the engine, update it, or reconnect.
         problem: crate::updates::EngineProblem,
+        /// The next step, when the operating system's refusal names the cause.
+        hint: Option<&'static str>,
     },
     Ended,
 }
@@ -97,6 +99,7 @@ impl From<&Connection> for ConnectionView {
             Connection::Failed(error) => Self::Failed {
                 error: error.clone(),
                 problem: crate::updates::classify_failure(error),
+                hint: crate::updates::failure_hint(error, cfg!(windows)),
             },
             Connection::Ended => Self::Ended,
         }

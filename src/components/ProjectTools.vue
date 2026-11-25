@@ -1,7 +1,7 @@
 <script lang="ts">
 // Project tools the terminal reaches with /usage, /skills, /extensions, /checks, /dirs,
 // /memory and /schedule, drawn as Settings pages.
-export type ProjectTab = "usage" | "skills" | "extensions" | "checks" | "folders" | "memory" | "schedules";
+export type ProjectTab = "usage" | "skills" | "extensions" | "checks" | "folders" | "memory" | "schedules" | "permissions";
 export const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
   { id: "usage", label: "Usage & stats" },
   { id: "memory", label: "Memory" },
@@ -10,6 +10,7 @@ export const PROJECT_TABS: { id: ProjectTab; label: string }[] = [
   { id: "checks", label: "Checks" },
   { id: "folders", label: "Extra folders" },
   { id: "schedules", label: "Schedules" },
+  { id: "permissions", label: "Permissions" },
 ];
 </script>
 
@@ -19,8 +20,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { OpenSnapshot } from "../types";
-import { showToast } from "../bridge";
-import { openTaskTerminal } from "../commandRunner";
+import { openExternal, providerApi, showToast, type ProviderEvent } from "../bridge";
+import { mcpLoginRequest, openTaskTerminal, words as commandWords } from "../commandRunner";
 import { dueLabel, nextRun, saveSchedule, schedulerHeadline, type SchedulerStatus } from "../schedules";
 import { applySaved, count, engineCall, loadEngineCommands, readable, tryEngine, usd } from "../engineTools";
 import { installedPackages, listedSkills, type SkillPackage } from "../skills";
@@ -46,6 +47,7 @@ const TITLES: Record<ProjectTab, [string, string]> = {
   checks: ["Checks", "Commands Dial runs after it edits files, so mistakes surface right away."],
   folders: ["Extra folders", "Folders outside this project that Dial may read and write."],
   schedules: ["Schedules", "Prompts that run on a timer or when files change, for this project."],
+  permissions: ["Permissions", "Rules for what Dial may do without asking and what it must never do. The first matching rule wins."],
 };
 
 async function load() {
@@ -81,6 +83,9 @@ async function load() {
         break;
       case "schedules":
         [data.value, extra.value] = await Promise.all([engineCall("list_schedules"), engineCall("schedule_status").catch(() => null)]);
+        break;
+      case "permissions":
+        data.value = await engineCall("list_permission_rules");
         break;
     }
   } catch (e) {
@@ -275,6 +280,113 @@ async function submitForm() {
     await load();
   }
 }
+/** Remote servers are the ones that can need a browser sign-in (`/mcp login`). */
+const remote = (x: any) => (x.details ?? []).some((d: string) => d.includes("remote MCP endpoint"));
+// Sign-in runs the engine's `mcp_login` on the separate connection provider sign-in uses, so its
+// prompts show here and never enter the conversation.
+interface SignIn { server: string; progress: string; url: string; prompt: Extract<ProviderEvent, { event: "auth_prompt" }> | null; answer: string; cancelling: boolean }
+const signing = ref<SignIn | null>(null);
+let signInSession: number | null = null;
+function closeSignIn() {
+  if (signInSession !== null) void providerApi.close(signInSession).catch(() => {});
+  signInSession = null;
+  signing.value = null;
+}
+async function signIn(server: string) {
+  if (signing.value) return;
+  signing.value = { server, progress: "Starting sign-in…", url: "", prompt: null, answer: "", cancelling: false };
+  const mine = () => (signing.value?.server === server ? signing.value : null);
+  try {
+    const id = await providerApi.open(props.snap.workspace.root, (e) => {
+      const s = mine();
+      if (!s) return;
+      if (e.event === "failed") {
+        showToast(`Could not sign in to ${server}: ${e.message}`);
+        return closeSignIn();
+      }
+      if (e.provider !== `mcp:${server}`) return;
+      if (e.event === "auth_progress") s.progress = e.message;
+      if (e.event === "auth_url") {
+        s.url = /^https:\/\//i.test(e.url) ? e.url : "";
+        s.progress = e.instructions || "Complete sign-in in your browser.";
+      }
+      if (e.event === "auth_prompt") {
+        s.prompt = e;
+        s.answer = "";
+      }
+    });
+    if (!mine()) return void providerApi.close(id).catch(() => {});
+    signInSession = id;
+    const reply = await providerApi.mcpLogin(id, server);
+    if (!mine()) return;
+    showToast(reply.message || `Signed in to ${server}`);
+    // The grant applies when the server reconnects.
+    await engineCall("apply_settings", { reconnect: true }).catch(reloadFailed);
+    await load();
+  } catch (e) {
+    const s = mine();
+    if (s) showToast(s.cancelling ? "Sign-in cancelled" : `Could not sign in to ${server}: ${readable(e)}`);
+  } finally {
+    if (mine()) closeSignIn();
+  }
+}
+async function answerSignIn() {
+  const s = signing.value, id = signInSession, p = s?.prompt;
+  if (!s || id === null || !p || (!s.answer && !p.allow_empty)) return;
+  const code = s.answer;
+  s.answer = "";
+  s.prompt = null;
+  s.progress = "Waiting for the server…";
+  try { await providerApi.answer(id, p.prompt_id, code); }
+  catch (e) { if (signing.value === s && !s.prompt) { s.prompt = p; showToast(readable(e)); } }
+}
+async function cancelSignIn() {
+  const s = signing.value;
+  if (!s || s.cancelling) return;
+  if (signInSession === null) return closeSignIn();
+  s.cancelling = true;
+  try { await providerApi.cancel(signInSession, `mcp:${s.server}`); }
+  catch (e) { s.cancelling = false; showToast(readable(e)); }
+}
+// `/mcp login <server>` typed in the composer opens this page and starts here.
+watch([mcpLoginRequest, () => props.which, live], ([server, which, connected]) => {
+  if (!server || which !== "extensions" || !connected) return;
+  mcpLoginRequest.value = "";
+  void signIn(server);
+}, { immediate: true });
+const customName = ref("");
+const customKind = ref<"command" | "url">("command");
+const customTarget = ref("");
+/** Save a server that is not in the catalog: a command to run, or a remote address. */
+async function addCustomServer() {
+  const name = customName.value.trim();
+  const target = customTarget.value.trim();
+  if (!/^[A-Za-z][\w-]*$/.test(name)) return showToast("Name the server with letters, digits, - or _, starting with a letter");
+  let value: Record<string, unknown>;
+  if (customKind.value === "url") {
+    if (!/^https?:\/\/\S+$/i.test(target)) return showToast("Enter the server's address, starting with https://");
+    value = { url: target };
+  } else {
+    const [program, ...args] = commandWords(target);
+    if (!program) return showToast("Enter the command that starts the server");
+    value = { program, args };
+  }
+  const exists = (data.value?.mcp ?? []).some((x: any) => x.id === name);
+  const what = customKind.value === "url" ? "connects to this address" : "runs this command on your computer";
+  if (!(await ask(`${exists ? "Replace" : "Add"} the MCP server ${name}?\n\n${target}\n\nDial ${what} whenever a session starts, in every project.`, { title: "Add MCP server", kind: "warning", okLabel: exists ? "Replace" : "Add" }))) return;
+  busy.value = "custom";
+  try {
+    await engineCall("set_setting", { key: `mcp.${name}`, value, scope: "global" });
+    await applySaved().catch(reloadFailed);
+    customName.value = customTarget.value = "";
+    showToast(`Added ${name}`);
+    await load();
+  } catch (e) {
+    showToast(`Could not add the server: ${readable(e)}`);
+  } finally {
+    busy.value = "";
+  }
+}
 
 // ── Checks ──
 const checkName = ref("");
@@ -313,6 +425,49 @@ async function removeFolder(path: string) {
 }
 const dirs = computed<string[]>(() => (data.value?.dirs ?? []).map((d: any) => (typeof d === "string" ? d : d.path ?? JSON.stringify(d))));
 
+// ── Permission rules ──
+interface Rule { index: number; effect: string; tool: string; command_prefix?: string[]; paths?: string[]; scope?: string }
+const rules = computed<Rule[]>(() => data.value?.rules ?? []);
+const EFFECTS = [{ value: "allow", label: "Always allow" }, { value: "deny", label: "Never allow" }];
+const ruleEffect = ref("allow");
+const ruleTool = ref("bash");
+const rulePrefix = ref("");
+const rulePaths = ref("");
+const rulePersist = ref(true);
+const ruleBusy = ref(false);
+const words = (text: string) => text.split(/\s+/).filter(Boolean);
+async function addRule() {
+  const tool = ruleTool.value.trim();
+  if (!tool || ruleBusy.value) return;
+  ruleBusy.value = true;
+  try {
+    const params = {
+      effect: ruleEffect.value,
+      tool,
+      command_prefix: tool === "bash" ? words(rulePrefix.value) : [],
+      paths: rulePaths.value.split(",").map((p) => p.trim()).filter(Boolean),
+      persist: rulePersist.value,
+    };
+    if ((await tryEngine("add_permission_rule", params, "Could not add the rule")) !== null) {
+      rulePrefix.value = "";
+      rulePaths.value = "";
+      await load();
+    }
+  } finally {
+    ruleBusy.value = false;
+  }
+}
+async function removeRule(rule: Rule) {
+  if (!(await ask(`Remove the rule “${ruleText(rule)}”? It is also removed from this project's saved rules.`, { title: "Remove rule", kind: "warning", okLabel: "Remove" }))) return;
+  if ((await tryEngine("remove_permission_rule", { index: rule.index, persist: true }, "Could not remove the rule")) !== null) await load();
+}
+function ruleText(rule: Rule) {
+  const prefix = (rule.command_prefix ?? []).join(" ");
+  const paths = (rule.paths ?? []).join(", ");
+  if (!rule.tool) return rule.scope ?? "";
+  return [rule.tool, prefix, paths && `on ${paths}`].filter(Boolean).join(" ") + (!prefix && !paths ? " (every call)" : "");
+}
+
 // ── Schedules ──
 const schedules = computed<any[]>(() => data.value?.schedules ?? []);
 const schedulePrompt = ref("");
@@ -340,6 +495,13 @@ async function startRunner() {
   const root = props.snap.workspace.root;
   if (await ask(`Run this project's saved schedules in ${root}? Due tasks may start immediately, with each schedule's saved tool approvals. The runner stays open in the Terminal panel until ended or the project closes.`, { title: "Start scheduler", kind: "warning", okLabel: "Start" })) {
     openTaskTerminal({ kind: "scheduler" }, root);
+  }
+}
+/** Run whatever is due right now, once, in the Terminal panel; nothing keeps running afterwards. */
+async function runDueNow() {
+  const root = props.snap.workspace.root;
+  if (await ask(`Run this project's due schedules once, now, in ${root}? Each runs with its saved tool approvals, then the runner exits.`, { title: "Run due schedules", kind: "warning", okLabel: "Run now" })) {
+    openTaskTerminal({ kind: "scheduler", once: true }, root);
   }
 }
 async function removeSchedule(entry: { id: string; prompt: string }) {
@@ -431,6 +593,7 @@ onBeforeUnmount(() => {
   unmounted = true;
   follow(false);
   unlisten?.();
+  closeSignIn();
 });
 </script>
 
@@ -564,17 +727,29 @@ onBeforeUnmount(() => {
           <SGroup v-if="Array.isArray(list)" :class="{ cap: kind !== 'mcp' }" :title="kind === 'mcp' ? 'MCP servers' : String(kind)">
             <template #aside><span class="s-muted small">{{ list.length }}</span></template>
             <div v-if="!list.length" class="s-empty">None installed.</div>
-            <div v-for="x in list" :key="x.id" class="s-row" :class="{ dim: busy === x.id }">
-              <div class="s-row-text">
-                <div class="s-label"><b>{{ x.title ?? x.id }}</b><span class="s-tag" :class="{ ok: x.state === 'enabled' }">{{ x.state }}</span></div>
-                <p class="s-desc">{{ (x.details ?? []).join(" · ") || x.summary }}</p>
+            <template v-for="x in list" :key="x.id">
+              <div class="s-row" :class="{ dim: busy === x.id }">
+                <div class="s-row-text">
+                  <div class="s-label"><b>{{ x.title ?? x.id }}</b><span class="s-tag" :class="{ ok: x.state === 'enabled' }">{{ x.state }}</span></div>
+                  <p class="s-desc">{{ (x.details ?? []).join(" · ") || x.summary }}</p>
+                </div>
+                <div v-if="kind === 'mcp'" class="s-control">
+                  <button v-if="remote(x)" class="s-link" :disabled="!!busy || !!signing" title="Sign in to this server in your browser" @click="signIn(String(x.id))">{{ signing?.server === x.id ? "Signing in…" : "Sign in" }}</button>
+                  <button class="s-link" :disabled="!!busy" @click="extension(x, { op: 'test_mcp', id: x.id }, 'Test')">Test</button>
+                  <button class="s-link danger" :disabled="!!busy" @click="extension(x, { op: 'remove_mcp', id: x.id }, 'Remove')">Remove</button>
+                  <SSwitch :model-value="x.state === 'enabled'" :label="x.title ?? x.id" :disabled="!!busy" :title="x.state === 'enabled' ? 'Turn off' : 'Turn on'" @update:model-value="extension(x, { op: 'toggle_mcp', id: x.id, enable: x.state !== 'enabled' })" />
+                </div>
               </div>
-              <div v-if="kind === 'mcp'" class="s-control">
-                <button class="s-link" :disabled="!!busy" @click="extension(x, { op: 'test_mcp', id: x.id }, 'Test')">Test</button>
-                <button class="s-link danger" :disabled="!!busy" @click="extension(x, { op: 'remove_mcp', id: x.id }, 'Remove')">Remove</button>
-                <SSwitch :model-value="x.state === 'enabled'" :label="x.title ?? x.id" :disabled="!!busy" :title="x.state === 'enabled' ? 'Turn off' : 'Turn on'" @update:model-value="extension(x, { op: 'toggle_mcp', id: x.id, enable: x.state !== 'enabled' })" />
-              </div>
-            </div>
+              <form v-if="signing && kind === 'mcp' && signing.server === x.id" class="s-row stacked" @submit.prevent="answerSignIn">
+                <p class="s-desc" role="status">{{ signing.prompt?.message || signing.progress }}</p>
+                <input v-if="signing.prompt" v-model="signing.answer" class="s-input" :aria-label="signing.prompt.message" :placeholder="signing.prompt.placeholder || undefined" :type="signing.prompt.secret ? 'password' : 'text'" autocomplete="off" spellcheck="false" />
+                <div class="inline">
+                  <button v-if="signing.prompt" class="btn btn-primary" :disabled="signing.cancelling || (!signing.answer && !signing.prompt.allow_empty)">Continue</button>
+                  <button v-if="signing.url" type="button" class="btn btn-secondary" @click="openExternal(signing.url)">Open sign-in page</button>
+                  <button type="button" class="btn btn-secondary" :disabled="signing.cancelling" @click="cancelSignIn">Cancel</button>
+                </div>
+              </form>
+            </template>
           </SGroup>
         </template>
         <SGroup title="Add an MCP server">
@@ -602,6 +777,19 @@ onBeforeUnmount(() => {
             <div class="inline">
               <button class="btn btn-primary" :disabled="busy === 'form'">Continue</button>
               <button type="button" class="btn btn-secondary" @click="form = null">Cancel</button>
+            </div>
+          </form>
+        </SGroup>
+        <SGroup title="Add your own server">
+          <form class="s-row stacked" @submit.prevent="addCustomServer">
+            <p class="s-desc">For a server that is not in the catalog. It is saved for every project.</p>
+            <div class="inline">
+              <input v-model="customName" class="s-input" aria-label="Server name" required placeholder="Name, e.g. docs" maxlength="40" />
+              <select v-model="customKind" class="s-select" aria-label="How Dial reaches it"><option value="command">Runs a command</option><option value="url">Remote address</option></select>
+            </div>
+            <div class="inline">
+              <input v-model="customTarget" class="s-input grow mono" :aria-label="customKind === 'url' ? 'Server address' : 'Command'" required spellcheck="false" :placeholder="customKind === 'url' ? 'https://example.com/mcp' : 'npx -y @scope/server --flag'" />
+              <button class="btn btn-primary" :disabled="busy === 'custom' || !customName.trim() || !customTarget.trim()">{{ busy === "custom" ? "Adding…" : "Add server" }}</button>
             </div>
           </form>
         </SGroup>
@@ -647,6 +835,32 @@ onBeforeUnmount(() => {
         </SGroup>
       </template>
 
+      <!-- Permission rules -->
+      <template v-else-if="which === 'permissions'">
+        <SGroup title="Rules">
+          <div v-if="!rules.length" class="s-empty">No rules. Dial asks according to the approval mode in the composer.</div>
+          <div v-for="r in rules" :key="r.index" class="s-row">
+            <span class="s-tag" :class="r.effect === 'deny' ? 'bad' : 'ok'">{{ r.effect === "deny" ? "Never" : "Always" }}</span>
+            <span class="grow text mono">{{ ruleText(r) }}</span>
+            <button class="s-link danger" @click="removeRule(r)">Remove</button>
+          </div>
+        </SGroup>
+        <SGroup title="Add a rule" description="For bash, give the start of the command (for example: git status). Paths are optional globs, separated by commas.">
+          <form class="s-row stacked" @submit.prevent="addRule">
+            <div class="inline">
+              <SSegmented v-model="ruleEffect" :options="EFFECTS" label="Rule effect" />
+              <input v-model="ruleTool" class="s-input narrow mono" aria-label="Tool" placeholder="Tool, e.g. bash" />
+              <input v-if="ruleTool.trim() === 'bash'" v-model="rulePrefix" class="s-input grow mono" aria-label="Command starts with" placeholder="Command starts with, e.g. npm test" />
+            </div>
+            <div class="inline">
+              <input v-model="rulePaths" class="s-input grow mono" aria-label="Paths (optional)" placeholder="Paths (optional): src/**, docs/*.md" />
+              <label class="opt"><SSwitch v-model="rulePersist" label="Save with this project" /> Save with project</label>
+              <button class="btn btn-primary" :disabled="!ruleTool.trim() || ruleBusy">Add rule</button>
+            </div>
+          </form>
+        </SGroup>
+      </template>
+
       <!-- Schedules -->
       <template v-else-if="which === 'schedules'">
         <SGroup title="Create a read-only schedule">
@@ -677,6 +891,7 @@ onBeforeUnmount(() => {
             <div class="inline">
               <button class="s-link" :disabled="!runner?.log.length" @click="showLog = !showLog">{{ showLog ? "Hide log" : "Show log" }}</button>
               <button class="s-link" :disabled="runnerActive || !!extra?.running || !schedules.length" title="A scheduler in a Terminal tab; it ends when the tab closes" @click="startRunner">Open in Terminal instead</button>
+              <button class="s-link" :disabled="runnerActive || !!extra?.running || !schedules.length" title="Run the schedules that are due right now, once, then stop" @click="runDueNow">Run due now</button>
             </div>
             <pre v-if="showLog" class="log">{{ runner?.log.join("\n") || "No output yet." }}</pre>
           </div>

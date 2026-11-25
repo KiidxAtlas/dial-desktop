@@ -14,6 +14,8 @@ import Icon, { PATHS } from "./Icon.vue";
 import SettingRow from "./SettingRow.vue";
 import AppearanceSettings from "./AppearanceSettings.vue";
 import UpdatesSettings from "./UpdatesSettings.vue";
+import HealthSettings from "./HealthSettings.vue";
+import MaintenanceSettings from "./MaintenanceSettings.vue";
 import NotificationSettings from "./NotificationSettings.vue";
 import TypeSettings from "./TypeSettings.vue";
 import ModelLibrary from "./ModelLibrary.vue";
@@ -22,6 +24,7 @@ import RolesPresets from "./RolesPresets.vue";
 import ImageSettings from "./ImageSettings.vue";
 import ProjectTools, { PROJECT_TABS, type ProjectTab } from "./ProjectTools.vue";
 import SettingsTransfer from "./SettingsTransfer.vue";
+import IntegrationsSettings from "./IntegrationsSettings.vue";
 import SPage from "./settings/SPage.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
@@ -30,7 +33,7 @@ import SSegmented from "./settings/SSegmented.vue";
 import "./settings/settings.css";
 
 type IconName = keyof typeof PATHS;
-type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "library" | "providers" | "roles" | "images" | ProjectTab;
+type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "health" | "maintenance" | "library" | "providers" | "roles" | "images" | "integrations" | ProjectTab;
 /** A desktop page, or `engine:<tab>` for one of the engine's tabs. */
 type PageId = DesktopPage | `engine:${string}`;
 
@@ -52,6 +55,7 @@ const PROJECT_ICONS: Record<ProjectTab, IconName> = {
   checks: "check",
   folders: "folder",
   schedules: "refresh",
+  permissions: "shield",
 };
 
 const DESKTOP: { title: string; pages: PageInfo[] }[] = [
@@ -66,6 +70,8 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
       { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify desktop notifications sound finished needs you" },
       { id: "types", label: "Types", icon: "folder", about: "Where new Types are saved: in the app for every project, or in this project.", words: "type collection save project folder global location storage where new types" },
       { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, which engine Desktop runs, and startup problems.", words: "version upgrade install check engine path binary dial_bin diagnostics warnings shell environment browser tools reconnect desktop copy" },
+      { id: "health", label: "Health & setup", icon: "shield", about: "What Dial can use on this computer, what is missing, and the dial command for your terminal.", words: "doctor setup install capability language server lsp voice whisper piper ollama llama mlx runtime path terminal command cli fix missing check" },
+      { id: "maintenance", label: "Storage & processes", icon: "chip", about: "What Dial keeps on this computer, what it is running, and safe cleanups.", words: "storage disk space gc garbage clean cleanup cache images purge archive processes ps running stop kill memory local model server rules stream" },
     ],
   },
   {
@@ -80,6 +86,12 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
   {
     title: "This project",
     pages: PROJECT_TABS.map((t) => ({ id: t.id, label: t.label, icon: PROJECT_ICONS[t.id], about: "" })),
+  },
+  {
+    title: "Connections",
+    pages: [
+      { id: "integrations", label: "Integrations", icon: "terminal", about: "Hooks, SSH hosts, model profiles, computer use and the collaboration relay.", words: "hooks hook lifecycle pre tool use event script ssh remote host server machine key user port profile model profiles computer use screen mouse keyboard relay collaboration collab room" },
+    ],
   },
 ];
 
@@ -108,6 +120,7 @@ const PROJECT_ABOUT: Record<ProjectTab, string> = {
   checks: "Commands run after Dial edits files.",
   folders: "Folders outside the project Dial may use.",
   schedules: "Prompts that run on a timer or on file changes.",
+  permissions: "What Dial may do without asking, and what it must never do.",
 };
 for (const p of DESKTOP[3].pages) p.about = PROJECT_ABOUT[p.id as ProjectTab];
 
@@ -116,7 +129,7 @@ for (const p of DESKTOP[3].pages) p.about = PROJECT_ABOUT[p.id as ProjectTab];
 const props = defineProps<{ snap: Snapshot }>();
 const project = computed(() => (props.snap.workspace ? (props.snap as OpenSnapshot) : null));
 /** Pages that work without a project. */
-const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates"]);
+const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates", "health", "maintenance", "providers"]);
 const groupsShown = computed(() =>
   project.value ? DESKTOP : DESKTOP.map((g) => ({ ...g, pages: g.pages.filter((p) => NO_PROJECT.has(p.id)) })).filter((g) => g.pages.length),
 );
@@ -332,11 +345,11 @@ async function restartEngine() {
             @click="go(p.id)"
           >
             <Icon :name="p.icon" :size="15" />
-            <span class="truncate">{{ p.label }}</span>
+            <span class="truncate" :title="p.label">{{ p.label }}</span>
           </button>
         </template>
 
-        <p v-if="!project" class="nav-hint">Open a project for engine settings, providers and models.</p>
+        <p v-if="!project" class="nav-hint">Open a project for engine settings and models. Providers and Health &amp; setup work without one.</p>
         <div v-if="project" class="nav-label">
           Engine
           <span class="filters">
@@ -389,9 +402,9 @@ async function restartEngine() {
         </div>
         <!-- Sign-in may be awaiting a browser or code. Cache only this page, and only for
              this project's lifetime in Settings; unmounting still closes its auth process. -->
-        <KeepAlive v-if="project" :key="project.workspace.root">
+        <KeepAlive :key="project?.workspace.root ?? ''">
           <SPage v-if="current === 'providers' && !overlay && desktopPage" :title="desktopPage.label" :description="desktopPage.about">
-            <ProviderSettings :snap="project" />
+            <ProviderSettings :snap="snap" />
           </SPage>
         </KeepAlive>
         <!-- Search results and the changed-settings list, across every page. -->
@@ -434,7 +447,7 @@ async function restartEngine() {
           </SGroup>
           <p v-if="!pageHits.length && !groups.length" class="nothing">Nothing matches. Try a shorter word.</p>
           <p v-if="searching && project && !page" class="s-note">Engine settings are searchable once the engine is connected.</p>
-          <p v-else-if="searching && !project" class="s-note">Open a project to search engine settings, providers and the model library.</p>
+          <p v-else-if="searching && !project" class="s-note">Open a project to search engine settings and the model library.</p>
         </SPage>
 
         <!-- Overview -->
@@ -471,7 +484,7 @@ async function restartEngine() {
             </template>
           </SGroup>
           <SettingsTransfer v-if="project && page" :snap="project" :rows="all" />
-          <p v-if="!project" class="s-note">Engine settings, providers and models live with a project’s engine. Open a project to change them.</p>
+          <p v-if="!project" class="s-note">Engine settings and models live with a project’s engine. Sign in to a provider and check your setup here; open a project to change the rest.</p>
           <SGroup title="More settings" plain>
             <div class="tiles">
               <button v-for="p in tiles" :key="p.id" class="tile" @click="go(p.id)">
@@ -500,6 +513,9 @@ async function restartEngine() {
           <AppearanceSettings v-if="current === 'appearance'" />
           <NotificationSettings v-else-if="current === 'notifications'" />
           <TypeSettings v-else-if="current === 'types'" />
+          <HealthSettings v-else-if="current === 'health'" />
+          <MaintenanceSettings v-else-if="current === 'maintenance'" />
+          <IntegrationsSettings v-else-if="current === 'integrations'" />
           <UpdatesSettings v-else />
         </SPage>
 
@@ -845,7 +861,7 @@ h1 {
   gap: 12px;
   padding: 13px 14px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--surface);
   text-align: left;
   transition: border-color 120ms var(--ease), background 120ms var(--ease);
@@ -860,7 +876,7 @@ h1 {
   place-items: center;
   width: 30px;
   height: 30px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
 }

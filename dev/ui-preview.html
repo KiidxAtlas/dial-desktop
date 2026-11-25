@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dial UI preview</title>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// Browser UI preview (`npm run preview:ui`): the real app with a stand-in for the Tauri backend,
+// fed the Rust design-preview fixtures (`src-tauri/examples/ui_preview_fixtures.rs`). Not part of
+// the app build.
+//
+//   ?state=session    a turn mid-run, waiting on an approval (the default)
+//   ?state=idle       the same conversation, finished
+//   ?state=approvals  three requests waiting at once
+//   ?state=long       long project, session and file names
+//   ?state=offline    the engine could not start
+//   ?state=empty      a new session
+//   ?state=question   the agent asking a question
+//   &theme=light|dark  the theme (otherwise the system's)
+//   &check            outline anything that runs past the edge of its pane (see __uiCheck)
+//
+// In the console, `__preview.snap` is the snapshot on screen; assign a changed copy to publish it.
+(() => {
+  const params = new URLSearchParams(location.search);
+  const state = params.get('state') || 'session';
+  const base = { idle: 'session', approvals: 'session', long: 'session', offline: 'session' }[state] || state;
+  const request = new XMLHttpRequest();
+  request.open('GET', `/.tmp/ui-preview/${base}.json`, false);
+  request.send();
+  if (request.status !== 200) {
+    document.body.textContent = 'No fixtures yet: run `npm run preview:ui`, which writes them before starting the server.';
+    throw new Error('missing UI preview fixtures');
+  }
+  let snap = JSON.parse(request.responseText);
+  snap.connection = { state: 'live', model: 'claude-sonnet-4-5', engineVersion: 'preview' };
+  const LONG = 'a-really-long-project-name-that-keeps-going-for-overflow-testing';
+  const variants = {
+    idle(s) {
+      s.turnRunning = false;
+      s.approvals = [];
+      for (const e of s.entries) if (e.state === 'running') Object.assign(e, { state: 'succeeded', progress: null });
+    },
+    approvals(s) {
+      s.approvals = [
+        ...s.approvals,
+        { approvalId: 'preview-2', tool: 'write_file', summary: 'src/server/limiter.rs\n+ 42 lines' },
+        { approvalId: 'preview-3', tool: 'bash', summary: 'cargo test -p server limiter -- --nocapture' },
+      ];
+    },
+    long(s) {
+      s.title = 'Investigate why the rate limiter rejects bursts from authenticated clients behind the corporate proxy';
+      s.workspace = { root: `/Users/demo/code/${LONG}`, display: `~/code/${LONG}`, name: LONG };
+      for (const session of s.sessions) session.title += ' — with a much longer title than usual to test truncation';
+    },
+    offline(s) {
+      s.turnRunning = false;
+      s.approvals = [];
+      s.connection = { state: 'failed', problem: 'other', error: 'dial rpc exited with status 1: address already in use' };
+    },
+  };
+  variants[state]?.(snap);
+
+  const theme = params.get('theme');
+  if (theme === 'light' || theme === 'dark') {
+    try {
+      const prefs = JSON.parse(localStorage.getItem('dial.appearance') || '{}');
+      localStorage.setItem('dial.appearance', JSON.stringify({ ...prefs, theme }));
+    } catch {}
+  }
+
+  let seq = 1;
+  const callbacks = new Map();
+  let nextCallback = 1;
+  const listeners = {};
+  const emit = (event, payload) => (listeners[event] || []).forEach((id) => callbacks.get(id)?.({ event, id: 0, payload }));
+  const publish = () => emit('snapshot', { seq: ++seq, base: seq - 1, full: JSON.parse(JSON.stringify(snap)) });
+  const recent = [
+    { root: '/Users/demo/code/site', name: 'site', display: '~/code/site' },
+    { root: `/Users/demo/code/${LONG}`, name: LONG, display: `~/code/${LONG}` },
+  ];
+  window.__preview = { get snap() { return snap; }, set snap(value) { snap = value; publish(); }, publish, calls: [] };
+  window.__TAURI_INTERNALS__ = {
+    metadata: { currentWindow: { label: 'main' }, currentWebview: { windowLabel: 'main', label: 'main' } },
+    transformCallback(callback) { const id = nextCallback++; callbacks.set(id, callback); return id; },
+    unregisterCallback(id) { callbacks.delete(id); },
+    convertFileSrc(path) { return path; },
+    async invoke(cmd, args) {
+      window.__preview.calls.push(cmd);
+      if (cmd === 'plugin:event|listen') { (listeners[args.event] ||= []).push(args.handler); return args.handler; }
+      if (cmd === 'plugin:event|unlisten') return null;
+      if (cmd === 'snapshot') return { seq, snapshot: JSON.parse(JSON.stringify(snap)) };
+      if (cmd === 'recent_workspaces') return recent;
+      if (cmd === 'models' || cmd.endsWith('_list')) return [];
+      if (cmd === 'read_transcript_image') {
+        const name = args.path.split('/').pop();
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#e8744f"/><stop offset="1" stop-color="#5b4bd6"/></linearGradient></defs><rect width="256" height="256" rx="48" fill="url(#g)"/><circle cx="128" cy="128" r="56" fill="none" stroke="#fff" stroke-width="14"/></svg>`;
+        return { path: args.path, name, url: `data:image/svg+xml,${encodeURIComponent(svg)}` };
+      }
+      if (cmd === 'resume') {
+        snap.sessions.forEach((s) => (s.selected = s.id === args.sessionId));
+        snap.sessionId = args.sessionId;
+        publish();
+        return null;
+      }
+      if (cmd === 'engine_call') {
+        const fixtures = {
+          list_hooks: {
+            events: ['session_start', 'session_end', 'user_prompt_submit', 'pre_tool_use', 'post_tool_use', 'stop'],
+            hooks: [
+              { event: 'pre_tool_use', matcher: 'bash', command: ['./scripts/guard.sh', '--strict'], timeout_secs: 30, fails_closed: true },
+              { event: 'stop', command: ['osascript', '-e', 'display notification "Dial finished"'], timeout_secs: 0, fails_closed: false },
+            ],
+          },
+          ssh_hosts: { hosts: [
+            { name: 'build-box', host: '10.0.0.9', user: 'ops', port: 2222, key: null, origin: 'dial', source: null },
+            { name: 'pi', host: 'raspberrypi.local', user: 'pi', port: null, key: '~/.ssh/id_ed25519', origin: 'ssh_config', source: '/Users/demo/.ssh/config' },
+          ] },
+          list_worktrees: { repository: true, worktrees: [
+            { path: '/Users/demo/code/site', branch: 'main', head: '7af2f53ab798', primary: true, current: true, bare: false, detached: false, locked: false },
+            { path: '/Users/demo/code/site-wt/rate-limit', branch: 'fix/rate-limit', head: 'ffe0adcffce8', primary: false, current: false, bare: false, detached: false, locked: false },
+          ] },
+          import_candidates: { source: 'claude', candidates: [
+            { id: '3f2a9c1e', title: 'Fix flaky limiter test', path: '/Users/demo/.claude/projects/site/3f2a9c1e.jsonl', modified: 1764000000 },
+          ] },
+          computer_status: { enabled: true, max_width: 1440, max_height: 900, capabilities: { backend: 'macos', capturePermission: 'denied', inputPermission: 'granted' }, unavailable: null },
+          session_tree: { session_id: 'demo', nodes: [
+            { id: 'a', parent: null, depth: 0, kind: 'user', text: 'Why does the limiter test flake?', label: null, ts: '2026-11-25T08:00:00Z', on_active_branch: true, current: false, children: 2 },
+            { id: 'b', parent: 'a', depth: 1, kind: 'assistant', text: 'The clock is read twice per request…', label: 'diagnosis', ts: '2026-11-25T08:01:00Z', on_active_branch: true, current: true, children: 0 },
+            { id: 'c', parent: 'a', depth: 1, kind: 'user', text: 'Try a fake clock instead', label: null, ts: '2026-11-25T08:03:00Z', on_active_branch: false, current: false, children: 0 },
+          ] },
+        };
+        const settings = {
+          model_profiles: { fast: { provider: 'openai', model: 'gpt-5-mini', reasoning_effort: 'low' }, deep: { provider: 'anthropic', model: 'claude-opus-4', reasoning_effort: 'high', context_window: 200000 } },
+          model_profile: 'deep',
+          integrations: ['computer'],
+        };
+        if (args.method in fixtures) return fixtures[args.method];
+        if (args.method === 'get_settings' && args.params?.key in settings) return { key: args.params.key, value: settings[args.params.key], scope: 'global' };
+      }
+      if (cmd === 'relay') return { bind: args.action === 'start' ? args.bind : null };
+      if (cmd === 'file_git_log') return [
+        { sha: '7af2f53ab7981c2d', subject: 'Keep the limiter clock monotonic', author: 'Ada', date: '2026-11-25T08:00:00Z', refs: 'HEAD -> main' },
+        { sha: 'ffe0adcffce81a90', subject: 'Add rate limiter', author: 'Bo', date: '2026-11-24T08:00:00Z', refs: '' },
+      ];
+      return null;
+    },
+  };
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+
+  /**
+   * Elements that run past the right edge of their pane (sidebar, conversation, inspector,
+   * settings) or the window without a scrolling or clipping box in between: the overflow a
+   * reader sees as cut-off text or controls. Returns short descriptions; with `outline`, marks them.
+   */
+  window.__uiCheck = (outline = false) => {
+    const found = [];
+    const panes = '.sidebar, .main, .inspector, .settings, .welcome, [role="dialog"]';
+    for (const el of document.querySelectorAll('#app *, body > [role], .overlay *')) {
+      const box = el.getBoundingClientRect();
+      if (!box.width || !box.height || getComputedStyle(el).visibility === 'hidden') continue;
+      const pane = el.closest(panes);
+      const limit = pane && pane !== el ? pane.getBoundingClientRect().right : window.innerWidth;
+      if (box.right <= limit + 1) continue;
+      let clipped = false;
+      for (let up = el.parentElement; up && up !== pane; up = up.parentElement) {
+        if (getComputedStyle(up).overflowX !== 'visible') { clipped = true; break; }
+      }
+      if (clipped) continue;
+      if (el.parentElement && el.parentElement.getBoundingClientRect().right > limit + 1 && found.some((f) => f.el === el.parentElement)) continue;
+      found.push({ el, what: `${el.tagName.toLowerCase()}.${[...el.classList].join('.')} "${(el.textContent || '').trim().slice(0, 40)}" +${Math.round(box.right - limit)}px` });
+      if (outline) el.style.outline = '2px solid red';
+    }
+    return found.map((f) => f.what);
+  };
+  if (params.has('check')) {
+    addEventListener('load', () => setTimeout(() => {
+      const problems = window.__uiCheck(true);
+      console[problems.length ? 'warn' : 'info'](`UI check: ${problems.length} overflowing element(s)`, problems);
+    }, 800));
+  }
+})();
+</script>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

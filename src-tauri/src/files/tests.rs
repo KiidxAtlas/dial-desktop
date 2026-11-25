@@ -529,6 +529,19 @@ fn commit_refuses_staged_files_outside_the_workspace() {
 }
 
 #[test]
+fn the_commit_author_is_saved_for_one_repository_and_read_back() {
+    let repo = Scratch::new("identity");
+    git_ok(&repo.0, &["init", "-q"]);
+    let saved = set_identity(&repo.0, "  Ada Lovelace ", "ada@example.com", false).unwrap();
+    assert_eq!(saved, GitIdentity { name: "Ada Lovelace".into(), email: "ada@example.com".into() });
+    assert_eq!(identity(&repo.0).unwrap(), saved);
+    for (name, email) in [("", "a@b.c"), ("Ada", "not-an-email"), ("Ada", "a b@c.d"), ("--global", "a@b.c"), ("A <x>", "a@b.c"), ("Ada", "a@b.c\nx")] {
+        assert!(set_identity(&repo.0, name, email, false).is_err(), "{name:?} {email:?}");
+    }
+    assert_eq!(identity(&repo.0).unwrap(), saved);
+}
+
+#[test]
 fn content_search_finds_lines_with_and_without_git() {
     let plain = Scratch::new("grep-nogit");
     fs::write(plain.0.join(".git"), "gitdir: missing\n").unwrap();
@@ -555,4 +568,16 @@ fn content_search_finds_lines_with_and_without_git() {
     found.sort();
     assert_eq!(found, [("loose.txt".to_owned(), 1), ("tracked.txt".to_owned(), 2), ("tracked.txt".to_owned(), 3)]);
     assert_eq!(grep(&repo.0, "needle", 1).unwrap().len(), 1);
+}
+
+#[test]
+fn log_records_split_on_separators_and_skip_noise() {
+    let text = "0123456789abcdef0123456789abcdef01234567\u{1f}Ada\u{1f}2026-11-25T08:00:00+00:00\u{1f}HEAD -> main\u{1f}fix: keep | pipes\u{1e}\nnot-a-sha\u{1f}x\u{1f}y\u{1f}\u{1f}z\u{1e}\nfedcba9\u{1f}Bo\u{1f}2026-11-24T08:00:00+00:00\u{1f}\u{1f}first\u{1e}\n";
+    let rows = parse_log(text);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].subject, "fix: keep | pipes");
+    assert_eq!(rows[0].refs, "HEAD -> main");
+    assert_eq!(rows[0].author, "Ada");
+    assert_eq!(rows[1].sha, "fedcba9");
+    assert_eq!(rows[1].refs, "");
 }

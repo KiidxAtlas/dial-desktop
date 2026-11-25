@@ -7,7 +7,7 @@ import { installEngine, updateEngine, updates } from "./updates";
 import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey } from "./keysGuard";
 import { focusComposer, ui, type InspectorTab } from "./ui";
 import { copyText, goToSession, sessionOrder, stepSession } from "./sessionActions";
-import { followAgentApp, followAgentBrowser, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
+import { followAgentApp, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -124,12 +124,12 @@ async function followFullscreen(): Promise<(() => void) | null> {
 /** The engine stopped or could not start: said in the conversation, not only the sidebar footer. */
 const disconnect = computed(() => {
   const c = opened.value?.connection;
-  if (c?.state === "ended") return { text: "The Dial engine stopped.", detail: "", problem: "other" as const };
+  if (c?.state === "ended") return { text: "The Dial engine stopped.", detail: "", hint: "", problem: "other" as const };
   if (c?.state !== "failed") return null;
   const text = c.problem === "missing" ? "No Dial engine is installed."
     : c.problem === "incompatible" ? "This Dial engine is too old or too new for the app."
     : "The Dial engine could not start.";
-  return { text, detail: c.error, problem: c.problem };
+  return { text, detail: c.error, hint: c.hint ?? "", problem: c.problem };
 });
 
 // One automatic reconnect a few seconds after a live engine goes away (see `autoReconnect.ts`),
@@ -322,6 +322,10 @@ function onKey(event: KeyboardEvent) {
   } else if (event.key === "Escape" && !event.isComposing && ui.settingsOpen) {
     event.preventDefault();
     ui.settingsOpen = false;
+  } else if (event.key === "Escape" && !event.isComposing && inspectorFloats() && !ui.menu && !ui.paletteOpen && !ui.shortcutsOpen) {
+    // The narrow-window drawer covers the conversation: Esc puts it away first.
+    event.preventDefault();
+    ui.inspectorOpen = false;
   } else if (event.key === "Escape" && !event.isComposing && showingType.value && typeComposerOpen.value) {
     event.preventDefault();
     typeComposerOpen.value = false;
@@ -333,6 +337,12 @@ function onKey(event: KeyboardEvent) {
     markTurnAborted(s);
     engine.abort();
   }
+}
+
+/** A press on the conversation beside the narrow-window drawer puts the drawer away; the title
+ *  bar keeps its own toggle. */
+function dismissDrawer(event: PointerEvent) {
+  if (inspectorFloats() && event.target instanceof Element && !event.target.closest(".topbar")) ui.inspectorOpen = false;
 }
 
 function scanOnReturn() {
@@ -375,7 +385,7 @@ onBeforeUnmount(() => {
       <Sidebar v-if="sidebarShown() && !reviewing" :snap="opened" />
     </Transition>
     <!-- Kept mounted under the settings page, so the conversation keeps its scroll and draft. -->
-    <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }">
+    <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }" @pointerdown="dismissDrawer">
       <Backdrop v-if="showBackdrop" :dimmed="!empty" />
       <TopBar :snap="viewed" />
       <UpdateBanner />
@@ -385,6 +395,7 @@ onBeforeUnmount(() => {
           <strong>{{ disconnect.text }}</strong>
           <span v-if="reconnectIn !== null" class="disconnect-detail" role="status">Reconnecting in {{ reconnectIn }} s…</span>
           <span v-else-if="reconnectRefused" class="disconnect-detail" :title="reconnectRefused">Not reconnected automatically: {{ reconnectRefused }}</span>
+          <span v-if="disconnect.hint" class="disconnect-hint">{{ disconnect.hint }}</span>
           <span v-if="disconnect.detail" class="disconnect-detail" :title="disconnect.detail">{{ disconnect.detail }}</span>
         </span>
         <button
@@ -504,6 +515,7 @@ onBeforeUnmount(() => {
   user-select: text;
   -webkit-user-select: text;
 }
+.disconnect-hint { color: var(--text); }
 .disconnect .btn { flex: none; }
 .sr-only {
   position: absolute;

@@ -7,6 +7,7 @@ import { conversationFindOpen } from "../commands";
 import { closeType, types } from "../savedTypes";
 import { showSidebar, sidebarShown } from "../workspace";
 import Icon from "./Icon.vue";
+import GoalPill from "./GoalPill.vue";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -65,12 +66,13 @@ function more(event: MouseEvent) {
       @blur="finishRename(session.id, session.title, ($event.target as HTMLInputElement).value)"
     />
     <button v-else-if="session" class="title" title="Rename, pin, export and more" @click="more">
-      <span class="truncate">{{ snap.title }}</span>
+      <span class="truncate" :title="snap.title">{{ snap.title }}</span>
       <Icon name="chevronDown" :size="13" />
     </button>
-    <h1 v-else class="truncate" data-tauri-drag-region>{{ snap.title }}</h1>
-    <span v-if="snap.connection.state === 'preview'" class="pill" data-tauri-drag-region>Preview</span>
-    <span v-if="snap.turnRunning" class="pill working" role="status" data-tauri-drag-region><span class="live-dot" />Working</span>
+    <h1 v-else class="truncate" data-tauri-drag-region :title="snap.title">{{ snap.title }}</h1>
+    <span v-if="snap.connection.state === 'preview'" class="pill preview" data-tauri-drag-region>Preview</span>
+    <span v-if="snap.turnRunning" class="pill working" role="status" title="Working" data-tauri-drag-region><span class="live-dot" /><span class="pill-label">Working</span></span>
+    <GoalPill v-if="!type || ui.typeMode === 'chat'" :snap="snap" />
     <div v-if="type" class="switch" role="tablist" aria-label="Type or its conversation">
       <button role="tab" :aria-selected="ui.typeMode === 'type'" :class="{ on: ui.typeMode === 'type' }" @click="ui.typeMode = 'type'">
         <span class="switch-icon">{{ type.icon }}</span> {{ type.name }}
@@ -116,6 +118,20 @@ function more(event: MouseEvent) {
   align-items: center;
   gap: 8px;
   padding: 0 10px 0 14px;
+  container: topbar / inline-size;
+}
+/* In a narrow bar the title comes first: the status pills give way before it truncates. */
+@container topbar (max-width: 640px) {
+  .pill.preview { display: none; }
+  .working { padding: 0 7px; }
+  .working .pill-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 h1,
 .title {

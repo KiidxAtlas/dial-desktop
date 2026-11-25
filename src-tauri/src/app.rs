@@ -6,8 +6,7 @@
 //! and short-lived messages as `toast` events. The UI sends requests back through the commands
 //! below; none of them talks to an engine directly.
 //!
-//! Engines run in the open workspace, one per running session ([`Tabs`]). Opening another folder,
-//! or reconnecting after the engine stopped, replaces them without restarting the app.
+//! Each project keeps its own session tabs; only the selected project's snapshot is published.
 
 mod watch;
 mod window;
@@ -56,6 +55,8 @@ pub enum Source {
 
 struct Inner {
     tabs: Tabs,
+    /// Hidden projects retain their selected tab and live engines until the window closes.
+    parked: std::collections::HashMap<String, Tabs>,
     /// `None` until a folder is chosen.
     workspace: Option<Workspace>,
     recents: Recents,
@@ -82,6 +83,40 @@ struct Shared {
     answer_support: crate::answer_style::Support,
 }
 
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn switching_projects_keeps_the_original_running_session_in_this_window() {
+        let shared = Shared {
+            inner: Mutex::new(Inner {
+                tabs: Tabs::new(Tab::new(Model::default(), None)),
+                parked: Default::default(),
+                workspace: None, recents: Recents::load(None), entry_views: EntryViews::default(),
+            }),
+            source: Source::Preview(Preview::Empty), home: None,
+            wake: Mutex::new(mpsc::channel().0), terminals: Default::default(),
+            provider_setup: Default::default(), installed: Default::default(),
+            published: Default::default(), answer_style: Default::default(), answer_support: Default::default(),
+        };
+        let a = Path::new("/projects/first");
+        let b = Path::new("/projects/second");
+        shared.open(a).unwrap();
+        shared.lock().tabs.active_mut().model.conversation.push_user("still working", 0);
+        shared.open(b).unwrap();
+        assert_eq!(shared.root().unwrap(), b);
+        assert!(!shared.lock().tabs.active().model.conversation.turn_running());
+        shared.open(a).unwrap();
+        assert_eq!(shared.root().unwrap(), a);
+        let inner = shared.lock();
+        let conversation = &inner.tabs.active().model.conversation;
+        assert!(conversation.turn_running());
+        assert!(matches!(conversation.entries().last(), Some(dial_client::Entry::User(u)) if u.text == "still working"));
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -106,43 +141,28 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run in `path` from now on: a fresh engine there (or the preview), remembered as recent.
-    fn open(
-        &self,
-        path: &Path,
-        confirmed_from: Option<&str>,
-        runner: &crate::app_runner::AppRunner,
-    ) -> Result<Option<String>, String> {
+    /// Select a project in this window, reusing its live tabs on return.
+    fn open(&self, path: &Path) -> Result<bool, String> {
         let workspace = self.workspace(path);
         let mut inner = self.lock();
         inner.tabs.allow_work()?;
-        let current = inner.workspace.as_ref().map(|w| w.root.as_str());
-        if current == Some(workspace.root.as_str()) {
-            return Ok(None);
-        }
-        let mut terminals = self.terminals();
-        if let Some(root) = current
-            && confirmed_from != Some(root)
-            && (inner.tabs.protects_work() || terminals.has_shells())
-        {
-            return Ok(Some(root.to_owned()));
-        }
-        if let Some(root) = current {
-            runner.revoke_vm_launch(root);
-        }
-        let tab = match &self.source {
-            Source::Preview(kind) => Tab::new(preview::model(*kind, &workspace.root), None),
-            Source::Engine { .. } => Tab::new(Model::starting(), self.spawn(path)),
-        };
+        if inner.workspace.as_ref().is_some_and(|w| w.root == workspace.root) { return Ok(false); }
+        let mut tabs = inner.parked.remove(&workspace.root).unwrap_or_else(|| {
+            let tab = match &self.source {
+                Source::Preview(kind) => Tab::new(preview::model(*kind, &workspace.root), None),
+                Source::Engine { .. } => Tab::new(Model::starting(), self.spawn(path)),
+            };
+            Tabs::new(tab)
+        });
+        tabs.active_mut().model.models_changed = true;
+        tabs.active_mut().model.settings_changed = true;
         inner.recents.touch(path);
-        let old = std::mem::replace(&mut inner.tabs, Tabs::new(tab));
-        inner.workspace = Some(workspace);
-        terminals.close_all();
-        drop(terminals);
+        let previous = std::mem::replace(&mut inner.tabs, tabs);
+        if let Some(old) = inner.workspace.replace(workspace) { inner.parked.insert(old.root, previous); }
+        inner.entry_views = EntryViews::default();
         drop(inner);
-        retire(old.into_tabs());
         self.poke();
-        Ok(None)
+        Ok(true)
     }
 
     fn reconnect(&self) -> Result<(), String> {
@@ -303,21 +323,40 @@ fn snapshot_of(inner: &mut Inner) -> Snapshot {
     snapshot
 }
 
+/// Run the same reducer and follow-up commands for visible and hidden projects.
+fn drain_project(app: &AppHandle, tabs: &mut Tabs) -> (Vec<String>, Vec<Tab>, Vec<crate::tabs::SessionNotice>) {
+    let before = tabs.busy_states();
+    let mut messages = Vec::new();
+    for tab in tabs.iter_mut() {
+        for update in tab.engine.as_ref().map(Engine::drain).unwrap_or_default() {
+            let follow = tab.apply(update);
+            dispatch(app, tab.engine.as_ref(), follow);
+        }
+        messages.extend(tab.model.toast.take());
+    }
+    tabs.sync_deletions();
+    messages.extend(tabs.background_news(&before));
+    let notices = tabs.session_notices();
+    let closed = tabs.close_idle();
+    if !closed.is_empty() {
+        dispatch(app, tabs.active().engine.as_ref(), vec![Command::ListSessions]);
+    }
+    (messages, closed, notices)
+}
+
 /// Fold queued engine updates into the models and publish the tab on screen.
 fn publish(app: &AppHandle) {
     let shared = app.state::<Shared>();
     let (snapshot, models, settings, messages, closed, notices) = {
         let mut inner = shared.lock();
-        let tabs = &mut inner.tabs;
-        let before = tabs.busy_states();
-        let mut messages = Vec::new();
-        for tab in tabs.iter_mut() {
-            let updates = tab.engine.as_ref().map(Engine::drain).unwrap_or_default();
-            for update in updates {
-                let follow = tab.apply(update);
-                dispatch(app, tab.engine.as_ref(), follow);
-            }
-            messages.extend(tab.model.toast.take());
+        let (mut messages, mut closed, active_notices) = drain_project(app, &mut inner.tabs);
+        let mut notices = Vec::new();
+        if let Some(w) = &inner.workspace { notices.push((w.root.clone(), active_notices)); }
+        for (root, tabs) in &mut inner.parked {
+            let (news, idle, alerts) = drain_project(app, tabs);
+            messages.extend(news.into_iter().map(|message| format!("{root}: {message}")));
+            closed.extend(idle);
+            if !alerts.is_empty() { notices.push((root.clone(), alerts)); }
         }
         // Setup owns a separate RPC connection. Its prompts never enter a chat transcript.
         if let Some(setup) = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
@@ -333,17 +372,9 @@ fn publish(app: &AppHandle) {
                 let _ = setup.output.send(event);
             }
         }
-        tabs.sync_deletions();
-        messages.extend(tabs.background_news(&before));
-        let notices = tabs.session_notices();
-        let closed = tabs.close_idle();
-        let active = tabs.active_mut();
+        let active = inner.tabs.active_mut();
         if let Some(scan) = active.model.discover_if_due(Instant::now(), Duration::from_secs(300)) {
             dispatch(app, active.engine.as_ref(), vec![scan]);
-        }
-        if !closed.is_empty() {
-            // Those sessions' titles and activity changed.
-            dispatch(app, active.engine.as_ref(), vec![Command::ListSessions]);
         }
         let models =
             std::mem::take(&mut active.model.models_changed).then(|| model_options(&active.model));
@@ -366,8 +397,8 @@ fn publish(app: &AppHandle) {
     if let Some(settings) = settings {
         let _ = app.emit("settings", settings);
     }
-    if let Some(workspace) = snapshot.workspace.as_ref() {
-        notifications::publish(app, &workspace.root, notices);
+    for (root, alerts) in notices {
+        notifications::publish(app, &root, alerts);
     }
     let event = shared
         .published
@@ -429,6 +460,10 @@ fn settings_of(model: &Model) -> Option<SettingsView> {
 /// page follows as the `settings` event.
 #[tauri::command]
 fn settings(shared: State<'_, Shared>) -> Option<SettingsView> {
+    load_settings(&shared)
+}
+
+fn load_settings(shared: &Shared) -> Option<SettingsView> {
     let inner = shared.lock();
     let model = &inner.tabs.active().model;
     let mut load = vec![Command::GetSettings];
@@ -443,6 +478,40 @@ fn settings(shared: State<'_, Shared>) -> Option<SettingsView> {
         }
     }
     settings_of(model)
+}
+
+/// The settings page for the agent's `desktop_settings`: loaded as the page does, waiting up to
+/// `timeout` for the engine's first answer.
+pub(crate) fn agent_settings(app: &AppHandle, timeout: Duration) -> Result<SettingsView, String> {
+    let shared = app.state::<Shared>();
+    if let Some(view) = load_settings(&shared) {
+        return Ok(view);
+    }
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        thread::sleep(Duration::from_millis(150));
+        if let Some(view) = settings_of(&shared.lock().tabs.active().model) {
+            return Ok(view);
+        }
+    }
+    Err("The engine has not sent its settings; is it connected?".into())
+}
+
+/// Save (`Some`) or reset (`None`) one setting for the agent's `desktop_set_setting`; the caller
+/// has already refused protected keys.
+pub(crate) fn agent_save_setting(
+    app: &AppHandle,
+    key: &str,
+    value: Option<serde_json::Value>,
+    scope: &str,
+) -> Result<(), String> {
+    let shared = app.state::<Shared>();
+    let command = match value {
+        Some(value) => Model::save_setting(key, value, scope)?,
+        None => Model::reset_setting(key, scope)?,
+    };
+    request(app, &shared, command);
+    Ok(())
 }
 
 /// Save one setting in `scope` (`global` or `project`); applied to the session once saved.
@@ -527,23 +596,21 @@ fn forget_workspace(shared: State<'_, Shared>, path: String) -> bool {
 fn open_workspace(
     app: AppHandle,
     shared: State<'_, Shared>,
-    runner: State<'_, crate::app_runner::AppRunner>,
     store: State<'_, crate::types::Store>,
     path: String,
-    confirmed_from: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     let path = PathBuf::from(&path);
     let path = path.canonicalize().unwrap_or(path);
     if !path.is_dir() {
         return Err(format!("{} is not a folder", path.display()));
     }
-    let confirm = shared.open(&path, confirmed_from.as_deref(), &runner)?;
-    if confirm.is_none() {
-        // The project's own types join the list.
+    let previous = shared.root().ok();
+    if shared.open(&path)? {
+        if let Some(root) = previous { app.state::<crate::app_runner::AppRunner>().revoke_vm_launch(&root.to_string_lossy()); }
         crate::types::follow_project(&app, &store, &path);
         scheduler_project_opened(&app);
     }
-    Ok(confirm)
+    Ok(())
 }
 
 #[tauri::command]
@@ -664,6 +731,123 @@ async fn engine_validate(path: String) -> Result<String, String> {
         .map_err(|error| error.to_string())?
 }
 
+/// Where engine subcommands that need no project run: the open project, else the home folder.
+fn cli_cwd(shared: &Shared) -> Option<PathBuf> {
+    shared.root().ok().or_else(|| shared.home.as_deref().map(PathBuf::from))
+}
+
+fn main_only(webview: &tauri::Webview, what: &str) -> Result<(), String> {
+    if webview.label() == "main" { Ok(()) } else { Err(format!("Only the app UI can {what}")) }
+}
+
+/// `dial doctor --all`: every optional capability and whether it is installed.
+#[tauri::command]
+async fn doctor_report(shared: State<'_, Shared>) -> Result<crate::engine_cli::DoctorReport, String> {
+    let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+    tauri::async_runtime::spawn_blocking(move || crate::engine_cli::doctor(&program, cwd.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// `dial doctor --fix <id>`: what the setup would run, or with `apply` the setup itself.
+#[tauri::command]
+async fn doctor_fix(webview: tauri::Webview, shared: State<'_, Shared>, id: String, apply: bool) -> Result<String, String> {
+    main_only(&webview, "set up capabilities")?;
+    let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+    tauri::async_runtime::spawn_blocking(move || crate::engine_cli::doctor_fix(&program, cwd.as_deref(), &id, apply))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// The stored accounts of an OAuth provider; `action` is `select` or `remove` with `key`.
+#[tauri::command]
+async fn auth_accounts(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    provider: String,
+    action: Option<String>,
+    key: Option<String>,
+) -> Result<Vec<crate::engine_cli::Account>, String> {
+    main_only(&webview, "manage accounts")?;
+    let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+    tauri::async_runtime::spawn_blocking(move || {
+        use crate::engine_cli::AccountAction;
+        let key = key.unwrap_or_default();
+        let action = match action.as_deref() {
+            None | Some("list") => AccountAction::List,
+            Some("select") => AccountAction::Select(&key),
+            Some("remove") => AccountAction::Remove(&key),
+            Some(other) => return Err(format!("Unknown account action `{other}`")),
+        };
+        crate::engine_cli::accounts(&program, cwd.as_deref(), &provider, action)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn cli_link_now(shared: &Shared) -> Result<crate::engine_cli::CliLink, String> {
+    let engine = engine_program(shared)?;
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let link = crate::engine_cli::link_path(std::env::consts::OS, shared.home.as_deref().map(Path::new), local.as_deref())
+        .ok_or("Could not locate your home folder")?;
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let mut status = crate::engine_cli::link_status(&engine, &link, &dirs);
+    if let (Some(home), Some(dir)) = (shared.home.as_deref(), link.parent()) {
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let zdotdir = std::env::var_os("ZDOTDIR").map(PathBuf::from);
+        status.shell = crate::engine_cli::shell_path(std::env::consts::OS, &shell, Path::new(home), zdotdir.as_deref(), dir);
+    }
+    Ok(status)
+}
+
+/// Whether `dial` in a terminal runs the engine Desktop uses.
+#[tauri::command]
+fn cli_link_status(shared: State<'_, Shared>) -> Result<crate::engine_cli::CliLink, String> {
+    cli_link_now(&shared)
+}
+
+/// Add (or with `remove`, take away) the `dial` terminal command for Desktop's engine.
+#[tauri::command]
+fn cli_link_set(webview: tauri::Webview, shared: State<'_, Shared>, remove: bool) -> Result<crate::engine_cli::CliLink, String> {
+    main_only(&webview, "change the terminal command")?;
+    let now = cli_link_now(&shared)?;
+    if remove {
+        crate::engine_cli::link_remove(&now.link)?;
+    } else {
+        crate::engine_cli::link_install(&now.engine, &now.link)?;
+    }
+    cli_link_now(&shared)
+}
+
+/// Put the `dial` command's folder on PATH for new terminals: one line appended to the login
+/// shell's profile. The UI shows the file and the line before asking for this.
+#[tauri::command]
+fn cli_path_add(webview: tauri::Webview, shared: State<'_, Shared>) -> Result<crate::engine_cli::CliLink, String> {
+    main_only(&webview, "change your shell profile")?;
+    let now = cli_link_now(&shared)?;
+    let setup = now.shell.as_ref().ok_or("Dial does not know this shell's profile, so it changed nothing. Add the folder to PATH in your shell's own settings.")?;
+    crate::engine_cli::shell_path_add(setup)?;
+    cli_link_now(&shared)
+}
+
+/// One fixed maintenance report from the engine's CLI (`gc`, `images`, `ps`, `rules`), as JSON.
+#[tauri::command]
+async fn engine_report(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    kind: String,
+    apply: Option<bool>,
+    target: Option<String>,
+) -> Result<serde_json::Value, String> {
+    main_only(&webview, "run engine maintenance")?;
+    let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::engine_cli::report(&program, cwd.as_deref(), &kind, apply.unwrap_or(false), target.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Exported and imported settings files are small text; anything larger is not one.
 const SETTINGS_FILE_LIMIT: u64 = 1 << 20;
 
@@ -753,6 +937,9 @@ fn app_try_reserve_restart(
         return Err("Only the app UI can reserve a restart".into());
     }
     let mut inner = shared.lock();
+    if inner.parked.values().any(|tabs| tabs.active_session_count() != 0) {
+        return Ok(crate::tabs::RestartDecision::Busy);
+    }
     let mut terminals = shared.terminals();
     let decision = inner.tabs.reserve_restart(terminals.open_ids(), &confirmed)?;
     if decision == crate::tabs::RestartDecision::Reserved {
@@ -890,6 +1077,23 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("apply_settings", 180),
     ("mcp_logout", 30),
     ("logout", 60),
+    ("list_permission_rules", 20),
+    ("add_permission_rule", 30),
+    ("remove_permission_rule", 30),
+    ("side_promote", 60),
+    ("collaboration_invite", 30),
+    ("collaboration_answer", 30),
+    ("research_status", 30),
+    ("list_hooks", 20),
+    ("ssh_hosts", 20),
+    ("list_worktrees", 20),
+    ("import_candidates", 30),
+    ("import_session", 120),
+    ("session_tree", 20),
+    ("tree_navigate", 60),
+    ("computer_status", 30),
+    // Held-out evaluation of a learned candidate: unloads the model and can run for a long time.
+    ("research_action", 3600),
 ];
 
 /// Call one allowed engine method in the open project and return its result.
@@ -957,6 +1161,7 @@ async fn local_model_removal(
         }
         if !dry_run {
             inner.tabs.check_model_removal(&model)?;
+            for tabs in inner.parked.values() { tabs.check_model_removal(&model)?; }
         }
         tab.engine.as_ref().ok_or("Dial is not connected")?.rpc(
             "delete_local_model",
@@ -967,6 +1172,7 @@ async fn local_model_removal(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn send_prompt(
     webview: tauri::Webview,
     shared: State<'_, Shared>,
@@ -1427,13 +1633,17 @@ fn project_window(shared: State<'_, Shared>, path: String) -> Result<(), String>
     if !path.is_dir() {
         return Err("Choose a project directory".into());
     }
+    launch_project_window(&shared, &path)
+}
+
+fn launch_project_window(shared: &Shared, path: &Path) -> Result<(), String> {
     let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     match &shared.source {
         Source::Engine { args, .. } => {
             child
                 .arg("--dial")
                 .arg(shared.program().ok_or("No engine configured")?)
-                .arg(&path)
+                .arg(path)
                 .arg("--")
                 .args(args);
         }
@@ -1444,7 +1654,7 @@ fn project_window(shared: State<'_, Shared>, path: String) -> Result<(), String>
                     Preview::Question => "--preview=question",
                     Preview::Session => "--preview",
                 })
-                .arg(&path);
+                .arg(path);
         }
     }
     let mut child = child
@@ -1482,7 +1692,8 @@ fn fork_session(
     Ok(())
 }
 
-/// Export the session on screen as Markdown to `path`, which must lie in the project folder.
+/// Export the session on screen to `path`, which must lie in the project folder: Markdown, or a
+/// standalone page when the name ends in `.html`.
 #[tauri::command]
 fn export_session(app: AppHandle, shared: State<'_, Shared>, path: String) -> Result<(), String> {
     let inner = shared.lock();
@@ -1545,16 +1756,8 @@ async fn steer(
         let inner = shared.lock();
         check_session(&inner, &workspace_root, session_id.as_deref())?;
         let tab = inner.tabs.active();
-        let text = match crate::types::type_scope(
-            &store,
-            type_id.as_deref(),
-            tab.model.type_context_supported,
-        ) {
-            // An engine that predates `type_context` reads the Type's framing in the guidance text.
-            Some(crate::engine::TypeScope::Framed(context)) => crate::types::legacy_prompt(&context, text.trim()),
-            _ => text.trim().to_owned(),
-        };
-        let command = tab.model.steer(&text)?;
+        let scope = crate::types::type_scope(&store, type_id.as_deref(), tab.model.type_context_supported);
+        let command = tab.model.steer(&text, scope)?;
         tab.engine
             .as_ref()
             .ok_or("Dial is not connected")?
@@ -1847,6 +2050,115 @@ async fn file_commit_review(
         .map_err(|e| e.to_string())?
 }
 
+/// The newest commits of the current branch. App UI only.
+#[tauri::command]
+async fn file_git_log(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    limit: Option<usize>,
+) -> Result<Vec<files::LogEntry>, String> {
+    main_only(&webview, "read the Git history")?;
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::log(&root, limit.unwrap_or(100)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// `dial review` over the project's changes, read-only; its report. App UI only.
+#[tauri::command]
+async fn review_changes(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    target: crate::engine_cli::ReviewTarget,
+    focus: Option<String>,
+) -> Result<String, String> {
+    main_only(&webview, "review changes")?;
+    let root = panel_root(&shared, &workspace_root)?;
+    let program = engine_program(&shared)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::engine_cli::review(&program, &root, &target, focus.as_deref().unwrap_or(""))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// `dial share <session>`: an encrypted link to the session's active branch. App UI only.
+#[tauri::command]
+async fn share_session(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: String,
+    gist: bool,
+) -> Result<crate::engine_cli::ShareLink, String> {
+    main_only(&webview, "share a session")?;
+    let root = panel_root(&shared, &workspace_root)?;
+    let program = engine_program(&shared)?;
+    tauri::async_runtime::spawn_blocking(move || crate::engine_cli::share(&program, &root, &session_id, gist))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The collaboration relay Desktop runs (`dial relay`): `start` with an address, `stop`, or the
+/// status. App UI only.
+#[tauri::command]
+async fn relay(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    action: String,
+    bind: Option<String>,
+) -> Result<crate::engine_cli::RelayStatus, String> {
+    main_only(&webview, "run the collaboration relay")?;
+    match action.as_str() {
+        "status" => Ok(crate::engine_cli::relay_status()),
+        "stop" => Ok(crate::engine_cli::relay_stop()),
+        "start" => {
+            let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+            let bind = bind.unwrap_or_else(|| "127.0.0.1:7331".into());
+            tauri::async_runtime::spawn_blocking(move || crate::engine_cli::relay_start(&program, cwd.as_deref(), &bind))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        other => Err(format!("Unknown relay action `{other}`")),
+    }
+}
+
+/// Reload the open conversation from the engine after a change made outside a turn.
+#[tauri::command]
+async fn reload_session(
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let reply = {
+        let inner = shared.lock();
+        check_session(&inner, &workspace_root, session_id.as_deref())?;
+        let tab = inner.tabs.active();
+        tab.engine
+            .as_ref()
+            .ok_or("Dial is not connected")?
+            .submit(tab.model.reload()?)?
+    };
+    rpc_reply(reply, None).await.map(|_| ())
+}
+
+/// The engine's AI commit message for the staged changes (`dial commit --dry-run`). App UI only.
+#[tauri::command]
+async fn file_commit_message(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+) -> Result<crate::engine_cli::CommitPreview, String> {
+    main_only(&webview, "write a commit message")?;
+    let root = panel_root(&shared, &workspace_root)?;
+    let program = engine_program(&shared)?;
+    tauri::async_runtime::spawn_blocking(move || crate::engine_cli::commit_message(&program, &root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Commit the staged changes with `message`; the new commit's short hash. App UI only.
 #[tauri::command]
 async fn file_commit(
@@ -1861,6 +2173,33 @@ async fn file_commit(
     }
     let root = panel_root(&shared, &workspace_root)?;
     tauri::async_runtime::spawn_blocking(move || files::commit(&root, &message, &review))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The commit author Git has for this project; a part it has no value for is empty.
+#[tauri::command]
+async fn file_git_identity(shared: State<'_, Shared>, workspace_root: String) -> Result<files::GitIdentity, String> {
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::identity(&root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Save the commit author for this project, or with `everywhere` for all of the user's
+/// repositories. App UI only.
+#[tauri::command]
+async fn file_git_identity_set(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    name: String,
+    email: String,
+    everywhere: bool,
+    workspace_root: String,
+) -> Result<files::GitIdentity, String> {
+    main_only(&webview, "change the Git author")?;
+    let root = panel_root(&shared, &workspace_root)?;
+    tauri::async_runtime::spawn_blocking(move || files::set_identity(&root, &name, &email, everywhere))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1952,11 +2291,23 @@ struct ProviderSetup {
     output: tauri::ipc::Channel<serde_json::Value>,
 }
 
+/// Where provider sign-in runs: the open project, else the home folder (accounts and keys are
+/// saved per user, so no project is needed to set them up).
+fn setup_root(shared: &Shared) -> Result<PathBuf, String> {
+    shared.root().or_else(|_| {
+        shared.home.as_deref().map(PathBuf::from).filter(|p| p.is_dir()).ok_or_else(|| "Could not locate your home folder".to_owned())
+    })
+}
+
 #[tauri::command]
-fn provider_setup_open(shared: State<'_, Shared>, workspace_root: String, output: tauri::ipc::Channel<serde_json::Value>) -> Result<u32, String> {
+fn provider_setup_open(shared: State<'_, Shared>, workspace_root: Option<String>, output: tauri::ipc::Channel<serde_json::Value>) -> Result<u32, String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(1);
-    let root = panel_root(&shared, &workspace_root)?;
+    let root = match workspace_root {
+        Some(expected) => panel_root(&shared, &expected)?,
+        None if shared.root().is_ok() => return Err("A project opened before sign-in could load".into()),
+        None => setup_root(&shared)?,
+    };
     let engine = shared.spawn(&root).ok_or(PREVIEW_NOTICE)?;
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let old = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1967,9 +2318,9 @@ fn provider_setup_open(shared: State<'_, Shared>, workspace_root: String, output
 
 #[tauri::command]
 async fn provider_setup_call(shared: State<'_, Shared>, id: u32, method: String, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    let method = ["auth_providers", "login", "auth_code", "auth_cancel", "logout", "remove_api_key"].into_iter()
+    let method = ["auth_providers", "login", "mcp_login", "auth_code", "auth_cancel", "logout", "remove_api_key"].into_iter()
         .find(|m| *m == method).ok_or("Unsupported provider action")?;
-    let root = shared.root()?;
+    let root = setup_root(&shared)?;
     let reply = {
         let setup = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner);
         let setup = setup.as_ref().filter(|s| s.id == id && s.root == root).ok_or("Provider setup has closed")?;
@@ -2155,6 +2506,13 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             engine_choice_get,
             engine_choice_set,
             engine_validate,
+            doctor_report,
+            doctor_fix,
+            auth_accounts,
+            cli_link_status,
+            cli_link_set,
+            cli_path_add,
+            engine_report,
             settings_file_write,
             settings_file_read,
             app_updates_enabled,
@@ -2223,6 +2581,14 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             file_stage,
             file_commit_review,
             file_commit,
+            file_commit_message,
+            file_git_log,
+            review_changes,
+            share_session,
+            relay,
+            reload_session,
+            file_git_identity,
+            file_git_identity_set,
             file_grep,
             file_open,
             app_runner_vm_ssh_setup_cancel,
@@ -2286,6 +2652,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             app.manage(Shared {
                 inner: Mutex::new(Inner {
                     tabs: Tabs::new(Tab::new(Model::default(), None)),
+                    parked: Default::default(),
                     workspace: None,
                     recents,
                     entry_views: EntryViews::default(),
@@ -2332,11 +2699,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             }
             if let Some(path) = workspace {
                 let path_root = path.clone();
-                app.state::<Shared>().open(
-                    &path,
-                    None,
-                    &app.state::<crate::app_runner::AppRunner>(),
-                )?;
+                app.state::<Shared>().open(&path)?;
                 app.state::<crate::types::Store>().set_project(Some(&path_root));
                 scheduler_project_opened(app.handle());
             }
@@ -2395,15 +2758,17 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             app.state::<crate::scheduler::Scheduler>().stop_all(true);
             shared.terminals().close_all();
             app.state::<crate::model_library::Downloads>().stop();
+            crate::engine_cli::relay_stop();
             if let Some(file) = &endpoint_on_exit {
                 crate::agent_browser::remove_endpoint(file);
             }
             // Shut every engine down gracefully (bounded, in parallel) before the process ends.
             let empty = Tabs::new(Tab::new(Model::default(), None));
-            let tabs = std::mem::replace(&mut shared.lock().tabs, empty);
-            let closing: Vec<_> = tabs
-                .into_tabs()
-                .into_iter()
+            let mut inner = shared.lock();
+            let mut tabs = std::mem::replace(&mut inner.tabs, empty).into_tabs();
+            for (_, parked) in inner.parked.drain() { tabs.extend(parked.into_tabs()); }
+            drop(inner);
+            let closing: Vec<_> = tabs.into_iter()
                 .map(|tab| thread::spawn(move || drop(tab)))
                 .collect();
             for handle in closing {

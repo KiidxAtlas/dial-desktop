@@ -1,6 +1,7 @@
 // What can be done to a session, shared by its sidebar menu, the title bar menu and the palette.
 
-import { engine, files, hiddenSessions, lastSubmission, showToast, snapshot } from './bridge';
+import { engine, files, folders, hiddenSessions, lastSubmission, showToast, snapshot } from './bridge';
+import { engineCall, goal, goalAction, readable } from './engineTools';
 import { beginSend, draftFor, hasDraft } from './drafts';
 import { draftReady, readyForFollowUp, restoreInput } from './draftInput';
 import type { OpenSnapshot, Session } from "./types";
@@ -261,12 +262,69 @@ export function sessionItems(snap: OpenSnapshot, session: Session, place: "sideb
         run: () => copyConversation(snap),
       },
       {
-        label: "Export…",
+        label: "Export as Markdown…",
         icon: "download",
         disabled: !live || !snap.entries.length,
         run: () => engine.exportSession(snap.workspace.root, session.title),
       },
+      {
+        label: "Export as HTML…",
+        icon: "download",
+        disabled: !live || !snap.entries.length,
+        run: () => engine.exportSession(snap.workspace.root, session.title, "html"),
+      },
       { label: "Undo last turn", icon: "undo", disabled: !live || !canUndo(snap), run: () => engine.undoTurn() },
+      { label: "Compact conversation", icon: "refresh", disabled: !canCompact(snap), run: () => engine.compact() },
+      {
+        label: "Pack to a file",
+        icon: "download",
+        disabled: !live || snap.turnRunning || !snap.entries.length,
+        run: () => engineCall<{ path?: string }>("pack_session", {}).then((r) => showToast(r.path ? `Packed to ${r.path}` : "Session packed"), (e) => showToast(`Could not pack the session: ${readable(e)}`)),
+      },
+      {
+        label: "Label the latest message…",
+        icon: "pin",
+        disabled: !live || !snap.entries.length,
+        prompt: {
+          label: "Label, so the message is easy to find later",
+          placeholder: "For example: before the refactor",
+          maxLength: 80,
+          confirm: "Label",
+          submit: (value) =>
+            void engineCall("label_session", { label: value.trim() }).then(() => showToast(`Labeled “${value.trim()}”`), (e) => showToast(`Could not label the message: ${readable(e)}`)),
+        },
+      },
+      {
+        label: goal.value && goal.value.status !== "dropped" && goal.value.status !== "complete" ? "Replace the goal…" : "Set a goal…",
+        icon: "check",
+        disabled: !live || snap.turnRunning,
+        prompt: {
+          label: "Goal: what Dial keeps working toward across turns",
+          placeholder: "For example: all tests pass on the release branch",
+          maxLength: 2000,
+          confirm: "Start",
+          submit: async (value) => {
+            const current = goal.value;
+            if (current && current.status !== "dropped" && current.status !== "complete" && !(await goalAction({ action: "drop" }))) return;
+            void goalAction({ action: "set", objective: value.trim() });
+          },
+        },
+      },
+      {
+        label: "Move to another project…",
+        icon: "folder",
+        disabled: !live || snap.turnRunning,
+        run: async () => {
+          const path = await folders.pick("Move this session to a project folder");
+          if (path) (await import("./commandRunner")).runTyped(snap, "move", path, []);
+        },
+      },
+      {
+        label: "Archived sessions",
+        icon: "list",
+        disabled: !live,
+        run: async () => (await import("./commandRunner")).runTyped(snap, "archive", "", []),
+      },
     );
   }
   items.push(

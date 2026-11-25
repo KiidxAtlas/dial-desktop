@@ -21,6 +21,7 @@ Or use the Makefile (`make` lists every target):
 ```sh
 make run DIR=~/code/my-project       # live engine, hot reload
 make preview                          # design preview, no engine
+make preview-ui                       # the same fixtures in a browser (npm run preview:ui)
 make app && make open DIR=~/code/app  # debug build, then launch it
 make test                             # Rust tests and the type check
 ```
@@ -40,6 +41,12 @@ npm run dev -- -- -- --preview=question                # the session waiting on 
 ```
 
 Under `npm run dev` the app runs from `src-tauri/`, so pass the workspace explicitly.
+
+For layout work there is also a browser preview: `npm run preview:ui` writes the design-preview
+fixtures as JSON and serves the real UI with a stand-in backend at
+`http://localhost:1420/dev/ui-preview.html`. It takes `?state=session|idle|approvals|long|offline|empty|question`,
+`&theme=light|dark`, and `&check`, which outlines anything running past the edge of its pane
+(`__uiCheck()` in the console returns the same list). It uses port 1420, so stop `npm run dev` first.
 
 Release build and bundle (`.app`/`.dmg`, `.msi`, `.deb`/`.AppImage` depending on the OS):
 
@@ -96,7 +103,8 @@ The app and the Dial engine update separately, and nothing installs until the us
   newer release is available for an externally managed install, choose **Install Desktop copy**
   in Settings. This runs Dial's signed release installer in a separate Desktop folder without
   replacing the original engine. Desktop prefers that copy on future launches unless you set
-  `--dial` or `DIAL_BIN`. On Windows the installer also adds that folder to the user PATH.
+  `--dial` or `DIAL_BIN`. The Desktop copy stays off your PATH on every platform; to run the same
+  engine from a terminal, add the `dial` command in Settings → Health & setup.
   Running sessions can reconnect when idle to use the new engine.
 - **CLI only**: people who do not want the app install the engine alone with the same one-line
   installer from <https://dial.rootatlas.dev/install?cli>.
@@ -156,7 +164,7 @@ continues. Local builds without the release config do not contact Azure.
   **Show more matches** expands the results up to 1,000. Pick a hit to open its conversation:
   Desktop jumps to a unique matching message, lets you step through identical messages, or shows
   the saved snippet if there’s no exact match in the displayed history.
-  Switching projects asks before stopping running work or closing terminals. **Reconnect**
+  Opening another project switches this window to it. The previous project's sessions and terminals stay open; pick it from Recent to return. **Reconnect**
   resumes the foreground conversation without restarting other session engines or terminals.
   Closing or quitting a project window asks first if it has active sessions (including background ones),
   open terminals, App panel connections, a running scheduler, a model download or App host setup.

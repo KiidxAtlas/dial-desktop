@@ -402,14 +402,16 @@ export const engine = {
       return null;
     }
   },
-  /** Ask where to save, inside the project folder, and export the session on screen as Markdown. */
-  async exportSession(root: string, title: string) {
+  /** Ask where to save, inside the project folder, and export the session on screen as Markdown
+   * or as a standalone HTML page. */
+  async exportSession(root: string, title: string, format: "markdown" | "html" = "markdown") {
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "session";
+    const html = format === "html";
     try {
       const path = await saveDialog({
-        title: "Export session as Markdown",
-        defaultPath: `${root}/${slug}.md`,
-        filters: [{ name: "Markdown", extensions: ["md"] }],
+        title: `Export session as ${html ? "HTML" : "Markdown"}`,
+        defaultPath: `${root}/${slug}.${html ? "html" : "md"}`,
+        filters: [html ? { name: "HTML", extensions: ["html"] } : { name: "Markdown", extensions: ["md"] }],
       });
       if (path) await call("export_session", { path });
     } catch (error) {
@@ -472,7 +474,8 @@ export const engine = {
 };
 
 export const folders = {
-  recent: () => invoke<Workspace[]>("recent_workspaces").catch(() => [] as Workspace[]),
+  // Always an array: a null reply (a backend not ready yet, or a mock) must not crash the menus.
+  recent: () => invoke<Workspace[] | null>("recent_workspaces").then((list) => list ?? []).catch(() => [] as Workspace[]),
   /** Drop a folder from the recent projects list; the folder itself stays on disk. */
   async forget(path: string) {
     try {
@@ -483,19 +486,8 @@ export const folders = {
       return false;
     }
   },
-  async open(path: string) {
-    try {
-      let from = await invoke<string | null>("open_workspace", { path });
-      while (from) {
-        if (!(await ask("Switching projects will stop active turns and close open terminals in the current project.", { title: "Switch projects?", kind: "warning" }))) return false;
-        from = await invoke<string | null>("open_workspace", { path, confirmedFrom: from });
-      }
-      return true;
-    } catch (error) {
-      showToast(String(error));
-      return false;
-    }
-  },
+  /** Switch projects in this window without stopping the previous project's sessions. */
+  open: (path: string) => call("open_workspace", { path }),
   /** Ask for a folder with the system dialog and open it. */
   async choose(newWindow = false) {
     try {
@@ -505,6 +497,16 @@ export const folders = {
       }
     } catch (error) {
       showToast(`Could not open the folder picker: ${error}`);
+    }
+  },
+  /** Ask for a folder with the system dialog without opening it; `null` when cancelled. */
+  async pick(title: string): Promise<string | null> {
+    try {
+      const path = await openDialog({ directory: true, multiple: false, title });
+      return typeof path === "string" ? path : null;
+    } catch (error) {
+      showToast(`Could not open the folder picker: ${error}`);
+      return null;
     }
   },
   /** Open `path` in another Dial window, leaving this one as it is. */
@@ -601,6 +603,29 @@ export const diagnosticsApi = {
   /** `path --version`: the version line, or a readable failure. */
   validateEngine: (path: string) => invoke<string>("engine_validate", { path }),
 };
+/** One optional capability from `dial doctor --all` (`engine_cli::Capability`). */
+export interface Capability { id: string; name: string; installed: boolean; path: string | null }
+export interface DoctorReport { capabilities: Capability[]; notes: string[] }
+/** One stored sign-in of an OAuth provider (`engine_cli::Account`). */
+export interface StoredAccount { key: string; detail: string; active: boolean }
+/** Whether `dial` in a terminal runs Desktop's engine (`engine_cli::CliLink`). `shell` is the
+ *  profile line that puts the link's folder on PATH, where Desktop can add it. */
+export interface CliLink { engine: string; link: string; linked: boolean; onPath: boolean; other: string | null; blocked: boolean; shell: { profile: string; line: string; present: boolean } | null }
+/** Engine features reached through `dial` subcommands; none needs an open project. */
+export const setupApi = {
+  doctor: () => invoke<DoctorReport>("doctor_report"),
+  /** What setting `id` up would run; with `apply`, run it. Returns the command's output. */
+  fix: (id: string, apply: boolean) => invoke<string>("doctor_fix", { id, apply }),
+  accounts: (provider: string, action?: "select" | "remove", key?: string) =>
+    invoke<StoredAccount[]>("auth_accounts", { provider, action: action ?? null, key: key ?? null }),
+  cliLink: () => invoke<CliLink>("cli_link_status"),
+  setCliLink: (remove: boolean) => invoke<CliLink>("cli_link_set", { remove }),
+  /** Append the PATH line to the login shell's profile; show `shell` to the user first. */
+  addCliPath: () => invoke<CliLink>("cli_path_add"),
+  /** A maintenance report: gc, images, images_purge, ps, ps_stop, ps_kill, ps_logs, ps_restart or rules. */
+  report: <T = any>(kind: string, options: { apply?: boolean; target?: string } = {}) =>
+    invoke<T>("engine_report", { kind, apply: options.apply ?? false, target: options.target ?? null }),
+};
 /** Settings export and import files (picked with the system dialogs). */
 export const settingsFiles = {
   write: (path: string, text: string) => invoke<void>("settings_file_write", { path, text }),
@@ -660,10 +685,14 @@ export type ProviderEvent =
   | { event: "failed"; message: string };
 const setupCall = <T>(id: number, method: string, params = {}) => invoke<T>("provider_setup_call", { id, method, params });
 export const providerApi = {
-  open: (workspaceRoot: string, handler: (event: ProviderEvent) => void) =>
+  /** `workspaceRoot` null: no project is open, so sign-in runs in the home folder. */
+  open: (workspaceRoot: string | null, handler: (event: ProviderEvent) => void) =>
     invoke<number>("provider_setup_open", { workspaceRoot, output: new Channel<ProviderEvent>(handler) }),
-  list: (id: number) => setupCall<{ providers: ProviderAccount[]; key_providers?: KeyProvider[] }>(id, "auth_providers"),
+  /** `endpoint_keys`: custom endpoints that take a saved key; engines before 0.3.18 omit it. */
+  list: (id: number) => setupCall<{ providers: ProviderAccount[]; key_providers?: KeyProvider[]; endpoint_keys?: KeyProvider[] }>(id, "auth_providers"),
   login: (id: number, provider: string) => setupCall(id, "login", { provider }),
+  /** Sign in to a remote MCP server; its events carry the provider `mcp:<server>`. */
+  mcpLogin: (id: number, server: string) => setupCall<{ server: string; message: string }>(id, "mcp_login", { server }),
   answer: (id: number, prompt_id: string, code: string) => setupCall(id, "auth_code", { prompt_id, code }),
   cancel: (id: number, provider: string) => setupCall(id, "auth_cancel", { provider }),
   logout: (id: number, provider: string) => setupCall(id, "logout", { provider }),
@@ -672,7 +701,18 @@ export const providerApi = {
 };
 
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
-export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler" };
+export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler"; once?: boolean };
+/** Session and collaboration tools that run the engine's own commands (`src-tauri/src/engine_cli.rs`). Calls throw a readable message. */
+export const sessionToolsApi = {
+  /** `dial share`: an encrypted link to the session's active branch, or a secret gist through `gh`. */
+  share: (workspaceRoot: string, sessionId: string, gist: boolean) =>
+    invoke<{ url: string; notes: string[] }>("share_session", { workspaceRoot, sessionId, gist }),
+  /** The collaboration relay Desktop runs: its address while running, else `null`. */
+  relay: (action: "status" | "start" | "stop", bind?: string) => invoke<{ bind: string | null }>("relay", { action, bind }),
+  /** Reload the open conversation after a move through its tree. */
+  reload: (workspaceRoot: string, sessionId: string | null) => invoke<void>("reload_session", { workspaceRoot, sessionId }),
+};
+
 export const terminalApi = {
   open: (workspaceRoot: string, cols: number, rows: number, task: TerminalTask | undefined, onEvent: (event: TerminalEvent) => void) =>
     invoke<number>("terminal_open", { workspaceRoot, cols, rows, task, output: new Channel<TerminalEvent>(onEvent) }),

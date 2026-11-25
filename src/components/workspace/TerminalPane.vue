@@ -66,7 +66,7 @@ async function closeTask(slot: TaskSlot) {
   mode.value = "shell";
 }
 watch(terminalRequest, request => {
-  if (!request) return;
+  if (!request || request.root !== props.snap.workspace.root) return;
   terminalRequest.value = null;
   const slot = request.task.kind;
   mode.value = slot;
