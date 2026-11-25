@@ -159,6 +159,25 @@ impl Terminals {
                 child,
             },
         );
+        // ConPTY keeps its output pipe open after the shell exits, until the pseudoconsole
+        // closes; watch the shell and close it (by removing it) so the reader below ends.
+        #[cfg(windows)]
+        {
+            let shells = Arc::clone(&self.shells);
+            let _ = thread::Builder::new()
+                .name(format!("dial-terminal-{id}-exit"))
+                .spawn(move || loop {
+                    thread::sleep(std::time::Duration::from_millis(150));
+                    let mut open = shells.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Some(shell) = open.get_mut(&id) else { break };
+                    if !matches!(shell.child.try_wait(), Ok(None)) {
+                        let ended = open.remove(&id);
+                        drop(open);
+                        drop(ended);
+                        break;
+                    }
+                });
+        }
         let shells = Arc::clone(&self.shells);
         if let Err(e) = thread::Builder::new()
             .name(format!("dial-terminal-{id}"))
