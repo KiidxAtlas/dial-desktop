@@ -42,7 +42,14 @@ fn a_shell_streams_output_and_reports_its_exit() {
     let mut exited = false;
     while Instant::now() < deadline && !exited {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(TerminalEvent::Data { data, .. }) => output.push_str(&data),
+            Ok(TerminalEvent::Data { data, .. }) => {
+                // Windows' ConPTY asks for the cursor position before it runs the shell; the
+                // app's terminal answers, so the test must too.
+                if data.contains("\u{1b}[6n") {
+                    let _ = terminals.write(id, "\u{1b}[1;1R");
+                }
+                output.push_str(&data);
+            }
             Ok(TerminalEvent::Exit { id: ended }) => exited = ended == id,
             Err(_) => {}
         }

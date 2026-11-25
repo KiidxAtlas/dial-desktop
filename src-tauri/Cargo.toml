@@ -38,9 +38,12 @@ portable-pty = "0.9"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
+# Signals to child processes (`scheduler::end`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The Browser panel's screenshot for the agent (`agent_browser::screenshot`): WebKit's own snapshot.
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 objc2 = "0.6"
 block2 = "0.6"
 mac-usernotifications = { version = "0.3.1", default-features = false }
