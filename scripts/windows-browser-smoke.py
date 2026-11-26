@@ -80,5 +80,6 @@ def smoke(exe, root):
 
 
 if __name__ == '__main__':
-    with tempfile.TemporaryDirectory() as tmp:
+    # WebView2 helper processes can outlive the killed app and briefly hold profile files.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         smoke(Path(sys.argv[1]).resolve(strict=True), Path(tmp))
