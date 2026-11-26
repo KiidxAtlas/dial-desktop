@@ -329,7 +329,8 @@ fn search_omits_symlinks_leaving_the_workspace() {
     assert_eq!(results, ["inside.txt"]);
 }
 
-/// Run git in `root` with a throwaway identity, asserting success.
+/// Run git in `root` with a throwaway identity, asserting success. New repositories store and
+/// restore bytes as written, independent of a host-wide `core.autocrlf` (on for Windows runners).
 fn git_ok(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -339,6 +340,9 @@ fn git_ok(root: &Path, args: &[&str]) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
+    if args.first() == Some(&"init") {
+        git_ok(root, &["config", "core.autocrlf", "false"]);
+    }
 }
 
 #[test]
