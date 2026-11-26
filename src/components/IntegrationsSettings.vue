@@ -8,7 +8,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { sessionToolsApi, showToast, snapshot } from "../bridge";
 import { applySaved, engineCall, readable } from "../engineTools";
 import {
-  engineTooOld, hookFromDraft, joinCommand, savedHook, sshFromDraft,
+  computerSetting, engineTooOld, hookFromDraft, joinCommand, savedHook, sshFromDraft,
   type Hook, type HookDraft, type SshDraft, type SshHost,
 } from "../integrations";
 import Icon from "./Icon.vue";
@@ -248,21 +248,23 @@ const denied = computed(() => {
 /** Add or remove `computer` in the saved `integrations` list, as `/computer on|off` does. */
 async function setComputer(on: boolean) {
   if (computerBusy.value || !computer.value) return;
-  if (on && !(await ask("Let Dial see the screen and use the mouse and keyboard? Every run and input action asks for approval first; screenshots and window lists do not.", { title: "Turn on computer use", kind: "warning", okLabel: "Turn on" }))) return;
+  const root = snapshot.value?.workspace?.root;
+  if (!root) return;
   computerBusy.value = true;
+  computerError.value = "";
   try {
-    const current = await engineCall<{ value?: unknown }>("get_settings", { key: "integrations" });
-    const names = (Array.isArray(current.value) ? current.value : []).filter((n): n is string => typeof n === "string" && n !== "computer");
-    if (on) names.push("computer");
-    await engineCall("set_setting", { key: "integrations", value: names, scope: "global" });
-    await applySaved().catch((e) => showToast(`Saved, but the running session did not reload: ${readable(e)}`));
-    showToast(on ? "Computer use is on" : "Computer use is off");
+    if (on && !(await ask("Let Dial see the screen and use the mouse and keyboard? Every run and input action asks for approval first; screenshots and window lists do not.", { title: "Turn on computer use", kind: "warning", okLabel: "Turn on" }))) return;
+    const current = await engineCall<Parameters<typeof computerSetting>[0]>("get_settings", { key: "integrations" }, root);
+    await engineCall("set_setting", computerSetting(current, on), root);
+    if (snapshot.value?.workspace?.root !== root) return;
+    await applySaved(); // Uses Desktop's existing deferred reload if a turn is in progress.
+    showToast(`Computer use preference saved: ${on ? "on" : "off"}`);
+    await loadComputer();
   } catch (e) {
     computerError.value = readable(e);
   } finally {
     computerBusy.value = false;
   }
-  await loadComputer();
 }
 
 // ── Collaboration relay (`dial relay`) ───────────────────────────────────────
@@ -432,6 +434,7 @@ onMounted(load);
         >
           <button class="btn btn-secondary" :disabled="computerBusy" @click="setComputer(!computer.enabled)">{{ computerBusy ? "Saving…" : computer.enabled ? "Turn off" : "Turn on" }}</button>
         </SRow>
+        <SRow v-if="computer.unavailable" label="Not available here" :description="computer.unavailable" />
         <SRow v-if="denied.length" label="Permission needed" :description="`Grant ${denied.join(' and ')} to Dial in System Settings → Privacy & Security, then restart Dial.`" />
       </template>
     </SGroup>

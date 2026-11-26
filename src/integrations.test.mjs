@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { engineTooOld, hookFromDraft, joinCommand, savedHook, splitCommand, sshFromDraft } from './integrations.ts';
+import { computerSetting, engineTooOld, hookFromDraft, joinCommand, savedHook, splitCommand, sshFromDraft } from './integrations.ts';
 
 test('commands split on spaces, group quoted words and round-trip through join', () => {
   assert.deepEqual(splitCommand('  ./check.sh --fast  '), ['./check.sh', '--fast']);
@@ -37,4 +37,14 @@ test('an ssh draft needs a fresh valid name and host, and a real port', () => {
 test('only a missing method reads as an old engine', () => {
   assert.equal(engineTooOld(new Error('the engine does not serve `ssh_hosts` on this connection')), true);
   assert.equal(engineTooOld('invalid_params: bad'), false);
+});
+
+test('computer use changes only its entry in the effective settings layer', () => {
+  for (const scope of [undefined, 'global', 'project']) {
+    const current = { scope, value: ['browser', 'computer', 'git', 'computer'] };
+    const off = computerSetting(current, false);
+    assert.deepEqual(off, { key: 'integrations', scope: scope ?? 'global', value: ['browser', 'git'] });
+    assert.deepEqual(computerSetting(off, true).value, ['browser', 'git', 'computer']);
+  }
+  for (const value of [null, 'browser', [1]]) assert.throws(() => computerSetting({ value }, true), /no settings were changed/);
 });

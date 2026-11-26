@@ -26,6 +26,11 @@ make app && make open DIR=~/code/app  # debug build, then launch it
 make test                             # Rust tests and the type check
 ```
 
+**Computer use:** In a connected project, open **Settings → Integrations → Computer use**.
+The switch updates the project’s integrations if it has its own list; otherwise it updates
+the global preference. Desktop reloads the session after saving (after the current turn if
+one is running). Enabling the tool does not grant OS permissions or approve input actions.
+
 ## Run
 
 During development (Vite hot reload for the UI, Rust rebuilt on change). Arguments for the app go

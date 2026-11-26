@@ -28,6 +28,6 @@ jobs:
           workspaces: src-tauri -> target
       - run: npm ci
       - run: npm run build:web
-      - run: node --test src/paths.test.mjs src/terminalLinks.test.mjs src/modelLibrary.test.mjs
+      - run: node --test src/paths.test.mjs src/terminalLinks.test.mjs src/modelLibrary.test.mjs src/integrations.test.mjs
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib launcher::tests
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib terminal::tests

@@ -102,3 +102,13 @@ export function sshFromDraft(draft: SshDraft, taken: string[]): { name: string; 
 export function engineTooOld(error: unknown): boolean {
   return /does not serve `|unknown method|method not found/i.test(String(error instanceof Error ? error.message : error));
 }
+
+/** Change only computer use in the layer that supplies the effective integrations list. */
+export function computerSetting(current: { value: unknown; scope?: "global" | "project" }, on: boolean) {
+  if (!Array.isArray(current.value) || !current.value.every((name): name is string => typeof name === "string")) {
+    throw new Error("Could not read the integrations list; no settings were changed.");
+  }
+  const value = current.value.filter((name) => name !== "computer");
+  if (on) value.push("computer");
+  return { key: "integrations", scope: current.scope ?? "global", value };
+}
