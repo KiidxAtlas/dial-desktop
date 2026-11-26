@@ -115,7 +115,7 @@ async function load(path: string, quiet = false) {
   }
 }
 
-/** Re-read Git status markers (one `git status` for the whole tree). */
+/** Re-read Git status markers across the workspace's worktrees. */
 async function loadStatus() {
   const root = props.snap.workspace.root, id = ++statusRequest;
   try {
@@ -173,7 +173,8 @@ const rows = computed(() => {
   const walk = (path: string, depth: number) => {
     for (const entry of children.get(path) ?? []) {
       out.push({ entry, depth });
-      if (entry.dir && expanded.has(entry.path)) walk(entry.path, depth + 1);
+      // A folder may have become a link since its children were loaded. Never walk back up.
+      if (entry.dir && expanded.has(entry.path) && entry.path && (!path || entry.path.startsWith(`${path}/`))) walk(entry.path, depth + 1);
     }
   };
   walk("", 0);
@@ -282,8 +283,9 @@ onMounted(() => {
     <div v-show="!reader" class="tree" :class="{ solo: !ui.filePath }" :style="ui.filePath ? { width: `${treeWidth}px` } : undefined">
       <div class="tree-head">
         <input v-model="filter" type="search" class="filter" :aria-label="contentMode ? 'Search inside project files' : 'Search project files'" :placeholder="contentMode ? 'Search inside files' : 'Search project files'" spellcheck="false" />
-        <button class="icon-btn contents" :class="{ on: contentMode }" :aria-pressed="contentMode" :title="contentMode ? 'Searching file contents; click to search file names' : 'Search file contents instead of names'" @click="toggleContent">
-          Aa
+        <!-- Says what is searched, like the sidebar's Titles / Messages switch. -->
+        <button class="icon-btn contents" :class="{ on: contentMode }" :aria-pressed="contentMode" :title="contentMode ? 'Searching file contents; click to search file names' : 'Searching file names; click to search file contents'" @click="toggleContent">
+          {{ contentMode ? "Contents" : "Names" }}
         </button>
         <button class="icon-btn" :class="{ on: showIgnored }" :aria-pressed="showIgnored" :title="showIgnored ? 'Hide files .gitignore excludes' : 'Show files .gitignore excludes'" @click="toggleIgnored">
           <Icon name="files" :size="14" />
@@ -431,7 +433,7 @@ onMounted(() => {
   width: auto;
   padding: 0 6px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
 }
 .row.hit {
   flex-direction: column;

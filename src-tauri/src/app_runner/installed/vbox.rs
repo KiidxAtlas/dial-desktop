@@ -142,7 +142,7 @@ impl Console {
     }
 
     fn start(mut command: Command) -> Result<Self, String> {
-        command
+        crate::launcher::without_console(&mut command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());

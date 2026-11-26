@@ -1,3 +1,4 @@
+import "./webviewCompat";
 import { createApp } from "vue";
 import App from "./App.vue";
 import { connect, openExternal, showToast, snapshot } from "./bridge";
@@ -5,6 +6,7 @@ import { loadHighlighter } from "./markdown";
 import { startAppearance } from "./appearance";
 import { openInBrowser, previewUrlsIn, showFile } from "./workspace";
 import { IMAGE_EXT, viewImage } from "./imageViewer";
+import { projectFileLink } from "./paths";
 import { startNotifications } from "./notifications";
 import { startTypes } from "./savedTypes";
 import { installLegacyKeyGuard } from "./macKeys";
@@ -36,19 +38,9 @@ document.addEventListener(
     const href = link.getAttribute("href") ?? "";
     const image = link.getAttribute("data-image-path");
     if (image) return viewImage(image);
-    if (previewUrlsIn(href).length && !(event.metaKey || event.ctrlKey)) openInBrowser(href);
+    if (/^https?:/i.test(href) && previewUrlsIn(href).length && !(event.metaKey || event.ctrlKey)) openInBrowser(href);
     else if (/^(https?|mailto):/i.test(href)) openExternal(href);
-    else if (!/^[a-z][a-z\d+.-]*:|^#/i.test(href)) {
-      const path = href.replace(/[?#].*$/, "");
-      if (IMAGE_EXT.test(path)) {
-        try {
-          return viewImage(decodeURIComponent(path));
-        } catch {
-          return showToast(`Could not open ${href}`);
-        }
-      }
-      openProjectFile(href, link instanceof HTMLElement ? link : undefined);
-    }
+    else openProjectFile(href, link instanceof HTMLElement ? link : undefined);
   },
   true,
 );
@@ -57,18 +49,14 @@ document.addEventListener(
 function openProjectFile(href: string, source?: HTMLElement) {
   const root = snapshot.value?.workspace?.root;
   if (!root) return;
-  let path: string;
   try {
-    path = decodeURIComponent(href.replace(/[?#].*$/, ""));
+    const file = projectFileLink(root, href);
+    if (!file) return;
+    if (IMAGE_EXT.test(file.path)) viewImage(file.path);
+    else showFile(file.path, file.lines, source);
   } catch {
     return showToast(`Could not open ${href}`);
   }
-  if (path.startsWith(`${root}/`)) path = path.slice(root.length + 1);
-  path = path.replace(/^\.\//, "");
-  if (!path) return;
-  const match = /#L([1-9]\d*)(?:-L([1-9]\d*))?$/.exec(href);
-  const start = Number(match?.[1]), end = Number(match?.[2] ?? start);
-  showFile(path, Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start ? { start, end } : null, source);
 }
 
 // Copy buttons in rendered code blocks.

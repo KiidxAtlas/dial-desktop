@@ -63,7 +63,7 @@ const elapsedLabel = computed(() => {
   color: var(--accent);
 }
 .label {
-  color: var(--accent);
+  color: var(--text);
   font-weight: 500;
 }
 @media (prefers-reduced-motion: no-preference) {

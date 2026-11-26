@@ -31,7 +31,8 @@ import SRow from "./settings/SRow.vue";
 import SSwitch from "./settings/SSwitch.vue";
 import SSegmented from "./settings/SSegmented.vue";
 
-const props = defineProps<{ which: ProjectTab; snap: OpenSnapshot }>();
+/** `embedded`: drawn under another page (Extra folders under Permissions), so it has no page header. */
+const props = defineProps<{ which: ProjectTab; snap: OpenSnapshot; embedded?: boolean }>();
 const live = computed(() => props.snap.connection.state === "live");
 const loading = ref(false);
 const error = ref("");
@@ -598,8 +599,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <SPage :title="TITLES[which][0]" :description="TITLES[which][1]">
-    <template v-if="live" #actions>
+  <SPage :title="embedded ? '' : TITLES[which][0]" :description="embedded ? undefined : TITLES[which][1]">
+    <template v-if="live && !embedded" #actions>
       <button class="btn btn-secondary" :disabled="loading || (which === 'skills' && !!busy)" @click="load">Refresh</button>
     </template>
 
@@ -824,7 +825,7 @@ onBeforeUnmount(() => {
 
       <!-- Folders -->
       <template v-else-if="which === 'folders'">
-        <SGroup title="Folders">
+        <SGroup :title="embedded ? 'Extra folders' : 'Folders'" :description="embedded ? TITLES.folders[1] : undefined">
           <template #aside><button class="btn btn-secondary" @click="addFolder">Add folder…</button></template>
           <div class="s-row"><span class="grow text mono">{{ data.root }}</span><span class="s-tag">Project</span></div>
           <div v-if="!dirs.length" class="s-empty">No extra folders. Dial works only inside this project.</div>

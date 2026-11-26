@@ -4,7 +4,7 @@ The App panel shows the hypervisor built into the computer Dial runs on, as a ch
 
 | Host | Backend | What the panel can install |
 | --- | --- | --- |
-| macOS (Apple silicon) | Apple's Virtualization framework, through the packaged `dial-mac-guest` helper | **Download and install macOS**: the packaged `dial-mac-prepare` downloads Apple's latest restore image for this Mac and installs it into a new private virtual Mac. A window opens for Setup Assistant; the `DIAL_TOOLS` disc carries the guest companion installer. When you shut the guest down, Dial imports the base into `app-runner/macos/` and deletes the restore image. |
+| macOS (Apple silicon) | Apple's Virtualization framework, through the packaged `dial-mac-guest` helper | On macOS 15+ **Download and install macOS** uses the packaged `dial-mac-prepare` to download Apple's latest restore image for this Mac and install it into a new private virtual Mac. A window opens for Setup Assistant; the `DIAL_TOOLS` disc carries the guest companion installer. When you shut the guest down, Dial imports the base into `app-runner/macos/` and deletes the restore image. On macOS 13/14, import an already-prepared base instead. |
 | Windows | QEMU with the Windows Hypervisor Platform (Hyper-V) | Turn on the `HypervisorPlatform` feature (UAC, then a restart), and install QEMU machine-wide with winget (`SoftwareFreedomConservancy.QEMU`). |
 | Linux | QEMU with KVM | Add you to the `kvm` group or load the KVM module through `pkexec`, and install QEMU and OVMF with apt-get, dnf, pacman or zypper through `pkexec`. |
 

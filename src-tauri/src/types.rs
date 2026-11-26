@@ -870,9 +870,13 @@ impl Store {
                 if valid_asset(text) {
                     return;
                 }
-                let path = Path::new(text.strip_prefix("file://").unwrap_or(text));
-                if path.is_absolute() {
-                    match self.import_image(&def.id, path) {
+                let path = if text.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://")) {
+                    tauri::Url::parse(text).ok().and_then(|url| url.to_file_path().ok())
+                } else {
+                    Some(PathBuf::from(text))
+                };
+                if let Some(path) = path.filter(|p| p.is_absolute()) {
+                    match self.import_image(&def.id, &path) {
                         Ok(name) => *v = Value::String(name),
                         Err(e) => problems.push(e),
                     }
@@ -999,7 +1003,10 @@ impl Store {
             .ok_or_else(|| format!("No item `{item_id}`"))?;
         if let Some(mut more) = patch.fields {
             if allow_import {
-                self.import_field_images(&def, &mut more);
+                let problems = self.import_field_images(&def, &mut more);
+                if !problems.is_empty() {
+                    return Err(problems.join("; "));
+                }
             }
             let mut merged = item.fields.clone();
             for (key, value) in more {

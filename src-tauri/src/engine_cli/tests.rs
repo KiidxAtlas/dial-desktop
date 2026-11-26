@@ -89,15 +89,21 @@ fn link_paths_follow_the_platform() {
     assert_eq!(link_path("windows", Some(home), None), None);
 }
 
+fn executable_at(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn linking_never_replaces_a_foreign_binary() {
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let engine = root.path().join("engine/dial");
-    std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
-    std::fs::write(&engine, b"engine").unwrap();
-    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let engine = root.path().join("engine");
+    executable_at(&engine, b"engine");
     let bin = root.path().join("bin");
     let link = bin.join("dial");
 
@@ -105,7 +111,7 @@ fn linking_never_replaces_a_foreign_binary() {
     assert!(!before.linked && !before.blocked && before.other.is_none());
     link_install(&engine, &link).unwrap();
     let after = link_status(&engine, &link, std::slice::from_ref(&bin));
-    assert!(after.linked && after.on_path && after.other.is_none());
+    assert!(after.linked && after.managed && after.on_path && after.other.is_none());
     link_install(&engine, &link).unwrap();
     link_remove(&link).unwrap();
     assert!(!link.exists());
@@ -117,6 +123,84 @@ fn linking_never_replaces_a_foreign_binary() {
     assert!(link_install(&engine, &link).is_err());
     assert!(link_remove(&link).is_err());
     assert_eq!(std::fs::read(&link).unwrap(), b"someone else's dial");
+
+    // The standalone executable itself may be Desktop's selected engine.
+    executable_at(&link, b"separate install");
+    let same = link_status(&link, &link, &[]);
+    assert!(same.linked && same.blocked && !same.managed);
+    assert!(link_install(&link, &link).is_err());
+    assert!(link_remove(&link).is_err());
+    assert_eq!(std::fs::read(&link).unwrap(), b"separate install");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_replacement_symlink_never_inherits_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = root.path().join("engine");
+    let foreign = root.path().join("somebody-elses");
+    let missing = root.path().join("no-longer-installed");
+    executable_at(&engine, b"engine");
+    executable_at(&foreign, b"foreign");
+    for name in ["dial", "dial.cmd"] {
+        let link = root.path().join(name);
+        link_install(&engine, &link).unwrap();
+        let previous = root.path().join(format!("old-{name}"));
+        std::fs::rename(&link, &previous).unwrap();
+        for target in [&engine, &foreign, &missing, &previous] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let state = link_status(&engine, &link, &[]);
+            assert!(state.blocked && !state.managed);
+            if target == &engine { assert!(state.linked); }
+            assert!(link_install(&engine, &link).is_err());
+            assert!(link_remove(&link).is_err());
+            assert_eq!(std::fs::read_link(&link).unwrap(), *target);
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+}
+
+#[test]
+fn command_files_survive_engine_updates_but_modified_commands_are_left_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("old engine.exe");
+    let engine = root.path().join("new %user% engine.exe");
+    let link = root.path().join("dial.cmd");
+    executable_at(&engine, b"engine");
+    // Exact shim installed by previous Desktop releases; its engine has already gone.
+    let legacy = format!("@rem Dial Desktop command-line link\r\n@\"{}\" %*\r\n", old.display());
+    std::fs::write(&link, &legacy).unwrap();
+    assert!(link_status(&engine, &link, &[]).managed);
+    link_install(&engine, &link).unwrap();
+    let current = link_status(&engine, &link, &[]);
+    assert!(current.managed && current.linked && !current.blocked);
+    link_remove(&link).unwrap();
+    assert!(!link.exists());
+
+    let modified = format!("{legacy}@echo user command\r\n");
+    std::fs::write(&link, &modified).unwrap();
+    assert!(link_status(&engine, &link, &[]).blocked);
+    assert!(link_install(&engine, &link).is_err());
+    assert!(link_remove(&link).is_err());
+    assert_eq!(std::fs::read_to_string(link).unwrap(), modified);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_command_retargets_and_forwards_literal_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("old");
+    let engine = root.path().join("new engine's $build");
+    let link = root.path().join("dial");
+    executable_at(&old, b"old");
+    executable_at(&engine, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    link_install(&old, &link).unwrap();
+    std::fs::remove_file(old).unwrap();
+    link_install(&engine, &link).unwrap();
+    let out = Command::new(&link).args(["one two", "$(false)", ""]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"one two\n$(false)\n\n");
+    link_remove(&link).unwrap();
 }
 
 #[test]

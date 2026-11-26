@@ -200,6 +200,8 @@ watch([query, matches], ([q, list], [old]) => {
 
 const empty = computed(() => props.snap.entries.length === 0 && !props.snap.turnRunning);
 const progress = computed(() => turnProgress(props.snap));
+/** The engine is gone: calls it was running will not finish, so they show as interrupted. */
+const stalled = computed(() => props.snap.connection.state === "failed" || props.snap.connection.state === "ended");
 /** The indicator names what the running call does ("Reading…", "Editing…") rather than "Running a tool…". */
 const progressLabel = computed(() => {
   const p = progress.value;
@@ -500,7 +502,7 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
     <div class="column">
       <template v-for="(entry, index) in snap.entries" :key="entry.kind === 'tool' ? entry.key : index">
         <div v-if="runs.get(index)" class="row k-run" :data-run="index" :class="{ lazy: lazyRun(runs.get(index)!) }">
-          <ToolRun :run="runs.get(index)!" :open="!folded(runs.get(index)!)" :session="snap.sessionId" :match="highlighted" :occurrence="current" @toggle="toggleFold(runs.get(index)!, $event)" />
+          <ToolRun :run="runs.get(index)!" :open="!folded(runs.get(index)!)" :session="snap.sessionId" :match="highlighted" :occurrence="current" :stalled="stalled" @toggle="toggleFold(runs.get(index)!, $event)" />
         </div>
         <div v-else-if="!inRun.has(index)" class="row" :class="[`k-${entry.kind}`, { 'current-match': index === highlighted, lazy: lazy(index) }]" :data-entry="index">
           <div v-if="entry.kind === 'user'" class="user">
@@ -648,7 +650,8 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
       </template>
 
       <RecordedTurns ref="recorded" v-if="snap.connection.state === 'live' && snap.sessionId && !snap.turnRunning && !snap.historyLoading" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" :session="snap.sessionId" />
-      <WorkingIndicator v-if="progress" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :label="progressLabel" :detail="progress.detail" :waiting="progress.waiting" />
+      <!-- While Dial waits on you, the request card under the conversation says so; no second line here. -->
+      <WorkingIndicator v-if="progress && !progress.waiting && !stalled" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :label="progressLabel" :detail="progress.detail" :waiting="progress.waiting" />
       <div v-if="!pinned && !matches.length" class="jump">
         <button :class="{ wide: unseen }" :title="unseen ? 'Jump to the new replies' : 'Jump to the latest message'" aria-label="Jump to the latest message" @click="jumpToEnd">
           <Icon name="arrowDown" :size="16" />
@@ -999,18 +1002,18 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   user-select: text;
   -webkit-user-select: text;
 }
+/* Engine notices ("Context compacted · 42k tokens freed"): a quiet centred note, not a rule
+ * across the conversation. */
 .divider {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: var(--text-sm);
+  justify-content: center;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
-.divider::before,
-.divider::after {
-  content: "";
-  flex: 1;
-  border-top: 1px solid var(--border);
+.divider > span {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--hover) 60%, transparent);
 }
 .error {
   display: flex;

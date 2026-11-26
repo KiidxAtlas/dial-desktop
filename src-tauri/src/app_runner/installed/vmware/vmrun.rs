@@ -44,7 +44,7 @@ impl Tool {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output, String> {
-        let mut child = Command::new(&self.path)
+        let mut child = crate::launcher::without_console(&mut Command::new(&self.path))
             .arg("-T")
             .arg(self.kind)
             .args(args)

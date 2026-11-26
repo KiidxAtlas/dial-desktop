@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changeRows, gitMarkers, gitStatusOf } from './workspaceGit.ts';
+import { changeRows, gitMarkers, gitStatusOf, otherNestedChanges } from './workspaceGit.ts';
 
 const files = [
   { path: 'src/a.ts', status: 'M' },
@@ -39,6 +39,15 @@ test('change rows list files that still differ first; settled only with git stat
   ]);
   // Not a repository (or status unknown): keep session order, nothing settled.
   assert.deepEqual(changeRows(items, (p) => p, [], false).map((r) => [r.item, r.settled]), items.map((p) => [p, false]));
+});
+
+test('nested changes are visible without a root repository and not duplicated as session edits', () => {
+  const repos = ['pkg', 'pkg/sub'];
+  const paths = ['pkg/file', 'pkg/sub/file', 'pkg/sub', 'pkg2/file'];
+  const files = paths.map(path => ({ path, status: 'M' }));
+  assert.deepEqual(otherNestedChanges(files, repos, ['pkg/file']).map(f => f.path), ['pkg/sub/file']);
+  assert.deepEqual(changeRows(['pkg/clean', 'pkg2/clean'], p => p, files, false, repos).map(r => [r.item, r.settled]),
+    [['pkg2/clean', false], ['pkg/clean', true]]);
 });
 
 test('stage state and count follow the index flags', async () => {

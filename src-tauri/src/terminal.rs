@@ -5,7 +5,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -32,27 +33,34 @@ pub struct Terminals {
     next: u32,
     shells: Arc<Mutex<HashMap<u32, Shell>>>,
 }
-/// The Windows shell: PowerShell 7 (`pwsh`) when installed, else Windows PowerShell.
-pub fn windows_shell(path: Option<&std::ffi::OsStr>) -> String {
-    let found = path
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .any(|dir| dir.join("pwsh.exe").is_file());
-    if found { "pwsh.exe".into() } else { "powershell.exe".into() }
+/// Git/MSYS shells may export a Unix-only SHELL such as `/usr/bin/bash`. Only honor a
+/// Windows executable that can actually be found; otherwise prefer PowerShell 7 on PATH.
+fn windows_shell(shell: Option<&OsStr>, path: Option<&OsStr>) -> PathBuf {
+    let resolve = |name: &OsStr| {
+        let mut exe = PathBuf::from(name);
+        if name.is_empty() { return None; }
+        if let Some(ext) = exe.extension() {
+            if !ext.eq_ignore_ascii_case("exe") { return None; }
+        } else {
+            exe.set_extension("exe");
+        }
+        if exe.is_absolute() { return exe.is_file().then_some(exe); }
+        if exe.components().count() != 1 { return None; }
+        path.into_iter().flat_map(std::env::split_paths).filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(&exe)).find(|file| file.is_file())
+    };
+    shell.and_then(resolve).or_else(|| resolve(OsStr::new("pwsh.exe")))
+        .unwrap_or_else(|| "powershell.exe".into())
 }
 
 /// The user's login shell, run in `cwd`.
 pub fn login_shell(cwd: &Path) -> CommandBuilder {
-    let program = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                windows_shell(std::env::var_os("PATH").as_deref())
-            } else {
-                "/bin/sh".into()
-            }
-        });
+    let shell = std::env::var_os("SHELL").filter(|s| !s.is_empty());
+    let program = if cfg!(windows) {
+        windows_shell(shell.as_deref(), std::env::var_os("PATH").as_deref())
+    } else {
+        shell.map(PathBuf::from).unwrap_or_else(|| "/bin/sh".into())
+    };
     let mut command = CommandBuilder::new(program);
     if !cfg!(windows) {
         command.arg("-l");
@@ -127,11 +135,18 @@ impl Terminals {
     /// thread until it ends. Returns the shell's id.
     pub fn open(
         &mut self,
-        command: CommandBuilder,
+        mut command: CommandBuilder,
         cols: u16,
         rows: u16,
         sink: impl Fn(TerminalEvent) + Send + 'static,
     ) -> Result<u32, String> {
+        // What the user runs here is theirs, not part of the AppImage Dial may run from.
+        for (key, value) in crate::launcher::appimage_env_fixes(std::env::vars_os()) {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            }
+        }
         let pair = native_pty_system()
             .openpty(size(cols, rows))
             .map_err(|e| format!("Could not open a terminal: {e}"))?;

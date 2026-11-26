@@ -4,14 +4,13 @@
 import { computed, onMounted, ref } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { setupApi, showToast, snapshot, type Capability, type CliLink, type DoctorReport } from "../bridge";
-import { updates } from "../updates";
+import { needsEngineInstall, updates } from "../updates";
 import { ui } from "../ui";
 import Icon from "./Icon.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
 
 const preview = computed(() => snapshot.value?.connection.state === "preview");
-const missing = computed(() => updates.engine?.state === "missing");
 
 // ── Capabilities ─────────────────────────────────────────────────────────────
 
@@ -121,6 +120,7 @@ async function addPath() {
 const linkLine = computed(() => {
   const l = link.value;
   if (!l) return linkError.value ? "" : "Checking…";
+  if (!l.linked && l.managed) return `Desktop’s terminal command points at a previous engine. Update it to use ${l.engine}, or remove it.`;
   if (l.linked && l.other) return `Added, but your terminal finds ${l.other} first. Remove that one, or choose it as Desktop’s engine in Updates.`;
   if (l.linked && !l.onPath && l.shell?.present) return `Added. ${l.shell.profile} puts its folder on PATH, so open a new terminal to use it.`;
   if (l.linked && !l.onPath && l.shell) return `Added at ${l.link}, but new terminals do not look in that folder yet. Dial can add one line to ${l.shell.profile} to fix that.`;
@@ -138,6 +138,19 @@ const linkStatus = computed(() => {
   if (l.linked) return { text: "Needs attention", kind: "warn" as const };
   return l.other ? { text: "Separate install", kind: "warn" as const } : { text: "Not added" };
 });
+/** One line at the top: all good, or how many things need a look. Optional capabilities that
+ *  are not set up are not problems; a missing engine or a broken terminal command is. */
+const summary = computed(() => {
+  const issues = [
+    needsEngineInstall(updates.engine?.state) && "the engine",
+    linkStatus.value?.kind === "warn" && "the terminal command",
+    !!error.value && "the capability check",
+  ].filter(Boolean) as string[];
+  if (issues.length) return { kind: "warn", text: `${issues.length === 1 ? "1 thing needs" : `${issues.length} things need`} a look: ${issues.join(", ")}.` };
+  if (!report.value || !link.value) return { kind: "", text: "Checking your setup…" };
+  const ready = report.value.capabilities.filter((c) => c.installed).length;
+  return { kind: "ok", text: `All good. ${ready} of ${total.value} optional capabilities are set up.` };
+});
 
 onMounted(() => { void load(); void loadLink(); });
 </script>
@@ -145,8 +158,9 @@ onMounted(() => { void load(); void loadLink(); });
 <template>
   <p v-if="preview" class="s-note">The design preview has no engine, so there is nothing to check.</p>
   <template v-else>
-    <div v-if="missing" class="s-banner" role="status">
-      <span>No Dial engine is installed yet. Install one first; everything on this page comes from it.</span>
+    <p class="health-summary" :class="summary.kind" role="status"><span class="dot" aria-hidden="true" />{{ summary.text }}</p>
+    <div v-if="needsEngineInstall(updates.engine?.state)" class="s-banner" role="status">
+      <span>Desktop needs a working Dial engine. Install or choose one in Updates.</span>
       <button class="btn btn-primary" @click="ui.settingsTab = 'updates'">Open Updates</button>
     </div>
 
@@ -156,9 +170,9 @@ onMounted(() => { void load(); void loadLink(); });
           <Icon name="terminal" :size="14" /> {{ linking ? "Adding…" : "Add to PATH…" }}
         </button>
         <button v-if="link && !link.linked && !link.blocked" class="btn btn-primary" :disabled="linking" @click="setLink(false)">
-          <Icon name="terminal" :size="14" /> {{ linking ? "Adding…" : "Add to PATH" }}
+          <Icon name="terminal" :size="14" /> {{ linking ? "Saving…" : link.managed ? "Update command" : "Add to PATH" }}
         </button>
-        <button v-else-if="link?.linked" class="btn btn-secondary" :disabled="linking" @click="setLink(true)">Remove</button>
+        <button v-if="link?.managed" class="btn btn-secondary" :disabled="linking" @click="setLink(true)">Remove</button>
         <template v-if="link || linkError" #below-text>
           <code v-if="link" class="path" :title="link.link">{{ link.link }} → {{ link.engine }}</code>
           <p v-if="linkError" role="alert" class="s-error">{{ linkError }}</p>
@@ -253,4 +267,16 @@ pre {
 .pre {
   white-space: pre-wrap;
 }
+.health-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 var(--space-md);
+  font-size: 13.5px;
+  color: var(--text-muted);
+}
+.health-summary .dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--text-faint); }
+.health-summary.ok .dot { background: var(--success); }
+.health-summary.warn { color: var(--text); }
+.health-summary.warn .dot { background: var(--warning); }
 </style>

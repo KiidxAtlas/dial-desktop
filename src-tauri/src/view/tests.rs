@@ -208,6 +208,36 @@ fn workspace_abbreviates_home_and_relativizes_paths() {
     assert_eq!(w.relative("/home/ada/work/app"), "/home/ada/work/app");
     assert_eq!(Workspace::new("/srv/x/", None).name, "x");
     assert_eq!(Workspace::new("/srv/x", None).display, "/srv/x");
+    assert_eq!(
+        Workspace::new("/home/adam/x", Some("/home/ada")).display,
+        "/home/adam/x",
+        "a sibling with the same prefix is not home"
+    );
+    assert_eq!(Workspace::new("/home/ada", Some("/home/ada/")).display, "~");
+    // Windows `canonicalize` roots are shown in their ordinary form, home abbreviated.
+    let win = Workspace::new(r"\\?\C:\Users\ada\app", Some(r"C:\Users\ada"));
+    assert_eq!((win.display.as_str(), win.name.as_str()), (r"~\app", "app"));
+    assert_eq!(win.root, r"\\?\C:\Users\ada\app");
+    assert_eq!(
+        Workspace::new(r"\\?\UNC\srv\share\app", None).display,
+        r"\\srv\share\app"
+    );
+    // Paths reported in either form are relative to a root in either form.
+    for path in [
+        r"\\?\C:\Users\ada\app\src\a.rs",
+        r"C:\Users\ada\app\src\a.rs",
+    ] {
+        assert_eq!(win.relative(path), r"src\a.rs", "{path}");
+    }
+    let plain = Workspace::new(r"C:\Users\ada\app", None);
+    assert_eq!(
+        plain.relative(r"\\?\C:\Users\ada\app\src\a.rs"),
+        r"src\a.rs"
+    );
+    assert_eq!(
+        win.relative(r"C:\Users\ada\apple\a.rs"),
+        r"C:\Users\ada\apple\a.rs"
+    );
 }
 
 #[test]

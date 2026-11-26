@@ -11,21 +11,21 @@ export interface PathLink {
 }
 
 // A path with at least one folder and a file extension, after a line start, space, quote or bracket.
-const PATH = /(?<=^|[\s'"(\[<=])((?:\.{0,2}\/|[A-Za-z]:[\\/])?(?:[\w@.+-]+[\\/])+[\w@.+-]*\.[A-Za-z0-9]+)(?::(\d+)(?::\d+)?)?/g;
+const PATH = /(^|[\s'"(\[<=])((?:\.{0,2}\/|[A-Za-z]:[\\/])?(?:[\w@.+-]+[\\/])+[\w@.+-]*\.[A-Za-z0-9]+)(?::(\d+)(?::\d+)?)?/g;
 
 /** Path links in one terminal line. `inProject` turns an absolute path into a project-relative one
  * (see `relativeTo` in paths.ts); absolute paths it leaves unchanged are outside and skipped. */
 export function findPathLinks(text: string, inProject: (absolute: string) => string): PathLink[] {
   const out: PathLink[] = [];
   for (const match of text.matchAll(PATH)) {
-    const raw = match[1];
+    const raw = match[2];
     const absolute = /^([A-Za-z]:)?[\\/]/.test(raw);
     let path = absolute ? inProject(raw) : raw.replace(/\\/g, "/").replace(/^\.\//, "");
     if (absolute && /^([A-Za-z]:)?[\\/]/.test(path)) continue;
     if (path.startsWith("../")) continue;
     path = path.replace(/\/+$/, "");
-    const start = match.index ?? 0;
-    out.push({ start, end: start + match[0].length, path, line: match[2] ? Number(match[2]) : null });
+    const offset = match.index ?? 0;
+    out.push({ start: offset + match[1].length, end: offset + match[0].length, path, line: match[3] ? Number(match[3]) : null });
   }
   return out;
 }

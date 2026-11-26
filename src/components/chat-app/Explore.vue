@@ -112,8 +112,8 @@ function step(by: number) {
 .stage :deep(img.diagram-light) { display: none; }
 :root[data-theme="light"] .stage :deep(img.diagram-light) { display: block; }
 :root[data-theme="light"] .stage :deep(img.diagram-dark) { display: none; }
-:root[data-theme="light"] .has-backdrop .stage :deep(img.diagram-light) { display: none; }
-:root[data-theme="light"] .has-backdrop .stage :deep(img.diagram-dark) { display: block; }
+:root[data-theme="light"] .has-backdrop:not(.conversing) .stage :deep(img.diagram-light) { display: none; }
+:root[data-theme="light"] .has-backdrop:not(.conversing) .stage :deep(img.diagram-dark) { display: block; }
 .hotspot {
   position: absolute;
   border-radius: var(--radius-md);

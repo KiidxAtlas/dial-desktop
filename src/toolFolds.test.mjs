@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { phaseOf, runActivity, runFiles, runImages, runSummary, toolRuns } from "./toolFolds.ts";
+import { phaseOf, progressFraction, runActivity, runFiles, runHeadline, runImages, runSummary, toolRuns } from "./toolFolds.ts";
 
 const tool = (key, label, state = "succeeded", check = false, extra = {}) =>
   ({ kind: "tool", key, label, target: key, state, check, changedPaths: [], images: [], output: null, ...extra });
@@ -58,6 +58,16 @@ test("the summary counts distinct files and calls in the order the work happened
     tool("cargo test", "Custom", "failed", true), tool("m", "browser_click"),
   ]).get(0);
   assert.equal(runSummary(run), "Read 2 files, 1 search, edited 1 file, ran 1 command, used 1 tool");
+  assert.equal(runHeadline(run), "Edited 1 file, ran 1 command · 3 more");
+  assert.equal(runHeadline(run, 9), "Edited 1 file, ran 1 command, used 1 tool, 1 search, read 2 files");
+});
+
+test("progress lines that state a count read as a fraction", () => {
+  assert.equal(progressFraction("8 of 12 tests passed"), 8 / 12);
+  assert.equal(progressFraction("step 3/10"), 0.3);
+  assert.equal(progressFraction("Compiling server"), null);
+  assert.equal(progressFraction("5 of 0"), null);
+  assert.equal(progressFraction(null), null);
 });
 
 test("changed files carry the line counts their calls reported", () => {

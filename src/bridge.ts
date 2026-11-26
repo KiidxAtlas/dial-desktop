@@ -13,7 +13,7 @@ import { readTrash, trashKey, updateTrash, type Deletable } from './deferredDele
 import { attachmentPayload } from './attachmentFormats';
 import type { KeyProvider } from './providerKeys';
 import { LastSubmission } from './promptEdit';
-import { nameFailure, settleSaves } from './settingsFeedback';
+import { nameFailure, saveRejected, settleSaves, startSave } from './settingsFeedback';
 import type {
   Answer,
   ApprovalMode,
@@ -27,6 +27,7 @@ import type {
   FileView,
   ModelOption,
   PageInfo,
+  Setting,
   SettingScope,
   SettingsPage,
   Snapshot,
@@ -326,11 +327,20 @@ function changeTrash(root: string, ids: string[], restore: boolean): boolean {
   } catch { showToast('Could not save Recently Deleted. No local change was made.'); return false; }
 }
 export function restoreSessions(root: string, ids: string[]) { return changeTrash(root, ids, true); }
-export async function purgeSession(root: string, session: Deletable) {
-  if (snapshot.value?.workspace?.root !== root || !hiddenSessions.has(session.id)) return;
-  if (!await ask(`Permanently delete “${session.title || 'Untitled session'}” and its history? This cannot be undone.`, { title: 'Delete permanently?', kind: 'warning', okLabel: 'Delete permanently', cancelLabel: 'Cancel' }).catch(() => false)) return;
-  if (snapshot.value?.workspace?.root !== root || !hiddenSessions.has(session.id)) return;
-  if (await call('delete_sessions', { workspaceRoot: root, sessionIds: [session.id], confirmRemoval: true })) restoreSessions(root, [session.id]);
+export const trashPrompt = shallowRef<{ title: string; message: string; action: string; finish: (yes: boolean) => void } | null>(null);
+function confirmTrash(title: string, message: string, action: string): Promise<boolean> {
+  if (trashPrompt.value) return Promise.resolve(false);
+  return new Promise(resolve => { trashPrompt.value = { title, message, action, finish(yes) { trashPrompt.value = null; resolve(yes); } }; });
+}
+export async function purgeSessions(root: string, sessions: Deletable[]) {
+  if (!sessions.length || snapshot.value?.workspace?.root !== root) return;
+  const subject = sessions.length === 1 ? `“${sessions[0].title || 'Untitled session'}”` : `${sessions.length} sessions`;
+  if (!await confirmTrash('Delete permanently?', `${subject} and all associated history will be deleted. This cannot be undone.`, 'Delete permanently')) return;
+  for (const { id } of sessions) {
+    if (snapshot.value?.workspace?.root !== root) break;
+    if (!hiddenSessions.has(id)) continue;
+    if (!await call('delete_sessions', { workspaceRoot: root, sessionIds: [id], confirmRemoval: true }) || !restoreSessions(root, [id])) break;
+  }
 }
 
 export const engine = {
@@ -369,7 +379,7 @@ export const engine = {
     const ids = sessions.map(s => s.id);
     const busy = () => snapshot.value?.sessions.some(s => ids.includes(s.id) && (s.running || s.waiting));
     if (busy()) { showToast('Stop the running session before moving it to Recently Deleted'); return false; }
-    if (ids.length > 1 && !await ask(`Move ${ids.length} sessions to Recently Deleted? You can restore them from the sidebar.`, { title: 'Move sessions?', okLabel: 'Move', cancelLabel: 'Cancel' }).catch(() => false)) return false;
+    if (ids.length > 1 && !await confirmTrash(`Move ${ids.length} sessions?`, 'You can restore these sessions from Recently Deleted in the sidebar.', 'Move sessions')) return false;
     if (snapshot.value?.workspace?.root !== root || busy()) return false;
     if (!changeTrash(root, ids, false)) return false;
     if (snapshot.value.sessionId && ids.includes(snapshot.value.sessionId) && !await engine.newSession()) {
@@ -584,6 +594,18 @@ export const settings = {
   reset: (key: string, scope: SettingScope) => call("reset_setting", { key, scope }),
 };
 
+/** Shared by Settings and inline editors. A fresh engine settings event confirms the write. */
+export async function saveSettingRow(s: Setting, value: unknown, scope: SettingScope, turnRunning: boolean, linked?: Record<string, unknown>) {
+  startSave(s, turnRunning);
+  if (!(await settings.save(s.key, value, scope))) return saveRejected(s.key);
+  for (const [key, also] of Object.entries(linked ?? {})) settings.save(key, also, scope);
+}
+
+export async function resetSettingRow(s: Setting, scope: SettingScope, turnRunning: boolean) {
+  startSave(s, turnRunning);
+  if (!(await settings.reset(s.key, scope))) saveRejected(s.key);
+}
+
 /** How the engine binary was chosen (`launcher::EngineOrigin`). */
 export type EngineOrigin = "flag" | "env" | "choice" | "desktop" | "path" | "fallback" | "missing";
 /** Which engine Desktop runs and what went wrong while starting (`launcher::Startup`). */
@@ -610,7 +632,7 @@ export interface DoctorReport { capabilities: Capability[]; notes: string[] }
 export interface StoredAccount { key: string; detail: string; active: boolean }
 /** Whether `dial` in a terminal runs Desktop's engine (`engine_cli::CliLink`). `shell` is the
  *  profile line that puts the link's folder on PATH, where Desktop can add it. */
-export interface CliLink { engine: string; link: string; linked: boolean; onPath: boolean; other: string | null; blocked: boolean; shell: { profile: string; line: string; present: boolean } | null }
+export interface CliLink { engine: string; link: string; linked: boolean; managed: boolean; onPath: boolean; other: string | null; blocked: boolean; shell: { profile: string; line: string; present: boolean } | null }
 /** Engine features reached through `dial` subcommands; none needs an open project. */
 export const setupApi = {
   doctor: () => invoke<DoctorReport>("doctor_report"),

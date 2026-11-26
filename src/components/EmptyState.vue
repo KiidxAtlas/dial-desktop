@@ -7,6 +7,7 @@ import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes
 import Logo from "./Logo.vue";
 import Icon from "./Icon.vue";
 import { ui } from "../ui";
+import { goToSession } from "../sessionActions";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -25,6 +26,13 @@ function providers() {
   ui.settingsTab = "providers";
   ui.settingsOpen = true;
 }
+/** Where to pick up: the latest few sessions with something in them. */
+const recent = computed(() => props.snap.sessions.filter((s) => !s.selected && !s.empty).slice(0, 3));
+/** The sidebar already lists recent sessions; the card stands in for it only while it's hidden. */
+const showRecent = computed(() => !ui.sidebarOpen && recent.value.length > 0);
+/** The newest session leads the starters as "Continue …", so the likeliest next step is one click. */
+const resume = computed(() => recent.value[0] ?? null);
+const recipes = computed(() => taskRecipes().slice(0, resume.value ? 2 : 3));
 </script>
 
 <template>
@@ -45,8 +53,11 @@ function providers() {
       </div>
     </div>
     <div class="chips">
+      <button v-if="resume" class="chip resume" :title="`Open ${resume.title}`" @click="goToSession(resume)">
+        <Icon name="chat" :size="12" /> <span class="truncate">Continue: {{ resume.title }}</span>
+      </button>
       <button
-        v-for="(s, i) in taskRecipes().slice(0, 3)"
+        v-for="(s, i) in recipes"
         :key="s.id"
         class="chip"
         :style="{ animationDelay: `${80 + i * 35}ms` }"
@@ -57,7 +68,15 @@ function providers() {
         {{ s.title }}
       </button>
     </div>
-    <button class="tips" @click="ui.shortcutsOpen = true">Keyboard shortcuts</button>
+    <nav v-if="showRecent" class="recent" aria-label="Recent sessions">
+      <span class="recent-label">Pick up where you left off</span>
+      <button v-for="(s, i) in recent" :key="s.id" class="recent-row" :style="{ animationDelay: `${200 + i * 40}ms` }" :title="s.title" @click="goToSession(s)">
+        <Icon name="chat" :size="13" />
+        <span class="truncate">{{ s.title }}</span>
+        <span class="meta">{{ s.meta.split(" · ")[0] }}</span>
+      </button>
+    </nav>
+    <span class="tips">Press <kbd>{{ snap.platform === "macos" ? "⌘K" : "Ctrl+K" }}</kbd> for every action</span>
   </div>
 </template>
 
@@ -175,6 +194,13 @@ p {
     box-shadow 120ms var(--ease),
     transform 120ms var(--ease);
 }
+.chip.resume {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  color: var(--text);
+}
 .chip:hover:not(:disabled) {
   background: var(--hover);
   color: var(--text);
@@ -187,16 +213,59 @@ p {
 .chip:disabled {
   opacity: 0.45;
 }
-.tips {
-  padding: 4px 12px;
-  border-radius: 999px;
-  font-size: var(--text-xs);
-  color: var(--text-muted);
+.recent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: min(420px, 100%);
+  padding: 8px;
+  border-radius: var(--radius-md);
   background: var(--glass-soft);
   -webkit-backdrop-filter: var(--glass-blur);
   backdrop-filter: var(--glass-blur);
-  animation: rise 420ms 260ms var(--ease) both;
-  transition: color 120ms var(--ease), background 120ms var(--ease);
+  box-shadow: inset 0 0 0 1px var(--border);
+  animation: rise 360ms 160ms var(--ease) both;
 }
-.tips:hover { color: var(--text); background: var(--hover); }
+.recent-label {
+  padding: 2px 8px 4px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.recent-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: left;
+}
+.recent-row span.truncate {
+  flex: 1;
+  min-width: 0;
+}
+.recent-row .meta {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.recent-row:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tips {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-shadow: var(--hero-shadow);
+  animation: rise 420ms 260ms var(--ease) both;
+}
+.tips kbd {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--glass-soft);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  font: inherit;
+}
 </style>

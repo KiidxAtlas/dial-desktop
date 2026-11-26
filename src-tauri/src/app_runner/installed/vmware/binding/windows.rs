@@ -1,11 +1,10 @@
 //! Windows probe for the VMware console (see `binding.rs`). Only fixed system tools run, and each
 //! query names one exact socket or one exact process; nothing scans the process list.
 //!
-//! - Sockets: `%SystemRoot%\System32\netstat.exe -ano`, one read of the TCP table. Only the English
-//!   states `LISTENING` and `ESTABLISHED` are understood; localized output fails closed.
-//! - Processes: `powershell.exe` runs one static script (`-EncodedCommand`) that asks CIM for
-//!   `Win32_Process` by exact PID and prints JSON. The PID reaches the script as a typed `u32` in
-//!   `DIAL_VMX_PID`; no other text is interpolated. `-NoProfile` keeps user profiles out.
+//! - Sockets: query CIM's `MSFT_NetTCPConnection` by local port. Numeric TCP states and
+//!   typed endpoint fields are independent of the Windows display language.
+//! - Processes: query CIM for `Win32_Process` by exact PID. Only static `-EncodedCommand`
+//!   scripts run, with typed numeric inputs through the environment and no profile.
 //! - Open file: `CommandLineToArgvW` splits the process's command line, and the `.vmx` must equal
 //!   one whole argument (ASCII-case-insensitive, `/` read as `\`), never a substring.
 //!
@@ -14,7 +13,7 @@
 
 use std::ffi::c_void;
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -28,15 +27,20 @@ use super::{Listener, Lsof, Probe};
 
 const SAFE_MESSAGE: &str = "could not query the system for the VM's VNC console";
 const MISSING_TOOL: &str = "a required system tool is missing";
-const NETSTAT: &str = r"System32\netstat.exe";
 const POWERSHELL: &str = r"System32\WindowsPowerShell\v1.0\powershell.exe";
-const NETSTAT_LIMIT: usize = 8 << 20;
 const PROCESS_LIMIT: usize = 256 << 10;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
-/// The one script ever run. Its only input is the numeric PID in `DIAL_VMX_PID`.
+/// The exact local port and PID reach these fixed queries only as typed integers.
+const SOCKET_SCRIPT: &str = "\
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$port = [uint16]$env:DIAL_VMX_PORT
+$rows = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter ('LocalPort = ' + $port) | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess)
+ConvertTo-Json -Compress -InputObject $rows
+";
 const PROCESS_SCRIPT: &str = "\
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $ErrorActionPreference = 'Stop'
@@ -48,13 +52,12 @@ if ($null -eq $p) { exit 0 }
 
 impl Probe for Lsof {
     fn supported(&self) -> Result<(), String> {
-        system_tool(NETSTAT)?;
         system_tool(POWERSHELL)?;
         Ok(())
     }
 
     fn listeners(&self, port: u16) -> Result<Vec<Listener>, String> {
-        Ok(listeners_in(&netstat()?, port))
+        Ok(listeners_in(&sockets(port)?, port))
     }
 
     fn executable(&self, pid: u32) -> Result<Option<PathBuf>, String> {
@@ -66,18 +69,21 @@ impl Probe for Lsof {
     }
 
     fn connection_owner(&self, port: u16, client: SocketAddr) -> Result<Option<u32>, String> {
-        Ok(owner_of(&netstat()?, port, client))
+        Ok(owner_of(&sockets(port)?, port, client))
     }
 }
 
-/// One TCP row from `netstat -ano`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Every required column must decode, or the whole proof fails (never drop an
+/// unparsed listener that could be another owner, or bound off loopback).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct Socket {
-    local: SocketAddr,
-    /// `None` for `*:*` and other rows without a numeric peer.
-    foreign: Option<SocketAddr>,
-    state: String,
-    pid: u32,
+    local_address: IpAddr,
+    local_port: u16,
+    remote_address: IpAddr,
+    remote_port: u16,
+    state: u32,
+    owning_process: u32,
 }
 
 /// The fields of one process the probe needs, as CIM reports them. `None` means CIM withheld it.
@@ -88,47 +94,23 @@ struct Process {
     command_line: Option<String>,
 }
 
-fn netstat() -> Result<Vec<Socket>, String> {
-    let output = run_bounded(&system_tool(NETSTAT)?, &["-ano"], &[], NETSTAT_LIMIT)?;
-    if !output.success {
-        return Err(SAFE_MESSAGE.to_owned());
-    }
-    parse_netstat(&output.stdout)
+fn sockets(port: u16) -> Result<Vec<Socket>, String> {
+    let text = query_cim(SOCKET_SCRIPT, ("DIAL_VMX_PORT", port.to_string()))?;
+    parse_sockets(&text)
 }
 
-/// Parse the TCP rows of `netstat -ano`. Headers and UDP rows are skipped. A TCP row that does not
-/// have exactly five fields with parsable addresses and pid is an error, never a silent skip,
-/// because a dropped listener could hide a second owner of the port.
-fn parse_netstat(text: &str) -> Result<Vec<Socket>, String> {
-    let mut sockets = Vec::new();
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.first() != Some(&"TCP") {
-            continue;
-        }
-        let [_, local, foreign, state, pid] = fields.as_slice() else {
-            return Err(SAFE_MESSAGE.to_owned());
-        };
-        let local = local.parse().map_err(|_| SAFE_MESSAGE.to_owned())?;
-        let pid = pid.parse().map_err(|_| SAFE_MESSAGE.to_owned())?;
-        sockets.push(Socket {
-            local,
-            foreign: foreign.parse().ok(),
-            state: (*state).to_owned(),
-            pid,
-        });
-    }
-    Ok(sockets)
+fn parse_sockets(text: &str) -> Result<Vec<Socket>, String> {
+    serde_json::from_str(text.trim()).map_err(|_| SAFE_MESSAGE.to_owned())
 }
 
 /// Every listener on exactly `port`, whatever its address (the caller refuses non-loopback ones).
 fn listeners_in(sockets: &[Socket], port: u16) -> Vec<Listener> {
     sockets
         .iter()
-        .filter(|s| s.state == "LISTENING" && s.local.port() == port)
+        .filter(|s| s.state == 2 /* Listen */ && s.local_port == port)
         .map(|s| Listener {
-            pid: s.pid,
-            host: s.local.ip().to_string(),
+            pid: s.owning_process,
+            host: s.local_address.to_string(),
         })
         .collect()
 }
@@ -139,19 +121,22 @@ fn owner_of(sockets: &[Socket], port: u16, client: SocketAddr) -> Option<u32> {
     let mut owners = sockets
         .iter()
         .filter(|s| {
-            s.state == "ESTABLISHED"
-                && s.local.port() == port
-                && s.local.ip().is_loopback()
-                && s.foreign == Some(client)
+            s.state == 5 /* Established */ && s.local_port == port && s.local_address.is_loopback()
+                && SocketAddr::new(s.remote_address, s.remote_port) == client
         })
-        .map(|s| s.pid);
+        .map(|s| s.owning_process);
     let owner = owners.next()?;
     owners.all(|pid| pid == owner).then_some(owner)
 }
 
 /// Query CIM for one exact PID. `Ok(None)` when no such process exists.
 fn process(pid: u32) -> Result<Option<Process>, String> {
-    let script = base64::engine::general_purpose::STANDARD.encode(utf16le(PROCESS_SCRIPT));
+    let text = query_cim(PROCESS_SCRIPT, ("DIAL_VMX_PID", pid.to_string()))?;
+    parse_process(&text)
+}
+
+fn query_cim(source: &str, input: (&str, String)) -> Result<String, String> {
+    let script = base64::engine::general_purpose::STANDARD.encode(utf16le(source));
     let output = run_bounded(
         &system_tool(POWERSHELL)?,
         &[
@@ -161,13 +146,13 @@ fn process(pid: u32) -> Result<Option<Process>, String> {
             "-EncodedCommand",
             script.as_str(),
         ],
-        &[("DIAL_VMX_PID", pid.to_string())],
+        &[input],
         PROCESS_LIMIT,
     )?;
     if !output.success {
         return Err(SAFE_MESSAGE.to_owned());
     }
-    parse_process(&output.stdout)
+    Ok(output.stdout)
 }
 
 /// Parse the script's JSON. Empty output means the process has exited.
@@ -211,6 +196,13 @@ fn normalize(path: &str) -> String {
 
 fn has_parent_segment(path: &str) -> bool {
     path.split(['\\', '/']).any(|segment| segment == "..")
+}
+
+pub(super) fn trusted_executable(exe: &Path, mut roots: impl Iterator<Item = PathBuf>) -> bool {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else { return false };
+    name.eq_ignore_ascii_case("vmware-vmx.exe")
+        && !exe.components().any(|c| c == std::path::Component::ParentDir)
+        && roots.any(|root| exe.ancestors().skip(1).any(|dir| dir.as_os_str().eq_ignore_ascii_case(root.as_os_str())))
 }
 
 fn utf16le(text: &str) -> Vec<u8> {
@@ -290,7 +282,7 @@ fn run_bounded(
     limit: usize,
 ) -> Result<Output, String> {
     let root = system_root()?;
-    let mut child = Command::new(exe)
+    let mut child = crate::launcher::without_console(&mut Command::new(exe))
         .args(args)
         .env_clear()
         .env("SystemRoot", &root)

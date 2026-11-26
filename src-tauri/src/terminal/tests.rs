@@ -82,11 +82,19 @@ fn slash_command_preserves_literal_argument_and_configured_program() {
 }
 
 #[test]
-fn windows_prefers_powershell_7_when_it_is_on_path() {
+fn windows_honors_resolvable_shells_and_falls_back_from_msys_paths() {
     let dir = tempfile::tempdir().unwrap();
     let path = std::env::join_paths([dir.path()]).unwrap();
-    assert_eq!(windows_shell(Some(&path)), "powershell.exe");
-    assert_eq!(windows_shell(None), "powershell.exe");
-    std::fs::write(dir.path().join("pwsh.exe"), b"").unwrap();
-    assert_eq!(windows_shell(Some(&path)), "pwsh.exe");
+    let resolve = |shell| windows_shell(shell, Some(&path));
+    assert_eq!(resolve(None), Path::new("powershell.exe"));
+    let pwsh = dir.path().join("pwsh.exe");
+    let bash = dir.path().join("custom bash.exe");
+    std::fs::write(&pwsh, b"").unwrap();
+    std::fs::write(&bash, b"").unwrap();
+    for invalid in [None, Some(OsStr::new("/usr/bin/bash")), Some(OsStr::new("script.sh")), Some(dir.path().as_os_str())] {
+        assert_eq!(resolve(invalid), pwsh);
+    }
+    for valid in [OsStr::new("custom bash"), OsStr::new("custom bash.exe"), bash.as_os_str()] {
+        assert_eq!(resolve(Some(valid)), bash);
+    }
 }

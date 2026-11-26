@@ -35,17 +35,36 @@ export function listedSession(s: Session, snap: OpenSnapshot): boolean {
   return !s.empty || s.running || s.waiting || s.pinned || s.selected || hasDraft(snap.workspace.root, s.id);
 }
 
+/** The age bucket of a session row, read from its "3h ago · 12 messages" line. */
+function ageGroup(meta: string): string {
+  const age = meta.split("·")[0].trim().toLowerCase();
+  if (age === "just now" || /^\d+[mh] ago$/.test(age)) return "Today";
+  if (age === "yesterday") return "Yesterday";
+  if (/^\d+d ago$/.test(age)) return "This week";
+  return "Older";
+}
+
 /**
- * Sessions as the sidebar groups them (Active, Pinned, Recents), keeping those whose title matches
- * `filter`. A type's own conversations are not listed: they open with their type.
+ * Sessions as the sidebar groups them (Active, Pinned, then Recents by age: Today, Yesterday, This
+ * week, Older), keeping those whose title matches `filter`. A type's own conversations are not
+ * listed: they open with their type. Recents that all fall in one age stay one "Recents" group.
  */
 export function sessionGroups(snap: OpenSnapshot, filter = ""): { name: string; sessions: Session[] }[] {
   const f = filter.trim().toLowerCase();
   const matching = snap.sessions.filter((s) => listedSession(s, snap) && (!f || s.title.toLowerCase().includes(f)));
+  const recents = matching.filter((s) => !s.pinned && !s.running && !s.waiting);
+  const byAge = new Map<string, Session[]>();
+  for (const s of recents) {
+    const name = ageGroup(s.meta ?? "");
+    byAge.set(name, [...(byAge.get(name) ?? []), s]);
+  }
+  const aged = f || byAge.size < 2
+    ? [{ name: "Recents", sessions: recents }]
+    : ["Today", "Yesterday", "This week", "Older"].map((name) => ({ name, sessions: byAge.get(name) ?? [] }));
   return [
     { name: "Active", sessions: matching.filter((s) => s.running || s.waiting) },
     { name: "Pinned", sessions: matching.filter((s) => s.pinned && !s.running && !s.waiting) },
-    { name: "Recents", sessions: matching.filter((s) => !s.pinned && !s.running && !s.waiting) },
+    ...aged,
   ].filter((g) => g.sessions.length);
 }
 

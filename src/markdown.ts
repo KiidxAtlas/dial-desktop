@@ -3,8 +3,7 @@
 import MarkdownIt from "markdown-it";
 import type Token from "markdown-it/lib/token.mjs";
 import { ref } from "vue";
-import { createHighlighterCore, type HighlighterCore } from "shiki/core";
-import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import type { HighlighterCore } from "shiki/core";
 import { diagramName } from "./diagram";
 import { appearance } from "./appearance";
 
@@ -16,6 +15,12 @@ export const highlighterVersion = ref(0);
 let highlighter: HighlighterCore | null = null;
 
 export async function loadHighlighter() {
+  // The optional JS regex engine uses newer RegExp features than older WebKit can load.
+  // Keep it outside the startup graph so plain code blocks and the rest of the UI still work.
+  try { new RegExp('(?<=a)b', 'd'); } catch { return; } // Grammar matching needs lookbehind and match indices.
+  const [{ createHighlighterCore }, { createJavaScriptRegexEngine }] = await Promise.all([
+    import("shiki/core"), import("shiki/engine/javascript"),
+  ]);
   highlighter = await createHighlighterCore({
     themes: [import("shiki/themes/vesper.mjs"), import("shiki/themes/github-light.mjs")],
     langs: [

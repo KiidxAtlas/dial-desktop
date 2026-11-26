@@ -47,7 +47,8 @@ export default defineConfig({
     watch: { ignored: ["**/src-tauri/**"] },
   },
   build: {
-    target: "es2022",
+    // The UI runs in the OS webview, not a bundled Chromium. Also lower dependency syntax.
+    target: ["safari13.1", "es2020"],
     chunkSizeWarningLimit: 1500,
   },
 });

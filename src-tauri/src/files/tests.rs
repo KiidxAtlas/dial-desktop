@@ -64,6 +64,23 @@ fn symlinks_out_of_the_workspace_are_refused() {
     fs::write(outside.0.join("secret"), "x").unwrap();
     std::os::unix::fs::symlink(outside.0.join("secret"), root.0.join("link")).unwrap();
     assert!(resolve(&root.0, "link").unwrap_err().contains("outside"));
+    assert!(read(&root.0, "link").is_err());
+    std::os::unix::fs::symlink(&root.0, root.0.join("loop")).unwrap();
+    assert!(!list(&root.0, "").unwrap().into_iter().find(|e| e.name == "loop").unwrap().dir);
+    assert!(list(&root.0, "loop").is_err(), "a remembered expanded directory link must not be loaded");
+}
+
+#[cfg(windows)]
+#[test]
+fn directory_junctions_are_never_expanded() {
+    let root = Scratch::new("junction");
+    // Unlike a Windows symlink, a directory junction does not need Developer Mode/elevation.
+    let out = Command::new("cmd.exe").current_dir(&root.0)
+        .args(["/d", "/c", "mklink", "/j", "loop", "."]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!list(&root.0, "").unwrap().into_iter().find(|e| e.name == "loop").unwrap().dir);
+    assert!(list(&root.0, "loop").is_err());
+    fs::remove_dir(root.0.join("loop")).unwrap();
 }
 
 #[test]
@@ -162,6 +179,71 @@ fn diffs_show_tracked_and_untracked_changes() {
 
     fs::write(root.0.join("a.txt"), "one\n").unwrap();
     assert_eq!(diff(&root.0, "a.txt").unwrap().diff, "");
+}
+
+#[test]
+fn git_operations_select_only_the_named_file() {
+    let root = Scratch::new("literal");
+    git_ok(&root.0, &["init", "-q"]);
+    let selected = "[ab].txt";
+    let sibling = "a.txt";
+    for path in [selected, sibling] { fs::write(root.0.join(path), "original\n").unwrap(); }
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+    for path in [selected, sibling] { fs::write(root.0.join(path), format!("modified {path}\n")).unwrap(); }
+    let shown = diff(&root.0, selected).unwrap();
+    assert!(shown.diff.contains("+modified [ab].txt"));
+    assert!(!shown.diff.contains("+modified a.txt"));
+    stage(&root.0, &[selected.into()], true).unwrap();
+    assert_eq!(commit_review(&root.0).unwrap().paths, [selected]);
+    revert(&root.0, selected).unwrap();
+    assert_eq!(fs::read_to_string(root.0.join(selected)).unwrap(), "original\n");
+    // This alternate spelling can resolve to the sibling on case-insensitive filesystems,
+    // but it isn't a distinct untracked entry and must never be deleted as one.
+    assert!(revert(&root.0, "A.TXT").is_err());
+    assert_eq!(fs::read_to_string(root.0.join(sibling)).unwrap(), "modified a.txt\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn actions_on_links_do_not_target_the_worktree_file() {
+    use std::os::unix::fs::symlink;
+    let root = Scratch::new("git-link");
+    git_ok(&root.0, &["init", "-q"]);
+    fs::write(root.0.join("target"), "original\n").unwrap();
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+    fs::write(root.0.join("target"), "edited\n").unwrap();
+    symlink("target", root.0.join("link")).unwrap();
+    let path = root.0.join("link");
+    let name = path.to_str().unwrap();
+    assert_eq!(read(&root.0, name).unwrap().path, "link");
+    let shown = diff(&root.0, name).unwrap();
+    assert_eq!(shown.path, "link");
+    assert_eq!(shown.base, DiffBase::Untracked);
+    assert!(shown.diff.contains("+target"));
+    stage(&root.0, &[name.into()], true).unwrap();
+    assert_eq!(commit_review(&root.0).unwrap().paths, ["link"]);
+    assert!(diff(&root.0, name).unwrap().delete_on_revert);
+    revert(&root.0, name).unwrap();
+    assert!(!path.exists());
+    assert_eq!(fs::read_to_string(root.0.join("target")).unwrap(), "edited\n");
+}
+
+#[test]
+fn unreadable_head_never_turns_restore_into_delete() {
+    let root = Scratch::new("revert-damaged");
+    git_ok(&root.0, &["init", "-q"]);
+    fs::write(root.0.join("tracked"), "original\n").unwrap();
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+    fs::write(root.0.join("tracked"), "edited\n").unwrap();
+    // Keep a valid HEAD ref but remove its object database.
+    fs::rename(root.0.join(".git/objects"), root.0.join("objects-backup")).unwrap();
+    fs::create_dir(root.0.join(".git/objects")).unwrap();
+    assert!(revert(&root.0, "tracked").is_err());
+    assert_eq!(fs::read_to_string(root.0.join("tracked")).unwrap(), "edited\n");
+    git_ok(&root.0, &["ls-files", "--error-unmatch", "--", "tracked"]);
 }
 
 #[test]
@@ -309,6 +391,9 @@ fn porcelain_status_is_rerooted_and_classified() {
     ];
     assert_eq!(got, want.map(|(p, s)| (p.to_owned(), s)));
     assert_eq!(parse_status(b"?? a\0", "").len(), 1);
+    let names = parse_status(b" M bad\xff\0?? bad\xef\xbf\xbd\0", "");
+    assert_eq!(names.len(), 1);
+    assert_eq!((names[0].path.as_str(), names[0].status), ("bad�", 'U'));
 
     let stats = parse_numstat(b"3\t1\ta.rs\0-\t-\tlogo.png\x002\t0\t\0old.rs\0new.rs\0");
     assert_eq!(stats["a.rs"], (Some(3), Some(1)));
@@ -346,6 +431,62 @@ fn status_reports_changes_with_line_counts() {
 }
 
 #[test]
+fn nested_changes_use_the_child_index_and_workspace_paths() {
+    let root = Scratch::new("nested-changes");
+    let child = root.0.join("packages/child");
+    fs::create_dir_all(child.join("src")).unwrap();
+    git_ok(&child, &["init", "-q"]);
+    fs::write(child.join("src/a"), "before\n").unwrap();
+    git_ok(&child, &["add", "src/a"]);
+    git_ok(&child, &["commit", "-qm", "initial"]);
+    fs::write(child.join("src/a"), "after\n").unwrap();
+    git_ok(&child, &["add", "src/a"]);
+    let path = "packages/child/src/a";
+    for parent_repo in [false, true] {
+        if parent_repo {
+            git_ok(&root.0, &["init", "-q"]);
+            fs::write(root.0.join("a"), "outer\n").unwrap();
+        }
+        let view = status(&root.0, true).unwrap();
+        assert_eq!(view.repo, parent_repo, "commit controls belong to the workspace repo");
+        let row = view.files.iter().find(|f| f.path == path).expect("nested file status");
+        assert_eq!((row.status, row.staged, row.added, row.removed), ('M', true, Some(1), Some(1)));
+        let shown = diff(&root.0, path).unwrap();
+        assert_eq!(shown.path, path);
+        assert!(shown.diff.contains("-before\n+after"));
+        assert!(shown.nested);
+        assert!(stage(&root.0, &[path.to_owned()], false).is_err());
+        assert!(revert(&root.0, path).is_err());
+        assert!(revert_hunk(&root.0, path, split_hunks(&shown.diff).1[0]).is_err());
+        assert_eq!(fs::read_to_string(child.join("src/a")).unwrap(), "after\n");
+        assert_eq!(commit_review(&child).unwrap().paths, ["src/a"]);
+    }
+}
+
+#[test]
+fn linked_nested_worktrees_show_deletions_and_untracked_files() {
+    let root = Scratch::new("nested-worktree");
+    let repo = Scratch::new("nested-worktree-source");
+    git_ok(&repo.0, &["init", "-q"]);
+    fs::write(repo.0.join("tracked"), "original\n").unwrap();
+    git_ok(&repo.0, &["add", "tracked"]);
+    git_ok(&repo.0, &["commit", "-qm", "initial"]);
+    let child = root.0.join("linked");
+    git_ok(&repo.0, &["worktree", "add", "--detach", child.to_str().unwrap()]);
+    fs::remove_file(child.join("tracked")).unwrap();
+    fs::create_dir(child.join("new")).unwrap();
+    fs::write(child.join("new/file"), "added\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&repo.0, root.0.join("outside")).unwrap();
+    let view = status(&root.0, false).unwrap();
+    assert_eq!(view.nested_repos, ["linked"]);
+    assert!(view.files.iter().any(|f| f.path == "linked/new/file" && f.status == 'U'));
+    assert!(view.files.iter().any(|f| f.path == "linked/tracked" && f.status == 'D'));
+    assert!(diff(&root.0, "linked/tracked").unwrap().diff.contains("-original"));
+    assert!(diff(&root.0, "linked/new/file").unwrap().diff.contains("+added"));
+}
+
+#[test]
 fn revert_discards_changes_inside_the_workspace_only() {
     let root = Scratch::new("revert");
     git_ok(&root.0, &["init", "-q"]);
@@ -359,10 +500,20 @@ fn revert_discards_changes_inside_the_workspace_only() {
     git_ok(&root.0, &["add", "a.txt"]);
     revert(&root.0, "a.txt").unwrap();
     assert_eq!(fs::read_to_string(root.0.join("a.txt")).unwrap(), "one\n");
-    // Deleted: restored.
-    fs::remove_file(root.0.join("gone.txt")).unwrap();
-    revert(&root.0, "gone.txt").unwrap();
-    assert_eq!(fs::read_to_string(root.0.join("gone.txt")).unwrap(), "kept\n");
+    // Deletion can be in the index or only the worktree. Hunk undo touches just the latter.
+    for staged in [false, true] {
+        fs::remove_file(root.0.join("gone.txt")).unwrap();
+        if staged { stage(&root.0, &["gone.txt".into()], true).unwrap(); }
+        let shown = diff(&root.0, "gone.txt").unwrap();
+        assert_eq!(shown.base, DiffBase::Head);
+        assert!(!shown.delete_on_revert);
+        assert!(shown.diff.contains("-kept"));
+        revert_hunk(&root.0, "gone.txt", split_hunks(&shown.diff).1[0]).unwrap();
+        assert_eq!(fs::read_to_string(root.0.join("gone.txt")).unwrap(), "kept\n");
+        fs::remove_file(root.0.join("gone.txt")).unwrap();
+        revert(&root.0, "gone.txt").unwrap();
+        assert_eq!(fs::read_to_string(root.0.join("gone.txt")).unwrap(), "kept\n");
+    }
     // Newly added (staged) and untracked: unstaged and deleted.
     fs::write(root.0.join("staged.txt"), "s").unwrap();
     git_ok(&root.0, &["add", "staged.txt"]);
@@ -387,6 +538,11 @@ fn revert_discards_changes_inside_the_workspace_only() {
     {
         std::os::unix::fs::symlink(outside.0.join("secret"), root.0.join("link")).unwrap();
         assert!(revert(&root.0, "link").unwrap_err().contains("outside"));
+        std::os::unix::fs::symlink(&outside.0, root.0.join("external")).unwrap();
+        assert!(revert(&root.0, "external/missing").unwrap_err().contains("outside"));
+        std::os::unix::fs::symlink(outside.0.join("missing"), root.0.join("dangling")).unwrap();
+        assert!(revert(&root.0, "dangling").is_err());
+        assert!(fs::symlink_metadata(root.0.join("dangling")).unwrap().is_symlink());
     }
     assert_eq!(fs::read_to_string(outside.0.join("secret")).unwrap(), "x");
 }

@@ -8,14 +8,19 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+mod probe;
+use probe::run_detailed;
+pub(crate) use probe::{available as pipe_available, run_captured};
 
 #[cfg(test)]
 mod tests;
 
 /// How long the login shell may take to print its environment.
+#[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Recent folders kept for the welcome screen and the folder menu.
 const MAX_RECENTS: usize = 12;
@@ -28,16 +33,19 @@ fn fallback_dirs(os: &str) -> &'static [&'static str] {
     }
 }
 /// Variables that describe the probe shell itself, not the user's environment.
+#[cfg(unix)]
 const SKIP_VARS: [&str; 5] = ["PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID"];
 
-/// Parse `env -0` output into pairs.
-pub fn parse_env(output: &[u8]) -> Vec<(String, String)> {
+/// Parse `env -0` output without requiring Unix paths or values to be Unicode.
+#[cfg(unix)]
+fn parse_env(output: &[u8]) -> Vec<(String, OsString)> {
+    use std::os::unix::ffi::OsStrExt;
     output
         .split(|&b| b == 0)
         .filter_map(|entry| {
-            let entry = std::str::from_utf8(entry).ok()?;
-            let (key, value) = entry.split_once('=')?;
-            let key = key.trim_start_matches('\n');
+            let eq = entry.iter().position(|&b| b == b'=')?;
+            let key = std::str::from_utf8(&entry[..eq]).ok()?.trim_start_matches('\n');
+            let value = OsStr::from_bytes(&entry[eq + 1..]);
             (!key.is_empty() && !key.contains(char::is_whitespace))
                 .then(|| (key.to_owned(), value.to_owned()))
         })
@@ -45,30 +53,32 @@ pub fn parse_env(output: &[u8]) -> Vec<(String, String)> {
 }
 
 /// `current` followed by the entries of `extra` it lacks.
-pub fn merge_path(current: &str, extra: &str) -> String {
-    let mut parts: Vec<&str> = current.split(':').filter(|p| !p.is_empty()).collect();
-    for part in extra.split(':').filter(|p| !p.is_empty()) {
+#[cfg(unix)]
+fn merge_path(current: &OsStr, extra: &OsStr) -> OsString {
+    let mut parts: Vec<_> = std::env::split_paths(current).collect();
+    for part in std::env::split_paths(extra).filter(|p| !p.as_os_str().is_empty()) {
         if !parts.contains(&part) {
             parts.push(part);
         }
     }
-    parts.join(":")
+    // Unix split_paths components cannot contain the ':' separator.
+    std::env::join_paths(parts).expect("split PATH components can be joined")
 }
 
 /// The changes that import `shell` into `current`: variables `current` lacks, and PATH merged.
-pub fn env_changes(
-    current: &[(String, String)],
-    shell: &[(String, String)],
-) -> Vec<(String, String)> {
-    let get = |key: &str| current.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+#[cfg(unix)]
+fn env_changes(
+    current: impl Fn(&str) -> Option<OsString>,
+    shell: &[(String, OsString)],
+) -> Vec<(String, OsString)> {
     shell
         .iter()
         .filter(|(key, _)| !SKIP_VARS.contains(&key.as_str()))
-        .filter_map(|(key, value)| match get(key) {
+        .filter_map(|(key, value)| match current(key) {
             None => Some((key.clone(), value.clone())),
             Some(existing) if key == "PATH" => {
-                let merged = merge_path(existing, value);
-                (merged != *existing).then(|| (key.clone(), merged))
+                let merged = merge_path(&existing, value);
+                (merged != existing).then(|| (key.clone(), merged))
             }
             Some(_) => None,
         })
@@ -78,9 +88,10 @@ pub fn env_changes(
 /// Copy the login shell's environment into this process when it was not started from a terminal.
 ///
 /// Must run at the very start of `main`, before any other thread exists.
+#[cfg(unix)]
 pub fn import_shell_env() {
     use std::io::IsTerminal;
-    if cfg!(windows) || std::io::stdin().is_terminal() {
+    if std::io::stdin().is_terminal() {
         return;
     }
     let Some(shell) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) else {
@@ -102,12 +113,14 @@ pub fn import_shell_env() {
             return;
         }
     };
-    let current: Vec<(String, String)> = std::env::vars().collect();
-    for (key, value) in env_changes(&current, &parse_env(&output)) {
+    for (key, value) in env_changes(|key| std::env::var_os(key), &parse_env(&output)) {
         // SAFETY: called at the start of `main`, while the process is single-threaded.
         unsafe { std::env::set_var(key, value) };
     }
 }
+
+#[cfg(not(unix))]
+pub fn import_shell_env() {}
 
 /// Piping standard I/O does not prevent Windows from opening a separate console for a GUI's child.
 pub(crate) fn without_console(command: &mut Command) -> &mut Command {
@@ -116,6 +129,61 @@ pub(crate) fn without_console(command: &mut Command) -> &mut Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Variables the AppImage runtime and its bundled-GTK hooks set for the app itself: its own
+/// identity (`APPIMAGE`, `APPDIR`, `ARGV0`, `OWD`) and paths into its private mount (`GTK_PATH`,
+/// `GDK_PIXBUF_MODULE_FILE`, `$APPDIR/usr/bin` on `PATH`, …). A shell or app the user starts from
+/// Dial must not load the bundled GTK modules or mistake itself for this AppImage (an updater
+/// reading `APPIMAGE` would replace Dial). Returns what to change: a cleaned value, or `None` to
+/// remove. Empty unless both `APPIMAGE` and an absolute, non-root `APPDIR` are set.
+pub fn appimage_env_fixes(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, Option<OsString>)> {
+    const IDENTITY: [&str; 4] = ["APPIMAGE", "APPDIR", "ARGV0", "OWD"];
+    let vars: Vec<(OsString, OsString)> = vars.into_iter().collect();
+    let get = |name: &str| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let appdir = get("APPDIR")
+        .and_then(|v| v.to_str())
+        .map(|v| v.trim_end_matches('/'))
+        .filter(|v| v.starts_with('/') && v.len() > 1);
+    let (Some(_), Some(appdir)) = (get("APPIMAGE"), appdir) else {
+        return Vec::new();
+    };
+    let inside = |entry: &str| {
+        entry
+            .strip_prefix(appdir)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    let mut fixes = Vec::new();
+    for (key, value) in &vars {
+        if key.to_str().is_some_and(|k| IDENTITY.contains(&k)) {
+            fixes.push((key.clone(), None));
+            continue;
+        }
+        let Some(text) = value.to_str() else { continue };
+        if !text.split(':').any(inside) {
+            continue;
+        }
+        let kept: Vec<&str> = text
+            .split(':')
+            .filter(|e| !e.is_empty() && !inside(e))
+            .collect();
+        let fixed = (!kept.is_empty()).then(|| kept.join(":").into());
+        fixes.push((key.clone(), fixed));
+    }
+    fixes
+}
+
+/// [`appimage_env_fixes`] for this process, applied to a child about to start.
+pub(crate) fn outside_appimage(command: &mut Command) -> &mut Command {
+    for (key, value) in appimage_env_fixes(std::env::vars_os()) {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
     }
     command
 }
@@ -129,56 +197,6 @@ pub(crate) fn without_console(command: &mut Command) -> &mut Command {
 /// owned by a dead process group. A new session detaches it from the terminal entirely.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
     run_detailed(command, timeout).ok()
-}
-
-/// [`run_with_timeout`], saying why there is no output ("timed out after 5 s").
-fn run_detailed(command: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe extern "C" {
-            fn setsid() -> i32;
-        }
-        // SAFETY: `setsid` is async-signal-safe, as required between fork and exec.
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut child = without_console(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("could not start: {error}"))?;
-    let mut stdout = child.stdout.take().ok_or("has no output")?;
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut stdout, &mut out).map(|_| out)
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                return reader
-                    .join()
-                    .map_err(|_| "output could not be read".to_owned())?
-                    .map_err(|error| format!("output could not be read: {error}"));
-            }
-            Ok(Some(status)) => return Err(format!("exited with {status}")),
-            Err(error) => return Err(format!("could not be waited on: {error}")),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("timed out after {} s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
 }
 
 /// `~/x` relative to `home`.
@@ -326,6 +344,17 @@ pub fn locate_dial(
     path: Option<&OsStr>,
     home: Option<&Path>,
 ) -> (PathBuf, EngineOrigin) {
+    locate_dial_in(flag, env, choice, path, home, app_dir(home).as_deref())
+}
+
+fn locate_dial_in(
+    flag: Option<OsString>,
+    env: Option<OsString>,
+    choice: Option<&EngineChoice>,
+    path: Option<&OsStr>,
+    home: Option<&Path>,
+    desktop_dir: Option<&Path>,
+) -> (PathBuf, EngineOrigin) {
     if let Some(flag) = flag.filter(|p| !p.is_empty()) {
         return (PathBuf::from(flag), EngineOrigin::Flag);
     }
@@ -348,7 +377,7 @@ pub fn locate_dial(
         }
         _ => {}
     }
-    if let Some(installed) = app_dir(home).and_then(|dir| desktop_engine(&dir)) {
+    if let Some(installed) = desktop_dir.and_then(desktop_engine) {
         return (installed, EngineOrigin::Desktop);
     }
     if let Some(on_path) = on_path() {
@@ -516,7 +545,11 @@ impl Recents {
 
 /// Prefer HOME when usable, then the native profile on Windows. Never use the working directory.
 pub fn home_dir() -> Option<PathBuf> {
-    [std::env::var_os("HOME"), cfg!(windows).then(|| std::env::var_os("USERPROFILE")).flatten()]
+    home_from(std::env::var_os("HOME"), cfg!(windows).then(|| std::env::var_os("USERPROFILE")).flatten())
+}
+
+fn home_from(home: Option<OsString>, profile: Option<OsString>) -> Option<PathBuf> {
+    [home, profile]
         .into_iter()
         .flatten()
         .map(PathBuf::from)

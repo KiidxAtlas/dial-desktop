@@ -10,6 +10,10 @@ const props = defineProps<{ question: Question }>();
 const picks = reactive<Record<string, { selected: string[]; custom: string }>>({});
 /** Set once an answer or skip went out, until the engine closes the question. */
 const sent = ref(false);
+/** With several questions, the one on screen; they are answered one at a time. */
+const step = ref(0);
+const item = computed(() => props.question.items[Math.min(step.value, props.question.items.length - 1)]);
+const last = computed(() => step.value >= props.question.items.length - 1);
 
 const answerable = computed(() => props.question.id !== "");
 
@@ -20,6 +24,7 @@ function reset() {
     picks[item.id] = { selected: suggested ? [suggested] : [], custom: "" };
   }
   sent.value = false;
+  step.value = 0;
 }
 
 // A new question resets the form and tells the engine it is on screen (this starts its timeout).
@@ -71,10 +76,17 @@ async function skip() {
   if (!(await engine.skipQuestion(id)) && props.question.id === id) sent.value = false;
 }
 
+/** Enter moves to the next question, and on the last one sends every answer. */
+function next() {
+  if (!item.value || !done(item.value)) return;
+  if (last.value) submit();
+  else step.value++;
+}
+
 function onKey(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
-    submit();
+    next();
   }
 }
 </script>
@@ -82,16 +94,18 @@ function onKey(event: KeyboardEvent) {
 <template>
   <section class="card question" :class="{ sent }" aria-live="polite">
     <div class="card-head">
-      <strong>{{ question.items.length > 1 ? `Dial has ${question.items.length} questions` : "Dial has a question" }}</strong>
+      <strong>{{ question.items.length > 1 ? "Dial has a few questions" : "Dial has a question" }}</strong>
+      <span v-if="question.items.length > 1" class="count" aria-live="polite">{{ step + 1 }} of {{ question.items.length }}</span>
     </div>
 
-    <!-- Only the questions scroll, so the actions stay in reach. -->
-    <div class="items">
-      <div v-for="item in question.items" :key="item.id" class="item">
+    <!-- Only the question scrolls, so the actions stay in reach. -->
+    <div v-if="item" :key="item.id" class="items">
+      <div class="item">
         <div class="ask">
           <span v-if="item.header" class="pill header">{{ item.header }}</span>
           <p>{{ item.text }}</p>
         </div>
+        <span v-if="answerable && item.options.length" class="hint">{{ item.multi ? "Choose any that apply" : "Choose one" }}</span>
         <template v-if="answerable">
           <div v-if="item.options.length" class="options" :role="item.multi ? 'group' : 'radiogroup'">
             <button
@@ -133,12 +147,16 @@ function onKey(event: KeyboardEvent) {
     </div>
 
     <div v-if="answerable" class="actions">
-      <span class="hint">{{ question.items.some((i) => i.multi) ? "Choose any that apply" : "Enter submits" }}</span>
+      <span class="hint">Enter {{ last ? "sends" : "continues" }}</span>
       <span class="grow" />
       <button class="btn btn-secondary" :disabled="sent" title="Let Dial continue without an answer" @click="skip">
         Skip
       </button>
-      <button class="btn btn-primary" :disabled="!canSubmit" @click="submit">
+      <button v-if="step > 0" class="btn btn-secondary" :disabled="sent" @click="step--">Back</button>
+      <button v-if="!last" class="btn btn-primary" :disabled="sent || !item || !done(item)" @click="next">
+        Next <Icon name="chevronRight" :size="13" />
+      </button>
+      <button v-else class="btn btn-primary" :disabled="!canSubmit" @click="submit">
         <Icon name="check" :size="14" /> {{ sent ? "Sent" : "Answer" }}
       </button>
     </div>
@@ -168,6 +186,12 @@ function onKey(event: KeyboardEvent) {
 .card-head strong {
   font-weight: 600;
 }
+.count {
+  margin-left: auto;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
 .items {
   min-height: 0;
   overflow: auto;
@@ -177,9 +201,9 @@ function onKey(event: KeyboardEvent) {
 .item {
   margin-top: 12px;
 }
-.item + .item {
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
+.item > .hint {
+  display: block;
+  margin: 4px 0 0;
 }
 .ask {
   display: flex;

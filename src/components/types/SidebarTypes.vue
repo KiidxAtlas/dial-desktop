@@ -129,7 +129,8 @@ function menu(event: MouseEvent, t: Summary) {
 <style scoped>
 .types {
   flex: none;
-  margin: -6px 0 12px;
+  /* Below the session list, so an empty or folded Types section never pushes sessions down. */
+  margin: 8px 0 4px;
 }
 .head {
   display: flex;

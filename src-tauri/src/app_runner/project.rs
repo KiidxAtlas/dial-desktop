@@ -343,7 +343,7 @@ impl Git {
     /// passed back in.
     fn command(&self) -> Command {
         let mut command = Command::new(&self.exe);
-        command.env_clear();
+        crate::launcher::without_console(&mut command).env_clear();
         for key in ["PATH", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

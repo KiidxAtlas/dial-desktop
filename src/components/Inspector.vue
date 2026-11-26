@@ -3,7 +3,7 @@ import { computed, nextTick, reactive, ref, watch } from "vue";
 import type { Change, OpenSnapshot, ToolEntry } from "../types";
 import { openMenu, ui, type InspectorTab } from "../ui";
 import { addToPrompt, inspectorWidth, mention, MIN_WIDTH, projectPref, setInspectorWidth, setProjectPref, showPanel } from "../workspace";
-import { changeRows, gitLabel, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
+import { changeRows, gitLabel, inNestedRepo, otherNestedChanges, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
 import { workspaceGitApi, type CommitReview } from "../workspaceGitApi";
 import { showToast } from "../bridge";
 import { aiReviewView, gitLogView, worktreesView } from "../commandRunner";
@@ -15,9 +15,9 @@ import DiffPane from "./workspace/DiffPane.vue";
 import FilesPane from "./workspace/FilesPane.vue";
 import TerminalPane from "./workspace/TerminalPane.vue";
 import AppPane from "./workspace/AppPane.vue";
-import RecordedTurns from './RecordedTurns.vue';
 import JobDiscovery from './JobDiscovery.vue';
 import ActivityWatch from './ActivityWatch.vue';
+import { toolFiles } from "../toolFolds";
 
 const props = defineProps<{ snap: OpenSnapshot; open: boolean }>();
 
@@ -29,12 +29,16 @@ const rosters = [
   { id: "workers", label: "Workers", icon: "chip" },
   { id: "peers", label: "Peers", icon: "chat" },
 ] as const;
-const auxiliary = [
-  { id: "activity", label: "Activity", icon: "activity" },
-  ...rosters,
+/** Workspace tools: one click each, shown as icons beside the two main tabs. */
+const toolTabs = [
   { id: "files", label: "Files", icon: "files" },
   { id: "terminal", label: "Terminal", icon: "terminal" },
   { id: "browser", label: "Browser", icon: "globe" },
+] as const;
+/** Less used panels, in the overflow menu. */
+const auxiliary = [
+  { id: "activity", label: "Activity", icon: "activity" },
+  ...rosters,
   { id: "app", label: "App", icon: "monitor" },
 ] as const;
 const watchKind = computed(() => ui.inspectorTab === "workers" ? "worker" : ui.inspectorTab === "peers" ? "peer" : null);
@@ -67,10 +71,11 @@ watch(() => props.snap.workspace.root, () => { activityLimit.value = ACTIVITY_PA
 const gitFiles = ref<GitFileStatus[]>([]);
 /** Whether the project is a git repository; `false` until a status says so. */
 const gitRepo = ref(false);
+const nestedRepos = ref<string[]>([]);
 /** The checked-out branch from the latest status. */
 const gitBranch = ref<string | null>(null);
 /** Files with something staged, across the whole project (a commit takes them all). */
-const staged = computed(() => stagedCount(gitFiles.value));
+const staged = computed(() => stagedCount(gitFiles.value.filter(f => !inNestedRepo(f.path, nestedRepos.value))));
 const commitMessage = ref("");
 /** A stage, unstage or commit is running; the controls wait for it. */
 const gitBusy = ref(false);
@@ -89,12 +94,14 @@ async function loadGit() {
     const view = await workspaceGitApi.status(root, true);
     if (id === gitRequest && root === props.snap.workspace.root) {
       gitFiles.value = view.files;
+      nestedRepos.value = view.nestedRepos ?? [];
       gitRepo.value = view.repo;
       gitBranch.value = view.branch ?? null;
     }
   } catch {
     if (id === gitRequest) {
       gitFiles.value = [];
+      nestedRepos.value = [];
       gitRepo.value = false;
       gitBranch.value = null;
     }
@@ -198,10 +205,16 @@ watch(
   { immediate: true },
 );
 /** Session-touched files; those git no longer reports as changed (committed or reverted) last. */
-const rows = computed(() =>
-  changeRows(props.snap.changes, (c: Change) => (c.dir + c.name).replaceAll("\\", "/"), gitFiles.value, gitRepo.value),
-);
+const sessionPath = (c: Change) => (c.dir + c.name).replaceAll("\\", "/");
+const rows = computed(() => changeRows(props.snap.changes, sessionPath, gitFiles.value, gitRepo.value, nestedRepos.value));
+const nestedChanges = computed(() => otherNestedChanges(gitFiles.value, nestedRepos.value, props.snap.changes.map(sessionPath)));
 const pending = computed(() => rows.value.filter((r) => !r.settled).length);
+/** Line counts Dial's own calls reported, for rows git has no numbers for (no repository yet). */
+const reported = computed(() => toolFiles([...allTools.value].reverse()));
+function reportedFor(change: Change) {
+  const path = sessionPath(change);
+  return reported.value.find((f) => { const p = f.path.replaceAll("\\", "/"); return p === path || p.endsWith(`/${path}`) || path.endsWith(`/${p}`); });
+}
 const width = computed(() => inspectorWidth());
 /** Show a tool call in the conversation, opened, and flash it. */
 async function reveal(key: string) {
@@ -303,8 +316,22 @@ function resizeByKey(event: KeyboardEvent) {
         {{ tab.label }}
         <span v-if="tab.id === 'changes' && snap.changes.length" class="badge">{{ snap.changes.length }}</span>
       </button>
-      <button aria-haspopup="menu" :aria-expanded="ui.menu?.anchor === panelButton" ref="panelButton" :class="{ active: auxiliary.some(t => t.id === ui.inspectorTab) }" @click="panelMenu">
-        {{ auxiliary.find(t => t.id === ui.inspectorTab)?.label ?? 'Panels' }} <Icon name="chevronDown" :size="12" />
+      <span class="grow" />
+      <button
+        v-for="tab in toolTabs"
+        :key="tab.id"
+        class="tool"
+        :title="hints[tab.id] ? `${tab.label} (${hints[tab.id]})` : tab.label"
+        :aria-label="tab.label"
+        :aria-pressed="ui.inspectorTab === tab.id"
+        :class="{ active: ui.inspectorTab === tab.id }"
+        @click="showPanel(tab.id)"
+      >
+        <Icon :name="tab.icon" :size="15" />
+      </button>
+      <button class="tool" title="More panels" aria-label="More panels" aria-haspopup="menu" :aria-expanded="ui.menu?.anchor === panelButton" ref="panelButton" :class="{ active: auxiliary.some(t => t.id === ui.inspectorTab) }" @click="panelMenu">
+        <template v-if="auxiliary.some(t => t.id === ui.inspectorTab)">{{ auxiliary.find(t => t.id === ui.inspectorTab)?.label }}</template>
+        <Icon name="more" :size="15" />
       </button>
     </div>
 
@@ -340,11 +367,11 @@ function resizeByKey(event: KeyboardEvent) {
           <span>Dial shares its task list here as it works.</span>
         </div>
         <template v-else>
-          <div class="head">
-            <span class="section-label">Plan</span>
+          <!-- The tab already says "Plan": the head carries only the progress. -->
+          <div class="head progress-head">
+            <div class="bar"><span :style="{ width: `${progress}%` }" /></div>
             <span class="faint">{{ done }} of {{ snap.plan.length }} done</span>
           </div>
-          <div class="bar"><span :style="{ width: `${progress}%` }" /></div>
           <ul class="tasks">
             <li v-for="(task, i) in snap.plan" :key="i" :class="taskClass(task.status)">
               <span class="mark">
@@ -360,23 +387,22 @@ function resizeByKey(event: KeyboardEvent) {
 
       <!-- Changes -->
       <template v-else-if="ui.inspectorTab === 'changes'">
-        <RecordedTurns v-if="shown('changes') && snap.connection.state === 'live' && snap.sessionId && !snap.turnRunning && !snap.historyLoading" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" :session="snap.sessionId" />
-        <div v-if="!snap.changes.length" class="empty">
+        <!-- Turn results live in the conversation, under the turn they describe. -->
+        <div v-if="!snap.changes.length && !nestedChanges.length" class="empty">
           <strong>No changes yet</strong>
           <span>Files Dial edits in this session appear here.</span>
         </div>
-        <template v-else>
+        <template v-if="snap.changes.length">
           <div class="head">
             <span class="section-label">{{ snap.changes.length }} {{ snap.changes.length === 1 ? "file" : "files" }} edited</span>
             <button class="btn btn-secondary" @click="addToPrompt('Review the changes to these files for bugs and missing tests:\n' + snap.changes.map(c => mention(c.path)).join('\n'))">Review files</button>
           </div>
-          <p class="faint">
+          <p class="faint" title="Diffs show every current change to a file, not just Dial’s.">
             Files Dial edited in this session<template v-if="gitRepo && pending < snap.changes.length">; {{ pending }} still {{ pending === 1 ? "differs" : "differ" }} from the last commit</template>.
-            Diffs show every current change to a file, not just Dial’s.
           </p>
           <div v-for="{ item: change, git, settled } in rows" :key="change.path" class="file-row">
             <input
-              v-if="git"
+              v-if="git && !inNestedRepo(git.path, nestedRepos)"
               type="checkbox"
               class="stage"
               :checked="stageState(git) === true"
@@ -403,6 +429,20 @@ function resizeByKey(event: KeyboardEvent) {
                 <span class="code" :class="'code-' + git.status">{{ git.status }}</span>
               </span>
               <span v-else-if="settled" class="change-stat faint">no changes</span>
+              <span v-else-if="reportedFor(change)?.added != null" class="change-stat">
+                <b v-if="reportedFor(change)!.added || !reportedFor(change)!.removed" class="add">+{{ reportedFor(change)!.added }}</b> <b v-if="reportedFor(change)!.removed" class="del">−{{ reportedFor(change)!.removed }}</b>
+              </span>
+              <Icon name="chevronRight" :size="13" />
+            </button>
+          </div>
+        </template>
+        <template v-if="nestedChanges.length">
+          <span class="section-label">Other changes in nested repositories</span>
+          <div v-for="git in nestedChanges" :key="git.path" class="file-row">
+            <button class="file" :title="git.path" @click="ui.diffPath = git.path">
+              <Icon name="file" :size="14" />
+              <span class="file-text mono truncate">{{ git.path }}</span>
+              <span class="change-stat" :title="gitLabel(git.status)"><span class="code" :class="'code-' + git.status">{{ git.status }}</span></span>
               <Icon name="chevronRight" :size="13" />
             </button>
           </div>
@@ -583,6 +623,17 @@ function resizeByKey(event: KeyboardEvent) {
   color: var(--text);
   box-shadow: inset 0 -2px 0 var(--accent);
 }
+.tabs .grow {
+  flex: 1;
+}
+.tabs button.tool {
+  min-width: 30px;
+  justify-content: center;
+  padding: 0 7px;
+}
+.tabs button.tool.active {
+  box-shadow: none;
+}
 .badge {
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -634,6 +685,9 @@ function resizeByKey(event: KeyboardEvent) {
   overflow: hidden;
   margin-bottom: var(--space-md);
 }
+.progress-head { gap: 12px; margin-bottom: var(--space-md); }
+.progress-head .bar { flex: 1; margin-bottom: 0; }
+.progress-head .faint { flex: none; }
 .bar span {
   display: block;
   height: 100%;

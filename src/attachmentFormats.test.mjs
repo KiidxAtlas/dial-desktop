@@ -7,8 +7,8 @@ const pdf = file('report.pdf', 'application/pdf');
 const png = file('plot.PNG', 'image/png');
 const tiff = file('shot.tif', 'image/tiff');
 const item = (f, isDirectory = false) => ({ kind: 'file', getAsFile: () => f, webkitGetAsEntry: () => ({ isDirectory }) });
-const paste = ({ files = [], items = [], text = '', isTrusted = true } = {}) => ({
-  isTrusted, clipboardData: { files, items, getData: type => type === 'text/plain' ? text : '' },
+const paste = ({ files = [], items = [], text = '', formats = {}, isTrusted = true } = {}) => ({
+  isTrusted, clipboardData: { files, items, types: Object.keys(formats), getData: type => type === 'text/plain' ? text : formats[type] ?? '' },
 });
 
 test('only raster image files get a preview MIME', () => {
@@ -27,7 +27,13 @@ test('file paste takes the DOM files or file items once; a folder never becomes 
 
 test('only trusted text-free pastes use native fallbacks; macOS TIFF screenshots still use PNG conversion', () => {
   for (const [event, platform, kind] of [
-    [paste(), 'windows', 'nativeFiles'], [paste(), 'macos', 'nativeFiles'], [paste(), 'linux', 'text'],
+    [paste(), 'windows', 'nativeFiles'], [paste(), 'macos', 'nativeFiles'], [paste(), 'linux', 'nativeFiles'],
+    [paste({ formats: { 'text/uri-list': '# files\r\nfile:///local.pdf\r\nfile://localhost/tmp/x' } }), 'linux', 'nativeFiles'],
+    [paste({ formats: { 'text/uri-list': 'https://example.com/' } }), 'linux', 'text'],
+    [paste({ formats: { 'text/uri-list': 'file://server/share/foo' } }), 'linux', 'text'],
+    [paste({ text: 'file:///local.pdf', formats: { 'text/uri-list': 'file:///local.pdf' } }), 'linux', 'text'],
+    [paste({ formats: { 'text/html': '<p>hello</p>' } }), 'linux', 'text'],
+    [paste({ isTrusted: false }), 'linux', 'text'],
     [paste({ text: 'C:\\copied.pdf' }), 'windows', 'text'], [paste({ text: ' ' }), 'macos', 'text'],
     [paste({ isTrusted: false }), 'windows', 'text'], [paste({ isTrusted: false }), 'macos', 'text'],
     [paste({ files: [tiff] }), 'macos', 'macImage'], [paste({ files: [tiff, pdf] }), 'macos', 'files'],

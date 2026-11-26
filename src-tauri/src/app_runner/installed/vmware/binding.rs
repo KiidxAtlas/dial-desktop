@@ -133,6 +133,7 @@ pub(super) fn check_connection(
 
 /// Install roots whose `vmware-vmx` may run a VM. Executables elsewhere are refused even when named
 /// correctly.
+#[cfg(not(windows))]
 fn trusted_roots() -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
@@ -142,13 +143,6 @@ fn trusted_roots() -> &'static [&'static str] {
     {
         &["/usr/lib/vmware/"]
     }
-    #[cfg(windows)]
-    {
-        &[
-            r"C:\Program Files\VMware\VMware Workstation\",
-            r"C:\Program Files (x86)\VMware\VMware Workstation\",
-        ]
-    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         &[]
@@ -156,6 +150,7 @@ fn trusted_roots() -> &'static [&'static str] {
 }
 
 /// The executable must be named exactly `vmware-vmx` (`.exe` on Windows) and lie under a trusted root.
+#[cfg(not(windows))]
 pub(super) fn is_trusted_vmx_executable(exe: &Path) -> bool {
     let name_ok = exe
         .file_name()
@@ -163,14 +158,12 @@ pub(super) fn is_trusted_vmx_executable(exe: &Path) -> bool {
         .is_some_and(|n| n == "vmware-vmx" || n == "vmware-vmx.exe");
     let text = exe.to_string_lossy();
     name_ok
-        && trusted_roots().iter().any(|root| {
-            if cfg!(windows) {
-                text.to_ascii_lowercase()
-                    .starts_with(&root.to_ascii_lowercase())
-            } else {
-                text.starts_with(root)
-            }
-        })
+        && trusted_roots().iter().any(|root| text.starts_with(root))
+}
+
+#[cfg(windows)]
+pub(super) fn is_trusted_vmx_executable(exe: &Path) -> bool {
+    windows::trusted_executable(exe, super::super::inventory::vmware_install_dirs())
 }
 
 /// A loopback IP literal. Hostnames such as `localhost` are not accepted: they are not proof.

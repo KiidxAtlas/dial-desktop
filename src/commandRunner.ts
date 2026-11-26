@@ -123,7 +123,13 @@ export function runInTerminal(command: string) {
 export function words(text: string): string[] {
   const out: string[] = [];
   const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
-  for (let m: RegExpExecArray | null; (m = re.exec(text)); ) out.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, "$1") : m[2] ?? m[3]);
+  for (let m: RegExpExecArray | null; (m = re.exec(text)); ) {
+    // Backslashes are path separators, including a UNC prefix. Only a run before a quote
+    // escapes it (or itself); the final closing quote is outside capture group 1.
+    out.push(m[1] !== undefined
+      ? m[1].replace(/\\+(?="|$)/g, slashes => "\\".repeat(Math.floor(slashes.length / 2)))
+      : m[2] ?? m[3]);
+  }
   return out;
 }
 

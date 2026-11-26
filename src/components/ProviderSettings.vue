@@ -6,6 +6,7 @@ import { engine, models, openExternal, providerApi, settings, settingsPage, setu
 import { applySaved, engineCall, readable } from "../engineTools";
 import { checkEndpoint, editedTable, endpointForm, endpointTable, ENDPOINT_PROTOCOLS, testProviderId, testResult, type EndpointForm, type ListedReply, type TestResult } from "../providerEndpoint";
 import type { SettingScope, Snapshot } from "../types";
+import { needsEngineInstall } from "../updates";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
 
@@ -15,7 +16,7 @@ const hasProject = computed(() => !!props.snap.workspace);
 const unavailable = computed(() => {
   const c = props.snap.connection;
   if (c.state === "preview") return "Sign-in is unavailable in the design preview.";
-  if (c.state === "failed" && c.problem === "missing") return "Install the Dial engine in Settings → Updates first.";
+  if (c.state === "failed" && needsEngineInstall(c.problem)) return "Install or choose a working Dial engine in Settings → Updates first.";
   return "";
 });
 const accounts = ref<ProviderAccount[]>([]), keys = ref<KeyProvider[]>([]);

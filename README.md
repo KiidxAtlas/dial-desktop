@@ -103,8 +103,11 @@ The app and the Dial engine update separately, and nothing installs until the us
   only bundles signed with the key in `src-tauri/tauri.release.conf.json` (`plugins.updater.pubkey`).
   Builds without that config (development, local `npm run build`) do not update themselves. On Linux only
   the AppImage self-updates; the `.deb` updates through its package manager.
+  Before installing, Desktop waits for active sessions, asks before closing terminals, and
+  asks you to stop App panel connections, background schedules, model downloads and host setup
+  yourself rather than interrupting them.
 - **The engine** is not bundled. Desktop checks the selected `dial` and uses its own updater
-  for signed releases, Homebrew, Cargo or source checkouts. If the engine is missing or a
+  for signed releases, Homebrew, Cargo or source checkouts. If the engine is missing, cannot run, or a
   newer release is available for an externally managed install, choose **Install Desktop copy**
   in Settings. This runs Dial's signed release installer in a separate Desktop folder without
   replacing the original engine. Desktop prefers that copy on future launches unless you set
@@ -119,8 +122,10 @@ The app and the Dial engine update separately, and nothing installs until the us
 Push a tag `vX.Y.Z` matching the version in `package.json`, `src-tauri/tauri.conf.json` and
 `src-tauri/Cargo.toml`. `.github/workflows/release.yml` builds macOS (arm64 and x86-64),
 Windows and Linux with `--config src-tauri/tauri.release.conf.json` (which adds updater
-artifacts), uploads them and `latest.json` into a draft release, publishes it once every platform
-succeeds, and asks the website to refresh its download links.
+artifacts), uploads them and `latest.json` into a draft release, and publishes it once every
+platform succeeds. Only stable `vX.Y.Z` tags are accepted. Builds may finish out of order:
+publication is queued across tags and checks all published stable versions before advancing
+`releases/latest` and refreshing the website. Older tags keep their versioned downloads.
 
 Before tagging, smoke-test the candidate from the app icon in a clean OS account, with no
 `dial` or `hf` on PATH. Open a project, install the engine, connect a test provider or download
@@ -159,8 +164,8 @@ continues. Local builds without the release config do not contact Azure.
   asks), and clicking it again brings it back. A pulsing dot marks running sessions, an amber dot
   one that waits for an approval or answer; you are told when a background session finishes. Hover
   an idle session and click × to move it to **Recently Deleted**. Choose **Undo** in the toast or
-  **Restore** in that project’s sidebar, even after restarting Desktop. The list is local to this
-  computer; only **Delete permanently** removes the engine’s transcript, after confirmation. Moving
+  select sessions and choose **Restore** in that project’s sidebar, even after restarting Desktop.
+  Use **Select all** to manage the whole list. The list is local to this computer; only **Delete permanently** removes the selected transcripts, after confirmation. Moving
   the open session starts a fresh one. <kbd>⌘/Ctrl</kbd>-click picks several sessions and <kbd>Shift</kbd>-click a
   range; then delete them together from the bar above the list or with <kbd>Delete</kbd>
   (several at once are confirmed first, and can be undone the same way; <kbd>Esc</kbd> clears the
@@ -236,6 +241,10 @@ continues. Local builds without the release config do not contact Azure.
   or a shell) is shown as such and not duplicated. **Open in Terminal instead** keeps the old
   Terminal-tab runner, which ends with its tab.
 - **Model library** (Settings, or **Get models…** in the model picker): lists the models already in your Hugging Face cache (honoring `HF_HUB_CACHE` and `HF_HOME`). **Browse Hugging Face** finds MLX and GGUF models; open a result to see its files and sizes, then download the whole MLX model or one GGUF file. Suggested models are pinned to tested revisions. Each download asks for confirmation with its size. If the official Hugging Face helper is missing, Desktop offers to download it and a private Python runtime into its app data, then continues the selected download. **Set up model downloads** also lets you do this after a search error. No terminal, administrator access or restart is needed. You can leave Settings while a model downloads, return to see the outcome, or cancel. Downloading does not select a session model or install an inference runtime.
+  The library opens on local data: cached files and platform-filtered suggestions need no Hub search. Choose **Search online** for live results, or **Choose a downloaded model for this session…** to open the composer’s Downloaded filter without changing your selection.
+  Use an absolute path when overriding the cache. Desktop and the engine skip relative overrides (their working directories differ) and use the first absolute location from `HF_HUB_CACHE`, the legacy `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, or the normal user cache.
+  A missing cache is normal on first use. If Desktop cannot open the configured cache, it shows an error and **Retry cache scan** rather than reporting that nothing is downloaded.
+  If a managed model fails to load, the composer keeps the engine’s diagnostic with **Retry load** and **Choose another model**. Retrying targets that session and file; it does not resend a prompt.
   During a download, the library shows the progress the helper reports: bytes received or processed, a percentage, or files ready. Before the first measurement it shows a waiting message rather than estimating progress from elapsed time.
   Under **Downloaded**, **Remove file** removes one listed GGUF from one revision. Other files,
   revisions and shared blobs stay in place, so it may not free disk space. **Delete entire repo**
@@ -310,8 +319,8 @@ continues. Local builds without the release config do not contact Azure.
   Use the search button or <kbd>⌘/Ctrl</kbd>+<kbd>F</kbd> to find text in the open conversation,
   including reasoning and tool input or output. <kbd>Enter</kbd> and <kbd>Shift</kbd>+<kbd>Enter</kbd>
   step through individual occurrences, even within the same message.
-  A ring by the send button shows how full the model's context is; click it (or type `/compact`)
-  to summarize the conversation and free context.
+  Click the ring by the send button to view context usage, set the current model’s token limit, or change the local-model default for this project. The local default is also in **Settings → Overview → Local model context window**, where you can save it for every project instead. Choose **Auto** to follow the model or server capacity. To summarize history without changing the limit, choose **Compact conversation** or type `/compact`.
+  In **Settings → Overview → Default thinking level**, choose a level for new sessions or restore the inherited default. The choices come from the saved default model, even if this chat uses a different one. The composer’s reasoning controls still change only this session.
 - **Composer**: unsent text and images are saved locally per project and session, including across
   restarts. Enter clears the composer immediately and shows “Sending…” while it waits. If Dial rejects a submission or disconnects before confirming it, the draft remains
   available and is never resent automatically. Check the transcript before retrying an unconfirmed
@@ -357,7 +366,8 @@ continues. Local builds without the release config do not contact Azure.
     **Revert** discards every uncommitted change to the file (yours too) after a confirmation:
     tracked files return to `HEAD`, new files are deleted. **Revert hunk** undoes just one hunk in
     the working tree after a confirmation; a hunk that no longer matches the file is refused.
-    The Expand/Shrink choice is remembered per project. Each listed file has a checkbox that
+    Nested repositories report their own status and diffs, including when the project folder isn't a Git repository. Child-repository edits made outside the session appear separately. To stage, revert or commit there, open the child repository as the project.
+    The Expand/Shrink choice is remembered per project. Each listed file from the project's own repository has a checkbox that
     stages or unstages it (a dash means partly staged), the header shows the current branch, and
     **Review staged files** (⌘/Ctrl+Enter in the commit message) lists every staged path, including files
     staged outside this session. Check the list, then choose **Commit staged**. If the staged changes or

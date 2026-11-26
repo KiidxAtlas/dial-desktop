@@ -6,7 +6,7 @@ import { commandKey, shortcutLabel } from "../keysGuard";
 import { useTranscriptSearch } from "../transcriptSearch";
 import { hasQueuedFollowUp } from "../queue";
 import RecentlyDeleted from "./RecentlyDeleted.vue";
-import { installEngine, updateEngine, updates } from "../updates";
+import { engineUpdateAvailable, installEngine, needsEngineInstall, updateEngine, updates } from "../updates";
 import { focusComposer, openMenu, ui } from "../ui";
 import { clickKind, pickAfter } from "../picking";
 import { copyText, finishRename, goToSession, sessionGroups, sessionItems, startRename } from "../sessionActions";
@@ -24,6 +24,18 @@ const { results, searching, searchError, canExpand, loadMore, searchTranscripts 
   () => props.snap.workspace.root, () => ui.sessionFilter, computed(() => searchMessages.value && live.value), engine.searchTranscripts,
 );
 const visibleHits = computed(() => results.value?.hits.filter(hit => !isTypeSession(hit.session_id) && !hiddenSessions.has(hit.session_id)) ?? []);
+/** The title filter's last row: search every message for the same words. */
+async function searchAllMessages() {
+  searchMessages.value = true;
+  await nextTick();
+  searchTranscripts();
+}
+/** A settings page from the project menu. */
+function openSettings(page: "updates" | "health" | "usage") {
+  menuOpen.value = false;
+  ui.settingsTab = page;
+  ui.settingsOpen = true;
+}
 
 async function openHit(hit: TranscriptHit) {
   const jump = { ...hit, root: props.snap.workspace.root };
@@ -74,9 +86,10 @@ const status = computed(() => {
     case "preview":
       return { tone: "violet", text: "Design preview", retry: false };
     case "failed":
-      // The error itself, and what to do about it, is in the message above the conversation.
+      // The error itself, and what to do about it, is in the one banner above the conversation;
+      // the footer only names the state, without a second alarm colour.
       return {
-        tone: "danger",
+        tone: "faint",
         text: c.problem === "missing" ? "No Dial engine" : c.problem === "incompatible" ? "Engine needs an update" : "Engine could not start",
         retry: true,
       };
@@ -238,16 +251,17 @@ function onKey(event: KeyboardEvent) {
       </button>
       <form class="item search" @submit.prevent="searchTranscripts">
         <Icon name="search" :size="16" />
-        <input ref="searchInput" v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search titles'" :aria-label="searchMessages ? 'Search messages' : 'Search titles'" spellcheck="false" @keydown="onSearchKey" />
+        <input ref="searchInput" v-model="ui.sessionFilter" :placeholder="searchMessages ? 'Search messages' : 'Search'" :aria-label="searchMessages ? 'Search messages' : 'Search sessions'" spellcheck="false" @keydown="onSearchKey" />
+        <!-- Typing filters titles; the list's last row offers every message. In message mode this
+             chip says so and takes you back. -->
         <button
-          type="button" class="scope" :aria-pressed="searchMessages"
-          :title="searchMessages ? 'Searching every message in this project; click to search titles' : 'Searching titles; click to search every message in this project'"
-          @click="searchMessages = !searchMessages"
-        >{{ searchMessages ? 'Messages' : 'Titles' }}</button>
+          v-if="searchMessages"
+          type="button" class="scope" aria-pressed="true"
+          title="Searching every message in this project; click to search titles"
+          @click="searchMessages = false"
+        >Messages <Icon name="cross" :size="10" /></button>
       </form>
     </nav>
-
-    <SidebarTypes />
 
     <nav v-if="searchMessages" class="list" aria-label="Transcript search results">
       <p v-if="!live" class="empty">Message search needs the Dial engine running.</p>
@@ -317,7 +331,13 @@ function onKey(event: KeyboardEvent) {
           </template>
         </div>
       </template>
+      <button v-if="ui.sessionFilter.trim() && live" class="search-all" @click="searchAllMessages">
+        <Icon name="search" :size="13" />
+        <span class="truncate">Search all messages for “{{ ui.sessionFilter.trim() }}”</span>
+      </button>
     </nav>
+
+    <SidebarTypes />
 
     <Transition name="pop">
       <div v-if="ui.picked.size" class="picking">
@@ -372,6 +392,16 @@ function onKey(event: KeyboardEvent) {
           <button class="menu-row" @click="menuOpen = false; folders.choose(true)">
             <Icon name="external" :size="14" /> <span>Open folder in new window…</span>
           </button>
+          <div class="menu-divider" />
+          <button v-if="updates.app || engineUpdateAvailable()" class="menu-row" @click="openSettings('updates')">
+            <Icon name="download" :size="14" /> <span>Update available</span>
+          </button>
+          <button v-if="snap.workspace" class="menu-row" @click="openSettings('usage')">
+            <Icon name="activity" :size="14" /> <span>Usage & stats</span>
+          </button>
+          <button class="menu-row" @click="openSettings('health')">
+            <Icon name="shield" :size="14" /> <span>Health & setup</span>
+          </button>
         </div>
       </Transition>
       <button ref="projectButton" class="project-btn" :aria-expanded="menuOpen" :title="`${snap.workspace.root} · switch project`" @click="toggleMenu">
@@ -386,7 +416,7 @@ function onKey(event: KeyboardEvent) {
            here they are only offered while settings cover that banner. -->
       <template v-if="ui.settingsOpen">
         <button
-          v-if="snap.connection.state === 'failed' && snap.connection.problem === 'missing'"
+          v-if="snap.connection.state === 'failed' && needsEngineInstall(snap.connection.problem)"
           class="btn btn-primary retry"
           :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
           @click="installEngine()"
@@ -540,6 +570,9 @@ function onKey(event: KeyboardEvent) {
   color: var(--text-faint);
 }
 .scope {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   flex: none;
   padding: 2px 7px;
   border-radius: 999px;
@@ -948,4 +981,17 @@ function onKey(event: KeyboardEvent) {
 .hit { display: grid; gap: 4px; width: 100%; padding: 8px; text-align: left; border-radius: var(--radius-sm); }
 .hit:hover { background: var(--hover); }
 .hit span { color: var(--text-faint); overflow-wrap: anywhere; }
+.search-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: left;
+}
+.search-all:hover { background: var(--hover); color: var(--text); }
 </style>

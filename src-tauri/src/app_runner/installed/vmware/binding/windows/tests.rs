@@ -1,47 +1,42 @@
-//! Fixture tests for the Windows probe's parsing and identity rules. Nothing here starts a system
-//! tool: `netstat`, PowerShell and CIM are only exercised through their captured output.
+//! Fixture tests for numeric CIM socket rows and Windows process identity. No live VM needed.
 
 use super::*;
 
-const NETSTAT_FIXTURE: &str = "\
-Active Connections
+fn row(local: &str, local_port: u16, remote: &str, remote_port: u16, state: u32, pid: u32) -> serde_json::Value {
+    serde_json::json!({"LocalAddress":local, "LocalPort":local_port, "RemoteAddress":remote,
+        "RemotePort":remote_port, "State":state, "OwningProcess":pid})
+}
 
-  Proto  Local Address          Foreign Address        State           PID
-  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       900
-  TCP    127.0.0.1:903          0.0.0.0:0              LISTENING       4321
-  TCP    [::1]:903              [::]:0                 LISTENING       4321
-  TCP    127.0.0.1:903          127.0.0.1:50123        ESTABLISHED     4321
-  TCP    127.0.0.1:50123        127.0.0.1:903          ESTABLISHED     777
-  TCP    127.0.0.1:9000         0.0.0.0:0              LISTENING       555
-  UDP    0.0.0.0:5353           *:*                                    1234
-";
+fn fixture() -> Vec<Socket> {
+    let rows = [
+        row("0.0.0.0", 135, "0.0.0.0", 0, 2, 900),
+        row("127.0.0.1", 903, "0.0.0.0", 0, 2, 4321),
+        row("::1", 903, "::", 0, 2, 4321),
+        row("127.0.0.1", 903, "127.0.0.1", 50123, 5, 4321),
+        row("127.0.0.1", 50123, "127.0.0.1", 903, 5, 777),
+        row("127.0.0.1", 9000, "0.0.0.0", 0, 2, 555),
+    ];
+    parse_sockets(&serde_json::to_string(&rows).unwrap()).unwrap()
+}
 
 fn client() -> SocketAddr {
     "127.0.0.1:50123".parse().unwrap()
 }
 
 #[test]
-fn netstat_rows_skip_headers_and_udp() {
-    let sockets = parse_netstat(NETSTAT_FIXTURE).unwrap();
-    assert_eq!(sockets.len(), 6);
-    assert!(sockets.iter().all(|s| s.local.port() != 5353));
-}
-
-#[test]
-fn malformed_tcp_row_is_an_error_not_a_skip() {
-    let rows = [
-        "  TCP    127.0.0.1:903          0.0.0.0:0              LISTENING",
-        "  TCP    not-an-address:903     0.0.0.0:0              LISTENING       4321",
-        "  TCP    127.0.0.1:903          0.0.0.0:0              LISTENING       pid",
-    ];
-    for row in rows {
-        assert!(parse_netstat(row).is_err(), "accepted {row:?}");
+fn malformed_cim_row_invalidates_the_table_not_just_that_row() {
+    let good = row("127.0.0.1", 903, "0.0.0.0", 0, 2, 4321);
+    for (field, invalid) in [("LocalAddress", "unknown"), ("State", "ÉCOUTE"), ("OwningProcess", "pid")] {
+        let mut bad = good.clone();
+        bad[field] = invalid.into();
+        let rows = serde_json::json!([good, bad]);
+        assert!(parse_sockets(&rows.to_string()).is_err(), "{field}");
     }
 }
 
 #[test]
 fn listeners_are_every_row_on_exactly_the_port() {
-    let sockets = parse_netstat(NETSTAT_FIXTURE).unwrap();
+    let sockets = fixture();
     let listeners = listeners_in(&sockets, 903);
     assert_eq!(
         listeners,
@@ -61,7 +56,7 @@ fn listeners_are_every_row_on_exactly_the_port() {
 
 #[test]
 fn connection_owner_is_the_server_end_for_the_exact_client() {
-    let sockets = parse_netstat(NETSTAT_FIXTURE).unwrap();
+    let sockets = fixture();
     let cases = [
         // (port, client, expected owner)
         (903, client(), Some(4321)),
@@ -79,21 +74,16 @@ fn connection_owner_is_the_server_end_for_the_exact_client() {
 
 #[test]
 fn connection_owner_refuses_a_non_loopback_server_end() {
-    let text = "\
-  TCP    10.0.0.5:903           10.0.0.9:50123         ESTABLISHED     4321
-";
-    let sockets = parse_netstat(text).unwrap();
+    let sockets = parse_sockets(&serde_json::json!([row("10.0.0.5", 903, "10.0.0.9", 50123, 5, 4321)]).to_string()).unwrap();
     let peer: SocketAddr = "10.0.0.9:50123".parse().unwrap();
     assert_eq!(owner_of(&sockets, 903, peer), None);
 }
 
 #[test]
 fn connection_owner_refuses_two_different_owners() {
-    let text = "\
-  TCP    127.0.0.1:903          127.0.0.1:50123        ESTABLISHED     4321
-  TCP    127.0.0.1:903          127.0.0.1:50123        ESTABLISHED     4322
-";
-    let sockets = parse_netstat(text).unwrap();
+    let rows = serde_json::json!([row("127.0.0.1", 903, "127.0.0.1", 50123, 5, 4321),
+        row("127.0.0.1", 903, "127.0.0.1", 50123, 5, 4322)]);
+    let sockets = parse_sockets(&rows.to_string()).unwrap();
     assert_eq!(owner_of(&sockets, 903, client()), None);
 }
 
@@ -141,6 +131,20 @@ fn executable_with_parent_segment_is_refused() {
     ];
     for (path, refused) in cases {
         assert_eq!(has_parent_segment(path), refused, "{path}");
+    }
+}
+
+#[test]
+fn only_exact_vmx_binaries_under_the_machine_install_dir_are_trusted() {
+    let root = PathBuf::from(r"D:\Programme\VMware\VMware Workstation");
+    for (exe, expected) in [
+        (root.join(r"x64\vmware-vmx.exe"), true),
+        (root.join(r"..\evil\vmware-vmx.exe"), false),
+        (root.with_file_name("VMware Workstation-old").join("vmware-vmx.exe"), false),
+        (root.join("vmware-vmx.exe.bak"), false),
+        (PathBuf::from(r"C:\Programme\VMware\VMware Workstation\vmware-vmx.exe"), false),
+    ] {
+        assert_eq!(trusted_executable(&exe, std::iter::once(root.clone())), expected);
     }
 }
 

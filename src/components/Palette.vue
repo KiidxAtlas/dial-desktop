@@ -3,7 +3,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import type { OpenSnapshot } from "../types";
 import { ui } from "../ui";
-import { commands, filterCommands, highlightMatch, type Command } from "../commands";
+import { commands, filterCommands, highlightMatch, slashOf, type Command } from "../commands";
 import Icon, { PATHS } from "./Icon.vue";
 import { shortcutLabel } from "../keysGuard";
 import { workspaceFiles } from "../bridge";
@@ -34,7 +34,30 @@ watch(() => [ui.filePalette, ui.paletteOpen, props.snap.workspace.root, query.va
   }, 100);
   cleanup(() => { current = false; clearTimeout(timer); });
 });
-const results = computed<Command[]>(() => ui.filePalette ? paths.value.map(path => ({ id: path, group: "Project files", label: path, icon: "file", run: () => showFile(path) })) : filterCommands(commands(props.snap), query.value));
+/** The last few commands run, newest first, shown above everything else before you type. */
+const RECENT_KEY = "dial.paletteRecent";
+const RECENT_MAX = 4;
+function readRecent(): string[] {
+  try {
+    const ids = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string").slice(0, RECENT_MAX) : [];
+  } catch {
+    return [];
+  }
+}
+const recent = ref<string[]>(readRecent());
+function remember(id: string) {
+  recent.value = [id, ...recent.value.filter((r) => r !== id)].slice(0, RECENT_MAX);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(recent.value));
+}
+const results = computed<Command[]>(() => {
+  if (ui.filePalette) return paths.value.map(path => ({ id: path, group: "Project files", label: path, icon: "file", run: () => showFile(path) }));
+  const found = filterCommands(commands(props.snap), query.value);
+  if (query.value.trim()) return found;
+  // Sessions and projects change between visits; only actions are worth repeating.
+  const again = recent.value.map((id) => found.find((c) => c.id === id)).filter((c): c is Command => !!c && !c.id.startsWith("session-") && !c.id.startsWith("project-"));
+  return [...again.map((c) => ({ ...c, group: "Recent" })), ...found.filter((c) => !again.includes(c))];
+});
 /** Results under group headings, keeping their ranked order; `index` counts across groups. */
 const groups = computed(() => {
   const out: { name: string; items: { command: Command; index: number }[] }[] = [];
@@ -80,6 +103,7 @@ function close() {
 
 function run(command: Command | undefined) {
   if (!command) return;
+  if (!ui.filePalette) remember(command.id);
   close();
   command.run();
 }
@@ -155,6 +179,7 @@ function onKey(event: KeyboardEvent) {
               <span v-else class="blank" />
               <span class="label truncate"><template v-for="(part, p) in highlightMatch(command.label, query)" :key="p"><mark v-if="part.hit">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template></span>
               <kbd v-if="command.hint">{{ shortcutLabel(command.hint, mac) }}</kbd>
+              <span v-else-if="slashOf(command)" class="slash" :title="`${slashOf(command)} does the same in the terminal`">{{ slashOf(command) }}</span>
             </button>
           </template>
         </div>
@@ -272,6 +297,13 @@ button {
 }
 kbd {
   flex: none;
+}
+/* The terminal command for the same action: one name to learn across both apps. */
+.slash {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
 }
 .none {
   margin: 14px 10px;

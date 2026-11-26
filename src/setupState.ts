@@ -21,6 +21,9 @@ export function welcomeSteps(engine: EngineUpdateView | null, checking: boolean)
   } else if (engine.state === "missing") {
     state = "next";
     detail = "Not found on this computer. Install a copy for Desktop below.";
+  } else if (engine.state === "unlaunchable") {
+    state = "next";
+    detail = `The selected engine could not start: ${engine.error}`;
   } else if (engine.state === "failed") {
     state = "problem";
     detail = `Could not check the engine: ${engine.error}`;

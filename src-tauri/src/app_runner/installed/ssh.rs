@@ -8,7 +8,6 @@
 //! SSH stays subject to the `ssh` tool's own approvals.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -119,11 +118,7 @@ pub(crate) fn save(data_dir: &Path, vm_id: &str, host: Option<&str>) -> Result<(
 
 /// The user's SSH config file, when the home folder is known and absolute.
 fn user_config() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
+    crate::launcher::home_dir()
         .map(|home| home.join(".ssh").join("config"))
 }
 

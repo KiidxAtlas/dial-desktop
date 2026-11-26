@@ -176,9 +176,23 @@ impl Report {
     }
 }
 
-pub(super) fn drain(mut reader: impl Read, report: &Arc<Mutex<Report>>) {
+pub(super) fn drain_snapshot(
+    pipe: &mut std::process::ChildStderr,
+    line: &mut Vec<u8>,
+    report: &Arc<Mutex<Report>>,
+) -> std::io::Result<()> {
+    let ready = crate::launcher::pipe_available(pipe)?;
+    drain_records(pipe.take(ready), line, report);
+    Ok(())
+}
+
+#[cfg(test)]
+fn drain(reader: impl Read, report: &Arc<Mutex<Report>>) {
+    drain_records(reader, &mut Vec::new(), report);
+}
+
+fn drain_records(mut reader: impl Read, line: &mut Vec<u8>, report: &Arc<Mutex<Report>>) {
     let mut buffer = [0; 4096];
-    let mut line = Vec::new();
     while let Ok(n) = reader.read(&mut buffer) {
         if n == 0 {
             break;
@@ -187,7 +201,7 @@ pub(super) fn drain(mut reader: impl Read, report: &Arc<Mutex<Report>>) {
         for &b in &buffer[..n] {
             if matches!(b, b'\n' | b'\r') {
                 if !line.is_empty() {
-                    report.observe(&line);
+                    report.observe(line);
                 }
                 line.clear();
             } else if line.len() < 2048 {
@@ -197,7 +211,7 @@ pub(super) fn drain(mut reader: impl Read, report: &Arc<Mutex<Report>>) {
         // tqdm writes CR *before* the next update. Don't wait for another record (or EOF)
         // to publish the last flushed counter. Delimited fields ignore partial pipe writes.
         if !line.is_empty() {
-            report.observe(&line);
+            report.observe(line);
         }
     }
 }
@@ -260,7 +274,9 @@ mod tests {
                 }
             }
             let (a, b) = record.as_bytes().split_at(12);
-            drain(a.chain(b).chain(BeforeEof(&report, n)), &report);
+            let mut line = Vec::new();
+            drain_records(a, &mut line, &report);
+            drain_records(b.chain(BeforeEof(&report, n)), &mut line, &report);
             assert_eq!(
                 report.lock().unwrap().metrics,
                 Metrics {

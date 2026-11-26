@@ -267,6 +267,7 @@ impl AppRunner {
         requested: Option<&str>,
         origin: Origin,
     ) -> Result<RunInfo, AppRunError> {
+        let _start = crate::app::starting_service(&self.inner.app).map_err(|e| start_failed(&e))?;
         let id = requested
             .filter(|id| !id.is_empty() && id.len() <= 256)
             .ok_or_else(|| start_failed("Choose an exact VM id from App → VM."))?;

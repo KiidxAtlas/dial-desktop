@@ -38,6 +38,11 @@ export interface Command {
   run: () => void;
 }
 
+/** The terminal's slash command for the same action, from the first `/word` in `keywords`. */
+export function slashOf(command: Pick<Command, "keywords">): string | null {
+  return command.keywords?.match(/(?:^|\s)(\/[a-z][a-z-]*)/)?.[1] ?? null;
+}
+
 export const conversationFindOpen = ref(false);
 
 function openConversationFind() {
@@ -71,7 +76,7 @@ export function commands(snap: OpenSnapshot): Command[] {
     live && (snap.voice.phase !== "off" || !snap.turnRunning),
   );
   if (session) {
-    add({ id: "rename", group: "Session", label: "Rename session", icon: "pencil", run: () => startRename(session.id, "title") });
+    add({ id: "rename", group: "Session", label: "Rename session", icon: "pencil", hint: "F2", run: () => startRename(session.id, "title") });
     add({
       id: "pin",
       group: "Session",
@@ -186,21 +191,22 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "zoom-out", group: "View", label: "Zoom out", icon: "minus", hint: "⌘−", keywords: "smaller text size", run: () => zoomBy(-1) });
   add({ id: "zoom-reset", group: "View", label: "Actual size", hint: "⌘0", keywords: "zoom reset", run: () => zoomBy(0) }, appearance.zoom !== 1);
 
-  add({ id: "settings", group: "App", label: "Settings", icon: "gear", hint: "⌘,", keywords: "preferences background", run: () => (ui.settingsOpen = true) });
+  add({ id: "settings", group: "App", label: "Settings", icon: "gear", hint: "⌘,", keywords: "preferences background /settings", run: () => (ui.settingsOpen = true) });
   const page = (tab: SettingsTab) => () => { ui.settingsTab = tab; ui.settingsOpen = true; };
-  add({ id: "roles", group: "Project", label: "Model roles & presets", icon: "gear", keywords: "roles presets small task coach tester memory /modelpreset", run: page("roles") }, live);
-  add({ id: "library", group: "App", label: "Model library", icon: "gear", keywords: "download local models mlx gguf hugging face delete", run: page("library") });
-  add({ id: "providers", group: "App", label: "Providers & sign-in", icon: "gear", keywords: "login account api key provider settings", run: page("providers") });
-  add({ id: "images", group: "App", label: "Image generation settings", icon: "gear", keywords: "image model picture flux", run: page("images") });
-  add({ id: "appearance", group: "App", label: "Appearance settings", icon: "gear", keywords: "theme background zoom cards diagrams", run: page("appearance") });
-  add({ id: "usage", group: "Project", label: "Usage limits & stats", icon: "gear", keywords: "usage cost tokens stats limits context /usage /stats /cost", run: page("usage") }, live);
-  add({ id: "memory", group: "Project", label: "What Dial remembers", icon: "gear", keywords: "memory facts remember forget /memory", run: page("memory") }, live);
+  // Labels match the Settings menu, and each names its terminal command, so one name works in both.
+  add({ id: "roles", group: "Project", label: "Roles & presets", icon: "gear", keywords: "/models roles presets small task coach tester memory /modelpreset", run: page("roles") }, live);
+  add({ id: "library", group: "App", label: "Model library", icon: "gear", keywords: "/models download local models mlx gguf hugging face delete", run: page("library") });
+  add({ id: "providers", group: "App", label: "Providers", icon: "gear", keywords: "login account api key provider settings sign-in /providers", run: page("providers") });
+  add({ id: "images", group: "App", label: "Image generation", icon: "gear", keywords: "image model picture flux /images", run: page("images") });
+  add({ id: "appearance", group: "App", label: "Appearance", icon: "gear", keywords: "theme background zoom cards diagrams /theme", run: page("appearance") });
+  add({ id: "usage", group: "Project", label: "Usage & stats", icon: "gear", keywords: "usage cost tokens stats limits context /stats /usage /cost", run: page("usage") }, live);
+  add({ id: "memory", group: "Project", label: "Memory", icon: "gear", keywords: "what dial remembers memory facts remember forget /memory", run: page("memory") }, live);
   add({ id: "skills", group: "Project", label: "Skills", icon: "gear", keywords: "skills install enable /skills", run: page("skills") }, live);
-  add({ id: "extensions", group: "Project", label: "Extensions & MCP servers", icon: "gear", keywords: "mcp extensions plugins /extensions", run: page("extensions") }, live);
-  add({ id: "checks", group: "Project", label: "Checks after edits", icon: "gear", keywords: "checks tests lint verify /checks", run: page("checks") }, live);
+  add({ id: "extensions", group: "Project", label: "Extensions", icon: "gear", keywords: "mcp servers extensions plugins /extensions", run: page("extensions") }, live);
+  add({ id: "checks", group: "Project", label: "Checks", icon: "gear", keywords: "checks after edits tests lint verify /checks", run: page("checks") }, live);
   add({ id: "folders", group: "Project", label: "Extra folders", icon: "gear", keywords: "dirs add-dir directories folders /dirs", run: page("folders") }, live);
   add({ id: "schedules", group: "Project", label: "Schedules", icon: "gear", keywords: "schedule cron recurring timer /schedule", run: page("schedules") }, live);
-  add({ id: "permissions", group: "Project", label: "Permission rules", icon: "gear", keywords: "permissions allow deny rules approval always never /permissions", run: page("permissions") }, live);
+  add({ id: "permissions", group: "Project", label: "Permissions", icon: "gear", keywords: "permission rules allow deny approval always never /permissions", run: page("permissions") }, live);
   // Workflows the engine serves in its own terminal UI; they open in the Terminal panel.
   const inTerminal = (command: string) => () => runInTerminal(command);
   add({ id: "ai-commit", group: "Git", label: "Write a commit message with AI", icon: "diff", keywords: "commit message generate git dry run /commit", run: () => { ui.settingsOpen = false; ui.inspectorOpen = true; showPanel("changes"); showToast("Stage files, then choose Write with AI above the message box"); } }, live);
@@ -345,52 +351,53 @@ export function highlightMatch(label: string, query: string): { text: string; hi
   return out;
 }
 
-export const SHORTCUTS: { group: string; keys: [string, string][] }[] = [
+/** The shortcuts sheet: keys, a short label, and the fine print shown on hover. */
+export const SHORTCUTS: { group: string; keys: [keys: string, what: string, detail?: string][] }[] = [
   {
     group: "General",
     keys: [
       ["⌘K", "Command palette"],
-      ["⌘P", "Quick-open project file"],
+      ["⌘P", "Open a project file"],
       ["⌘N", "New session"],
       ["⌘,", "Settings"],
       ["⌘/", "Keyboard shortcuts"],
-      ["⌘B", "Show or hide the sidebar"],
-      ["⌥⌘I", "Show or hide plan and changes"],
+      ["⌘B", "Sidebar"],
+      ["⌥⌘I", "Plan and changes"],
       ["⇧⌘B", "Browser"],
       ["⇧⌘E", "Files"],
       ["⌃`", "Terminal"],
-      ["⌘+  ⌘−  ⌘0", "Zoom in, out, actual size"],
+      ["⌘+  ⌘−  ⌘0", "Zoom", "Zoom in, zoom out, actual size"],
       ["⌘L", "Focus the message box"],
     ],
   },
   {
     group: "Conversation",
     keys: [
-      ["Enter", "Send (while Dial works: add a note)"],
+      ["Enter", "Send", "While Dial works, Enter adds a note to the running turn"],
       ["⇧Enter", "New line"],
-      ["⌥⌘↑ / ⌥⌘↓", "Previous / next prompt you sent"],
-      ["⌘Enter", "Queue a follow-up during a turn"],
-      ["@", "Find and insert a project file path"],
-      ["⌘F", "Find in conversation"],
-      ["↑  ↓", "Earlier prompts (in an empty box)"],
-      ["Esc", "Stop the turn (an open menu closes first; not from the terminal or other fields)"],
-      ["⇧⌘M", "Change model"],
-      ["⇧⌘V", "Voice: start talking, stop recording, or interrupt a spoken reply"],
+      ["⌘Enter", "Queue a follow-up", "During a turn: sent once the turn ends"],
+      ["⌥⌘↑ / ⌥⌘↓", "Previous / next prompt"],
+      ["↑  ↓", "Earlier prompts", "In an empty message box"],
+      ["@", "Mention a file", "Find and insert a project file path"],
       ["/", "Slash commands"],
-      ["Enter  ⌘⌫", "Approval card: allow once (Allow has focus) / deny"],
+      ["⌘F", "Find in conversation"],
+      ["Esc", "Stop the turn", "An open menu closes first. Not from the terminal or other text fields"],
+      ["⇧⌘M", "Change model"],
+      ["⇧⌘V", "Voice", "Start talking, stop recording, or interrupt a spoken reply"],
+      ["Enter  ⌘⌫", "Allow / deny", "On an approval card: Enter allows once while Allow has focus; ⌘⌫ denies"],
     ],
   },
   {
     group: "Sessions",
     keys: [
-      ["⌘-click  ⇧-click", "Select several"],
-      ["⌘A", "Select all (in the session list with a selection)"],
-      ["⌫", "Move selected to Recently Deleted"],
-      ["⌘1 … ⌘9", "Open a session by position (hold the modifier to see numbers)"],
-      ["⇧⌘[  ⇧⌘]", "Previous or next session"],
-      ["⌃⇧Tab  ⌃Tab", "Cycle sessions backward or forward"],
-      ["⇧⌘F", "Search sessions (Esc clears)"],
+      ["⌘1 … ⌘9", "Open by position", "Hold ⌘ to see the numbers"],
+      ["⇧⌘[  ⇧⌘]", "Previous / next session"],
+      ["⌃⇧Tab  ⌃Tab", "Cycle sessions"],
+      ["⇧⌘F", "Search sessions", "Esc clears the search"],
       ["F2  double-click", "Rename"],
+      ["⌘-click  ⇧-click", "Select several"],
+      ["⌘A", "Select all", "In the session list, once something is selected"],
+      ["⌫", "Delete selected", "Moves them to Recently Deleted"],
       ["Right-click", "Session actions"],
     ],
   },

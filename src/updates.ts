@@ -5,11 +5,16 @@ import { reactive } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { engine, showToast, snapshot, updatesApi } from "./bridge";
-import type { EngineUpdateView } from "./types";
+import type { EngineProblem, EngineUpdateView } from "./types";
 import { createAppInstaller, restartBlocked } from "./appInstaller";
 
 const RECHECK_MS = 6 * 60 * 60 * 1000;
 const installer = createAppInstaller<Update>(() => restartBlocked(snapshot.value), updatesApi);
+
+/** Both connection failures and update checks can offer a separate, signed engine. */
+export function needsEngineInstall(state: EngineProblem | EngineUpdateView["state"] | undefined) {
+  return state === "missing" || state === "unlaunchable";
+}
 
 export const updates = reactive({
   /** The app's own version. */
@@ -133,7 +138,7 @@ export async function installEngine() {
   updates.engineError = "";
   updates.engineLog = "";
   try {
-    const confirmed = await ask("Desktop will install a signed Dial release in its own folder and select it for new connections. Your existing engine will not be replaced. On Windows the installer also adds the folder to your user PATH. An explicit engine override still wins on the next launch.", {
+    const confirmed = await ask("Desktop will install a signed Dial release in its own folder and select it for new connections. Your existing engine will not be replaced. Desktop requests no PATH changes, but older Windows installers may add the folder to your user PATH. An explicit engine override still wins on the next launch.", {
       title: "Install a separate Dial engine?", okLabel: "Install Desktop copy", cancelLabel: "Cancel",
     });
     if (!confirmed) return;

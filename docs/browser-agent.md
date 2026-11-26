@@ -1,8 +1,9 @@
 # The agent drives the Browser panel
 
 Dial (the agent) can open pages in Dial Desktop's Browser panel, read them, click, type and take
-screenshots, in the same web view the user watches. This note explains how, and why it is built
-this way.
+screenshots, in the same web view the user watches. When the panel tools are available, this is
+the default for ordinary browsing, including local dev servers. Ask for standalone Chromium when
+you want a separate session or need a Playwright feature such as tracing.
 
 ## How it fits together
 
@@ -16,11 +17,12 @@ dial rpc (engine) ──stdio MCP──▶ dial-desktop --browser-mcp (bridge)
                               Browser panel web view
 ```
 
-- **Registration** (`agent_browser::register`, called from `main.rs` before any engine starts):
-  the app makes sure Dial's global setting `mcp.dial_desktop` runs this very binary with
-  `--browser-mcp`. It reads the entry with `dial config get mcp.dial_desktop --json` and writes it
-  with `dial config set` only when the program path changed. An entry you set to
-  `enabled = false` stays off. Preview mode (`--preview`) does not register.
+- **Registration** (`agent_browser::register`): before starting a live engine, and again when
+  installing or selecting one for new connections, Desktop checks the global MCP table with
+  `dial config get mcp --json` in an empty project directory. It only sets `mcp.dial_desktop` if
+  missing or pointing at the wrong bridge. Failed reads do not cause writes. `enabled = false`
+  stays off, and per-project overrides still apply when a session starts. Preview mode does not
+  register, and switching engines does not restart running work.
 - **The bridge** (`browser_mcp.rs`) is a stdio MCP server (one JSON-RPC message per line):
   `initialize`, `ping`, `tools/list`, `tools/call`. It holds no browser. Each call goes to the
   running app. With no app running it lists no tools, so Dial sessions in a terminal see nothing.
@@ -31,7 +33,9 @@ dial rpc (engine) ──stdio MCP──▶ dial-desktop --browser-mcp (bridge)
   The bridge matches its project directory to one live window; zero or ambiguous matches are not routed. The app checks the project again on every authenticated call.
 - **The tools** run small scripts in the page through `eval_with_callback`, so they work with each
   platform's system web view; nothing needs the Chrome DevTools Protocol, which WKWebView and
-  WebKitGTK lack. Screenshots use WebKit's own `takeSnapshot` (macOS only for now).
+  WebKitGTK lack. Browser panel screenshots use WebKit's `takeSnapshot` on macOS and WebView2's
+  `CapturePreview` on Windows. Both capture only the page, not the surrounding Desktop window.
+  Browser, window and Type screenshots use the same output budget: oversized captures are downsampled before base64 encoding to fit both the model's 5 MiB image limit and the engine's MCP message limit. Sources over 64 MiB are refused.
 
 Why a stdio bridge and not a URL server: the engine clears the environment of MCP children and
 offers no per-launch config overlay, so a URL server would need its port and token written into
@@ -50,7 +54,7 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 | `browser_click(ref \| selector \| name)` | Click (pointer and mouse events, then `click`); waits for a load it starts |
 | `browser_type(target, text, clear?, submit?)` | Fill a field (works with React/Vue inputs) or editable element |
 | `browser_select(target, option)` | Choose a `<select>` option by value or text |
-| `browser_press(key)` | Key events in the focused element; Enter submits a form |
+| `browser_press(key)` | Page keyboard events, with in-page Tab/Shift+Tab, typing/deletion and left/right caret movement in plain text controls, up/down in single selects, and Enter/Space activation on applicable controls. Escape and keys without an implemented default send events only; native browser/OS shortcuts are not supported. |
 | `browser_scroll(direction \| target)` | Scroll up, down, top, bottom, or to an element |
 | `browser_navigate(action)` | Back, forward, reload |
 | `browser_wait(text?, timeout_ms?)` | Wait for text to show (up to 30 s) |
@@ -149,4 +153,4 @@ Use the returned run ID with the usual `frame` and `input` actions. A VM already
 - Should the agent's browsing get its own approval rule (for example, ask before leaving
   localhost)?
 - Separate cookie stores for agent sessions?
-- Screenshots on Windows (WebView2 `CapturePreview`) and Linux.
+- Browser panel screenshots on Linux.

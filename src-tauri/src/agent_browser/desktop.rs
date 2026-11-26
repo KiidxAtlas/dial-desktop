@@ -350,16 +350,11 @@ fn tabs(rows: &[SettingView]) -> String {
 
 #[cfg(target_os = "macos")]
 fn screenshot(app: &AppHandle, text: String) -> Result<Reply, String> {
-    use base64::Engine;
     let view = app
         .get_webview("main")
         .ok_or("The Dial Desktop window is not open")?;
     let png = super::screenshot::capture(&view, None)?;
-    Ok(Reply {
-        ok: true,
-        text,
-        image: Some(base64::engine::general_purpose::STANDARD.encode(png)),
-    })
+    super::screenshot_wire::reply(text, png)
 }
 
 #[cfg(not(target_os = "macos"))]

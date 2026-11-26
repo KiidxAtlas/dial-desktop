@@ -1,12 +1,12 @@
 <script setup lang="ts">
 // The model switcher in the composer, like `/model` in a terminal agent: search, pick, and set
 // how hard the model thinks. The choice applies to this session.
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, toRef, watch } from "vue";
 import type { LocalModelRemoval, ModelOption, OpenSnapshot } from "../types";
 import { engine, models, settings, settingsPage, showToast } from "../bridge";
 import { engineCall, loadModes, modes } from "../engineTools";
 import { focusComposer, ui } from "../ui";
-import { buildPickerGroups, pickerProviders, usableModels, type PickerFilter } from "../modelPicker";
+import { buildPickerGroups, pickerProviders, usableModels } from "../modelPicker";
 import { lastRequestLabel, selectedRoute, type RequestObservation } from '../setupState';
 import { normalizeArrowKey } from "../macKeys";
 import Icon from "./Icon.vue";
@@ -17,7 +17,7 @@ const root = ref<HTMLElement | null>(null);
 const search = ref<HTMLInputElement | null>(null);
 const query = ref("");
 const active = ref(0);
-const filter = ref<PickerFilter>("all");
+const filter = toRef(ui, 'modelPickerFilter');
 const expandedProviders = ref<Set<string>>(new Set());
 const downloadedOnly = computed(() => filter.value === "downloaded");
 const details = ref<{ row: ModelOption; plan?: LocalModelRemoval; error?: string } | null>(null);
@@ -254,7 +254,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
     <button
       class="trigger"
       :disabled="!usable"
-      :title="snap.loadingLocalModel ? `Loading ${snap.loadingLocalModel}` : `Model and session modes · ${current?.label ?? 'Choose model'}`" :aria-expanded="ui.modelPickerOpen"
+      :title="snap.loadingLocalModel ? `Loading ${snap.loadingLocalModel}` : current && snap.connection.state === 'live' ? `${current.label} · ${current.provider || 'unknown provider'}/${current.modelId}\n${selectedRoute(current, models)}. ${lastRequestLabel(current, lastRequest)}.` : `Model and session modes · ${current?.label ?? 'Choose model'}`" :aria-expanded="ui.modelPickerOpen"
       @click.stop="ui.modelPickerOpen ? close() : open()"
     >
       <Icon name="chip" :size="14" />
@@ -274,15 +274,13 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 
     <Transition name="pop">
       <div v-if="ui.modelPickerOpen" class="menu" @click.stop @keydown.esc.stop="close()">
-        <div v-if="snap.connection.state === 'live'" class="filters" role="group" aria-label="Session settings">
+        <div v-if="snap.connection.state === 'live'" class="filters tabs" role="group" aria-label="Session settings">
           <button :aria-pressed="!modesPage" @click="modesPage = false; nextTick(() => search?.focus())">Model</button>
           <button :aria-pressed="modesPage" @click="showModes">Session modes</button>
-          <button @click="close(false); ui.settingsTab = 'providers'; ui.settingsOpen = true">Set up a provider…</button>
         </div>
         <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
         <template v-else>
         <p v-if="snap.turnRunning" class="empty">Changes apply to this session after the running turn.</p>
-        <p v-if="snap.connection.state === 'live'" class="empty">{{ current ? `${current.provider || 'Unknown provider'} / ${current.modelId}` : 'Selected route' }} · {{ selectedRoute(current, models) }}. {{ lastRequestLabel(current, lastRequest) }}. No test request made.</p>
         <label class="search">
           <Icon name="search" :size="14" />
           <input ref="search" v-model="query" placeholder="Search models" spellcheck="false" @keydown="onKey" />
@@ -290,28 +288,30 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
             <Icon name="refresh" :size="13" />
           </button>
         </label>
-        <div class="filters" role="group" aria-label="Model source">
+        <!-- One row of filters: where models come from, then each provider. -->
+        <div class="providers" role="group" aria-label="Show models from">
           <button :aria-pressed="filter === 'all'" @click="filter = 'all'">All</button>
           <button :aria-pressed="filter === 'downloaded'" @click="filter = 'downloaded'">Downloaded</button>
-          <button @click="close(false); ui.settingsTab = 'library'; ui.settingsOpen = true">Get models…</button>
-          <button title="Helper models for background work, and saved model sets" @click="close(false); ui.settingsTab = 'roles'; ui.settingsOpen = true">Roles &amp; presets…</button>
-        </div>
-        <div v-if="providers.length > 1" class="providers" role="group" aria-label="Filter by provider">
-          <button
-            v-for="p in providers"
-            :key="p.provider"
-            :aria-pressed="filter === p.provider"
-            @click="filter = filter === p.provider ? 'all' : p.provider"
-          >
-            {{ p.provider }} <span class="count">{{ p.count }}</span>
-          </button>
+          <template v-if="providers.length > 1">
+            <button
+              v-for="p in providers"
+              :key="p.provider"
+              :aria-pressed="filter === p.provider"
+              @click="filter = filter === p.provider ? 'all' : p.provider"
+            >
+              {{ p.provider }} <span class="count">{{ p.count }}</span>
+            </button>
+          </template>
         </div>
 
         <div class="list">
           <p v-if="downloadedOnly && cleanedModels.length && !cleanedModels.some((m) => m.local)" class="empty">
             No downloaded models found by Dial. After adding a local model, reload this list.
           </p>
-          <p v-else-if="!cleanedModels.length" class="empty">No models listed yet. Use reload to check again.</p>
+          <div v-else-if="!cleanedModels.length" class="empty none">
+            <span>Couldn’t find any models yet. Sign in to a provider or download a model, then reload.</span>
+            <button class="btn btn-secondary" @click="engine.refreshModels()"><Icon name="refresh" :size="13" /> Reload</button>
+          </div>
           <p v-else-if="!groups.length" class="empty">No model matches “{{ query }}”.</p>
           <template v-for="group in groups" :key="group.title">
             <div class="group">{{ group.title }}</div>
@@ -347,7 +347,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         </div>
         <p v-if="changingEngine" class="empty" role="status">Preparing the engine choice…</p>
         <div v-if="downloadedOnly" class="model-details">
-          <p v-if="!details">Add models outside Desktop, then reload this list.</p>
+          <p v-if="!details">Choose a model above to load it, or get more from the model library.</p>
           <template v-else>
             <strong>{{ details.row.label }}</strong>
             <p v-if="details.error" role="alert">{{ details.error }}</p>
@@ -378,12 +378,17 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
             </button>
           </div>
         </div>
+        <div class="more-links">
+          <button class="link" @click="close(false); ui.settingsTab = 'providers'; ui.settingsOpen = true"><Icon name="globe" :size="13" /> Providers…</button>
+          <button class="link" @click="close(false); ui.settingsTab = 'library'; ui.settingsOpen = true"><Icon name="download" :size="13" /> Get models…</button>
+          <button class="link" title="Helper models for background work, and saved model sets" @click="close(false); ui.settingsTab = 'roles'; ui.settingsOpen = true"><Icon name="list" :size="13" /> Roles &amp; presets…</button>
+        </div>
         <div class="foot">
-          <span>↑↓ to move · Enter to switch · Esc to close · applies to this session</span>
           <span v-if="snap.connection.state === 'live'" class="default-model">
-            Default for new sessions: <span class="mono" :title="defaultModel ?? undefined">{{ defaultModel ?? "engine default" }}</span> ·
+            New sessions use <span :class="{ mono: defaultModel }" :title="defaultModel ?? undefined">{{ defaultModel ?? "the engine default" }}</span> ·
             <button class="link" title="Change the default in Settings" @click="changeDefault">Change</button>
           </span>
+          <span class="keys"><kbd>↑↓</kbd> <kbd>↵</kbd> <kbd>esc</kbd></span>
         </div>
         </template>
       </div>
@@ -509,6 +514,18 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   color: var(--text);
   background: var(--hover);
 }
+/* Model / Session modes: one segmented switch, the only navigation in the menu. */
+.filters.tabs {
+  padding: 8px 10px;
+}
+.filters.tabs button {
+  flex: 1;
+  padding: 5px 8px;
+}
+.filters.tabs button[aria-pressed="true"] {
+  background: var(--active);
+  font-weight: 500;
+}
 .providers {
   display: flex;
   gap: 4px;
@@ -563,6 +580,33 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   margin: 14px 8px;
   font-size: var(--text-sm);
   color: var(--text-faint);
+}
+.empty.none {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  line-height: 1.5;
+}
+.more-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
+.more-links .link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.more-links .link:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 .group {
   padding: 10px 8px 4px;
@@ -628,35 +672,48 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
   padding: 10px 12px;
   border-top: 1px solid var(--border);
 }
+/* Reasoning: a segmented control, like every other one-of-several choice. */
 .chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--active);
 }
 .chip {
   height: 24px;
-  padding: 0 9px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
+  padding: 0 10px;
+  border-radius: 6px;
   font-size: var(--text-sm);
   color: var(--text-muted);
   text-transform: capitalize;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
 .chip:hover {
   color: var(--text);
 }
 .chip.on {
-  border-color: transparent;
-  background: var(--active);
+  background: var(--raised);
   color: var(--text);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 14%), 0 0 0 1px var(--border);
 }
 .faint {
   color: var(--text-faint);
   text-transform: none;
 }
+.foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
 .foot .default-model {
-  display: block;
-  margin-top: 3px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -671,11 +728,15 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 .foot .link:hover {
   text-decoration: underline;
 }
-.foot {
-  padding: 7px 12px;
-  border-top: 1px solid var(--border);
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+.foot .keys {
+  flex: none;
+  margin-left: auto;
+}
+.foot kbd {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--hover);
+  font: inherit;
 }
 .pop-enter-active,
 .pop-leave-active {

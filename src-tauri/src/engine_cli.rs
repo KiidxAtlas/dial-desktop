@@ -298,6 +298,8 @@ pub struct CliLink {
     pub link: PathBuf,
     /// `link` already runs `engine`.
     pub linked: bool,
+    /// Only Desktop's complete, unmodified shim can be updated or removed.
+    pub managed: bool,
     /// `link`'s folder is on this process's PATH (which includes the login shell's).
     pub on_path: bool,
     /// A different `dial` the terminal finds first, if any.
@@ -308,8 +310,11 @@ pub struct CliLink {
     pub shell: Option<ShellPath>,
 }
 
-/// First line of the Windows shim, so only our own file is ever replaced.
-const SHIM_MARK: &str = "@rem Dial Desktop command-line link";
+const CMD_PREFIX: &[u8] = b"@rem Dial Desktop command-line link\r\n@setlocal DisableDelayedExpansion\r\n@\"";
+const LEGACY_CMD_PREFIX: &[u8] = b"@rem Dial Desktop command-line link\r\n@\"";
+const CMD_SUFFIX: &[u8] = b"\" %*\r\n";
+const SH_PREFIX: &[u8] = b"#!/bin/sh\n# Dial Desktop command-line link\nexec '";
+const SH_SUFFIX: &[u8] = b"' \"$@\"\n";
 
 /// Where the terminal command goes: `~/.local/bin/dial`, or on Windows a `dial.cmd` in the
 /// per-user WindowsApps folder, which is on PATH by default.
@@ -333,33 +338,123 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn shim_text(engine: &Path) -> String {
-    format!("{SHIM_MARK}\r\n@\"{}\" %*\r\n", engine.display())
+fn is_cmd(link: &Path) -> bool {
+    link.extension().is_some_and(|e| e == "cmd")
 }
 
-/// Whether `link` is ours to replace: a symlink, or a shim carrying our mark.
-fn replaceable(link: &Path) -> bool {
-    match std::fs::symlink_metadata(link) {
-        Err(_) => true,
-        Ok(meta) if meta.file_type().is_symlink() => true,
-        Ok(meta) if meta.is_file() && link.extension().is_some_and(|e| e == "cmd") => {
-            std::fs::read_to_string(link).is_ok_and(|text| text.starts_with(SHIM_MARK))
+fn shim_text(engine: &Path, cmd: bool) -> Result<Vec<u8>, String> {
+    if !engine.is_absolute() {
+        return Err("Choose an engine with an absolute path".into());
+    }
+    if cmd {
+        let path = engine.to_str().filter(|s| !s.contains(['\r', '\n', '"']))
+            .ok_or("The engine path cannot be represented in a command file")?;
+        Ok([CMD_PREFIX, path.replace('%', "%%").as_bytes(), CMD_SUFFIX].concat())
+    } else {
+        let mut text = SH_PREFIX.to_vec();
+        // A single-quoted shell word, including literal non-UTF-8 bytes on Unix.
+        for &b in engine.as_os_str().as_encoded_bytes() {
+            if b == b'\'' { text.extend_from_slice(b"'\\''"); } else { text.push(b); }
         }
-        Ok(_) => false,
+        text.extend_from_slice(SH_SUFFIX);
+        Ok(text)
     }
 }
 
-fn runs_engine(link: &Path, engine: &Path) -> bool {
-    if link.extension().is_some_and(|e| e == "cmd") {
-        return std::fs::read_to_string(link).is_ok_and(|text| text == shim_text(engine));
+/// Parse only the exact two command-file templates and the single quoted POSIX exec word.
+/// A copied marker with other commands, even trailing text, is not evidence of ownership.
+fn shim_target(text: &[u8], cmd: bool) -> Option<PathBuf> {
+    if cmd {
+        let body = text.strip_suffix(CMD_SUFFIX)?;
+        let (path, legacy) = body.strip_prefix(CMD_PREFIX).map(|s| (s, false))
+            .or_else(|| body.strip_prefix(LEGACY_CMD_PREFIX).map(|s| (s, true)))?;
+        let path = std::str::from_utf8(path).ok()?;
+        if path.contains(['\0', '\n', '\r', '"']) { return None; }
+        let decoded = if legacy { path.to_owned() } else { path.replace("%%", "%") };
+        if !legacy && decoded.replace('%', "%%") != path { return None; }
+        let target = PathBuf::from(decoded);
+        return target.is_absolute().then_some(target);
     }
-    same_file(link, engine)
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut word = text.strip_prefix(SH_PREFIX)?.strip_suffix(SH_SUFFIX)?;
+        if !word.starts_with(b"/") || word.contains(&0) { return None; }
+        let mut path = Vec::new();
+        while let Some(at) = word.iter().position(|&b| b == b'\'') {
+            path.extend_from_slice(&word[..at]);
+            path.push(b'\'');
+            word = word[at..].strip_prefix(b"'\\''")?;
+        }
+        path.extend_from_slice(word);
+        Some(std::ffi::OsString::from_vec(path).into())
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+#[derive(PartialEq)]
+enum LinkEntry { Missing, Foreign, Shim(PathBuf) }
+
+const MAX_SHIM: u64 = 256 * 1024;
+
+fn possible_shim(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return false; }
+    }
+    meta.is_file() && meta.len() <= MAX_SHIM
+}
+
+fn read_shim(link: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    // Inspect the opened object too: the path may have changed since symlink_metadata.
+    let file = open.open(link).ok()?;
+    if !possible_shim(&file.metadata().ok()?) { return None; }
+    let mut bytes = Vec::new();
+    file.take(MAX_SHIM + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_SHIM { return None; }
+    shim_target(&bytes, is_cmd(link))
+}
+
+fn link_entry(link: &Path) -> LinkEntry {
+    let meta = match std::fs::symlink_metadata(link) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LinkEntry::Missing,
+        Ok(meta) => meta,
+        Err(_) => return LinkEntry::Foreign,
+    };
+    // Never follow a symlink (even one pointing at our exact shim), parse a device,
+    // or read a standalone engine binary into memory to check its signature.
+    if possible_shim(&meta) && let Some(target) = read_shim(link) {
+        return LinkEntry::Shim(target);
+    }
+    LinkEntry::Foreign
+}
+
+fn runs_engine(link: &Path, entry: &LinkEntry, engine: &Path) -> bool {
+    same_file(link, engine) || matches!(entry, LinkEntry::Shim(target) if same_file(target, engine))
 }
 
 /// The state of the terminal command for `engine`, given the PATH folders in order.
 pub fn link_status(engine: &Path, link: &Path, path_dirs: &[PathBuf]) -> CliLink {
     let dir = link.parent().unwrap_or(Path::new(""));
-    let linked = runs_engine(link, engine);
+    let entry = link_entry(link);
+    let linked = runs_engine(link, &entry, engine);
     let names: &[&str] = if cfg!(windows) {
         &["dial.exe", "dial.cmd"]
     } else {
@@ -369,14 +464,15 @@ pub fn link_status(engine: &Path, link: &Path, path_dirs: &[PathBuf]) -> CliLink
         .iter()
         .flat_map(|d| names.iter().map(move |n| d.join(n)))
         .find(|candidate| candidate.is_file());
-    let other = first.filter(|found| !same_file(found, engine) && !runs_engine(found, engine));
+    let other = first.filter(|found| !runs_engine(found, &link_entry(found), engine));
     CliLink {
         engine: engine.to_owned(),
         link: link.to_owned(),
         linked,
+        managed: matches!(entry, LinkEntry::Shim(_)),
         on_path: path_dirs.iter().any(|d| d == dir || same_file(d, dir)),
         other,
-        blocked: !linked && !replaceable(link),
+        blocked: entry == LinkEntry::Foreign,
         shell: None,
     }
 }
@@ -386,53 +482,42 @@ pub fn link_install(engine: &Path, link: &Path) -> Result<(), String> {
     if !crate::launcher::is_executable(engine) {
         return Err(format!("{} is not an executable file", engine.display()));
     }
-    if runs_engine(link, engine) {
-        return Ok(());
+    let entry = link_entry(link);
+    if entry == LinkEntry::Foreign {
+        return Err(format!("{} already exists and is not Desktop’s shim; it was left alone.", link.display()));
     }
-    if !replaceable(link) {
-        return Err(format!(
-            "{} already exists and was not created by Dial Desktop. Remove or rename it, or choose it as the engine in Settings › Updates.",
-            link.display()
-        ));
+    if runs_engine(link, &entry, engine) {
+        return Ok(());
     }
     let dir = link.parent().ok_or("The link has no folder")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    if std::fs::symlink_metadata(link).is_ok() {
-        std::fs::remove_file(link)
-            .map_err(|e| format!("Could not replace {}: {e}", link.display()))?;
-    }
-    let made = if link.extension().is_some_and(|e| e == "cmd") {
-        std::fs::write(link, shim_text(engine))
-    } else {
-        symlink(engine, link)
+    let text = shim_text(engine, is_cmd(link))?;
+    let install = || -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(&text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
+        match entry {
+            LinkEntry::Missing => tmp.persist_noclobber(link)?,
+            LinkEntry::Shim(_) if link_entry(link) == entry => tmp.persist(link)?,
+            _ => return Err(std::io::Error::other("the terminal command changed during installation")),
+        };
+        Ok(())
     };
-    made.map_err(|e| format!("Could not create {}: {e}", link.display()))
+    install().map_err(|e| format!("Could not install {}: {e}", link.display()))
 }
 
-/// Remove Desktop's link; anything else at that path is left alone.
+/// Legacy Unix symlinks have no ownership marker. Leave them (and their targets) intact.
 pub fn link_remove(link: &Path) -> Result<(), String> {
-    if std::fs::symlink_metadata(link).is_err() {
-        return Ok(());
+    match link_entry(link) {
+        LinkEntry::Missing => Ok(()),
+        LinkEntry::Shim(_) => std::fs::remove_file(link).map_err(|e| format!("Could not remove {}: {e}", link.display())),
+        LinkEntry::Foreign => Err(format!("{} is not Desktop’s shim, so it was left in place.", link.display())),
     }
-    if !replaceable(link) {
-        return Err(format!(
-            "{} was not created by Dial Desktop, so it was left in place.",
-            link.display()
-        ));
-    }
-    std::fs::remove_file(link).map_err(|e| format!("Could not remove {}: {e}", link.display()))
-}
-
-#[cfg(unix)]
-fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(not(unix))]
-fn symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "symbolic links are not used on this platform",
-    ))
 }
 
 // ── PATH for new terminals ───────────────────────────────────────────────────
