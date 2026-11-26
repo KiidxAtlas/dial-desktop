@@ -3,10 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { connect, connecting, engine, snapshot, startupError } from "./bridge";
-import { installEngine, updateEngine, updates } from "./updates";
-import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey } from "./keysGuard";
+import { installEngine, needsEngineInstall, updateEngine, updates } from "./updates";
+import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey, typingIn } from "./keysGuard";
 import { focusComposer, ui, type InspectorTab } from "./ui";
-import { copyText, goToSession, sessionOrder, stepSession } from "./sessionActions";
+import { copyText, goToSession, openSession, sessionOrder, startRename, stepSession } from "./sessionActions";
 import { followAgentApp, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
@@ -14,6 +14,7 @@ import { background, hasBackground, restoreImage } from "./backgrounds";
 import { markTurnAborted, syncQueue } from "./queue";
 import type { OpenSnapshot } from "./types";
 import Sidebar from "./components/Sidebar.vue";
+import TrashConfirmation from './components/TrashConfirmation.vue';
 import TopBar from "./components/TopBar.vue";
 import Timeline from "./components/LiveTimeline.vue";
 import Composer from "./components/Composer.vue";
@@ -82,6 +83,23 @@ watch(() => [opened.value?.workspace.root, opened.value?.sessionId] as const, ([
 const empty = computed(() => !!opened.value && !opened.value.historyLoading && !opened.value.entries.length && !opened.value.turnRunning);
 const showBackdrop = computed(
   () => hasBackground.value && !showingType.value && (background.placement === "always" || empty.value),
+);
+
+// A fresh, empty session starts with the side panel out of the way: Plan and Changes have nothing
+// to show yet. It comes back on its own once Dial makes a plan or edits a file, unless you opened
+// or closed it yourself in between. A parked panel is still saved as open for the next launch.
+watch(empty, (now) => {
+  if (now && ui.inspectorOpen && !ui.settingsOpen && !opened.value?.plan.length && !opened.value?.changes.length) {
+    ui.inspectorParked = true;
+    ui.inspectorOpen = false;
+  }
+});
+watch(() => ui.inspectorOpen, (open) => { if (open) ui.inspectorParked = false; });
+watch(
+  () => !!opened.value && (opened.value.plan.length > 0 || opened.value.changes.length > 0),
+  (has) => {
+    if (has && ui.inspectorParked) ui.inspectorOpen = true;
+  },
 );
 
 // Dev servers Dial starts are offered in (or opened by) the browser panel.
@@ -314,6 +332,13 @@ function onKey(event: KeyboardEvent) {
     // Voice: start it, or do what tapping the orb does (talk, stop recording, interrupt).
     event.preventDefault();
     void (s.voice.phase === "off" ? engine.voiceStart() : engine.voiceTap());
+  } else if (event.key === "F2" && !command && !event.altKey && !event.shiftKey && !event.defaultPrevented && !typingIn(event.target)) {
+    // Rename the open session from anywhere but a text field (a focused sidebar row renames itself).
+    const session = openSession(s);
+    if (session) {
+      event.preventDefault();
+      startRename(session.id, "title");
+    }
   } else if (event.key === "Escape" && !event.isComposing && ui.modelPickerOpen) {
     ui.modelPickerOpen = false;
   } else if (event.key === "Escape" && !event.isComposing && ui.picked.size) {
@@ -384,8 +409,9 @@ onBeforeUnmount(() => {
     <Transition name="drawer">
       <Sidebar v-if="sidebarShown() && !reviewing" :snap="opened" />
     </Transition>
-    <!-- Kept mounted under the settings page, so the conversation keeps its scroll and draft. -->
-    <main v-show="!ui.settingsOpen" class="main" :class="{ 'has-backdrop': showBackdrop, orb: !composerShown }" @pointerdown="dismissDrawer">
+    <!-- Settings opens as a sheet over the conversation, which stays in view (and keeps its
+         scroll and draft) but takes no input until the sheet closes. -->
+    <main class="main" :inert="ui.settingsOpen" :class="{ 'has-backdrop': showBackdrop, conversing: showBackdrop && !empty, orb: !composerShown }" @pointerdown="dismissDrawer">
       <Backdrop v-if="showBackdrop" :dimmed="!empty" />
       <TopBar :snap="viewed" />
       <UpdateBanner />
@@ -399,7 +425,7 @@ onBeforeUnmount(() => {
           <span v-if="disconnect.detail" class="disconnect-detail" :title="disconnect.detail">{{ disconnect.detail }}</span>
         </span>
         <button
-          v-if="disconnect.problem === 'missing'"
+          v-if="needsEngineInstall(disconnect.problem)"
           class="btn btn-primary"
           :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'"
           @click="installEngine()"
@@ -433,7 +459,13 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </main>
-    <Settings v-if="ui.settingsOpen" :snap="opened" />
+    <Transition name="sheet">
+      <div v-if="ui.settingsOpen" class="sheet-wrap" @pointerdown.self="ui.settingsOpen = false; ui.settingsTab = ''">
+        <div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
+          <Settings :snap="opened" />
+        </div>
+      </div>
+    </Transition>
     <Transition name="slide">
       <Inspector v-show="ui.inspectorOpen && !ui.settingsOpen" :open="ui.inspectorOpen" :snap="opened" />
     </Transition>
@@ -457,6 +489,7 @@ onBeforeUnmount(() => {
     <Logo :size="40" />
   </div>
   <Toasts />
+  <TrashConfirmation />
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{{ announcement }}</div>
   <ContextMenu />
   <template v-if="opened">
@@ -468,8 +501,44 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .shell {
+  position: relative;
   display: flex;
   height: 100%;
+}
+/* Settings sheet: a large card over the window, with the conversation dimmed behind it. */
+.sheet-wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgb(0 0 0 / 38%);
+}
+.sheet {
+  display: flex;
+  width: min(1120px, 100%);
+  height: min(820px, 100%);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--bg);
+  box-shadow: var(--shadow-pop), 0 0 0 1px var(--border-strong);
+}
+.sheet-enter-active,
+.sheet-leave-active {
+  transition: opacity 160ms var(--ease);
+}
+.sheet-enter-active .sheet,
+.sheet-leave-active .sheet {
+  transition: transform 160ms var(--ease);
+}
+.sheet-enter-from,
+.sheet-leave-to {
+  opacity: 0;
+}
+.sheet-enter-from .sheet,
+.sheet-leave-to .sheet {
+  transform: translateY(8px) scale(0.99);
 }
 /* Settings from the welcome screen: no sidebar, so the macOS window buttons sit over its title. */
 .welcome-settings.mac:not(.fullscreen) :deep(.settings .head) {

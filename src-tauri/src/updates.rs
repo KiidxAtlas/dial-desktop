@@ -10,10 +10,9 @@
 //! which lack it, never check.
 
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +69,8 @@ pub enum EngineUpdateView {
     Unsupported { detail: String },
     /// No engine could be run.
     Missing { error: String },
+    /// A selected engine exists but the OS refuses to run it.
+    Unlaunchable { error: String },
     /// The check ran but failed.
     Failed { error: String },
 }
@@ -78,8 +79,10 @@ pub enum EngineUpdateView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EngineProblem {
-    /// No `dial` executable was found or it could not be started: offer to install it.
+    /// No `dial` executable was found: offer to install it.
     Missing,
+    /// The OS refuses this executable: offer a separate signed copy without replacing it.
+    Unlaunchable,
     /// The engine speaks no protocol version this app does: offer to update one of them.
     Incompatible,
     /// Anything else: the error text says what.
@@ -91,10 +94,12 @@ pub fn classify_failure(error: &str) -> EngineProblem {
     let lower = error.to_ascii_lowercase();
     let not_found = lower.contains("not found")
         || lower.contains("no such file")
-        || lower.contains("os error 2")
+        || lower.contains("(os error 2)")
         || lower.contains("cannot find the file");
     if lower.starts_with("could not start") && not_found {
         EngineProblem::Missing
+    } else if lower.starts_with("could not start") {
+        EngineProblem::Unlaunchable
     } else if lower.contains("engine serves protocol") {
         EngineProblem::Incompatible
     } else {
@@ -125,7 +130,7 @@ pub fn failure_hint(error: &str, windows: bool) -> Option<&'static str> {
     if blocked {
         Some("Windows blocked this engine before it could run (Smart App Control or an application control policy). Install the signed release in Settings → Updates, or ask whoever manages this computer to allow it.")
     } else if foreign {
-        Some("This engine was built for a different kind of computer. Install the one for this computer in Settings → Updates.")
+        Some("The system could not load this engine as an executable. It may be damaged or built for a different kind of computer. Install a signed copy for this computer in Settings → Updates.")
     } else if elevation {
         Some("This engine asks for administrator rights, which Dial never uses. Choose another engine in Settings → Updates.")
     } else if denied {
@@ -139,10 +144,11 @@ pub fn failure_hint(error: &str, windows: bool) -> Option<&'static str> {
 pub fn parse_check(outcome: Result<RunOutput, String>) -> EngineUpdateView {
     let output = match outcome {
         Ok(output) => output,
-        Err(error) if classify_failure(&error) == EngineProblem::Missing => {
-            return EngineUpdateView::Missing { error };
-        }
-        Err(error) => return EngineUpdateView::Failed { error },
+        Err(error) => return match classify_failure(&error) {
+            EngineProblem::Missing => EngineUpdateView::Missing { error },
+            EngineProblem::Unlaunchable => EngineUpdateView::Unlaunchable { error },
+            _ => EngineUpdateView::Failed { error },
+        },
     };
     if output.success {
         return match serde_json::from_str::<EngineStatus>(output.stdout.trim()) {
@@ -294,49 +300,12 @@ pub struct RunOutput {
 /// cannot be started or runs out of time.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<RunOutput, String> {
     let shown = format!("{:?}", command.get_program());
-    let mut child = crate::launcher::without_console(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start {shown}: {error}"))?;
-    let read = |stream: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut text = Vec::new();
-            if let Some(mut stream) = stream {
-                let _ = stream.read_to_end(&mut text);
-            }
-            String::from_utf8_lossy(&text).into_owned()
-        })
-    };
-    let stdout = read(
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let stderr = read(
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{shown} did not finish within {timeout:?}"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => return Err(format!("waiting for {shown}: {error}")),
-        }
-    };
+    let output = crate::launcher::run_captured(command, timeout, u64::MAX, |error| {
+        format!("could not start {shown}: {error}")
+    })?;
     Ok(RunOutput {
-        success: status.success(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }

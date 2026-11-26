@@ -42,7 +42,18 @@ export function clipboardAction(event: ClipboardEvent, platform: string): PasteA
     if (!hasDirectory && event.isTrusted && platform === 'macos' && files.every(f => /^image\/(?:x-)?tiff?$/i.test(f.type))) return { kind: 'macImage' };
     return { kind: 'files', files, hasDirectory };
   }
-  const hasText = c?.getData('text/plain') || Array.from(c?.types ?? []).some(type => type.startsWith('text/') && !!c?.getData(type));
-  if (event.isTrusted && !hasText && (platform === 'macos' || platform === 'windows')) return { kind: 'nativeFiles' };
+  if (!event.isTrusted) return { kind: 'text' };
+  const hasText = c?.getData('text/plain') || Array.from(c?.types ?? []).some(type => {
+    if (!type.startsWith('text/')) return false;
+    const data = c?.getData(type);
+    // A Linux file-manager URI list is a file format, not editable text. Never interpret
+    // clipboard text as paths: the native reader requests only the file-list target.
+    if (data && type === 'text/uri-list' && platform === 'linux') {
+      const uris = data.split(/\r?\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+      if (uris.length && uris.every(uri => /^file:\/\/(?:localhost)?\//i.test(uri))) return false;
+    }
+    return !!data;
+  });
+  if (!hasText && ['linux', 'macos', 'windows'].includes(platform)) return { kind: 'nativeFiles' };
   return { kind: 'text' };
 }

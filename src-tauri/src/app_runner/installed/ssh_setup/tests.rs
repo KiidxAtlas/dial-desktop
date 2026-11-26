@@ -116,6 +116,29 @@ fn the_config_block_is_prepended_replaced_and_leaves_the_rest() {
     let again = upsert_block(&other, "kali", &config_block("kali", "10.0.0.11", 22, "atlas", key));
     assert!(again.contains("Host kali2") && again.contains("HostName 10.0.0.11"));
     assert_eq!(upsert_block("", "kali", "B\n"), "B\n");
+    let incomplete = format!("{MARK_OPEN}kali\nHost kali\n{user_config}");
+    assert!(upsert_block(&incomplete, "kali", "B\n").ends_with(&incomplete));
+}
+
+#[test]
+fn config_write_refuses_read_errors_and_stale_alias_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config");
+    for invalid in [b"\xff\xfeH\0".as_slice(), b"H\0o\0s\0t\0", b"\xef\xbb\xbfHost vm"] {
+        fs::write(&path, invalid).unwrap();
+        assert!(read_config(&path).is_err());
+        assert!(write_config(&path, None, "vm", "block").is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+    }
+    fs::remove_file(&path).unwrap();
+    write_config(&path, None, "vm", "original\n").unwrap();
+    let original = read_config(&path).unwrap();
+    fs::write(&path, "Host vm\n  HostName other\n").unwrap();
+    for stale in [None, original.as_deref()] {
+        assert!(write_config(&path, stale, "vm", "new\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "Host vm\n  HostName other\n");
+    }
+    assert!(read_config(dir.path()).is_err());
 }
 
 #[test]

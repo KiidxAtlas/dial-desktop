@@ -59,8 +59,8 @@ export interface RenderedDiagram {
 
 /** Flowchart arrows that Mermaid reads without spaces but the renderer only reads when spaced:
  * `A-->B` parses as a node `A--`, and `A -.label.-> B` silently drops the edge and `B`. */
-const TEXT_ARROW = /(?<![-.=])(<?)(--|-\.|==)(?![->.=])\s*([^|]+?)\s*(-->|---|\.->|\.-|==>|===)(?![->.=])/g;
-const ARROW = /(?<![-.=<])(<?)(-->|-\.->|==>|---|-\.-|===)(?![->.=])/g;
+const TEXT_ARROW = /(^|[^-.=])(<?)(--|-\.|==)(?![->.=])\s*([^|]+?)\s*(-->|---|\.->|\.-|==>|===)(?![->.=])/g;
+const ARROW = /(^|[^-.=<])(<?)(-->|-\.->|==>|---|-\.-|===)(?![->.=])/g;
 const OPEN = '[({';
 const CLOSE = ')]}';
 
@@ -74,7 +74,7 @@ export function spaceArrows(source: string): string {
     let depth = 0;
     let quote = false;
     let pipe = false;
-    const flush = () => { out += free.replace(TEXT_ARROW, ' $1$2 $3 $4 ').replace(ARROW, ' $1$2 '); free = ''; };
+    const flush = () => { out += free.replace(TEXT_ARROW, '$1 $2$3 $4 $5 ').replace(ARROW, '$1 $2$3 '); free = ''; };
     for (const ch of line) {
       if (!depth && !quote && !pipe) {
         if (ch !== '"' && ch !== '|' && !OPEN.includes(ch)) { free += ch; continue; }

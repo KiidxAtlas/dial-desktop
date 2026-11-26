@@ -145,8 +145,9 @@ export function runActivity(run: ToolRun) {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-/** "Read 3 files, 2 searches, edited 2 files, ran 1 command, received 1 message", in the order the work happened. */
-export function runSummary(run: ToolRun): string {
+type Part = { kind: Kind | "message"; text: string };
+
+function summaryParts(run: ToolRun): Part[] {
   const order: (Kind | "message")[] = [];
   const calls = new Map<Kind, ToolEntry[]>();
   let messages = 0;
@@ -161,24 +162,51 @@ export function runSummary(run: ToolRun): string {
     calls.get(k)!.push(entry);
   }
   const distinct = (values: string[]) => new Set(values.filter(Boolean)).size;
-  const parts = order.map((k) => {
-    if (k === "message") return `received ${plural(messages, "message")}`;
+  return order.map((k) => {
+    if (k === "message") return { kind: k, text: `received ${plural(messages, "message")}` };
     const list = calls.get(k)!;
-    switch (k) {
-      case "read": return `read ${plural(distinct(list.map((t) => t.target)) || list.length, "file")}`;
-      case "search": return plural(list.length, "search", "searches");
-      case "edit": {
-        const files = distinct(list.flatMap((t) => (t.changedPaths.length ? t.changedPaths : [t.target])));
-        return `edited ${plural(files || list.length, "file")}`;
+    const text = (() => {
+      switch (k) {
+        case "read": return `read ${plural(distinct(list.map((t) => t.target)) || list.length, "file")}`;
+        case "search": return plural(list.length, "search", "searches");
+        case "edit": {
+          const files = distinct(list.flatMap((t) => (t.changedPaths.length ? t.changedPaths : [t.target])));
+          return `edited ${plural(files || list.length, "file")}`;
+        }
+        case "run": return `ran ${plural(list.length, "command")}`;
+        case "web": return plural(list.length, "web lookup");
+        case "image": return `generated ${plural(list.reduce((n, t) => n + Math.max(1, t.images.length), 0), "image")}`;
+        case "other": return `used ${plural(list.length, "tool")}`;
       }
-      case "run": return `ran ${plural(list.length, "command")}`;
-      case "web": return plural(list.length, "web lookup");
-      case "image": return `generated ${plural(list.reduce((n, t) => n + Math.max(1, t.images.length), 0), "image")}`;
-      case "other": return `used ${plural(list.length, "tool")}`;
-    }
+    })();
+    return { kind: k, text };
   });
-  const text = parts.join(", ");
-  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+const capital = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** "Read 3 files, 2 searches, edited 2 files, ran 1 command, received 1 message", in the order the work happened. */
+export function runSummary(run: ToolRun): string {
+  return capital(summaryParts(run).map((p) => p.text).join(", "));
+}
+
+/** What a run changed, before what it looked at. */
+const WEIGHT: Record<Kind | "message", number> = { edit: 0, image: 1, run: 2, other: 3, web: 4, search: 5, read: 6, message: 7 };
+
+/** The run's headline: its weightiest `max` parts, the rest as a count.
+ *  "Edited 2 files, generated 1 image · 2 more". The full line is `runSummary`. */
+export function runHeadline(run: ToolRun, max = 2): string {
+  const parts = summaryParts(run).sort((a, b) => WEIGHT[a.kind] - WEIGHT[b.kind]);
+  const head = capital(parts.slice(0, max).map((p) => p.text).join(", "));
+  return parts.length > max ? `${head} · ${parts.length - max} more` : head;
+}
+
+/** "8 of 12 tests passed", "3/10" → 0.67, 0.3: a progress line's fraction, if it states one. */
+export function progressFraction(text: string | null | undefined): number | null {
+  const m = /(\d+)\s*(?:of|\/)\s*(\d+)/.exec(text ?? "");
+  if (!m) return null;
+  const [done, total] = [Number(m[1]), Number(m[2])];
+  return total > 0 && done <= total ? done / total : null;
 }
 
 export interface FileChange {
@@ -207,8 +235,13 @@ function lineCounts(tool: ToolEntry): [number, number] | null {
 
 /** Files the run changed, in first-change order, with the line counts its calls reported. */
 export function runFiles(run: ToolRun): FileChange[] {
+  return toolFiles(run.tools);
+}
+
+/** Files `tools` changed, in first-change order, with the line counts the calls reported. */
+export function toolFiles(tools: ToolEntry[]): FileChange[] {
   const files = new Map<string, FileChange>();
-  for (const tool of run.tools) {
+  for (const tool of tools) {
     const counts = tool.changedPaths.length === 1 ? lineCounts(tool) : null;
     for (const path of tool.changedPaths) {
       const file = files.get(path) ?? { path, added: null, removed: null };

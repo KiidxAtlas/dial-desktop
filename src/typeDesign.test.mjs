@@ -33,6 +33,9 @@ test('answers name the local images they show', async () => {
     const { markdownImages } = await vite.ssrLoadModule('/src/typeExtract.ts');
     const text = '![a](/tmp/a.png) ![b](./out/b%20c.jpg) ![w](https://x/y.png) ![a](/tmp/a.png)';
     assert.deepEqual(markdownImages(text, '/proj/'), ['/tmp/a.png', '/proj/out/b c.jpg']);
+    const unc = String.raw`\\server\share\image.png`;
+    assert.deepEqual(markdownImages(`![bad](a%ZZ) ![a](file:///C:/work/a%20b.png) ![b](${unc}) ![c](file://server/share/c.png)`, 'C:/work'),
+      ['C:/work/a b.png', unc, '//server/share/c.png']);
   } finally {
     await vite.close();
   }
@@ -66,4 +69,17 @@ test('failed Types lookup and stale workspace replies never hide ordinary sessio
   resolveStale([{ sessions: ['ordinary'] }]);
   await stale;
   assert.deepEqual(groups(), ['ordinary', 'classified']);
+});
+
+test('recent sessions group by age once they span more than one', async t => {
+  const vite = await createServer({ configFile: false, optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, ws: false } });
+  t.after(() => vite.close());
+  const { sessionGroups } = await vite.ssrLoadModule('/src/sessionActions.ts');
+  const row = (id, meta, extra = {}) => ({ id, title: id, meta, empty: false, pinned: false, running: false, waiting: false, ...extra });
+  const snap = sessions => ({ sessions, workspace: { root: 'grouping' } });
+  const names = (s, filter) => sessionGroups(snap(s), filter).map(g => `${g.name}:${g.sessions.map(x => x.id).join(',')}`);
+  const rows = [row('a', 'just now · 2 messages'), row('b', '5h ago · 1 message'), row('c', 'yesterday'), row('d', '3d ago'), row('e', 'Mar 4, 2025'), row('p', '1d ago', { pinned: true })];
+  assert.deepEqual(names(rows), ['Pinned:p', 'Today:a,b', 'Yesterday:c', 'This week:d', 'Older:e']);
+  assert.deepEqual(names(rows.slice(0, 2)), ['Recents:a,b']);
+  assert.deepEqual(names(rows, 'a'), ['Recents:a']);
 });

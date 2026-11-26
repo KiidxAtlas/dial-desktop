@@ -53,6 +53,7 @@ test('unpublished work starting during download defers installation until the na
 
 for (const [fail, expected] of [
   ['download', ['download', 'download', 'reserve', 'install', 'restart']],
+  ['reserve', ['download', 'reserve', 'download', 'reserve', 'install', 'restart']],
   ['install', ['download', 'reserve', 'install', 'release', 'download', 'reserve', 'install', 'restart']],
   ['restart', ['download', 'reserve', 'install', 'restart', 'release', 'reserve', 'restart']],
 ]) {
@@ -64,7 +65,7 @@ for (const [fail, expected] of [
     };
     const updater = createAppInstaller(() => false, {
       downloadApp: step('download'), installApp: step('install'), restartApp: step('restart'),
-      tryReserveRestart: async () => { calls.push('reserve'); return { state: 'reserved' }; },
+      tryReserveRestart: async () => { await step('reserve')(); return { state: 'reserved' }; },
       releaseRestart: step('release'),
     });
     await updater.run('release');

@@ -21,6 +21,8 @@ export interface GitStatusView {
   files: GitFileStatus[];
   /** The checked-out branch, or `detached at <commit>`; null outside Git or before a first commit. */
   branch?: string | null;
+  /** Project-relative worktrees inspected separately from the workspace index. */
+  nestedRepos?: string[];
 }
 
 /** One line a content search found (`files.rs` `GrepMatch`). */
@@ -87,6 +89,16 @@ export function gitLabel(code: GitCode): string {
   return LABELS[code];
 }
 
+export function inNestedRepo(path: string, repos: string[]): boolean {
+  return repos.some(repo => path.startsWith(repo + "/"));
+}
+
+/** Changes in child worktrees that aren't already shown as session edits. */
+export function otherNestedChanges(files: GitFileStatus[], repos: string[], sessionPaths: string[]): GitFileStatus[] {
+  const session = new Set(sessionPaths);
+  return files.filter(f => inNestedRepo(f.path, repos) && !session.has(f.path) && !repos.includes(f.path) && !f.path.endsWith("/"));
+}
+
 /** A session-touched file with its current git status; `settled` when git reports no diff for it
  *  any more (committed or reverted since). */
 export interface ChangeRow<T> {
@@ -97,10 +109,10 @@ export interface ChangeRow<T> {
 
 /** The Changes list: files that still differ first, in session order, then settled ones.
  *  Without git status (`repo` false or unknown) nothing counts as settled. */
-export function changeRows<T>(items: T[], pathOf: (item: T) => string, files: GitFileStatus[], repo: boolean): ChangeRow<T>[] {
+export function changeRows<T>(items: T[], pathOf: (item: T) => string, files: GitFileStatus[], repo: boolean, nestedRepos: string[] = []): ChangeRow<T>[] {
   const rows = items.map((item) => {
-    const git = gitStatusOf(files, pathOf(item));
-    return { item, git, settled: repo && !git };
+    const path = pathOf(item), git = gitStatusOf(files, path);
+    return { item, git, settled: !git && (repo || inNestedRepo(path, nestedRepos)) };
   });
   return [...rows.filter((r) => !r.settled), ...rows.filter((r) => r.settled)];
 }

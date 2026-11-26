@@ -129,14 +129,19 @@ fn home_dir() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn program_files_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
-        .iter()
-        .filter_map(|key| absolute_path(env::var_os(key)))
-        .collect();
-    if dirs.is_empty() {
-        dirs.push(PathBuf::from(r"C:\Program Files"));
-    }
-    dirs
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    [FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86].iter().filter_map(|id| {
+        // SAFETY: a successful shell call returns a CoTaskMem-allocated, nul-terminated
+        // string. Copy it before releasing it. Never trust a caller-supplied env var.
+        unsafe {
+            let ptr = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
+            let path = OsString::from_wide(ptr.as_wide());
+            CoTaskMemFree(Some(ptr.0.cast()));
+            absolute_path(Some(path))
+        }
+    }).collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -170,15 +175,13 @@ fn vmware_tools() -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
+pub(super) fn vmware_install_dirs() -> impl Iterator<Item = PathBuf> {
+    program_files_dirs().into_iter().map(|dir| dir.join("VMware").join("VMware Workstation"))
+}
+
+#[cfg(windows)]
 fn vmware_tools() -> Vec<PathBuf> {
-    program_files_dirs()
-        .into_iter()
-        .map(|dir| {
-            dir.join("VMware")
-                .join("VMware Workstation")
-                .join("vmrun.exe")
-        })
-        .collect()
+    vmware_install_dirs().map(|dir| dir.join("vmrun.exe")).collect()
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]

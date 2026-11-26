@@ -223,10 +223,15 @@ function inspector() {
   browserOptionsApi.devtools().catch((error) => showToast(paneErrorText(error)));
 }
 
-/** The panel's menu: open a local file, the viewport and the search engine. */
+/** The panel's menu: recent pages, the system browser, the inspector, a local file, the viewport
+ *  and the search engine. The bar keeps only what a page needs every few seconds. */
 function more(event: MouseEvent) {
+  const anchor = event.currentTarget as HTMLElement;
   const mark = (on: boolean) => (on ? "✓" : undefined);
   const items: MenuItem[] = [
+    { label: "Recent pages…", icon: "list", run: () => showHistory(event, anchor) },
+    { label: "Open in the system browser", icon: "external", disabled: blank.value, run: () => void openExternal(state.value.url) },
+    ...(devtools.value ? [{ label: "Inspect (Web Inspector)", icon: "terminal", disabled: blank.value, run: inspector } as MenuItem] : []),
     { label: "Open file…", icon: "file", run: () => void openFile() },
     { divider: true },
     ...VIEWPORTS.map((v): MenuItem => ({ label: v.label, icon: "monitor", hint: mark(viewport.value === v.id), run: () => chooseViewport(v.id) })),
@@ -260,7 +265,7 @@ function more(event: MouseEvent) {
 }
 
 /** Recent pages of this panel session, to jump back to. */
-function showHistory(event: MouseEvent) {
+function showHistory(event: MouseEvent, anchor = event.currentTarget as HTMLElement) {
   const items: MenuItem[] = history.value.length
     ? history.value.map((entry) => ({
         label: entry.title ? `${entry.title} — ${entry.url}` : entry.url,
@@ -269,7 +274,7 @@ function showHistory(event: MouseEvent) {
         run: () => void open(entry.url),
       }))
     : [{ label: "No pages yet", disabled: true, run: () => {} }];
-  openMenu(event, items, event.currentTarget as HTMLElement, "Recent pages");
+  openMenu(event, items, anchor, "Recent pages");
 }
 
 watch(state, (now) => {
@@ -359,9 +364,6 @@ onBeforeUnmount(() => {
       <button type="button" class="icon-btn" title="Forward" :disabled="blank" @click="go('forward')">
         <Icon name="arrowRight" :size="15" />
       </button>
-      <button type="button" class="icon-btn" title="Recent pages" @click="showHistory">
-        <Icon name="list" :size="15" />
-      </button>
       <button
         type="button"
         class="icon-btn"
@@ -378,7 +380,7 @@ onBeforeUnmount(() => {
           v-model="address"
           spellcheck="false"
           autocapitalize="off"
-          placeholder="Address, localhost:3000 or search"
+          placeholder="Address or search"
           aria-label="Address"
           @focus="editing = true; ($event.target as HTMLInputElement).select()"
           @blur="editing = false"
@@ -388,19 +390,7 @@ onBeforeUnmount(() => {
       <button type="button" class="icon-btn" title="Give this page to Dial" :disabled="blank" @click="share">
         <Icon name="send" :size="15" />
       </button>
-      <button
-        type="button"
-        class="icon-btn"
-        title="Open in the system browser"
-        :disabled="blank"
-        @click="openExternal(state.url)"
-      >
-        <Icon name="external" :size="15" />
-      </button>
-      <button v-if="devtools" type="button" class="icon-btn" title="Inspect (Web Inspector)" :disabled="blank" @click="inspector">
-        <Icon name="terminal" :size="15" />
-      </button>
-      <button type="button" class="icon-btn" title="Open file, viewport and search engine" @click="more">
+      <button type="button" class="icon-btn" title="Recent pages, system browser, viewport and search engine" aria-label="More browser actions" @click="more">
         <Icon name="more" :size="15" />
       </button>
     </form>

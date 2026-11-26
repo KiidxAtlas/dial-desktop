@@ -47,13 +47,22 @@ fn a_missing_engine_and_a_broken_answer_are_told_apart() {
         EngineUpdateView::Missing { .. }
     ));
     for error in [
-        "could not start dial: Permission denied",
+        "could not read dial update output",
         "dial did not finish within 30s",
     ] {
         assert!(matches!(
             parse_check(Err(error.into())),
             EngineUpdateView::Failed { .. }
         ));
+    }
+    for error in [
+        "could not start dial.exe: %1 is not a valid Win32 application. (os error 193)",
+        "could not start dial.exe: (os error 216)",
+        "could not start dial: Permission denied (os error 13)",
+        "could not start dial: Exec format error (os error 8)",
+    ] {
+        assert_eq!(classify_failure(error), EngineProblem::Unlaunchable);
+        assert_eq!(parse_check(Err(error.into())), EngineUpdateView::Unlaunchable { error: error.into() });
     }
     assert!(matches!(
         parse_check(ran(true, "not json", "")),
@@ -83,11 +92,6 @@ fn connect_failures_name_their_fix() {
     );
     assert_eq!(
         classify_failure("handshake failed: engine exited before `ready`"),
-        EngineProblem::Other
-    );
-    // A permission error starting the binary is not a missing engine.
-    assert_eq!(
-        classify_failure("could not start dial: Permission denied (os error 13)"),
         EngineProblem::Other
     );
 }
@@ -186,7 +190,7 @@ fn bounded_runs_capture_both_streams_and_stop_at_the_deadline() {
         Duration::from_millis(200),
     )
     .unwrap_err();
-    assert!(error.contains("did not finish"), "{error}");
+    assert!(error.contains("timed out"), "{error}");
     assert!(
         run_bounded(
             &mut Command::new("/nonexistent/dial"),

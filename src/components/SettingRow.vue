@@ -14,6 +14,7 @@ import SSwitch from "./settings/SSwitch.vue";
 import SSegmented from "./settings/SSegmented.vue";
 import SCombo, { type ComboOption } from "./settings/SCombo.vue";
 import SNumber from "./settings/SNumber.vue";
+import SContextWindow from "./settings/SContextWindow.vue";
 import SChips from "./settings/SChips.vue";
 import SPath from "./settings/SPath.vue";
 
@@ -211,6 +212,9 @@ const folderList = computed(() => /(write|paths|dirs|folders|roots)$/.test(s.val
         <option v-for="o in options" :key="o.value" :value="o.value">{{ o.label }}</option>
       </select>
     </template>
+
+    <SContextWindow v-else-if="c.type === 'number' && c.auto && ['context_window', 'local_context_window', 'cloud_context_window'].includes(s.key)"
+      :value="s.value" :min="c.min" :max="c.max" :label="s.label" @save="save" />
 
     <template v-else-if="c.type === 'number'">
       <SSegmented

@@ -24,7 +24,7 @@ onBeforeUnmount(() => stop());
   <div class="backdrop" aria-hidden="true">
     <canvas v-if="preset" ref="canvas" />
     <img v-else-if="customUrl" :src="customUrl" alt="" />
-    <div class="scrim" :style="{ opacity: props.dimmed ? background.dim : 0 }" />
+    <div class="scrim" :style="{ '--dim': props.dimmed ? background.dim : 0 }" />
     <div class="floor" />
   </div>
 </template>
@@ -50,7 +50,12 @@ img {
   position: absolute;
   inset: 0;
   background: var(--bg);
+  opacity: var(--dim);
   transition: opacity 400ms var(--ease);
+}
+/* Light text-on-dark is not an option here: wash the art enough for dark text to read. */
+:global(:root[data-theme="light"] .conversing) .scrim {
+  opacity: max(var(--dim), 0.74);
 }
 /* Keeps the composer and its caption readable over bright artwork. */
 .floor {
@@ -58,6 +63,9 @@ img {
   inset: auto 0 0;
   height: 180px;
   background: linear-gradient(to top, rgb(0 0 0 / 35%), transparent);
+}
+:global(:root[data-theme="light"] .conversing) .floor {
+  background: linear-gradient(to top, rgb(250 249 245 / 45%), transparent);
 }
 @keyframes fade {
   from {

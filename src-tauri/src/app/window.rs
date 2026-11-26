@@ -136,9 +136,9 @@ impl Placement {
     }
 }
 
-/// Work owned by this process that exit would interrupt. Only query it when asked to quit.
+/// Work owned by this process that exit or installing an app update would interrupt.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct Inventory {
+pub(super) struct Inventory {
     sessions: usize,
     shells: usize,
     apps: usize,
@@ -155,18 +155,32 @@ impl Inventory {
             inner.tabs.active_session_count() + inner.parked.values().map(|tabs| tabs.active_session_count()).sum::<usize>()
         };
         let shells = shared.terminals().open_ids().len();
+        Self { sessions, shells, ..Self::services(app) }
+    }
+
+    pub(super) fn services(app: &AppHandle) -> Self {
         Self {
-            sessions,
-            shells,
             apps: app.state::<crate::app_runner::AppRunner>().open_count(),
             scheduler: app.state::<crate::scheduler::Scheduler>().running(),
             download: app.state::<crate::model_library::Downloads>().running(),
             host_setup: crate::app_runner::host::setup_busy(),
+            ..Self::default()
         }
     }
 
+    /// Updates may quit during install on Windows, bypassing normal quit consent. Do not
+    /// interrupt these services: ask the user to finish or stop them before retrying.
+    pub(super) fn allow_update(self) -> Result<(), String> {
+        if self == Self::default() { return Ok(()); }
+        Err(self.message_for("Finish or stop this work before installing the update, then try again:"))
+    }
+
     fn message(self) -> String {
-        let mut lines = vec!["Quitting this window will interrupt:".to_owned()];
+        self.message_for("Quitting this window will interrupt:")
+    }
+
+    fn message_for(self, heading: &str) -> String {
+        let mut lines = vec![heading.to_owned()];
         for (n, label) in [
             (self.sessions, "active session"),
             (self.shells, "terminal session"),
@@ -283,6 +297,19 @@ pub(super) fn menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn updates_refuse_each_nonterminal_service_and_can_retry_when_idle() {
+        let idle = Inventory::default();
+        for (work, service) in [
+            (Inventory { apps: 1, ..idle }, "App panel"),
+            (Inventory { scheduler: true, ..idle }, "scheduler"),
+            (Inventory { download: true, ..idle }, "Model download"),
+            (Inventory { host_setup: true, ..idle }, "host setup"),
+        ] {
+            assert!(work.allow_update().unwrap_err().contains(service));
+        }
+        assert_eq!(idle.allow_update(), Ok(()));
+    }
     #[test]
     fn quit_shares_pending_dialog_and_rechecks_work_after_consent() {
         let mut consent = Consent::default();

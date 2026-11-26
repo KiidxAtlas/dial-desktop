@@ -31,6 +31,9 @@ fn initialize_answers_the_clients_revision() {
     assert_eq!(reply["result"]["protocolVersion"], "2025-03-26");
     assert!(reply["result"]["capabilities"]["tools"].is_object());
     assert_eq!(reply["result"]["serverInfo"]["name"], "dial-desktop");
+    let instructions = reply["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("panel by default"));
+    assert!(instructions.contains("Use standalone Chromium when the user requests it"));
     let bare = ask(
         json!({"jsonrpc": "2.0", "id": "a", "method": "initialize"}),
         true,

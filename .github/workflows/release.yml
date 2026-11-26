@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag matches every version field
         run: |
+          python3 scripts/test-release-policy.py
+          python3 scripts/release-policy.py "$GITHUB_REF_NAME" </dev/null
           tag="${GITHUB_REF_NAME#v}"
           npm_version=$(jq -r .version package.json)
           tauri_version=$(jq -r .version src-tauri/tauri.conf.json)
@@ -164,13 +166,32 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    # Compare published versions and change latest under one lock, across all tags.
+    # Queue every completed build instead of replacing an older pending publication.
+    concurrency:
+      group: desktop-release-publish
+      queue: max
+      cancel-in-progress: false
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide whether to advance the stable updater feed
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            python3 scripts/release-policy.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
       - name: Publish the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          IS_LATEST: ${{ steps.policy.outputs.latest }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$IS_LATEST"
       - name: Refresh the website's release cache
-        if: vars.DIAL_WEB_REFRESH_URL != ''
+        if: steps.policy.outputs.latest == 'true' && vars.DIAL_WEB_REFRESH_URL != ''
         env:
           URL: ${{ vars.DIAL_WEB_REFRESH_URL }}
           TOKEN: ${{ secrets.DIAL_WEB_REFRESH_TOKEN }}

@@ -13,6 +13,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLoadFailure {
+    pub session_id: String,
+    pub provider: String,
+    pub model_id: String,
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -31,6 +40,7 @@ pub struct Tab {
     /// Edits belong to this tab's journal, including while its turn runs in the background.
     edits: Vec<Command>,
     editing: Option<Command>,
+    local_load_failure: Option<LocalLoadFailure>,
     // Stand-in lifetime for tabs without a worker (preview and routing tests).
     lifetime: Arc<AtomicBool>,
 }
@@ -48,6 +58,7 @@ impl Tab {
             turn_queued: false,
             edits: Vec::new(),
             editing: None,
+            local_load_failure: None,
             lifetime: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -98,7 +109,10 @@ impl Tab {
         }
         // A different model resets effort. Repeated effort picks replace the previous one.
         match &command {
-            Command::SetModel { .. } => self.edits.clear(),
+            Command::SetModel { .. } => {
+                self.edits.clear();
+                self.local_load_failure = None;
+            }
             Command::SetThinking { .. } => self
                 .edits
                 .retain(|c| !matches!(c, Command::SetThinking { .. })),
@@ -113,25 +127,34 @@ impl Tab {
             return None;
         }
         let next = self.edits.remove(0);
+        if matches!(next, Command::SetModel { .. }) {
+            self.local_load_failure = None;
+        }
         self.editing = Some(next.clone());
         Some(next)
     }
 
-    fn settle_edit(&mut self, method: &str, ok: bool) {
+    fn settle_edit(&mut self, method: &str, error: Option<&str>) {
         if self
             .editing
             .as_ref()
             .is_some_and(|c| c.request().1 == method)
         {
-            if ok && !self.model.prepare_local_model_supported
-                && let Some(Command::SetModel { session_id, provider, .. }) = &self.editing
+            if let Some(Command::SetModel { session_id, provider, model_id }) = &self.editing
                 && self.session() == Some(session_id.as_str())
                 && crate::engine::managed_local_provider(provider)
             {
-                self.model.toast = Some("Model selected. This engine loads it on the first prompt. Update Dial engine to load it on selection.".into());
+                if let Some(error) = error {
+                    self.local_load_failure = Some(LocalLoadFailure {
+                        session_id: session_id.clone(), provider: provider.clone(),
+                        model_id: model_id.clone(), error: error.to_owned(),
+                    });
+                } else if !self.model.prepare_local_model_supported {
+                    self.model.toast = Some("Model selected. This engine loads it on the first prompt. Update Dial engine to load it on selection.".into());
+                }
             }
             self.editing = None;
-            if !ok
+            if error.is_some()
                 && method == "set_model"
                 && matches!(self.edits.first(), Some(Command::SetThinking { .. }))
             {
@@ -153,12 +176,13 @@ impl Tab {
     pub fn apply(&mut self, update: Update) -> Vec<Command> {
         match &update {
             Update::Message(Message::Response { method, result, .. }) => {
-                self.settle_edit(method, result.is_ok())
+                self.settle_edit(method, result.as_ref().err().map(|err| err.message.as_str()))
             }
-            Update::RequestFailed { command, .. } => self.settle_edit(command.request().1, false),
+            Update::RequestFailed { command, error } => self.settle_edit(command.request().1, Some(error)),
             Update::ConnectFailed(_) | Update::Message(Message::Disconnected { .. }) => {
                 self.edits.clear();
                 self.editing = None;
+                self.local_load_failure = None;
             }
             _ => {}
         }
@@ -213,6 +237,9 @@ impl Tab {
         let was_running = self.model.conversation.turn_running();
         let mut follow = self.model.apply(update);
         follow.extend(self.next_edit());
+        if self.local_load_failure.as_ref().is_some_and(|failure| self.session() != Some(failure.session_id.as_str())) {
+            self.local_load_failure = None;
+        }
         self.turn_ended |= was_running && !self.model.conversation.turn_running();
         follow
     }
@@ -227,6 +254,10 @@ impl Tab {
 
     pub fn opening_session(&self) -> bool {
         self.opening.is_some()
+    }
+
+    pub fn local_load_failure(&self) -> Option<&LocalLoadFailure> {
+        self.local_load_failure.as_ref()
     }
 
     /// The model being switched now (not one deferred until the current turn ends).

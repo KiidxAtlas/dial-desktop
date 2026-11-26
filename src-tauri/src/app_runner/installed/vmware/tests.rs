@@ -23,13 +23,14 @@ const WAITS: Waits = Waits {
 
 /// A VMware executable under a trusted install root, for the current platform.
 fn trusted_exe() -> PathBuf {
-    PathBuf::from(if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    { super::super::inventory::vmware_install_dirs().next().unwrap().join("vmware-vmx.exe") }
+    #[cfg(not(windows))]
+    { PathBuf::from(if cfg!(target_os = "macos") {
         "/Applications/VMware Fusion.app/Contents/Library/vmware-vmx"
-    } else if cfg!(windows) {
-        r"C:\Program Files (x86)\VMware\VMware Workstation\vmware-vmx.exe"
     } else {
         "/usr/lib/vmware/bin/vmware-vmx"
-    })
+    }) }
 }
 
 /// A fake probe whose answers each test sets. `vm` describes a healthy VM owned by pid 7.

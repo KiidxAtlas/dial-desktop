@@ -15,7 +15,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -234,23 +234,21 @@ IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n{MARK_CLOSE}{alias}\n"
 /// `text` without the managed block for `alias`.
 pub(crate) fn without_block(text: &str, alias: &str) -> String {
     let mut out = String::new();
-    let mut inside = false;
+    let mut open = None;
     for line in text.split_inclusive('\n') {
         let bare = line.trim_end();
         let names = |mark: &str| {
             bare.strip_prefix(mark)
                 .is_some_and(|rest| rest == alias || rest.starts_with(&format!("{alias} ")))
         };
-        if !inside && names(MARK_OPEN) {
-            inside = true;
+        if names(MARK_OPEN) {
+            open = Some(out.len());
+        } else if names(MARK_CLOSE) && let Some(start) = open.take() {
+            out.truncate(start);
             continue;
         }
-        if inside {
-            if names(MARK_CLOSE) {
-                inside = false;
-            }
-            continue;
-        }
+        // Keep the text until we have seen both markers: an incomplete block must
+        // never cause the remainder of a user's config to be silently discarded.
         out.push_str(line);
     }
     out
@@ -282,10 +280,7 @@ pub(crate) fn free_alias(config: &str, base: &str) -> String {
 // ----- the host side -----
 
 fn home() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+    crate::launcher::home_dir()
         .ok_or_else(|| "Dial could not find your home folder.".to_owned())
 }
 
@@ -450,17 +445,43 @@ fn probe(key: &Path, user: &str, host: &str, port: u16) -> bool {
     run(&system_tool("ssh"), &args, PROBE_TIMEOUT).is_ok_and(|(ok, _)| ok)
 }
 
-fn write_config(path: &Path, alias: &str, block: &str) -> Result<(), String> {
-    let old = fs::read_to_string(path).unwrap_or_default();
-    let new = upsert_block(&old, alias, block);
-    let tmp = path.with_extension("dial-tmp");
-    fs::write(&tmp, new).map_err(|_| "Dial could not write ~/.ssh/config.".to_owned())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+/// Only a missing file means an empty config. In particular, never rewrite a symlink,
+/// a directory, or a config we cannot decode (e.g. Windows PowerShell's UTF-16 output).
+fn read_config(path: &Path) -> Result<Option<String>, String> {
+    let read_error = |e: std::io::Error| format!("Dial could not read ~/.ssh/config: {e}");
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(read_error(e)),
+        Ok(meta) if !meta.is_file() => return Err("Dial can only update a regular ~/.ssh/config file.".into()),
+        Ok(_) => {}
     }
-    fs::rename(&tmp, path).map_err(|_| "Dial could not write ~/.ssh/config.".to_owned())
+    let text = fs::read_to_string(path).map_err(read_error)?;
+    if text.contains('\0') || text.starts_with('\u{feff}') {
+        return Err("Dial can only update a UTF-8 ~/.ssh/config file without a byte-order mark.".into());
+    }
+    Ok(Some(text))
+}
+
+fn write_config(path: &Path, snapshot: Option<&str>, alias: &str, block: &str) -> Result<(), String> {
+    let dir = path.parent().ok_or("No SSH config directory.")?;
+    let write_error = |e: std::io::Error| format!("Dial could not write ~/.ssh/config: {e}");
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(write_error)?;
+    tmp.write_all(upsert_block(snapshot.unwrap_or_default(), alias, block).as_bytes()).map_err(write_error)?;
+    tmp.as_file().sync_all().map_err(write_error)?;
+
+    // Serialize competing Dial instances across the compare and rename. Keep the lock
+    // file: unlinking it while another writer waits would create two independent locks.
+    let lock = fs::OpenOptions::new().write(true).create(true).truncate(false)
+        .open(dir.join(".dial-ssh-config.lock")).map_err(write_error)?;
+    lock.lock().map_err(write_error)?;
+    if read_config(path)?.as_deref() != snapshot {
+        return Err("~/.ssh/config changed during setup. Its contents were not replaced; try again.".into());
+    }
+    if snapshot.is_none() {
+        tmp.persist_noclobber(path)
+    } else {
+        tmp.persist(path)
+    }.map(|_| ()).map_err(|e| write_error(e.error))
 }
 
 impl AppRunner {
@@ -492,6 +513,13 @@ impl AppRunner {
             return Err(fail("Set up SSH supports VirtualBox VMs for now. For VMware, enable sshd in the guest and link a host from ~/.ssh/config."));
         }
 
+        // Refuse an unreadable config before touching the guest or its network. Keep the
+        // snapshot used to pick the alias so a new Host added during setup is not shadowed.
+        let ssh_dir = home().map_err(|e| fail(&e))?.join(".ssh");
+        let config_path = ssh_dir.join("config");
+        let config = read_config(&config_path).map_err(|e| fail(&e))?;
+        let alias = free_alias(config.as_deref().unwrap_or_default(), &alias_for(&vm.name));
+
         // 1. How the Mac reaches the guest.
         let (ok, info) = run(&vm.tool, &["showvminfo", vm.locator.as_str(), "--machinereadable"], TOOL_TIMEOUT)
             .map_err(|e| fail(&e))?;
@@ -511,11 +539,6 @@ impl AppRunner {
         }
 
         // 2. Key and alias.
-        let home = home().map_err(|e| fail(&e))?;
-        let ssh_dir = home.join(".ssh");
-        let config_path = ssh_dir.join("config");
-        let config = fs::read_to_string(&config_path).unwrap_or_default();
-        let alias = free_alias(&config, &alias_for(&vm.name));
         let (key, pub_key) = ensure_key(&ssh_dir, &alias).map_err(|e| fail(&e))?;
 
         // 3. The guest command, typed as the user's own input.
@@ -573,7 +596,7 @@ impl AppRunner {
 
         // 5. Config and link.
         let block = config_block(&alias, &address, port, user, &key);
-        write_config(&config_path, &alias, &block).map_err(|e| fail(&e))?;
+        write_config(&config_path, config.as_deref(), &alias, &block).map_err(|e| fail(&e))?;
         ssh::save(&self.inner.data_dir, &vm_id, Some(&alias)).map_err(|e| fail(&e))?;
         Ok(SetupDone { host: alias, address, port, user: user.to_owned() })
     }

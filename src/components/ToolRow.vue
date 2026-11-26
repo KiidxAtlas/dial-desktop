@@ -4,6 +4,7 @@ import type { ToolEntry } from "../types";
 import { toggle, ui } from "../ui";
 import { snapshot } from "../bridge";
 import { addToPrompt, showFile, showPanel } from "../workspace";
+import { relativeTo } from "../paths";
 import Icon from "./Icon.vue";
 import CodeBlock from "./CodeBlock.vue";
 import GeneratedImage from "./GeneratedImage.vue";
@@ -26,9 +27,9 @@ const file = computed(() => {
   const t = props.tool;
   if (!["read", "edit", "write", "view"].includes(t.label.toLowerCase())) return null;
   const root = snapshot.value?.workspace?.root ?? "";
-  let path = t.target.trim();
-  if (root && path.startsWith(`${root}/`)) path = path.slice(root.length + 1);
-  return path && !/\s/.test(path) && !path.startsWith("/") && /[./]/.test(path) ? path : null;
+  // `relativeTo` accepts either separator under a Windows root and returns a `/`-separated path.
+  const path = root ? relativeTo(root, t.target.trim()) : t.target.trim();
+  return path && !/\s/.test(path) && !/^(?:[\\/]|[a-z]:[\\/])/i.test(path) && /[./\\]/.test(path) ? path : null;
 });
 
 /** The one-line result under the call, as a terminal agent prints it. */

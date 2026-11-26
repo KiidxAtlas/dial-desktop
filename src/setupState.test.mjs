@@ -8,6 +8,7 @@ test("welcome checklist follows the engine check", () => {
   const cases = [
     [null, true, ["checking", "later", "later"]],
     [{ state: "missing", error: "x" }, false, ["next", "later", "later"]],
+    [{ state: "unlaunchable", error: "os error 193" }, false, ["next", "later", "later"]],
     [{ state: "failed", error: "boom" }, false, ["problem", "next", "later"]],
     [{ state: "unsupported", detail: "" }, false, ["done", "next", "later"]],
     [{ state: "checked", status: { current: "1.2.3" } }, false, ["done", "next", "later"]],

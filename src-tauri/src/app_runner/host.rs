@@ -217,6 +217,23 @@ const TOOLS_ISO: &str = "dial-tools.iso";
 #[cfg(target_os = "macos")]
 const MAC_DISK_GIB: &str = "64";
 
+#[cfg(any(target_os = "macos", test))]
+fn mac_image_step(have_base: bool, can_prepare: bool, have_tools: bool) -> Step {
+    const ID: &str = "macos-image";
+    const LABEL: &str = "macOS virtual Mac";
+    if have_base {
+        Step::ready(ID, LABEL, "Installed.")
+    } else if can_prepare && have_tools {
+        Step::missing(ID, LABEL,
+            "Download macOS from Apple (about 15 GB) and install it into a private virtual Mac. A window opens for macOS setup; Dial imports the Mac when you shut it down.",
+            install("Download and install macOS", false))
+    } else {
+        Step::missing(ID, LABEL,
+            "Automatic installation needs macOS 15 or later and Dial's packaged preparation tools. Import a shut-down virtual Mac with its guest companion configured.",
+            Some(Action { label: "Import virtual Mac…", kind: "import", admin: false, cancellable: false }))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn host_setup(runner: &AppRunner) -> HostSetup {
     const BACKEND: &str = "Apple Virtualization";
@@ -247,29 +264,15 @@ fn host_setup(runner: &AppRunner) -> HostSetup {
     });
     let base = runtime::macos_base_dir(&runner.inner.data_dir);
     let have_base = runtime::MAC_BASE_FILES.iter().all(|name| base.join(name).is_file());
-    steps.push(if have_base {
-        Step::ready("macos-image", "macOS virtual Mac", "Installed.")
-    } else if helper_dir.join(PREPARE).is_file() {
-        Step::missing(
-            "macos-image",
-            "macOS virtual Mac",
-            "Download macOS from Apple (about 15 GB) and install it into a private virtual Mac. A window opens for macOS setup; Dial imports the Mac when you shut it down.",
-            install("Download and install macOS", false),
-        )
-    } else {
-        Step::blocked(
-            "macos-image",
-            "macOS virtual Mac",
-            "This build of Dial cannot install macOS. Install a Dial release for Apple silicon.",
-        )
-    });
+    steps.push(mac_image_step(have_base, objc2::available!(macos = 15.0),
+        helper_dir.join(PREPARE).is_file() && helper_dir.join(TOOLS_ISO).is_file()));
     setup("macos", BACKEND, GuestTarget::Macos, steps)
 }
 
 #[cfg(target_os = "macos")]
 fn run_install(app: &AppHandle, runner: &AppRunner, step: &str) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    if step != "macos-image" || !runtime::host_is_apple_silicon() {
+    if step != "macos-image" || !runtime::host_is_apple_silicon() || !objc2::available!(macos = 15.0) {
         return Err("Nothing to install for that step.".into());
     }
     let confirmed = app
@@ -311,10 +314,7 @@ fn run_install(app: &AppHandle, runner: &AppRunner, step: &str) -> Result<(), St
         .arg(&dest)
         .arg("--disk-gib")
         .arg(MAC_DISK_GIB);
-    let tools = helper_dir.join(TOOLS_ISO);
-    if tools.is_file() {
-        command.arg("--tools-iso").arg(tools);
-    }
+    command.arg("--tools-iso").arg(helper_dir.join(TOOLS_ISO));
     let code = stream(app, step, command);
     let code = match code {
         Ok(code) => code,
@@ -360,13 +360,36 @@ fn winget() -> Option<PathBuf> {
         .filter(|path| path.exists())
 }
 
+/// WHPX is optional; statically importing the DLL would stop Dial itself from
+/// starting on hosts without it. Only load the system copy and test the same
+/// HypervisorPresent capability that QEMU requires, not just DLL presence.
+#[cfg(windows)]
+fn hypervisor_present() -> bool {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    use windows::core::{s, w};
+    // SAFETY: both names are static and nul-terminated. The function signature
+    // matches WHvGetCapability and its output pointers live through the call.
+    unsafe {
+        let Ok(dll) = LoadLibraryExW(w!("WinHvPlatform.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return false };
+        let present = GetProcAddress(dll, s!("WHvGetCapability")).is_some_and(|proc| {
+            type GetCapability = unsafe extern "system" fn(i32, *mut i32, u32, *mut u32) -> i32;
+            let get: GetCapability = std::mem::transmute(proc);
+            let (mut present, mut written) = (0, 0);
+            let size = size_of::<i32>() as u32;
+            get(0 /* WHvCapabilityCodeHypervisorPresent */, &mut present, size, &mut written) >= 0
+                && written == size && present != 0
+        });
+        let _ = FreeLibrary(dll);
+        present
+    }
+}
+
 #[cfg(windows)]
 fn host_setup(runner: &AppRunner) -> HostSetup {
     let guest = GuestTarget::Windows;
     let mut steps = Vec::new();
-    // WinHvPlatform.dll is present once the Windows Hypervisor Platform feature is on.
-    let platform_on = system32().is_some_and(|dir| dir.join("WinHvPlatform.dll").is_file());
-    steps.push(if platform_on {
+    steps.push(if hypervisor_present() {
         Step::ready("hypervisor", "Windows Hypervisor Platform", "On.")
     } else if RESTART_PENDING.load(Ordering::Relaxed) {
         Step::blocked("hypervisor", "Windows Hypervisor Platform", "Turned on. Restart Windows to finish.")
@@ -390,6 +413,17 @@ fn host_setup(runner: &AppRunner) -> HostSetup {
     setup("windows", "Hyper-V (Windows Hypervisor Platform)", guest, steps)
 }
 
+// DISM has documented exit codes (including 3010); a PowerShell cmdlet does not
+// set $LASTEXITCODE. Do not convert UAC cancellation or a missing status to zero.
+#[cfg(windows)]
+const ENABLE_HYPERVISOR: &str = r#"
+try {
+    $p = Start-Process -ErrorAction Stop -FilePath (Join-Path ([Environment]::SystemDirectory) 'dism.exe') -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '/Online','/Enable-Feature','/FeatureName:HypervisorPlatform','/All','/NoRestart'
+    if ($null -eq $p.ExitCode) { exit 1 }
+    exit $p.ExitCode
+} catch { exit 1 }
+"#;
+
 #[cfg(windows)]
 fn run_install(app: &AppHandle, _runner: &AppRunner, step: &str) -> Result<(), String> {
     match step {
@@ -403,10 +437,8 @@ fn run_install(app: &AppHandle, _runner: &AppRunner, step: &str) -> Result<(), S
             let powershell = system32()
                 .map(|dir| dir.join(r"WindowsPowerShell\v1.0\powershell.exe"))
                 .ok_or("Windows PowerShell was not found.")?;
-            // The inner command is fixed text; nothing in it comes from the webview.
-            let script = "$p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-Command','Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart | Out-Null; exit $LASTEXITCODE'; exit $p.ExitCode";
             let mut command = Command::new(powershell);
-            command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+            command.args(["-NoProfile", "-NonInteractive", "-Command", ENABLE_HYPERVISOR]);
             let code = stream(app, step, command)?;
             // 3010: success, restart required.
             if code != 0 && code != 3010 {
@@ -730,9 +762,11 @@ pub async fn app_runner_host_install(
         let Some(action) = offered else {
             return Err(AppRunError::new("not_offered", "That step has nothing to install right now. Check again."));
         };
+        let start = crate::app::starting_service(&app).map_err(|e| AppRunError::new("busy", e))?;
         if BUSY.swap(true, Ordering::SeqCst) {
             return Err(AppRunError::new("busy", "Another install is still running."));
         }
+        drop(start); // Now visible to the updater as App host setup.
         CANCEL.store(false, Ordering::SeqCst);
         CANCELLABLE.store(action.cancellable, Ordering::SeqCst);
         let result = run_install(&app, &runner, &step);
@@ -748,6 +782,35 @@ pub async fn app_runner_host_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn elevated_feature_command_propagates_child_status_and_cancellation() {
+        let ps = system32().unwrap().join(r"WindowsPowerShell\v1.0\powershell.exe");
+        for (mock, code) in [
+            ("[pscustomobject]@{ ExitCode = 0 }", 0),
+            ("[pscustomobject]@{ ExitCode = 3010 }", 3010),
+            ("[pscustomobject]@{ ExitCode = 87 }", 87),
+            ("throw 'declined'", 1),
+            ("$null", 1),
+        ] {
+            // Shadow the launch cmdlet: no DISM, UAC prompt or feature change.
+            let script = format!("function Start-Process {{ {mock} }}\n{ENABLE_HYPERVISOR}");
+            let status = Command::new(&ps).args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .status().unwrap();
+            assert_eq!(status.code(), Some(code));
+        }
+    }
+
+    #[test]
+    fn mac_image_action_requires_supported_host_and_bundled_tools() {
+        for (base, supported, tools, action) in [
+            (false, false, true, Some("import")), (false, true, false, Some("import")),
+            (false, true, true, Some("install")), (true, false, true, None),
+        ] {
+            assert_eq!(mac_image_step(base, supported, tools).action.map(|a| a.kind), action);
+        }
+    }
 
     #[test]
     fn setup_serializes_in_the_shape_the_panel_reads() {

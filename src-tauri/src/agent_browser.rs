@@ -26,6 +26,10 @@ use crate::browser::{self, Browser};
 
 #[cfg(target_os = "macos")]
 mod screenshot;
+#[cfg(windows)]
+mod screenshot_windows;
+#[cfg(any(target_os = "macos", windows, test))]
+mod screenshot_wire;
 mod desktop;
 #[cfg(test)]
 mod tests;
@@ -105,8 +109,11 @@ pub fn endpoint_file(home: Option<&Path>) -> Option<PathBuf> {
 
 /// What the tools say about themselves, for the bridge's `initialize`.
 pub const INSTRUCTIONS: &str = "These tools drive the Browser panel of Dial Desktop, a real \
-browser the user watches beside this conversation. Use them to open and check web pages and local \
-dev servers: browser_open loads a page and lists its interactive elements with refs like [3]; \
+browser the user watches beside this conversation. When these tools are available, use the Browser \
+panel by default for opening, inspecting and interacting with pages, including local dev servers; \
+the user need not name the panel. Keep follow-up actions in the same panel. Use standalone Chromium \
+when the user requests it or the task needs a capability the panel lacks, such as Playwright tracing. \
+browser_open loads a page and lists its interactive elements with refs like [3]; \
 browser_click, browser_type and browser_select act on a ref; browser_read returns the page text \
 and console errors; browser_screenshot shows how it looks. Take a new snapshot after the page \
 changes. For a request to launch a graphical app, use app_desktop when the guest is configured; \
@@ -155,8 +162,8 @@ pub fn tools() -> Value {
             "browser_open",
             "Open a page",
             false,
-            "Open a page in the Dial Desktop Browser panel and wait for it to load. Takes a full URL, \
-             `localhost:3000`, a bare host, or words to search. Returns the page's title and its \
+            "Open a page in the visible Dial Desktop Browser panel (the default for browsing in Desktop) \
+             and wait for it to load. Takes a full URL, `localhost:3000`, a bare host, or words to search. Returns the page's title and its \
              interactive elements with refs (like browser_snapshot).",
             json!({"type": "object", "properties": {"url": {"type": "string", "description": "Address or search words"}}, "required": ["url"]}),
         ),
@@ -211,8 +218,10 @@ pub fn tools() -> Value {
             "browser_press",
             "Press a key",
             false,
-            "Press a key in the focused element: Enter, Escape, Backspace, ArrowDown, a letter… \
-             Enter in a form field submits the form. Focus a field with browser_click first.",
+            "Send a page key to the focused element. Plain text fields support typing, deletion and \
+             left/right caret movement; Tab/Shift+Tab focus page controls, select arrows choose an \
+             option, Enter activates or requests submission. Other page keys (e.g. Escape) dispatch \
+             events only; native browser shortcuts are not supported.",
             json!({"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}),
         ),
         tool(
@@ -253,7 +262,7 @@ pub fn tools() -> Value {
             "browser_screenshot",
             "Screenshot",
             true,
-            "A PNG of what the Browser panel shows.",
+            "A PNG of what the Browser panel shows (macOS and Windows).",
             none,
         ),
         tool(
@@ -364,20 +373,80 @@ const HELPERS: &str = r#"(() => {
     }
     throw new Error('Say which element: ref, selector or name');
   };
-  A.press = (key) => {
-    const el = document.activeElement || document.body;
+  A.press = (requested) => {
+    const shiftKey = requested === 'Shift+Tab';
+    const key = shiftKey ? 'Tab' : requested === 'Space' ? ' ' : requested;
+    const printable = [...key].length === 1 && !/[\x00-\x1f\x7f]/.test(key);
     const codes = { Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, ' ': 32, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39 };
-    const keyCode = codes[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
-    const o = { key, code: key.length === 1 ? 'Key' + key.toUpperCase() : key, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true };
-    const go = el.dispatchEvent(new KeyboardEvent('keydown', o));
-    if (key.length === 1 || key === 'Enter') el.dispatchEvent(new KeyboardEvent('keypress', o));
-    el.dispatchEvent(new KeyboardEvent('keyup', o));
-    if (go && key === 'Enter' && el.form && el.tagName === 'INPUT') {
-      if (el.form.requestSubmit) el.form.requestSubmit(); else el.form.submit();
-      return 'pressed Enter: submitted the form';
+    if (!printable && !Object.hasOwn(codes, key)) throw new Error('Unsupported page key or shortcut: ' + requested);
+    const el = document.activeElement || document.body;
+    const keyCode = codes[key] || (printable ? key.toUpperCase().charCodeAt(0) : 0);
+    const code = /^[a-z]$/i.test(key) ? 'Key' + key.toUpperCase() : /^\d$/.test(key) ? 'Digit' + key : key === ' ' ? 'Space' : printable ? '' : key;
+    const o = { key, code, keyCode, which: keyCode, shiftKey, bubbles: true, cancelable: true, composed: true };
+    const send = (type, target = el) => target.dispatchEvent(new KeyboardEvent(type, o));
+    const eventsOnly = `sent ${requested} to the page; no native default action simulated`;
+    try {
+      if (!send('keydown') || ((printable || key === 'Enter') && !send('keypress'))) return `page canceled ${requested}`;
+      if (document.activeElement !== el || !el.isConnected) return eventsOnly;
+      if (key === 'Tab') {
+        // Stay within this document, even at the first/last control. Never tab into app chrome.
+        const controls = [...document.querySelectorAll(A.SELECTOR)].filter(e => e.tabIndex >= 0 && A.visible(e) && !e.matches(':disabled') && !e.closest('[inert]'));
+        const rank = e => e.tabIndex || Infinity;
+        controls.sort((a, b) => rank(a) - rank(b));
+        const i = controls.indexOf(el);
+        const next = controls[i < 0 ? (shiftKey ? controls.length - 1 : 0) : i + (shiftKey ? -1 : 1)];
+        if (!next) return 'no further focusable page control';
+        next.focus();
+        return document.activeElement === next ? `focused ${A.describe(next)}` : 'page did not focus the next control';
+      }
+      if (el.matches(':disabled')) return 'focused control is disabled';
+      if (el.matches('select:not([multiple])') && (key === 'ArrowDown' || key === 'ArrowUp')) {
+        const step = key === 'ArrowDown' ? 1 : -1;
+        for (let i = el.selectedIndex + step; i >= 0 && i < el.length; i += step) {
+          if (el.options[i].matches(':disabled')) continue;
+          el.selectedIndex = i;
+          for (const type of ['input', 'change']) el.dispatchEvent(new Event(type, { bubbles: true }));
+          return `selected option ${el.selectedIndex + 1}`;
+        }
+        return 'no further selectable option';
+      }
+      if ((key === 'Enter' || key === ' ') && el.matches('button,summary,input:is([type=submit],[type=button],[type=reset],[type=image])') ||
+          key === 'Enter' && el.matches('a[href]') || key === ' ' && el.matches('input:is([type=checkbox],[type=radio])')) {
+        el.click();
+        return `clicked ${A.describe(el)}`;
+      }
+      if (key === 'Enter' && el.form && el.tagName === 'INPUT' && /^(text|search|url|tel|email|password|number)$/.test(el.type)) {
+        el.form.requestSubmit();
+        return 'requested form submission';
+      }
+      // Only edit controls with a text selection. A page handler may cancel beforeinput.
+      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) || el.selectionStart == null) return eventsOnly;
+      let start = el.selectionStart, end = el.selectionEnd;
+      const value = el.value;
+      const back = i => Math.max(0, i - (/^[\uD800-\uDBFF][\uDC00-\uDFFF]$/.test(value.slice(i - 2, i)) ? 2 : 1));
+      const forward = i => Math.min(value.length, i + (value.codePointAt(i) > 0xffff ? 2 : 1));
+      if (key === 'ArrowLeft' || key === 'ArrowRight') {
+        const pos = key === 'ArrowLeft' ? (start < end ? start : back(start)) : (start < end ? end : forward(end));
+        el.setSelectionRange(pos, pos);
+        return `caret at ${pos}`;
+      }
+      if (!(printable || key === 'Backspace' || key === 'Delete' || key === 'Enter' && el.tagName === 'TEXTAREA')) return eventsOnly;
+      if (el.readOnly) return 'text field is read-only';
+      const inputType = printable ? 'insertText' : key === 'Enter' ? 'insertLineBreak' : key === 'Backspace' ? 'deleteContentBackward' : 'deleteContentForward';
+      const text = printable ? key : key === 'Enter' ? '\n' : '';
+      if (start === end && key === 'Backspace') start = back(start);
+      if (start === end && key === 'Delete') end = forward(end);
+      if (start === end && !text) return 'nothing to delete at the caret';
+      if (text && el.maxLength >= 0 && value.length - (end - start) + text.length > el.maxLength) return 'field length limit reached';
+      const input = { inputType, data: printable ? text : null, bubbles: true, composed: true };
+      if (!el.dispatchEvent(new InputEvent('beforeinput', { ...input, cancelable: true }))) return `page canceled ${inputType}`;
+      if (document.activeElement !== el || el.value !== value || el.readOnly || el.matches(':disabled')) return eventsOnly;
+      el.setRangeText(text, start, end, 'end');
+      el.dispatchEvent(new InputEvent('input', input));
+      return `applied ${inputType} to ${A.describe(el)}`;
+    } finally {
+      send('keyup', document.activeElement || el);
     }
-    if (go && key === 'Enter' && (el.tagName === 'A' || el.tagName === 'BUTTON')) el.click();
-    return `pressed ${key} in ${el === document.body ? 'the page' : A.describe(el)}`;
   };
   A.run = (fn) => {
     try {
@@ -1018,7 +1087,7 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
             )?;
             Ok(Reply::text(format!(
                 "{}. {}",
-                value.as_str().unwrap_or("Pressed"),
+                value.as_str().ok_or("The page did not return a key action result")?,
                 settle(app, before)
             )))
         }
@@ -1129,46 +1198,43 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn capture(app: &AppHandle) -> Result<Reply, String> {
-    use base64::Engine;
     // Let the panel come up if the agent's call just showed it.
     thread::sleep(Duration::from_millis(250));
     let view = app
         .get_webview(browser::LABEL)
         .ok_or("The browser is not open")?;
+    #[cfg(target_os = "macos")]
     let png = screenshot::capture(&view, None)?;
+    #[cfg(windows)]
+    let png = screenshot_windows::capture(&view)?;
     let state = app.state::<Browser>().current();
-    Ok(Reply {
-        ok: true,
-        text: format!("Screenshot of {} ({})", state.title, state.url),
-        image: Some(base64::engine::general_purpose::STANDARD.encode(png)),
-    })
+    screenshot_wire::reply(
+        format!("Screenshot of {} ({})", clip(&state.title, 512), clip(&state.url, 2048)),
+        png,
+    )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn capture(_app: &AppHandle) -> Result<Reply, String> {
-    Err("Screenshots of the Browser panel are available on macOS only for now".into())
+    Err("Screenshots of the Browser panel are available on macOS and Windows".into())
 }
 
 #[cfg(target_os = "macos")]
 fn capture_type(app: &AppHandle, args: &Value) -> Result<Reply, String> {
-    use base64::Engine;
     let id = app.state::<crate::types::Store>().find(string_arg(args, "type")?)?;
     crate::types::live::wait_loaded(app, &id, Duration::from_secs(10))?;
     // Let web fonts, images and entrance animations settle.
     thread::sleep(Duration::from_millis(400));
     let view = app.get_webview("main").ok_or("The Dial window is not open")?;
     let png = screenshot::capture_type(&view, &id)?;
+    let reply = screenshot_wire::reply(
+        format!("Screenshot of Type {id}'s app.\n{}", crate::types::live::console(app, &id, false)),
+        png,
+    )?;
     crate::types::progress(app, &id, json!({"checked": true}));
-    Ok(Reply {
-        ok: true,
-        text: format!(
-            "Screenshot of Type {id}'s app.\n{}",
-            crate::types::live::console(app, &id, false)
-        ),
-        image: Some(base64::engine::general_purpose::STANDARD.encode(png)),
-    })
+    Ok(reply)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1219,19 +1285,41 @@ pub fn needs_registration(saved: Option<&Value>, exe: &Path) -> bool {
 pub fn register(dial: &Path, exe: &Path) -> Result<bool, String> {
     let key = format!("mcp.{SERVER_NAME}");
     let timeout = Duration::from_secs(10);
-    let saved = crate::launcher::run_with_timeout(
-        Command::new(dial).args(["config", "get", &key, "--json"]),
-        timeout,
-    )
-    .and_then(|out| serde_json::from_slice::<Value>(&out).ok())
-    .and_then(|v| v.get("value").cloned());
-    if !needs_registration(saved.as_ref(), exe) {
+    // Config resolves a project layer in the process cwd (and rejects the filesystem root,
+    // common for GUI launches). Inspect only global settings, regardless of the launch folder.
+    let scratch = tempfile::tempdir().map_err(|error| format!("Could not prepare a config directory: {error}"))?;
+    let absolute = |path: &Path| std::path::absolute(path).map_err(|error| error.to_string());
+    let dial = if dial.is_relative() && dial.components().count() > 1 {
+        absolute(dial)?
+    } else {
+        dial.to_owned()
+    };
+    // Keep an explicitly relative DIAL_HOME relative to the original cwd, not the scratch one.
+    let dial_home = std::env::var_os("DIAL_HOME").filter(|p| !p.is_empty())
+        .map(PathBuf::from).filter(|p| p.is_relative()).map(|p| absolute(&p)).transpose()?;
+    let config = |args: &[&str]| {
+        let mut command = Command::new(&dial);
+        command.current_dir(scratch.path()).arg("config").args(args);
+        if let Some(home) = &dial_home { command.env("DIAL_HOME", home); }
+        crate::launcher::run_with_timeout(&mut command, timeout)
+    };
+
+    // Unlike querying a single absent entry, an empty `mcp` table is a successful read. A
+    // failed or unrecognizable read must never be interpreted as permission to enable tools.
+    let out = config(&["get", "mcp", "--json"]).ok_or("`dial config get mcp` failed")?;
+    let saved: Value = serde_json::from_slice(&out).map_err(|_| "Invalid `dial config get mcp` response")?;
+    let servers = saved.get("value").and_then(Value::as_object)
+        .filter(|_| saved.get("key").and_then(Value::as_str) == Some("mcp"))
+        .ok_or("Missing MCP table in config response")?;
+    let entry = servers.get(SERVER_NAME);
+    if entry.is_some_and(|entry| !entry.is_object()) {
+        return Err(format!("Invalid {key} entry in config response"));
+    }
+    if !needs_registration(entry, exe) {
         return Ok(false);
     }
-    crate::launcher::run_with_timeout(
-        Command::new(dial).args(["config", "set", &key, &mcp_entry(exe)]),
-        timeout,
-    )
-    .map(|_| true)
-    .ok_or_else(|| format!("`dial config set {key}` failed"))
+    // `config set` without `--project` writes only the global layer.
+    config(&["set", &key, &mcp_entry(exe)])
+        .map(|_| true)
+        .ok_or_else(|| format!("`dial config set {key}` failed"))
 }

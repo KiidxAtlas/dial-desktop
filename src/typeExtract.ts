@@ -6,9 +6,19 @@ const IMAGE = /!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
 export function markdownImages(markdown: string, root: string): string[] {
   const out: string[] = [];
   for (const m of markdown.matchAll(IMAGE)) {
-    let path = decodeURI(m[1]).replace(/^file:\/\//, "");
-    if (/^[a-z]+:/i.test(path) && !/^[a-z]:[\\/]/i.test(path)) continue; // web and data URLs
-    if (!path.startsWith("/") && !/^[a-z]:[\\/]/i.test(path)) path = `${root.replace(/[\\/]+$/, "")}/${path.replace(/^\.\//, "")}`;
+    let path: string;
+    try {
+      if (/^file:\/\//i.test(m[1])) {
+        const url = new URL(m[1]);
+        path = decodeURIComponent(url.pathname);
+        if (url.hostname) path = `//${url.hostname}${path}`;
+        else path = path.replace(/^\/([a-z]:\/)/i, "$1");
+      } else {
+        path = decodeURI(m[1]);
+        if (/^[a-z][a-z\d+.-]*:/i.test(path) && !/^[a-z]:[\\/]/i.test(path)) continue;
+      }
+    } catch { continue; } // One malformed link must not discard the rest of the answer.
+    if (!/^(?:\/|\\\\|[a-z]:[\\/])/i.test(path)) path = `${root.replace(/[\\/]+$/, "")}/${path.replace(/^\.\//, "")}`;
     if (!out.includes(path)) out.push(path);
   }
   return out;

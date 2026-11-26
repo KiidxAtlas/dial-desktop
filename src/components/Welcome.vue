@@ -2,7 +2,7 @@
 // Shown when no folder is open: pick a project, like starting a terminal agent in one.
 import { computed, onMounted } from "vue";
 import { folders } from "../bridge";
-import { installEngine, updates } from "../updates";
+import { installEngine, needsEngineInstall, updates } from "../updates";
 import { openMenu, ui } from "../ui";
 import { clearRecentProjects, forgetProject, loadRecentProjects, projectItems, recentProjects as recent } from "../projects";
 import { welcomeSteps } from "../setupState";
@@ -49,9 +49,9 @@ const showSteps = computed(() => !recent.value.length || steps.value[0].state !=
           </span>
         </li>
       </ol>
-      <div v-if="updates.engine?.state === 'missing'" class="engine-missing">
+      <div v-if="needsEngineInstall(updates.engine?.state)" class="engine-missing">
         <p>
-          Dial Desktop couldn’t find an engine. Install a signed copy for Desktop to use.
+          Install a signed engine for Desktop to use, or choose an existing one.
           On macOS and Linux, this copy stays private to Desktop; Settings › Health &amp; setup can add it to your terminal’s PATH afterwards.
         </p>
         <button class="btn btn-secondary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine()">

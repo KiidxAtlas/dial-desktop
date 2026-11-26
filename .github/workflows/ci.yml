@@ -28,6 +28,41 @@ jobs:
           workspaces: src-tauri -> target
       - run: npm ci
       - run: npm run build:web
-      - run: node --test src/paths.test.mjs src/terminalLinks.test.mjs src/modelLibrary.test.mjs src/integrations.test.mjs
+      - run: node --test src/paths.test.mjs src/commandRunner.test.mjs src/terminalLinks.test.mjs src/modelLibrary.test.mjs src/integrations.test.mjs
+      - run: node --test --test-name-pattern="answers name the local images" src/typeDesign.test.mjs
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib agent_browser::screenshot_wire
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib launcher::tests
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib engine_cli::tests::command_files_survive_engine_updates
+      - if: runner.os != 'Windows'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib selecting_an_engine_retries_browser_registration
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib terminal::tests
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib browser_mcp::tests
+      - name: Check workspace file selection, engine recovery and update guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          filters=(files::tests::git_operations_select_only_the_named_file
+            files::tests::unreadable_head_never_turns_restore_into_delete
+            files::tests::revert_discards_changes_inside_the_workspace_only
+            updates::tests::a_missing_engine_and_a_broken_answer_are_told_apart
+            new_project_windows_only_replay_a_real_dial_flag updates_refuse_each_nonterminal_service_and_can_retry_when_idle
+            config_write_refuses_read_errors_and_stale_alias_snapshots)
+          if [[ $RUNNER_OS == Windows ]]; then
+            filters+=(directory_junctions_are_never_expanded elevated_feature_command_propagates_child_status_and_cancellation
+              only_exact_vmx_binaries_under_the_machine_install_dir_are_trusted)
+          else
+            filters+=(actions_on_links_do_not_target_the_worktree_file)
+          fi
+          for filter in "${filters[@]}"; do
+            cargo test --locked --manifest-path src-tauri/Cargo.toml --lib "$filter" | tee "$RUNNER_TEMP/dial-test.txt"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/dial-test.txt"
+          done
+      - name: Capture the Windows Browser panel through the MCP bridge
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: src-tauri/target
+        run: |
+          cargo build --locked --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/windows-browser-smoke.py src-tauri/target/debug/dial-desktop.exe

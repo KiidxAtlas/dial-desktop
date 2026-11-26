@@ -6,6 +6,11 @@ import type { Attachment } from './types';
 
 export { IMAGE_FILE } from './attachmentFormats';
 
+// A persisted draft key, not a credential. getRandomValues is available on older WebKit too.
+function attachmentKey(): string {
+  return Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, '0')).join('');
+}
+
 function hasRoom(draft: Draft): boolean {
   if (draft.attachments.length < MAX_ATTACHMENTS) return true;
   showToast(`Attach at most ${MAX_ATTACHMENTS} files to one prompt`);
@@ -29,7 +34,7 @@ export async function addPaths(draft: Draft, paths: string[]) {
       const image = IMAGE_FILE.test(path);
       if (!image) await files.validateAttachment(path);
       const file = image ? await files.readImage(path) : { path, name: path.split(/[\\/]/).pop() || path, url: null };
-      if (!append(draft, { ...file, key: crypto.randomUUID(), data: null })) return;
+      if (!append(draft, { ...file, key: attachmentKey(), data: null })) return;
     } catch (error) {
       showToast(String(error));
     }
@@ -64,7 +69,7 @@ export async function addBlobs(draft: Draft, blobs: File[]) {
     try {
       const data = await readBase64(blob);
       const url = mime ? `data:${mime};base64,${data}` : null;
-      if (!append(draft, { key: crypto.randomUUID(), name, url, path: null, data })) return;
+      if (!append(draft, { key: attachmentKey(), name, url, path: null, data })) return;
     } catch (error) {
       showToast(`Could not read ${name}: ${error}`);
     }
@@ -76,13 +81,13 @@ export async function addNativeClipboardImage(draft: Draft) {
   try {
     const data = await files.readClipboardImage();
     if (!data) return showToast('No clipboard image found. Copy the screenshot, or choose its file.');
-    append(draft, { key: crypto.randomUUID(), name: 'Pasted image.png', url: `data:image/png;base64,${data}`, path: null, data });
+    append(draft, { key: attachmentKey(), name: 'Pasted image.png', url: `data:image/png;base64,${data}`, path: null, data });
   } catch (error) {
     showToast(String(error));
   }
 }
 
-/** Native Finder / Explorer file lists may not be exposed as DOM files. */
+/** Native file-manager copies may not be exposed as DOM files. */
 export async function addNativeClipboardFiles(draft: Draft, platform: string) {
   try {
     const paths = await files.readClipboardFilePaths();

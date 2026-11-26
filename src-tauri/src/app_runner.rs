@@ -351,6 +351,7 @@ impl AppRunner {
         origin: Origin,
         guest: GuestTarget,
     ) -> Result<RunInfo, AppRunError> {
+        let _start = crate::app::starting_service(&self.inner.app).map_err(|e| start_failed(&e))?;
         let root = Path::new(workspace);
         if !root.is_dir() {
             return Err(AppRunError::new(

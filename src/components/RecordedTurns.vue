@@ -61,7 +61,7 @@ function workingTree(path: string) { ui.diffPath = path; showPanel('changes'); }
 </script>
 <template>
   <details ref="panel" class="recorded">
-    <summary>Turn results<span v-if="turns[0]"> · {{ turns[0].outcome.replaceAll('_', ' ') }}{{ turns[0].step_limit ? ' (step limit)' : '' }}</span></summary>
+    <summary>Turn results<span v-if="turns[0]" class="status">&nbsp;· {{ turns[0].outcome.replaceAll('_', ' ') }}{{ turns[0].step_limit ? ' (step limit)' : '' }}</span></summary>
     <p v-if="error" role="alert">{{ error }} <button class="btn btn-secondary" @click="load">Reload</button></p>
     <p v-if="loading">Loading recorded results…</p>
     <p v-else-if="!turns.length && !error">No recorded turn result available.</p>
@@ -85,5 +85,6 @@ function workingTree(path: string) { ui.diffPath = path; showPanel('changes'); }
 </template>
 <style scoped>
 .recorded { margin: 10px 0; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 8px 12px; font-size: var(--text-sm); color: var(--text-muted); overflow-wrap: anywhere; }
-summary { cursor: pointer; color: var(--text); } select { max-width: 100%; margin-top: 8px; } p { margin: 6px 0; } .btn { margin: 3px; max-width: 100%; white-space: normal; height: auto; min-height: 28px; }
+summary { display: flex; align-items: center; gap: 2px; color: var(--text); } summary:hover { color: var(--text-strong); } select { max-width: 100%; margin-top: 8px; } p { margin: 6px 0; } .btn { margin: 3px; max-width: 100%; white-space: normal; height: auto; min-height: 28px; }
+.status { color: var(--text-muted); }
 </style>

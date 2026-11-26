@@ -71,11 +71,13 @@ pub struct GitFileStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatusView {
-    /// `false` outside a Git work tree (or when Git is not installed); `files` is then empty.
+    /// Whether the workspace itself has a Git index (the one used by commit controls).
     pub repo: bool,
     pub files: Vec<GitFileStatus>,
     /// The checked-out branch, `detached at <commit>` without one; `None` outside Git.
     pub branch: Option<String>,
+    /// Successfully inspected child worktrees, with project-relative paths.
+    pub nested_repos: Vec<String>,
 }
 
 /// One line of a content search: the file, its 1-based line number and the line's text.
@@ -111,6 +113,10 @@ pub struct DiffView {
     /// Empty when the file has no uncommitted changes.
     pub diff: String,
     pub base: DiffBase,
+    /// Reverting deletes this entry rather than restoring a committed version.
+    pub delete_on_revert: bool,
+    /// Child repositories can be inspected without authorizing writes to their indexes.
+    pub nested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -175,17 +181,21 @@ pub fn list(root: &Path, path: &str) -> Result<Vec<DirEntryView>, String> {
 
 /// Like [`list`]; with `show_ignored`, ignored entries are kept and marked instead.
 pub fn list_with(root: &Path, path: &str, show_ignored: bool) -> Result<Vec<DirEntryView>, String> {
-    let dir = resolve(root, if path.is_empty() { "." } else { path })?;
+    // This also applies when reloading a directory remembered by an older tree.
+    let dir = panel_entry(root, path)?;
+    let meta = fs::symlink_metadata(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
+    if !meta.is_dir() || directory_reparse_point(&meta) { return Err(format!("{path} is not a plain folder")); }
     let entries = fs::read_dir(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
     let mut out: Vec<DirEntryView> = entries
         .flatten()
         .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let name = entry.file_name().into_string().ok()?;
             if HIDDEN.contains(&name.as_str()) {
                 return None;
             }
-            // Follows symlinks, so a linked folder expands like a folder.
-            let is_dir = entry.path().is_dir();
+            // Do not recurse through directory links/junctions (including links to ancestors).
+            let meta = entry.metadata().ok()?;
+            let is_dir = meta.is_dir() && !directory_reparse_point(&meta);
             Some(DirEntryView {
                 path: relative(root, &dir.join(&name)),
                 name,
@@ -219,7 +229,18 @@ fn git_in(root: &Path, args: &[&str]) -> Result<Output, String> {
 
 fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    crate::launcher::without_console(&mut cmd).arg("-C").arg(root).args(args);
+    crate::launcher::without_console(&mut cmd).arg("-C").arg(root);
+    // Inspecting a child worktree must not start a monitor configured by that worktree.
+    cmd.args(["-c", "core.fsmonitor=false"]);
+    // Panel paths are filenames, never user-entered patterns. Do not inherit a shell's
+    // pathspec mode (including case folding); check-ignore requires plain ./-prefixed names.
+    if matches!(args.first().copied(), Some("add" | "restore" | "rm" | "diff" | "ls-files" | "ls-tree" | "check-ignore")) {
+        for key in ["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"] {
+            cmd.env_remove(key);
+        }
+        if args[0] != "check-ignore" { cmd.arg("--literal-pathspecs"); }
+    }
+    cmd.args(args);
     cmd
 }
 
@@ -227,11 +248,8 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
 /// `None` outside a work tree or without Git.
 fn git_prefix(root: &Path) -> Option<String> {
     let out = git_in(root, &["rev-parse", "--show-prefix"]).ok()?;
-    out.status.success().then(|| {
-        String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches(['\n', '\r'])
-            .to_owned()
-    })
+    if !out.status.success() { return None; }
+    Some(std::str::from_utf8(&out.stdout).ok()?.trim_end_matches(['\n', '\r']).to_owned())
 }
 
 /// The paths among `entries` that `.gitignore` (or Git's other exclude files) matches. Empty
@@ -247,7 +265,7 @@ fn ignored_paths(root: &Path, entries: &[DirEntryView]) -> HashSet<String> {
     };
     if let Some(name) = prefix.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty())
         && let Some(parent) = root.canonicalize().ok().and_then(|r| r.parent().map(Path::to_path_buf))
-        && git_in(&parent, &["check-ignore", "-q", "--", &format!("{name}/")])
+        && git_in(&parent, &["check-ignore", "-q", "--", &format!("./{name}/")])
             .is_ok_and(|o| o.status.success())
     {
         return out;
@@ -255,6 +273,8 @@ fn ignored_paths(root: &Path, entries: &[DirEntryView]) -> HashSet<String> {
     // Folders get a trailing `/` so folder-only patterns such as `build/` match them.
     let mut input = Vec::new();
     for entry in entries {
+        // check-ignore does not support :(literal); ./ also disarms leading colon magic.
+        input.extend_from_slice(b"./");
         input.extend_from_slice(entry.path.as_bytes());
         if entry.dir {
             input.push(b'/');
@@ -270,7 +290,7 @@ fn ignored_paths(root: &Path, entries: &[DirEntryView]) -> HashSet<String> {
     }
     for raw in output.stdout.split(|&b| b == 0).filter(|raw| !raw.is_empty()) {
         let path = String::from_utf8_lossy(raw);
-        out.insert(path.trim_end_matches('/').to_owned());
+        out.insert(path.strip_prefix("./").unwrap_or(&path).trim_end_matches('/').to_owned());
     }
     out
 }
@@ -298,18 +318,73 @@ fn with_input(command: &mut Command, input: Vec<u8>) -> std::io::Result<Output> 
     output
 }
 
-/// The workspace's changed paths from one `git status`; with `counts`, also each file's added and
-/// removed lines (`git diff --numstat` against `HEAD`, line counts for untracked files).
+/// Look for child worktrees, including submodules and linked worktrees (`.git` files).
+/// Never descend through links, Git metadata or common dependency/build folders.
+fn nested_worktrees(root: &Path) -> Vec<PathBuf> {
+    let mut queue = std::collections::VecDeque::from([root.to_owned()]);
+    let mut repos = Vec::new();
+    let mut visited = 0;
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() { continue; }
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            if name.eq_ignore_ascii_case(".git") || SKIP_DIRS.contains(&name.as_str()) { continue; }
+            if !entry.metadata().is_ok_and(|meta| !directory_reparse_point(&meta)) { continue; }
+            let path = entry.path();
+            if worktree_marker(&path) { repos.push(path.clone()); }
+            queue.push_back(path);
+            visited += 1;
+            if visited >= MAX_WALK_FILES { return repos; }
+        }
+    }
+    repos
+}
+
+fn worktree_marker(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| (m.is_dir() || m.is_file()) && !directory_reparse_point(&m))
+}
+
+/// A gitfile can redirect Git. Only report a child whose worktree is actually this folder.
+fn is_worktree_root(dir: &Path) -> bool {
+    git_checked(dir, &["rev-parse", "--show-toplevel"]).ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|top| Path::new(top.trim_end_matches(['\r', '\n'])).canonicalize().ok())
+        .is_some_and(|top| top == dir)
+}
+
+/// Aggregate files, not branches or indexes: commit controls always describe the workspace.
 pub fn status(root: &Path, counts: bool) -> Result<GitStatusView, String> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("The project folder is unavailable: {e}"))?;
-    let Some(prefix) = git_prefix(&root) else {
-        return Ok(GitStatusView { repo: false, files: Vec::new(), branch: None });
+    let prefix = git_prefix(&root);
+    let children = nested_worktrees(&root);
+    let mut files = match &prefix {
+        Some(prefix) => repo_status(&root, prefix, counts, !children.is_empty())?,
+        None => Vec::new(),
     };
+    let mut nested_repos = Vec::new();
+    for child in children {
+        if !is_worktree_root(&child) { continue; }
+        let Ok(changes) = repo_status(&child, "", counts, true) else { continue };
+        let path = relative(&root, &child);
+        let prefix = format!("{path}/");
+        // Git lists an embedded repository as an untracked directory. Its own status
+        // supersedes that placeholder (but not an actual staged submodule pointer).
+        files.retain(|f| !f.path.starts_with(&prefix));
+        files.extend(changes.into_iter().map(|mut f| { f.path.insert_str(0, &prefix); f }));
+        nested_repos.push(path);
+    }
+    Ok(GitStatusView { repo: prefix.is_some(), branch: prefix.and_then(|_| current_branch(&root)), files, nested_repos })
+}
+
+fn repo_status(root: &Path, prefix: &str, counts: bool, nested: bool) -> Result<Vec<GitFileStatus>, String> {
+    let untracked = if nested { "--untracked-files=all" } else { "--untracked-files=normal" };
     let output = git_in(
-        &root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", "."],
+        root,
+        &["status", "--porcelain=v1", "-z", untracked, "--", "."],
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -317,13 +392,13 @@ pub fn status(root: &Path, counts: bool) -> Result<GitStatusView, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut files = parse_status(&output.stdout, &prefix);
-    if counts {
-        let has_head = git_in(&root, &["rev-parse", "--verify", "--quiet", "HEAD"])?
+    let mut files = parse_status(&output.stdout, prefix);
+    if counts && !files.is_empty() {
+        let has_head = git_in(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?
             .status
             .success();
         let stats = if has_head {
-            git_in(&root, &["diff", "--numstat", "-z", "--relative", "--no-color", "HEAD", "--"])
+            git_in(root, &["diff", "--numstat", "--no-ext-diff", "--no-textconv", "-z", "--relative", "--no-color", "HEAD", "--"])
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| parse_numstat(&o.stdout))
@@ -335,12 +410,12 @@ pub fn status(root: &Path, counts: bool) -> Result<GitStatusView, String> {
             if let Some(&(added, removed)) = stats.get(&file.path) {
                 (file.added, file.removed) = (added, removed);
             } else if file.status == 'U' && !file.path.ends_with('/') {
-                file.added = untracked_lines(&root, &file.path);
+                file.added = untracked_lines(root, &file.path);
                 file.removed = file.added.map(|_| 0);
             }
         }
     }
-    Ok(GitStatusView { repo: true, files, branch: current_branch(&root) })
+    Ok(files)
 }
 
 /// The checked-out branch's short name, or `detached at <commit>`; `None` before the first commit
@@ -371,7 +446,8 @@ fn parse_status(raw: &[u8], prefix: &str) -> Vec<GitFileStatus> {
         if matches!(x, b'R' | b'C') {
             fields.next();
         }
-        let path = String::from_utf8_lossy(&field[3..]);
+        // The JSON UI cannot identify a non-Unicode file without changing its name.
+        let Ok(path) = std::str::from_utf8(&field[3..]) else { continue };
         let Some(path) = path.strip_prefix(prefix).filter(|p| !p.is_empty()) else {
             continue;
         };
@@ -403,7 +479,7 @@ fn parse_numstat(raw: &[u8]) -> HashMap<String, (Option<u64>, Option<u64>)> {
     let mut out = HashMap::new();
     let mut fields = raw.split(|&b| b == 0);
     while let Some(field) = fields.next() {
-        let text = String::from_utf8_lossy(field);
+        let Ok(text) = std::str::from_utf8(field) else { continue };
         let mut parts = text.splitn(3, '\t');
         let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
@@ -412,8 +488,8 @@ fn parse_numstat(raw: &[u8]) -> HashMap<String, (Option<u64>, Option<u64>)> {
         // A rename has an empty path here, then its old and new paths as separate fields.
         let path = if path.is_empty() {
             fields.next();
-            match fields.next() {
-                Some(new) => String::from_utf8_lossy(new).into_owned(),
+            match fields.next().and_then(|new| std::str::from_utf8(new).ok()) {
+                Some(new) => new.to_owned(),
                 None => continue,
             }
         } else {
@@ -434,84 +510,154 @@ fn untracked_lines(root: &Path, path: &str) -> Option<u64> {
     Some(text.lines().count() as u64)
 }
 
-/// `path` inside `root`, which need not exist (a deleted file): the nearest existing ancestor is
-/// resolved like [`resolve`] and the missing tail, plain names only, is appended.
-fn resolve_missing(root: &Path, path: &str) -> Result<PathBuf, String> {
-    if let Ok(found) = resolve(root, path) {
-        return Ok(found);
+/// Windows junctions and other directory reparse points need not report a symlink file type.
+fn directory_reparse_point(_meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const DIRECTORY_REPARSE: u32 = 0x10 | 0x400;
+        return _meta.file_attributes() & DIRECTORY_REPARSE == DIRECTORY_REPARSE;
     }
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
+    #[cfg(not(windows))]
+    false
+}
+
+/// The selected directory entry, without following a link and losing its Git name.
+fn workspace_entry(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let canonical = root.canonicalize().map_err(|e| format!("The project folder is unavailable: {e}"))?;
     let given = Path::new(path);
-    let relative = if given.is_absolute() {
-        given.strip_prefix(&canonical).or_else(|_| given.strip_prefix(root)).map_err(|_| outside(path))?
+    let rel = if given.is_absolute() {
+        given.strip_prefix(root).or_else(|_| given.strip_prefix(&canonical)).or_else(|_| {
+            // Windows may spell the same root with a different case or verbatim prefix.
+            let ancestor = given.ancestors().filter(|a| a.canonicalize().is_ok_and(|p| p == canonical)).last();
+            given.strip_prefix(ancestor.ok_or_else(|| outside(path))?).map_err(|_| outside(path))
+        })?
     } else {
         given
     };
-    if relative.components().any(|c| !matches!(c, Component::Normal(_))) {
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         return Err(outside(path));
     }
-    let mut base = relative.to_path_buf();
-    let mut tail = Vec::new();
-    while !canonical.join(&base).exists() {
-        let Some(name) = base.file_name() else { break };
-        tail.push(name.to_owned());
-        base.pop();
+    Ok(canonical.join(rel))
+}
+
+/// Address a missing entry (deletion) or an in-project link (the link, not its target).
+/// Refuse traversal through links, dangling or escaping links, and Git's own metadata.
+fn panel_entry(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let entry = workspace_entry(root, path)?;
+    let canonical = root.canonicalize().map_err(|e| e.to_string())?;
+    let rel = entry.strip_prefix(&canonical).map_err(|_| outside(path))?;
+    let mut current = canonical.clone();
+    for part in rel.components() {
+        if part.as_os_str().eq_ignore_ascii_case(".git") {
+            return Err("Cannot change Git metadata".into());
+        }
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if directory_reparse_point(&meta) => return Err(format!("Cannot address {path} through a directory reparse point")),
+            Ok(meta) if meta.is_symlink() => {
+                let target = current.canonicalize().map_err(|e| format!("Cannot resolve {path}: {e}"))?;
+                if !target.starts_with(&canonical) { return Err(outside(path)); }
+                if current != entry { return Err(format!("Cannot address {path} through a directory link")); }
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("Cannot open {path}: {e}")),
+            _ => {}
+        }
     }
-    let mut real = if base.as_os_str().is_empty() {
-        canonical.clone()
-    } else {
-        resolve(&canonical, &base.to_string_lossy())?
-    };
-    if !real.starts_with(&canonical) {
-        return Err(outside(path));
+    Ok(entry)
+}
+
+/// Find the nearest repository boundary without walking outside the authorized workspace.
+/// The entry itself may be deleted or a symlink; ownership is determined by its parents.
+fn nested_owner(root: &Path, entry: &Path) -> Option<PathBuf> {
+    entry.parent()?.ancestors().take_while(|p| p.starts_with(root) && *p != root)
+        .find(|p| fs::symlink_metadata(p.join(".git")).is_ok()).map(Path::to_path_buf)
+}
+
+fn require_workspace_index(root: &Path, entry: &Path) -> Result<(), String> {
+    if nested_owner(root, entry).is_some() {
+        return Err("Open the nested repository as a project to change it".into());
     }
-    real.extend(tail.iter().rev());
-    Ok(real)
+    Ok(())
+}
+
+/// Exact state of one file across the worktree, index and HEAD. Even a literal pathspec
+/// selects descendants of a directory; a single-file operation must refuse such a selection.
+struct GitFile {
+    entry: PathBuf,
+    rel: String,
+    in_head: bool,
+    has_head: bool,
+    in_index: bool,
+}
+
+fn git_checked(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = git_in(root, args)?;
+    if out.status.success() { Ok(out.stdout) } else {
+        Err(format!("git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn has_head(root: &Path) -> Result<bool, String> {
+    let head = git_in(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    match head.status.code() {
+        Some(0) => Ok(true),
+        Some(1) if head.stderr.is_empty() => {
+            // Unborn HEAD points at a named branch with no ref yet, not an unreadable commit.
+            let branch = git_checked(root, &["symbolic-ref", "HEAD"])?;
+            let branch = std::str::from_utf8(&branch).map_err(|_| "Cannot read the current branch")?.trim_end_matches(['\r', '\n']);
+            let reference = git_in(root, &["show-ref", "--verify", "--quiet", branch])?;
+            if reference.status.code() != Some(1) || !reference.stderr.is_empty() { return Err("Cannot verify the current HEAD".into()); }
+            Ok(false)
+        }
+        _ => Err("Cannot read the current HEAD".into()),
+    }
+}
+
+fn git_file(root: &Path, path: &str) -> Result<GitFile, String> {
+    let entry = panel_entry(root, path)?;
+    if fs::symlink_metadata(&entry).is_ok_and(|m| m.is_dir()) { return Err(format!("{path} is a folder")); }
+    if git_prefix(root).is_none() { return Err("File changes need the project to be a Git repository".into()); }
+    let rel = relative(root, &entry);
+    let has_head = has_head(root)?;
+    let tree = if has_head { git_checked(root, &["ls-tree", "-z", "HEAD", "--", &rel])? } else { Vec::new() };
+    if !tree.is_empty() && tree.split(|&b| b == b' ').nth(1) != Some(b"blob") { return Err(format!("{path} is not a file in HEAD")); }
+    let index = git_checked(root, &["ls-files", "-z", "--", &rel])?;
+    if index.split(|&b| b == 0).any(|p| !p.is_empty() && p != rel.as_bytes()) {
+        return Err(format!("{path} is not a single file in the index"));
+    }
+    if tree.is_empty() && index.is_empty() {
+        // On a case-insensitive filesystem an alternate spelling may open a tracked file
+        // even though HEAD and the index have no such name. Never delete it as 'untracked'.
+        let others = git_checked(root, &["ls-files", "--others", "-z", "--", &rel])?;
+        if others.strip_suffix(b"\0") != Some(rel.as_bytes()) { return Err(format!("Cannot identify {path} as an untracked file")); }
+    }
+    Ok(GitFile { entry, rel, has_head, in_head: !tree.is_empty(), in_index: !index.is_empty() })
 }
 
 /// Discard every uncommitted change to file `path`: a tracked file goes back to `HEAD` in both the
 /// working tree and the index; a file added since `HEAD` (or untracked) is unstaged and deleted.
 /// This also drops the user's own edits to that file; the UI confirms before calling it.
 pub fn revert(root: &Path, path: &str) -> Result<(), String> {
-    let file = resolve_missing(root, path)?;
-    if file.is_dir() {
-        return Err(format!("{path} is a folder"));
-    }
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
-    let rel = relative(&canonical, &file);
-    if rel.is_empty() {
-        return Err(outside(path));
-    }
-    if git_prefix(&canonical).is_none() {
-        return Err("Reverting needs the project to be a Git repository".into());
-    }
-    let in_head = git_in(&canonical, &["cat-file", "-e", &format!("HEAD:./{rel}")])?
-        .status
-        .success();
+    require_workspace_index(&root.canonicalize().map_err(|e| e.to_string())?, &panel_entry(root, path)?)?;
+    let file = git_file(root, path)?;
     let failed = |what: &str, output: Output| {
         format!("{what} failed: {}", String::from_utf8_lossy(&output.stderr).trim())
     };
-    if in_head {
+    if file.in_head {
         let output = git_in(
-            &canonical,
-            &["restore", "--source=HEAD", "--worktree", "--staged", "--", &rel],
+            root,
+            &["restore", "--source=HEAD", "--worktree", "--staged", "--", &file.rel],
         )?;
         return if output.status.success() { Ok(()) } else { Err(failed("git restore", output)) };
     }
-    let staged = git_in(&canonical, &["ls-files", "--error-unmatch", "--", &rel])?
-        .status
-        .success();
-    if staged {
-        let output = git_in(&canonical, &["rm", "--cached", "--quiet", "--force", "--", &rel])?;
+    if file.in_index {
+        let output = git_in(root, &["rm", "--cached", "--quiet", "--force", "--", &file.rel])?;
         if !output.status.success() {
             return Err(failed("git rm", output));
         }
     }
-    match fs::remove_file(&file) {
+    match fs::remove_file(&file.entry) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("Cannot delete {path}: {e}")),
         _ => Ok(()),
     }
@@ -521,52 +667,19 @@ pub fn revert(root: &Path, path: &str) -> Result<(), String> {
 /// the diff panel showed it (its `@@` header and lines); it must still be in the file's current
 /// diff, so a stale or edited hunk is refused rather than guessed at. The UI confirms first.
 pub fn revert_hunk(root: &Path, path: &str, hunk: &str) -> Result<(), String> {
-    let canonical = root
-        .canonicalize()
-        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
-    let file = resolve(&canonical, path)?;
-    if file.is_dir() {
-        return Err(format!("{path} is a folder"));
-    }
-    let rel = relative(&canonical, &file);
-    if git_prefix(&canonical).is_none() {
-        return Err("Reverting needs the project to be a Git repository".into());
-    }
-    let tracked = git_in(&canonical, &["ls-files", "--error-unmatch", "--", &rel])?
-        .status
-        .success();
-    if !tracked {
+    let shown = diff(root, path)?;
+    if shown.nested { return Err("Open the nested repository as a project to change it".into()); }
+    if shown.base == DiffBase::Untracked {
         return Err(format!("{path} is a new file; revert the whole file instead"));
     }
-    let has_head = git_in(&canonical, &["rev-parse", "--verify", "--quiet", "HEAD"])?
-        .status
-        .success();
-    // Fixed prefixes and repository-relative paths, whatever the user's diff settings, so the
-    // patch applies from the top of the work tree.
-    let mut args = vec![
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-relative",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-    ];
-    if has_head {
-        args.push("HEAD");
-    }
-    args.extend(["--", &rel]);
-    let output = git_in(&canonical, &args)?;
-    if !output.status.success() {
-        return Err(format!("git diff failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (head, hunks) = split_hunks(&text);
+    let (head, hunks) = split_hunks(&shown.diff);
     let wanted = hunk.trim_end_matches('\n');
     let Some(found) = hunks.into_iter().find(|h| h.trim_end_matches('\n') == wanted) else {
         return Err("That change is no longer in the file. Refresh the diff and try again.".into());
     };
-    let top = git_in(&canonical, &["rev-parse", "--show-toplevel"])?;
-    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim_end_matches(['\n', '\r']));
+    let top = git_in(root, &["rev-parse", "--show-toplevel"])?;
+    let top = std::str::from_utf8(&top.stdout).map_err(|_| "Cannot address the Git work tree")?;
+    let top = PathBuf::from(top.trim_end_matches(['\n', '\r']));
     let mut patch = format!("{head}{found}");
     if !patch.ends_with('\n') {
         patch.push('\n');
@@ -611,7 +724,8 @@ pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> 
     }
     let mut rels = Vec::with_capacity(paths.len());
     for path in paths {
-        let file = resolve_missing(&canonical, path.trim_end_matches('/'))?;
+        let file = panel_entry(root, path.trim_end_matches('/'))?;
+        require_workspace_index(&canonical, &file)?;
         let rel = relative(&canonical, &file);
         if rel.is_empty() {
             return Err(outside(path));
@@ -621,10 +735,7 @@ pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> 
     if rels.is_empty() {
         return Ok(());
     }
-    let has_head = git_in(&canonical, &["rev-parse", "--verify", "--quiet", "HEAD"])?
-        .status
-        .success();
-    let mut args: Vec<&str> = match (staged, has_head) {
+    let mut args: Vec<&str> = match (staged, has_head(&canonical)?) {
         (true, _) => vec!["add", "--all", "--"],
         (false, true) => vec!["restore", "--staged", "--"],
         // Before the first commit there is nothing to restore from: drop the index entries.
@@ -980,7 +1091,7 @@ pub fn read(root: &Path, path: &str) -> Result<FileView, String> {
     let truncated = size > MAX_READ;
     let text = decode_text(&bytes, truncated);
     Ok(FileView {
-        path: relative(root, &file),
+        path: relative(root, &workspace_entry(root, path)?),
         text,
         size,
         truncated,
@@ -1005,66 +1116,49 @@ fn decode_text(bytes: &[u8], truncated: bool) -> Option<String> {
 /// The uncommitted changes of file `path` against Git's `HEAD` (or the index in a repository
 /// without commits). Untracked files show as entirely added.
 pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
-    let file = resolve(root, path)?;
-    if file.is_dir() {
-        return Err(format!("{path} is a folder"));
+    let workspace = root.canonicalize().map_err(|e| e.to_string())?;
+    let entry = panel_entry(root, path)?;
+    let nested = nested_owner(&workspace, &entry);
+    let root = nested.as_deref().unwrap_or(&workspace);
+    if nested.is_some() && !(worktree_marker(root) && is_worktree_root(root)) {
+        return Err("Cannot identify this nested Git worktree".into());
     }
-    let rel = relative(root, &file);
-    let git = |args: &[&str]| {
-        crate::launcher::without_console(&mut Command::new("git"))
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .map_err(|e| format!("Could not run git: {e}"))
-    };
-    let inside = git(&["rev-parse", "--is-inside-work-tree"])?;
-    if !inside.status.success() {
-        return Err("Diffs need the project to be a Git repository".into());
-    }
-    let tracked = git(&["ls-files", "--error-unmatch", "--", &rel])?
-        .status
-        .success();
-    let (output, base) = if tracked {
-        let has_head = git(&["rev-parse", "--verify", "--quiet", "HEAD"])?
-            .status
-            .success();
-        let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
-        if has_head {
-            args.push("HEAD");
-        }
-        args.extend(["--", &rel]);
-        (
-            git(&args)?,
-            if has_head {
-                DiffBase::Head
-            } else {
-                DiffBase::Index
-            },
-        )
+    let file = git_file(root, &relative(root, &entry))?;
+    let (output, base) = if file.in_head || file.in_index {
+        // Hunk revert applies this single-file patch from the repository top.
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"];
+        if file.has_head { args.push("HEAD"); }
+        args.extend(["--", &file.rel]);
+        (git_in(root, &args)?, if file.has_head { DiffBase::Head } else { DiffBase::Index })
     } else {
+        // `git diff --no-index` treats a symlink to a directory as the directory itself.
+        if file.entry.is_dir() { return Err(format!("Cannot diff {path} as an untracked directory link")); }
         // Exit status 1 just means the files differ.
         (
-            git(&[
+            git_in(root, &[
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-index",
                 "--",
                 null_device(),
-                &rel,
+                &file.rel,
             ])?,
             DiffBase::Untracked,
         )
     };
-    if !output.status.success() && output.status.code() != Some(1) {
+    let differs = base == DiffBase::Untracked && output.status.code() == Some(1) && !output.stdout.is_empty();
+    if !output.status.success() && !differs {
         return Err(format!(
             "git diff failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(DiffView {
-        path: rel,
+        path: relative(&workspace, &entry),
+        nested: nested.is_some(),
+        delete_on_revert: !file.in_head,
         diff: String::from_utf8_lossy(&output.stdout).into_owned(),
         base,
     })
@@ -1152,13 +1246,13 @@ fn walk_files(root: &Path) -> Vec<String> {
             continue;
         };
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(name) = entry.file_name().into_string() else { continue };
             if HIDDEN.contains(&name.as_str()) {
                 continue;
             }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
+            let Ok(meta) = entry.metadata() else { continue };
+            if directory_reparse_point(&meta) { continue; }
+            let kind = meta.file_type();
             let path = entry.path();
             if kind.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) {

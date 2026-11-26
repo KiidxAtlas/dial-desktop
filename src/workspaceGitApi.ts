@@ -24,7 +24,7 @@ export const workspaceGitApi = {
   /** Folder `path` (`""` is the root); `.gitignore`d entries are left out unless `showIgnored`. */
   list: (path: string, workspaceRoot: string, showIgnored: boolean) =>
     invoke<GitDirEntry[]>("list_dir", { path, workspaceRoot, showIgnored }),
-  /** Changed paths from one `git status`; `counts` adds +/- lines per file. */
+  /** Workspace-relative changed paths across worktrees; `counts` adds +/- lines per file. */
   status: (workspaceRoot: string, counts = false) => invoke<GitStatusView>("file_git_status", { workspaceRoot, counts }),
   /** Discard every uncommitted change to `path`. Confirm with the user first. */
   revert: (path: string, workspaceRoot: string) => invoke<void>("file_revert", { path, workspaceRoot }),

@@ -1,35 +1,46 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { hiddenSessions, purgeSession, restoreSessions, snapshot } from '../bridge';
-import type { Deletable } from '../deferredDelete';
+import { computed, ref, watch } from 'vue';
+import { hiddenSessions, purgeSessions, restoreSessions, snapshot } from '../bridge';
 const props = defineProps<{ root: string }>();
 const items = computed(() => {
   const byId = new Map(snapshot.value?.sessions.map(s => [s.id, s.title]));
   return Array.from(hiddenSessions, id => ({ id, title: byId.get(id) || `Session ${id}` })).reverse();
 });
+const picked = ref<string[]>([]);
+const selected = computed(() => items.value.filter(item => picked.value.includes(item.id)));
+watch(() => props.root, () => { picked.value = []; });
+watch(items, () => { picked.value = selected.value.map(item => item.id); });
 const busy = ref(false);
-async function purge(item: Deletable) {
+async function purge() {
   if (busy.value) return;
   busy.value = true;
-  try { await purgeSession(props.root, item); } finally { busy.value = false; }
+  try { await purgeSessions(props.root, selected.value); } finally { busy.value = false; }
 }
 </script>
 <template>
-  <details v-if="items.length" class="trash" :key="root">
-    <summary>Recently Deleted ({{ items.length }})</summary>
-    <p>Kept on this computer until you restore or permanently delete them.</p>
-    <div v-for="item in items" :key="item.id" class="entry">
-      <span class="truncate" :title="item.title">{{ item.title }}</span>
-      <div class="actions"><button :aria-label="`Restore ${item.title}`" :disabled="busy" @click="restoreSessions(root, [item.id])">Restore</button>
-      <button :aria-label="`Permanently delete ${item.title}`" :disabled="busy" @click="purge(item)">Delete permanently…</button></div>
-    </div>
+  <details v-if="items.length" :key="root" class="trash">
+    <summary>Recently Deleted <span>{{ items.length }}</span></summary>
+    <p>Kept on this computer until you restore or delete them.</p>
+    <fieldset :disabled="busy" aria-label="Deleted sessions">
+      <label class="all"><input type="checkbox" :checked="selected.length === items.length" :indeterminate="selected.length > 0 && selected.length < items.length" @change="picked = selected.length === items.length ? [] : items.map(i => i.id)">Select all <small v-if="selected.length">{{ selected.length }} selected</small></label>
+      <div class="entries"><label v-for="item in items" :key="item.id"><input v-model="picked" type="checkbox" :value="item.id"><span class="truncate" :title="item.title">{{ item.title }}</span></label></div>
+      <div class="actions"><button :disabled="!selected.length" @click="restoreSessions(root, selected.map(i => i.id))">Restore</button><button :disabled="!selected.length" class="danger" @click="purge">Delete permanently…</button></div>
+    </fieldset>
   </details>
 </template>
 <style scoped>
-.trash { flex: none; max-height: 35%; overflow-y: auto; padding: 8px 12px; color: var(--text-muted); font-size: 12px; }
+.trash { flex: none; max-height: 38%; overflow: auto; border-top: 1px solid var(--border); padding: 9px 12px; font-size: 12px; }
 summary { cursor: pointer; font-weight: 600; }
-p { margin: 8px 0; }
-.entry { display: grid; gap: 4px; padding: 6px 0; border-top: 1px solid var(--border); }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.actions button { color: var(--accent); }
+summary span { float: right; border-radius: 8px; padding: 0 6px; background: var(--surface); }
+p, small { color: var(--text-muted); }
+fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+label { display: flex; align-items: center; gap: 8px; padding: 5px 3px; cursor: pointer; }
+small { margin-left: auto; }
+.all { border-bottom: 1px solid var(--border); }
+.entries { max-height: 14vh; overflow-y: auto; }
+.entries label:hover { background: var(--surface); }
+.actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+button { padding: 4px 7px; border: 1px solid var(--border); border-radius: 5px; }
+.danger { color: var(--danger); }
+button:disabled { opacity: .45; }
 </style>

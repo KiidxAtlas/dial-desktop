@@ -59,15 +59,9 @@ fn main() {
             if let Some(warning) = launcher::choice_ignored(choice.as_ref(), origin) {
                 launcher::warn(warning);
             }
-            // Before any engine starts, so its sessions get the Browser panel's tools.
-            if let Ok(exe) = std::env::current_exe()
-                && let Err(error) = agent_browser::register(&program, &exe)
-            {
-                eprintln!("dial-desktop: the agent's browser tools are off: {error}");
-                launcher::warn(format!("The agent's browser tools are off: {error}"));
-            }
             Source::Engine {
                 program,
+                origin,
                 args: cli.rpc_args,
             }
         }

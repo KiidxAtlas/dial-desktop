@@ -425,6 +425,18 @@ fn undo_needs_an_idle_turn_and_reloads_the_conversation() {
 }
 
 #[test]
+fn context_meter_prefers_the_effective_window_with_a_catalog_fallback() {
+    let mut model = Model::starting();
+    let mut wire = json!({"provider":"mlx", "model_id":"m", "context_window":65536});
+    model.models = vec![ModelOption::from_wire(&wire).unwrap()];
+    for (reported, expected) in [(json!(8192), 8192), (Value::Null, 65536)] {
+        wire["context_window"] = reported;
+        model.current_model = CurrentModel::from_wire(&wire);
+        assert_eq!(model.context_window(), Some(expected));
+    }
+}
+
+#[test]
 fn context_usage_is_kept_until_the_session_changes() {
     let mut model = Model::starting();
     model.apply(Update::Connected(Box::new(ready("s1"))));

@@ -2,8 +2,9 @@
 //! process (no terminal), so saved schedules keep running while the project is open.
 //!
 //! One runner at a time (the app has one open project). It is restarted with backoff when it exits
-//! on its own, given up on after repeated quick failures, and stopped (SIGINT first, so the engine
-//! can cancel its own `dial -p` children, then killed) when the project closes or the app quits.
+//! on its own, given up on after repeated quick failures, and stopped (SIGINT first, Ctrl-Break on
+//! Windows, so the engine can cancel its own `dial -p` children, then killed) when the project
+//! closes or the app quits.
 //! The engine holds a per-project lease (`schedule.lock`): a second scheduler fails fast with
 //! [`ELSEWHERE`], which is reported as running elsewhere and never retried. The last
 //! [`LOG_LINES`] output lines are kept for the UI. Every phase change goes to the sink (the app
@@ -35,7 +36,7 @@ pub struct Timing {
     pub stable: Duration,
     /// Quick exits in a row before giving up.
     pub max_failures: u32,
-    /// How long a stop waits after SIGINT before killing.
+    /// How long a stop waits after asking the scheduler to finish before killing it.
     pub grace: Duration,
     /// How often the supervisor checks the child and the stop flag.
     pub poll: Duration,
@@ -460,13 +461,15 @@ impl Scheduler {
 
 fn spawn(program: &Path, root: &str) -> std::io::Result<Child> {
     let mut command = Command::new(program);
+    crate::launcher::outside_appimage(&mut command);
     command
         .args(["schedule", "run"])
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Its own process group: signals meant for the app (a Ctrl-C in a dev terminal) stay ours.
+    // Its own process group: signals meant for the app (a Ctrl-C in a dev terminal) stay ours,
+    // and on Windows the group's id is the child's, so [`ask_to_finish`] can address it alone.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -475,21 +478,17 @@ fn spawn(program: &Path, root: &str) -> std::io::Result<Child> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     command.spawn()
 }
 
-/// Ask the scheduler to finish (it cancels its runs on SIGINT); kill it after `grace`.
-/// Returns its exit code (`None` when it had to be killed).
+/// Ask the scheduler to finish (it cancels its runs on SIGINT, or Ctrl-Break on Windows); kill
+/// it after `grace`. Returns its exit code (`None` when it had to be killed).
 fn end(child: &mut Child, grace: Duration, poll: Duration) -> Option<i32> {
-    #[cfg(unix)]
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: signalling our own, not yet reaped, child process.
-        unsafe {
-            libc::kill(pid, libc::SIGINT);
-        }
+    if ask_to_finish(child) {
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if let Ok(Some(status)) = child.try_wait() {
@@ -498,10 +497,43 @@ fn end(child: &mut Child, grace: Duration, poll: Duration) -> Option<i32> {
             thread::sleep(poll);
         }
     }
-    #[cfg(not(unix))]
-    let _ = (grace, poll);
     let _ = child.kill();
     child.wait().ok().and_then(|status| status.code())
+}
+
+/// Send the scheduler its cooperative-stop request; `false` when it could not be sent.
+#[cfg(unix)]
+fn ask_to_finish(child: &Child) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return false;
+    };
+    // SAFETY: signalling our own, not yet reaped, child process.
+    unsafe { libc::kill(pid, libc::SIGINT) == 0 }
+}
+
+/// Ctrl-Break reaches only processes on the sender's console, and the app (a GUI program) has
+/// none: attach to the child's hidden one just to send it to the child's own process group.
+#[cfg(windows)]
+fn ask_to_finish(child: &Child) -> bool {
+    use windows::Win32::System::Console::{
+        AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent,
+    };
+    let pid = child.id();
+    // SAFETY: scalar arguments only. `pid` is our own unreaped child, which leads its process
+    // group; the app is not in that group, so the event never reaches the app itself.
+    unsafe {
+        if AttachConsole(pid).is_err() {
+            return false;
+        }
+        let sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid).is_ok();
+        let _ = FreeConsole();
+        sent
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ask_to_finish(_: &Child) -> bool {
+    false
 }
 
 fn read_lines(core: Arc<Core>, id: u64, source: impl Read + Send + 'static) {

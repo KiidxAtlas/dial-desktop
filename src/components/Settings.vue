@@ -4,12 +4,14 @@
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import type { OpenSnapshot, Setting, SettingScope, Snapshot } from "../types";
-import { engine, settings, settingsPage } from "../bridge";
+import { engine, resetSettingRow, saveSettingRow, settings, settingsPage } from "../bridge";
 import { appearance, type Theme } from "../appearance";
 import { notifications, setNotifications } from "../notifications";
-import { restartDone, saveRejected, settingFeedback, startSave } from "../settingsFeedback";
+import { restartDone, settingFeedback } from "../settingsFeedback";
 import { changedCounts, changedTitle, hasSources, resetScope, saveScope } from "../settingScope";
+import { settingMatches } from "../settingSearch";
 import { ui } from "../ui";
+import { engineUpdateAvailable, updates } from "../updates";
 import Icon, { PATHS } from "./Icon.vue";
 import SettingRow from "./SettingRow.vue";
 import AppearanceSettings from "./AppearanceSettings.vue";
@@ -28,6 +30,7 @@ import IntegrationsSettings from "./IntegrationsSettings.vue";
 import SPage from "./settings/SPage.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
+import SDefaultThinking from "./settings/SDefaultThinking.vue";
 import SSwitch from "./settings/SSwitch.vue";
 import SSegmented from "./settings/SSegmented.vue";
 import "./settings/settings.css";
@@ -70,22 +73,23 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
       { id: "notifications", label: "Notifications", icon: "volume", about: "Desktop alerts while Dial works in the background.", words: "alert notify desktop notifications sound finished needs you" },
       { id: "types", label: "Types", icon: "folder", about: "Where new Types are saved: in the app for every project, or in this project.", words: "type collection save project folder global location storage where new types" },
       { id: "updates", label: "Updates", icon: "download", about: "Versions of the app and the engine, which engine Desktop runs, and startup problems.", words: "version upgrade install check engine path binary dial_bin diagnostics warnings shell environment browser tools reconnect desktop copy" },
-      { id: "health", label: "Health & setup", icon: "shield", about: "What Dial can use on this computer, what is missing, and the dial command for your terminal.", words: "doctor setup install capability language server lsp voice whisper piper ollama llama mlx runtime path terminal command cli fix missing check" },
-      { id: "maintenance", label: "Storage & processes", icon: "chip", about: "What Dial keeps on this computer, what it is running, and safe cleanups.", words: "storage disk space gc garbage clean cleanup cache images purge archive processes ps running stop kill memory local model server rules stream" },
+      { id: "health", label: "Health & setup", icon: "shield", about: "What Dial can use on this computer, what is missing, what it keeps and runs, and safe cleanups.", words: "doctor setup install capability language server lsp voice whisper piper ollama llama mlx runtime path terminal command cli fix missing check storage disk space gc garbage clean cleanup cache images purge archive processes ps running stop kill memory local model server rules stream" },
     ],
   },
   {
-    title: "Models",
+    title: "",
+    // One "Models" entry: providers, the library, roles and image generation are tabs on it.
     pages: [
-      { id: "providers", label: "Providers", icon: "globe", about: "Sign in to a model provider or configure an API key.", words: "login sign in out account authentication credentials api key token subscription hosted setup anthropic openai" },
-      { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "download hugging face local delete mlx gguf cache" },
-      { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "role preset profile embedding thinking helper model" },
-      { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "image picture flux diffusion steps seed lora strength size quality moderation edit background mlx serve stable" },
+      { id: "providers", label: "Providers", icon: "globe", about: "Sign in to a model provider or configure an API key.", words: "models login sign in out account authentication credentials api key token subscription hosted setup anthropic openai" },
+      { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "models download hugging face local delete mlx gguf cache" },
+      { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "models role preset profile embedding thinking helper model" },
+      { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "models image picture flux diffusion steps seed lora strength size quality moderation edit background mlx serve stable" },
     ],
   },
   {
     title: "This project",
-    pages: PROJECT_TABS.map((t) => ({ id: t.id, label: t.label, icon: PROJECT_ICONS[t.id], about: "" })),
+    // Extra folders are shown on the Permissions page: both say what Dial may reach.
+    pages: PROJECT_TABS.filter((t) => t.id !== "folders").map((t) => ({ id: t.id, label: t.label, icon: PROJECT_ICONS[t.id], about: "" })),
   },
   {
     title: "Connections",
@@ -120,19 +124,31 @@ const PROJECT_ABOUT: Record<ProjectTab, string> = {
   checks: "Commands run after Dial edits files.",
   folders: "Folders outside the project Dial may use.",
   schedules: "Prompts that run on a timer or on file changes.",
-  permissions: "What Dial may do without asking, and what it must never do.",
+  permissions: "What Dial may do without asking, what it must never do, and folders outside the project it may use.",
 };
 for (const p of DESKTOP[3].pages) p.about = PROJECT_ABOUT[p.id as ProjectTab];
+
+/** The pages under the one "Models" entry, shown as tabs. */
+const MODEL_PAGES = DESKTOP[2].pages;
+const isModelPage = (id: PageId) => MODEL_PAGES.some((p) => p.id === id);
 
 // Without a project (the welcome screen) only the app's own pages show: the engine's settings,
 // providers and models need an engine, which runs in a project.
 const props = defineProps<{ snap: Snapshot }>();
 const project = computed(() => (props.snap.workspace ? (props.snap as OpenSnapshot) : null));
 /** Pages that work without a project. */
-const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates", "health", "maintenance", "providers"]);
+const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates", "health", "providers"]);
 const groupsShown = computed(() =>
   project.value ? DESKTOP : DESKTOP.map((g) => ({ ...g, pages: g.pages.filter((p) => NO_PROJECT.has(p.id)) })).filter((g) => g.pages.length),
 );
+/** The menu: the model pages collapse into one "Models" entry that opens the last one used. */
+const lastModelPage = ref<PageId>("providers");
+const navGroups = computed(() =>
+  groupsShown.value.map((g) => (g.pages.some((p) => isModelPage(p.id))
+    ? { title: "", pages: [{ id: lastModelPage.value, label: "Models", icon: "brain" as IconName, about: "" }] }
+    : g)),
+);
+const modelTabs = computed(() => groupsShown.value.flatMap((g) => g.pages).filter((p) => isModelPage(p.id)));
 
 const page = computed(() => (project.value ? settingsPage.value : null));
 const live = computed(() => props.snap.connection.state === "live");
@@ -155,9 +171,15 @@ function fromUi(t: string): PageId {
   if (t === "background") return "appearance";
   return t as PageId;
 }
-/** A page this window can show: without a project, one of the app's own. */
-const allowed = (id: PageId): PageId => (project.value || NO_PROJECT.has(id) ? id : "overview");
+/** A page this window can show: without a project, one of the app's own. Pages folded into
+ *  another (storage into Health, extra folders into Permissions) open that page. */
+const MERGED: Partial<Record<PageId, PageId>> = { maintenance: "health", folders: "permissions" };
+const allowed = (asked: PageId): PageId => {
+  const id = MERGED[asked] ?? asked;
+  return project.value || NO_PROJECT.has(id) ? id : "overview";
+};
 const current = ref<PageId>(allowed(fromUi(ui.settingsTab)));
+if (isModelPage(current.value)) lastModelPage.value = current.value;
 // A slash command or palette entry can ask for a page while Settings is already open. The request
 // is consumed, so asking for the same page again (a row's "Manage in Providers") still moves.
 watch(() => ui.settingsTab, (t) => {
@@ -168,9 +190,18 @@ watch(() => ui.settingsTab, (t) => {
 
 onMounted(() => {
   if (project.value) settings.load();
-  search.value?.focus();
+  // The page gets focus, not the search box (no ring on open); typing anywhere goes to search.
+  sheet.value?.focus();
   ui.settingsTab = "";
 });
+const sheet = ref<HTMLElement | null>(null);
+/** A printable key pressed outside a field starts a settings search. */
+function typeToSearch(event: KeyboardEvent) {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing || event.key.length !== 1 || event.key === " ") return;
+  const t = event.target as HTMLElement | null;
+  if (t?.closest("input, textarea, select, [contenteditable='true'], [role='textbox']")) return;
+  search.value?.focus();
+}
 // A reconnected engine has a fresh copy.
 watch(live, (now) => now && project.value && settings.load());
 
@@ -220,7 +251,7 @@ const groups = computed(() => {
     if (listing.value === "changed" && !s.modified) continue;
     if (listing.value === "project" && s.source !== "project") continue;
     if (searching.value) {
-      if (!has(`${s.label} ${s.key} ${s.description} ${s.section} ${s.tab} ${engineInfo(s.tab).label}`)) continue;
+      if (!settingMatches(terms.value, s, engineInfo(s.tab).label)) continue;
     } else if (!changedOnly.value && (s.tab !== engineTab.value || isRawTable(s))) continue;
     const title = searching.value || changedOnly.value ? [engineInfo(s.tab).label, sectionName(s)].filter((x) => x !== "General").join(" · ") || "General" : sectionName(s);
     let g = out.find((x) => x.title === title);
@@ -238,6 +269,7 @@ const overlay = computed(() => searching.value || changedOnly.value);
 
 function go(id: PageId) {
   current.value = allowed(id);
+  if (isModelPage(current.value)) lastModelPage.value = current.value;
   query.value = "";
   listing.value = "";
   nextTick(() => body.value?.scrollTo({ top: 0 }));
@@ -255,6 +287,7 @@ function close() {
 /** The engine settings on the overview, with plainer words than the reference uses. */
 const QUICK: Record<string, { label: string; description: string }> = {
   model: { label: "Default model", description: "The model new sessions start with. The model picker in the composer (⇧⌘M) switches only the session you are in." },
+  local_context_window: { label: "Local model context window", description: "Default token limit for local models. Auto follows the model or server capacity. A custom current-model limit takes precedence." },
   approval: { label: "Ask before acting", description: "When Dial stops to ask before it edits files or runs commands." },
   "sandbox.mode": { label: "Sandbox", description: "Off, project writes only (Dev), or project only with no network (Strict)." },
   "ui.show_thinking": { label: "Show reasoning", description: "Show the model's reasoning, or fold it to one line." },
@@ -270,21 +303,24 @@ const THEMES: { value: Theme; label: string }[] = [
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
 ];
-const tiles = computed<PageInfo[]>(() => [
-  ...groupsShown.value.filter((g) => g.title && g.title !== "This project").flatMap((g) => g.pages),
-  ...engineTabs.value.filter((t) => t !== "Common").map((t) => ({ id: `engine:${t}` as PageId, ...engineInfo(t) })),
-]);
+/** What needs a look, for the overview: the menu on the left already lists every page. */
+const attention = computed(() => {
+  const out: { id: PageId; icon: IconName; title: string; detail: string }[] = [];
+  const c = props.snap.connection;
+  if (updates.app) out.push({ id: "updates", icon: "download", title: `Dial ${updates.app.version} is available`, detail: "Install the new version of the app." });
+  if (engineUpdateAvailable()) out.push({ id: "updates", icon: "download", title: "A newer Dial engine is available", detail: "Update the engine this app runs." });
+  if (c.state === "failed" || c.state === "ended") out.push({ id: "updates", icon: "refresh", title: "The Dial engine isn't running", detail: "See which engine Desktop runs and what went wrong at startup." });
+  if (project.value && c.state === "live" && !(project.value.model?.modelId || c.model)) out.push({ id: "providers", icon: "globe", title: "No model is set up", detail: "Sign in to a provider or add an API key." });
+  return out;
+});
 
 /** Save one setting, and whatever its chosen option brings along (an image model's endpoint). */
 async function save(s: Setting, value: unknown, where: SettingScope = scope.value, linked?: Record<string, unknown>) {
-  startSave(s, props.snap.turnRunning);
-  if (!(await settings.save(s.key, value, where))) return saveRejected(s.key);
-  for (const [key, also] of Object.entries(linked ?? {})) settings.save(key, also, where);
+  return saveSettingRow(s, value, where, props.snap.turnRunning, linked);
 }
 /** Reset the layer that set the value when the engine says which; else the picked scope. */
 async function reset(s: Setting, where: SettingScope = resetScope(s.source, scope.value)) {
-  startSave(s, props.snap.turnRunning);
-  if (!(await settings.reset(s.key, where))) saveRejected(s.key);
+  return resetSettingRow(s, where, props.snap.turnRunning);
 }
 
 /** The changed list: put every row shown back to its default, after asking. */
@@ -318,7 +354,7 @@ async function restartEngine() {
 </script>
 
 <template>
-  <section class="settings">
+  <section ref="sheet" class="settings" tabindex="-1" @keydown="typeToSearch">
     <header class="head" data-tauri-drag-region>
       <h1 data-tauri-drag-region>Settings</h1>
       <button class="close" title="Close settings (Esc)" aria-label="Close settings" @click="close">
@@ -334,14 +370,15 @@ async function restartEngine() {
           <button v-if="query" class="clear" aria-label="Clear search" @click="query = ''"><Icon name="cross" :size="11" /></button>
         </label>
 
-        <template v-for="g in groupsShown" :key="g.title">
+        <template v-for="(g, gi) in navGroups" :key="g.title || `g${gi}`">
           <div v-if="g.title" class="nav-label">{{ g.title }}</div>
+          <div v-else-if="gi" class="nav-gap" />
           <button
             v-for="p in g.pages"
             :key="p.id"
             class="item"
-            :class="{ active: current === p.id && !overlay }"
-            :aria-current="current === p.id && !overlay ? 'page' : undefined"
+            :class="{ active: (current === p.id || (isModelPage(p.id) && isModelPage(current))) && !overlay }"
+            :aria-current="(current === p.id || (isModelPage(p.id) && isModelPage(current))) && !overlay ? 'page' : undefined"
             @click="go(p.id)"
           >
             <Icon :name="p.icon" :size="15" />
@@ -350,9 +387,9 @@ async function restartEngine() {
         </template>
 
         <p v-if="!project" class="nav-hint">Open a project for engine settings and models. Providers and Health &amp; setup work without one.</p>
-        <div v-if="project" class="nav-label">
+        <div v-if="project" class="nav-label engine-heading">
           Engine
-          <span class="filters">
+          <span v-if="changedTotal || (sourced && projectTotal)" class="filters">
             <button
               v-if="changedTotal"
               class="changed"
@@ -402,6 +439,17 @@ async function restartEngine() {
         </div>
         <!-- Sign-in may be awaiting a browser or code. Cache only this page, and only for
              this project's lifetime in Settings; unmounting still closes its auth process. -->
+        <!-- The model pages share one menu entry; tabs move between them. -->
+        <div v-if="!overlay && isModelPage(current) && modelTabs.length > 1" class="model-tabs" role="tablist" aria-label="Models">
+          <button
+            v-for="p in modelTabs"
+            :key="p.id"
+            role="tab"
+            :aria-selected="current === p.id"
+            :class="{ on: current === p.id }"
+            @click="go(p.id)"
+          >{{ p.label }}</button>
+        </div>
         <KeepAlive :key="project?.workspace.root ?? ''">
           <SPage v-if="current === 'providers' && !overlay && desktopPage" :title="desktopPage.label" :description="desktopPage.about">
             <ProviderSettings :snap="snap" />
@@ -451,23 +499,26 @@ async function restartEngine() {
         </SPage>
 
         <!-- Overview -->
-        <SPage v-else-if="current === 'overview'" title="Settings" description="The settings most people change. Everything else is a page away.">
+        <SPage v-else-if="current === 'overview'" title="">
           <div v-if="quick.length" class="result-scope">
             <SSegmented v-model="scope" :options="scopeOptions" label="Save changes for" />
-            <span class="s-note">Saving for {{ scopeDestination }}<template v-if="sourced">, except values already saved for this project, which stay project values</template>. A value saved for this project overrides the everywhere value.</span>
+            <span class="s-note" :title="`A value saved for this project overrides the everywhere value.${sourced ? ' Values already saved for this project stay project values.' : ''}`">Changes apply to {{ scopeDestination }}.</span>
           </div>
           <SGroup title="Quick settings">
             <SRow label="App theme" description="Light, dark, or follow the system. Applies to this computer.">
               <SSegmented :model-value="appearance.theme" :options="THEMES" label="App theme" @update:model-value="appearance.theme = $event as Theme" />
             </SRow>
-            <SettingRow
-              v-for="s in quick"
-              :key="`${snap.workspace?.root}:${scope}:${s.key}`"
-              :setting="s"
-              :page-scope="saveScope(s.source, scope)"
-              @save="(value, linked) => save(s, value, saveScope(s.source, scope), linked)"
-              @reset="reset(s)"
-            />
+            <template v-for="s in quick" :key="`${snap.workspace?.root}:${scope}:${s.key}`">
+              <SettingRow
+                :setting="s"
+                :page-scope="saveScope(s.source, scope)"
+                @save="(value, linked) => save(s, value, saveScope(s.source, scope), linked)"
+                @reset="reset(s)"
+              />
+              <SDefaultThinking v-if="s.key === 'model' && live && project"
+                :key="`${s.value}:${all.find(row => row.key === 'provider')?.value}:${s.source}`"
+                :root="project.workspace.root" :scope="saveScope(s.source, scope)" />
+            </template>
             <SRow label="Desktop notifications" description="An alert when Dial needs you or finishes in the background.">
               <SSwitch
                 :model-value="notifications.enabled"
@@ -485,22 +536,26 @@ async function restartEngine() {
           </SGroup>
           <SettingsTransfer v-if="project && page" :snap="project" :rows="all" />
           <p v-if="!project" class="s-note">Engine settings and models live with a project’s engine. Sign in to a provider and check your setup here; open a project to change the rest.</p>
-          <SGroup title="More settings" plain>
-            <div class="tiles">
-              <button v-for="p in tiles" :key="p.id" class="tile" @click="go(p.id)">
-                <span class="tile-icon"><Icon :name="p.icon" :size="16" /></span>
+          <SGroup title="Needs a look" plain>
+            <div v-if="attention.length" class="tiles">
+              <button v-for="a in attention" :key="a.title" class="tile" @click="go(a.id)">
+                <span class="tile-icon"><Icon :name="a.icon" :size="16" /></span>
                 <span class="tile-text">
-                  <span class="tile-title">{{ p.label }}</span>
-                  <span class="tile-about">{{ p.about }}</span>
+                  <span class="tile-title">{{ a.title }}</span>
+                  <span class="tile-about">{{ a.detail }}</span>
                 </span>
               </button>
             </div>
+            <p v-else class="s-note">Nothing needs your attention. Every other setting is in the list on the left.</p>
           </SGroup>
         </SPage>
 
         <!-- Project pages drawn on SPage themselves. -->
         <RolesPresets v-else-if="project && current === 'roles'" :snap="project" />
-        <ProjectTools v-else-if="project && PROJECT_TABS.some((t) => t.id === current)" :key="current" :which="current as ProjectTab" :snap="project" />
+        <template v-else-if="project && PROJECT_TABS.some((t) => t.id === current)">
+          <ProjectTools :key="current" :which="current as ProjectTab" :snap="project" />
+          <ProjectTools v-if="current === 'permissions'" key="folders" which="folders" :snap="project" embedded />
+        </template>
 
         <!-- Pages that draw their own header. -->
         <div v-else-if="project && (current === 'library' || current === 'images')" class="s-page own">
@@ -513,8 +568,13 @@ async function restartEngine() {
           <AppearanceSettings v-if="current === 'appearance'" />
           <NotificationSettings v-else-if="current === 'notifications'" />
           <TypeSettings v-else-if="current === 'types'" />
-          <HealthSettings v-else-if="current === 'health'" />
-          <MaintenanceSettings v-else-if="current === 'maintenance'" />
+          <template v-else-if="current === 'health'">
+            <HealthSettings />
+            <details class="advanced">
+              <summary>Advanced: storage, running processes and stream rules</summary>
+              <MaintenanceSettings />
+            </details>
+          </template>
           <IntegrationsSettings v-else-if="current === 'integrations'" />
           <UpdatesSettings v-else />
         </SPage>
@@ -635,6 +695,9 @@ h1 {
   overflow-y: auto;
   border-right: 1px solid var(--border);
 }
+.nav > * {
+  flex-shrink: 0;
+}
 .find {
   display: flex;
   align-items: center;
@@ -680,11 +743,18 @@ h1 {
   font-weight: 600;
   color: var(--text-faint);
 }
+.engine-heading {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
 .filters {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
 }
 .changed {
+  white-space: nowrap;
   padding: 0 7px;
   border-radius: 999px;
   font-size: 10.5px;
@@ -895,4 +965,35 @@ h1 {
   line-height: 1.45;
   color: var(--text-faint);
 }
+.nav-gap { height: 12px; }
+/* Tabs across the model pages, which share one menu entry. */
+.model-tabs {
+  display: flex;
+  gap: 2px;
+  width: min(680px, 100%);
+  margin: 20px auto 0;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--hover);
+}
+.model-tabs button {
+  flex: 1;
+  height: 28px;
+  border-radius: calc(var(--radius-sm) - 2px);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.model-tabs button:hover { color: var(--text); }
+.model-tabs button.on { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / 0.15); }
+/* Storage, processes and stream rules: kept on Health & setup, folded away. */
+.advanced { margin-top: var(--space-lg); }
+.advanced > summary {
+  cursor: pointer;
+  padding: 6px 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.advanced > summary:hover { color: var(--text); }
+.advanced[open] > summary { margin-bottom: var(--space-md); }
+.settings:focus { outline: none; }
 </style>

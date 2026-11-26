@@ -49,6 +49,11 @@ export function inOtherField(target: unknown): boolean {
   return isClosest(target) && !!target.closest(FIELD) && !target.closest(PROMPT);
 }
 
+/** Focus is in any text field, the prompt box included, or a terminal. */
+export function typingIn(target: unknown): boolean {
+  return isClosest(target) && !!target.closest(`${FIELD}, ${PROMPT}, .xterm`);
+}
+
 /**
  * A key pressed in a terminal belongs to the shell, except ⌘ shortcuts on macOS (the shell never
  * sees ⌘) and Ctrl+` which shows or hides the terminal itself.

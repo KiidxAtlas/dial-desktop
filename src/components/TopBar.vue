@@ -5,7 +5,7 @@ import { openMenu, ui } from "../ui";
 import { finishRename, openSession, sessionItems } from "../sessionActions";
 import { conversationFindOpen } from "../commands";
 import { closeType, types } from "../savedTypes";
-import { showSidebar, sidebarShown } from "../workspace";
+import { showPanel, showSidebar, sidebarShown } from "../workspace";
 import Icon from "./Icon.vue";
 import GoalPill from "./GoalPill.vue";
 
@@ -16,6 +16,9 @@ const session = computed(() => openSession(props.snap));
 /** The type open in place of the transcript, if any. */
 const type = computed(() => (ui.typeOpen ? types.list.find((t) => t.id === ui.typeOpen) ?? null : null));
 const editing = computed(() => !!session.value && ui.renaming?.id === session.value.id && ui.renaming.place === "title");
+/** The turn is paused on the user: an approval or a question is waiting. */
+const needsYou = computed(() => props.snap.approvals.length > 0 || !!props.snap.question);
+const planDone = computed(() => props.snap.plan.filter((t) => t.status === "completed").length);
 
 const input = ref<HTMLInputElement | null>(null);
 watch(editing, async (now) => {
@@ -71,7 +74,23 @@ function more(event: MouseEvent) {
     </button>
     <h1 v-else class="truncate" data-tauri-drag-region :title="snap.title">{{ snap.title }}</h1>
     <span v-if="snap.connection.state === 'preview'" class="pill preview" data-tauri-drag-region>Preview</span>
-    <span v-if="snap.turnRunning" class="pill working" role="status" title="Working" data-tauri-drag-region><span class="live-dot" /><span class="pill-label">Working</span></span>
+    <span
+      v-if="snap.turnRunning"
+      class="pill working"
+      :class="{ waiting: needsYou }"
+      role="status"
+      :title="needsYou ? 'Dial is waiting for your answer' : 'Dial is working'"
+      data-tauri-drag-region
+    ><span class="live-dot" /><span class="pill-label">{{ needsYou ? "Needs you" : "Working" }}</span></span>
+    <!-- Plan progress stays in sight with the side panel closed; a click opens the plan. -->
+    <button
+      v-if="snap.plan.length && !(ui.inspectorOpen && ui.inspectorTab === 'plan')"
+      class="plan-chip"
+      :title="`Plan: ${planDone} of ${snap.plan.length} done. Show the plan`"
+      @click="showPanel('plan')"
+    >
+      <Icon name="list" :size="12" /> {{ planDone }}/{{ snap.plan.length }}
+    </button>
     <GoalPill v-if="!type || ui.typeMode === 'chat'" :snap="snap" />
     <div v-if="type" class="switch" role="tablist" aria-label="Type or its conversation">
       <button role="tab" :aria-selected="ui.typeMode === 'type'" :class="{ on: ui.typeMode === 'type' }" @click="ui.typeMode = 'type'">
@@ -120,11 +139,13 @@ function more(event: MouseEvent) {
   padding: 0 10px 0 14px;
   container: topbar / inline-size;
 }
-/* In a narrow bar the title comes first: the status pills give way before it truncates. */
+/* In a narrow bar the title comes first, but "Needs you" keeps its words: the plan chip and the
+ * Working label give way before it, and the title truncates before it shrinks. */
 @container topbar (max-width: 640px) {
   .pill.preview { display: none; }
-  .working { padding: 0 7px; }
-  .working .pill-label {
+  .plan-chip { display: none; }
+  .working:not(.waiting) { padding: 0 7px; }
+  .working:not(.waiting) .pill-label {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -133,6 +154,7 @@ function more(event: MouseEvent) {
     white-space: nowrap;
   }
 }
+.working.waiting { flex: none; }
 h1,
 .title {
   min-width: 0;
@@ -184,21 +206,48 @@ h1 {
   flex: 1;
   align-self: stretch;
 }
+.plan-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  margin-left: 6px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.plan-chip:hover { background: var(--hover); color: var(--text); }
 /* Title-bar buttons match the 30px title; the shared look is `.icon-btn` in styles.css. */
 .icon-btn {
   width: 30px;
   height: 30px;
 }
+/* Status colours: neutral while working, amber when Dial needs you; red is kept for failures. */
 .working {
   gap: 6px;
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text-muted);
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.working .live-dot {
+  background: var(--success);
+}
+.working.waiting {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  box-shadow: none;
+}
+.working.waiting .live-dot {
+  background: currentColor;
 }
 .live-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: currentColor;
   animation: pulse 1.2s ease-in-out infinite;
 }
 .type-name {

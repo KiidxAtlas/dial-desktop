@@ -105,5 +105,6 @@ fn png(image: &NSImage) -> Result<Vec<u8>, String> {
         rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
     }
     .ok_or("Could not encode PNG")?;
+    super::screenshot_wire::check_source_size(data.length() as u64)?;
     Ok(data.to_vec())
 }

@@ -118,12 +118,12 @@ fn store_round_trip_with_images_and_patches() {
     assert_eq!(store.find("COOKBOOK").unwrap(), def.id);
     assert!(store.find("nope").unwrap_err().contains("Cookbook"));
 
-    let image = dir.path().join("pic.png");
+    let image = dir.path().join("my photo #1.png");
     std::fs::write(&image, PNG).unwrap();
     let (item, problems) = store
         .add_item(
             &def.id,
-            json!({"title": "Soup", "photo": image.to_str().unwrap(), "ingredients": ["Leek", "Salt"]})
+            json!({"title": "Soup", "photo": tauri::Url::from_file_path(&image).unwrap().as_str(), "ingredients": ["Leek", "Salt"]})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -136,6 +136,17 @@ fn store_round_trip_with_images_and_patches() {
     let full = store.get(&def.id).unwrap();
     assert!(Path::new(&full.assets).join(&asset).is_file());
     assert_eq!(full.items.len(), 1);
+
+    for invalid in ["https://example.com/bad.png".to_owned(), dir.path().join("missing.png").display().to_string()] {
+        let fields = json!({"photo": invalid, "title": "Replacement"});
+        let error = store.update_item(&def.id, &item.id, ItemPatch {
+            fields: fields.as_object().cloned(), done: Some(true),
+        }).unwrap_err();
+        assert!(!error.is_empty());
+        let unchanged = &store.get(&def.id).unwrap().items[0];
+        assert_eq!(unchanged.fields, item.fields);
+        assert!(!unchanged.done);
+    }
 
     let (_, problems) = store
         .add_item(

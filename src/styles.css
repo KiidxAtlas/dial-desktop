@@ -1,10 +1,12 @@
 /* Design tokens. Every colour, radius, spacing step and type size comes from here.
    Warm charcoal neutrals with one clay accent, kept quiet: the conversation is the interface,
    chrome stays out of the way. Borders are hairlines; depth comes from tone, not shadows.
-   Colours come in a dark and a light set (`appearance.ts` sets `data-theme` on <html>). A pane
-   over background artwork keeps the dark set, so text stays readable on the art. */
+   Colours come in a dark and a light set (`appearance.ts` sets `data-theme` on <html>). In the
+   light theme, an empty pane over background artwork keeps the dark set so its title reads on
+   the art; once a conversation is on screen the art is washed light and the pane turns light
+   too, so the whole window follows the theme. */
 :root,
-:root[data-theme="light"] .has-backdrop {
+:root[data-theme="light"] .has-backdrop:not(.conversing) {
   --bg: #262624;
   --sidebar: #1f1e1d;
   --surface: #30302e;
@@ -54,7 +56,8 @@
   --accent-hover: #b5583a;
   --accent-soft: #eba78c;
   --on-accent: #ffffff;
-  --code-inline: #9a4a2f;
+  /* Neutral ink: a rust tint read like an error next to real error text. */
+  --code-inline: #3d3a35;
   --success: #2f8a4f;
   --danger: #c4483c;
   --warning: #a8751c;
@@ -122,6 +125,14 @@
   color: var(--text);
 }
 
+
+/* Light theme with a conversation over artwork: the art is washed out (Backdrop.vue) and the
+   floating cards turn to light glass. */
+:root[data-theme="light"] .has-backdrop.conversing {
+  --glass: rgb(250 249 245 / 78%);
+  --glass-soft: rgb(250 249 245 / 50%);
+  --hero-shadow: none;
+}
 /* With the sidebar hidden, the macOS window buttons sit over the title bar (TopBar.vue).
    Full screen has no window buttons, so nothing is reserved there (App.vue). */
 .mac.no-sidebar:not(.fullscreen) .topbar {
@@ -145,11 +156,13 @@
   .shell > .main > .disconnect .disconnect-text { min-width: 50%; }
 }
 
-/* Settings already has its own navigation. Don't squeeze its forms between two sidebars. */
+/* Settings already has its own navigation. In a narrow window the sheet fills the window, clear
+   of the macOS window buttons, and its page list narrows. */
 @media (max-width: 960px) {
-  .shell:has(> .settings) > .sidebar { display: none; }
-  .shell.mac:not(.fullscreen) > .settings .head { padding-left: 84px; }
-  .shell > .settings .nav, .welcome-settings > .settings .nav { width: 170px; }
+  .shell > .sheet-wrap { padding: 0; }
+  .shell > .sheet-wrap > .sheet { border-radius: 0; height: 100%; }
+  .shell.mac:not(.fullscreen) > .sheet-wrap .settings .head { padding-left: 84px; }
+  .shell > .sheet-wrap .settings .nav, .welcome-settings > .settings .nav { width: 170px; }
 }
 
 * {
@@ -497,6 +510,30 @@ kbd {
   border-radius: var(--radius-lg);
   background: var(--glass-soft);
 }
+/* One disclosure look everywhere: a chevron that turns when the section opens. Summaries that
+   draw their own icon keep it; `:where` keeps these defaults below any component's own rules. */
+:where(summary) {
+  list-style: none;
+  cursor: pointer;
+}
+:where(summary)::-webkit-details-marker {
+  display: none;
+}
+:where(summary:not(:has(svg)))::before {
+  content: "›";
+  display: inline-block;
+  width: 0.9em;
+  margin-right: 4px;
+  color: var(--text-faint);
+  font-size: 1.1em;
+  line-height: 1;
+  text-align: center;
+  transition: transform 140ms var(--ease);
+}
+:where(details[open] > summary:not(:has(svg)))::before {
+  transform: rotate(90deg);
+}
+
 /* Source toggles under diagrams and interactive cards: mono, like tool rows. */
 .reply-app > details > summary,
 .reply-diagram summary {
@@ -615,8 +652,8 @@ kbd {
 .reply-diagram img.diagram-light { display: none; }
 :root[data-theme="light"] .reply-diagram img.diagram-light { display: block; }
 :root[data-theme="light"] .reply-diagram img.diagram-dark { display: none; }
-:root[data-theme="light"] .has-backdrop .reply-diagram img.diagram-light { display: none; }
-:root[data-theme="light"] .has-backdrop .reply-diagram img.diagram-dark { display: block; }
+:root[data-theme="light"] .has-backdrop:not(.conversing) .reply-diagram img.diagram-light { display: none; }
+:root[data-theme="light"] .has-backdrop:not(.conversing) .reply-diagram img.diagram-dark { display: block; }
 .reply-diagram details { border-top: 1px solid var(--border); }
 .reply-diagram summary { padding: 7px 12px; }
 .reply-diagram .code-block { margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
@@ -740,7 +777,7 @@ kbd {
 :root[data-theme="light"] .shiki span {
   color: var(--shiki-light);
 }
-:root[data-theme="light"] .has-backdrop .shiki,
-:root[data-theme="light"] .has-backdrop .shiki span {
+:root[data-theme="light"] .has-backdrop:not(.conversing) .shiki,
+:root[data-theme="light"] .has-backdrop:not(.conversing) .shiki span {
   color: var(--shiki-dark);
 }

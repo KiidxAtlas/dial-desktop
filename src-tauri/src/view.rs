@@ -29,13 +29,18 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Describe `root`; `home` abbreviates it when it lies inside the home directory.
+    /// Describe `root`; `home` abbreviates it when it lies inside the home directory. The shown
+    /// path drops the Windows verbatim prefix `canonicalize` adds (`\\?\C:\…`); `root` keeps it.
     pub fn new(root: &str, home: Option<&str>) -> Self {
-        let display = match home {
-            Some(home) if !home.is_empty() && root.starts_with(home) => {
-                format!("~{}", &root[home.len()..])
-            }
-            _ => root.to_owned(),
+        let shown = without_verbatim(root);
+        let home = home.map(without_verbatim);
+        let home = home
+            .as_deref()
+            .map(|h| h.trim_end_matches(['/', '\\']))
+            .filter(|h| !h.is_empty());
+        let display = match home.and_then(|home| shown.strip_prefix(home)) {
+            Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => format!("~{rest}"),
+            _ => shown.into_owned(),
         };
         let name = root
             .trim_end_matches(['/', '\\'])
@@ -51,13 +56,32 @@ impl Workspace {
         }
     }
 
-    /// `path` relative to the workspace when it lies inside it.
+    /// `path` relative to the workspace when it lies inside it. Either side may carry the
+    /// Windows verbatim prefix (`\\?\C:\…`) that `canonicalize` adds.
     pub fn relative<'a>(&self, path: &'a str) -> &'a str {
-        path.strip_prefix(self.root.as_str())
-            .and_then(|rest| rest.strip_prefix('/').or(rest.strip_prefix('\\')))
-            .filter(|rest| !self.root.is_empty() && !rest.is_empty())
+        let root = self.root.as_str();
+        let plain_root = without_verbatim(root);
+        let plain_path = path
+            .strip_prefix(r"\\?\")
+            .filter(|p| !p.starts_with(r"UNC\"))
+            .unwrap_or(path);
+        [(path, root), (plain_path, plain_root.as_ref())]
+            .into_iter()
+            .find_map(|(path, root)| {
+                path.strip_prefix(root)
+                    .and_then(|rest| rest.strip_prefix('/').or(rest.strip_prefix('\\')))
+                    .filter(|rest| !root.is_empty() && !rest.is_empty())
+            })
             .unwrap_or(path)
     }
+}
+
+/// `\\?\C:\x` as `C:\x` and `\\?\UNC\server\share` as `\\server\share`, for display.
+fn without_verbatim(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}").into();
+    }
+    path.strip_prefix(r"\\?\").unwrap_or(path).into()
 }
 
 /// Connection state as the UI shows it.
@@ -597,6 +621,7 @@ pub struct Snapshot {
     pub turn_running: bool,
     pub model_progress: Option<crate::model::ModelProgress>,
     pub loading_local_model: Option<String>,
+    pub local_load_failure: Option<crate::tabs::LocalLoadFailure>,
     pub can_send: bool,
     pub sessions: Vec<SessionView>,
     /// Shared with the previous snapshot where unchanged (see [`EntryViews`]).
@@ -633,7 +658,7 @@ pub struct VoiceView {
 #[serde(rename_all = "camelCase")]
 pub struct ContextView {
     pub tokens: u64,
-    /// `None` when the model list does not say.
+    /// Effective window, or catalog capacity on engines without that field.
     pub window: Option<u64>,
     pub estimated: bool,
 }
@@ -747,6 +772,7 @@ impl Snapshot {
             turn_running: conversation.turn_running(),
             model_progress: model.model_progress,
             loading_local_model: None,
+            local_load_failure: None,
             can_send: model.can_send(),
             sessions,
             entries,
@@ -989,6 +1015,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
         turn_running,
         model_progress,
         loading_local_model,
+        local_load_failure,
         can_send,
         sessions,
         entries,
@@ -1020,6 +1047,7 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
     field!(turn_running, "turnRunning");
     field!(model_progress, "modelProgress");
     field!(loading_local_model, "loadingLocalModel");
+    field!(local_load_failure, "localLoadFailure");
     field!(can_send, "canSend");
     field!(sessions, "sessions");
     field!(approvals, "approvals");

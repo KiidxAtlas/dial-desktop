@@ -25,3 +25,19 @@ export function relativeTo(root: string, path: string): string {
   if (base && same(full.slice(0, base.length), base) && full[base.length] === "/") return full.slice(base.length + 1);
   return full;
 }
+
+/** Decode a file citation, not a URL or a fragment. This formats its display path; the backend
+ * still resolves it inside the project. A malformed percent escape throws URIError. */
+export function projectFileLink(root: string, href: string) {
+  if (!href || href.startsWith("#")) return null;
+  const decoded = decodeURIComponent(href.replace(/[?#].*$/, ""));
+  // Markdown percent-encodes Windows backslashes. A single drive separator is not a URL scheme.
+  if (/^[a-z][a-z\d+.-]*:/i.test(href) &&
+      !(separatorOf(root) === "\\" && /^[a-z]:[\\/](?![\\/])/i.test(decoded))) return null;
+  const path = relativeTo(root, decoded).replace(/^\.\//, "");
+  if (!path) return null;
+  const match = /#L([1-9]\d*)(?:-L([1-9]\d*))?$/.exec(href);
+  const start = Number(match?.[1]), end = Number(match?.[2] ?? start);
+  const lines = Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start ? { start, end } : null;
+  return { path, lines };
+}

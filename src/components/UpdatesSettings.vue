@@ -9,6 +9,7 @@ import {
   engineUpdateAvailable,
   installApp,
   installEngine,
+  needsEngineInstall,
   updateEngine,
   updates,
 } from "../updates";
@@ -32,15 +33,17 @@ const engineLine = computed(() => {
   switch (e.state) {
     case "checked": {
       const s = e.status;
-      const via = INSTALLATIONS[s.installation] ?? s.installation;
-      if (s.update_available) return `Dial ${s.latest} is available (you have ${s.current}) · installed with ${via}`;
-      if (s.latest) return `Dial ${s.current} is up to date · installed with ${via}`;
+      const source = s.method === "checkout" ? "built from a source checkout" : `installed with ${INSTALLATIONS[s.installation] ?? s.installation}`;
+      if (s.update_available) return `Dial ${s.latest} is available (you have ${s.current}) · ${source}`;
+      if (s.latest) return `Dial ${s.current} is up to date · ${source}`;
       return `Dial ${s.current} · could not reach GitHub${s.error ? `: ${s.error}` : ""}`;
     }
     case "unsupported":
       return e.detail;
     case "missing":
       return "No Dial engine was found on this computer.";
+    case "unlaunchable":
+      return `The selected Dial engine could not start: ${e.error}`;
     case "failed":
       return `Could not check: ${e.error}`;
   }
@@ -164,6 +167,18 @@ async function chooseEngineFile() {
   }
   await pick({ kind: "custom", path }, `Using ${version}`);
 }
+function selectEngine(event: Event) {
+  const select = event.currentTarget as HTMLSelectElement;
+  const next = select.value;
+  // Only show the new preference once it is saved; a file pick can also be cancelled.
+  select.value = choice.value?.kind ?? "automatic";
+  switch (next) {
+    case "file": return chooseEngineFile();
+    case "path": return pick({ kind: "path" }, "Using the engine on PATH");
+    case "desktop": return pick({ kind: "desktop" }, "Using Dial Desktop’s copy");
+    case "automatic": return pick(null, "Back to the usual order");
+  }
+}
 const restarting = ref(false);
 async function restartNow() {
   restarting.value = true;
@@ -219,10 +234,11 @@ async function copyReport() {
 
   <SGroup title="Dial engine" description="Update the selected Dial engine, or install a separate signed release when its updates are managed elsewhere.">
     <SRow
+      class="engine-row"
       :label="engineStatus ? `Version ${engineStatus.current}` : 'Engine'"
       :description="updates.engineBusy === 'updating' ? 'Updating… (a source or Cargo install rebuilds Dial; this can take minutes)' : updates.engineBusy === 'installing' ? 'Installing the signed Dial release…' : engineLine"
     >
-      <button v-if="updates.engine?.state === 'missing' || manualEngine" class="btn btn-primary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine">
+      <button v-if="needsEngineInstall(updates.engine?.state) || manualEngine" class="btn btn-primary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="installEngine">
         <Icon name="download" :size="14" /> Install Desktop copy
       </button>
       <button v-else-if="canUpdateEngine" class="btn btn-primary" :disabled="!!updates.engineBusy || updates.appPhase !== 'idle'" @click="updateEngine">
@@ -234,27 +250,21 @@ async function copyReport() {
       <button v-if="updates.engineChanged && snapshot?.workspace" class="btn btn-secondary" :disabled="!!updates.engineBusy || snapshot.turnRunning" @click="engine.reconnect()">
         Reconnect this session
       </button>
-      <template v-if="manualEngine" #below-text>
-        <div class="s-desc">Installing a separate copy lets Desktop use the latest release without replacing your existing engine.</div>
+      <template v-if="manualEngine || startup?.engine" #below-text>
+        <div v-if="manualEngine" class="s-desc">Installing a separate copy lets Desktop use the latest release without replacing your existing engine.</div>
+        <!-- Which binary is running, in the same card as its version: one place for "what engine is this". -->
+        <code v-if="startup?.engine" class="path" :title="startup.origin ? `${ORIGINS[startup.origin]}\n${startup.engine}` : startup.engine">{{ startup.engine }}</code>
       </template>
     </SRow>
-    <SRow
-      v-if="startup?.engine || startup?.origin"
-      label="Engine in use"
-      :description="startup.origin ? ORIGINS[startup.origin] : undefined"
-    >
-      <template #below-text>
-        <code class="path" :title="startup.engine ?? ''">{{ startup.engine }}</code>
-      </template>
-    </SRow>
-    <SRow v-if="snapshot?.connection.state !== 'preview'" label="Engine to use" :description="choiceLine">
+    <SRow v-if="snapshot?.connection.state !== 'preview'" stacked class="engine-row" label="Engine to use" :description="choiceLine">
       <button v-if="choiceLoadError" class="btn btn-secondary" @click="loadChoice">Try again</button>
-      <template v-if="choiceLoaded">
-        <button class="btn btn-secondary" :disabled="choosing" @click="chooseEngineFile">Use a different engine…</button>
-        <button v-if="choice?.kind !== 'path'" class="btn btn-secondary" :disabled="choosing" @click="pick({ kind: 'path' }, 'Using the engine on PATH')">Use the one on PATH</button>
-        <button v-if="choice?.kind !== 'desktop'" class="btn btn-secondary" :disabled="choosing" @click="pick({ kind: 'desktop' }, 'Using Dial Desktop’s copy')">Use Dial Desktop’s copy</button>
-        <button v-if="choice" class="btn btn-secondary" :disabled="choosing" title="DIAL_BIN, then Desktop’s copy, then PATH" @click="pick(null, 'Back to the usual order')">Automatic</button>
-      </template>
+      <select v-if="choiceLoaded" class="s-select" aria-label="Engine to use" :value="choice?.kind ?? 'automatic'" :disabled="choosing" @change="selectEngine">
+        <option value="automatic">Automatic</option>
+        <option value="desktop">Dial Desktop’s copy</option>
+        <option value="path">Engine on PATH</option>
+        <option v-if="choice?.kind === 'custom'" value="custom">Custom engine</option>
+        <option value="file">Use a different engine…</option>
+      </select>
       <template v-if="choiceError || choiceNotice || switched" #below-text>
         <p v-if="choiceError" role="alert" class="error">{{ choiceError }}</p>
         <p v-else-if="choiceNotice" role="status" class="s-desc">{{ choiceNotice }}</p>
@@ -298,6 +308,12 @@ async function copyReport() {
 </template>
 
 <style scoped>
+.engine-row :deep(.s-control) {
+  flex-wrap: wrap;
+}
+.engine-row :deep(.s-desc) {
+  overflow-wrap: anywhere;
+}
 code {
   font-family: var(--font-mono);
   font-size: 0.95em;

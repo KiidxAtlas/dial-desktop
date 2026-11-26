@@ -66,6 +66,8 @@ export const ui = reactive({
   transcriptJump: null as (import("./types").TranscriptHit & { root: string }) | null,
   inspectorOpen: layout.inspectorOpen,
   inspectorTab: layout.inspectorTab,
+  /** The side panel was put away for an empty session (not by you), so a restart keeps it open. */
+  inspectorParked: false,
   /** The changed file whose diff the Changes panel shows, or `null` for the list. */
   diffPath: null as string | null,
   diffExpanded: false,
@@ -76,6 +78,7 @@ export const ui = reactive({
   expanded: new Set<string>(),
   /** The composer's model picker. */
   modelPickerOpen: false,
+  modelPickerFilter: 'all' as import('./modelPicker').PickerFilter,
   /** The settings page replaces the conversation while open. */
   settingsOpen: false,
   /** The Desktop tab to open settings on (`updates`), or `""` for the usual first tab. */
@@ -103,7 +106,7 @@ export const ui = reactive({
 });
 
 watch(
-  () => [ui.sidebarOpen, ui.inspectorOpen, ui.inspectorTab] as const,
+  () => [ui.sidebarOpen, ui.inspectorOpen || ui.inspectorParked, ui.inspectorTab] as const,
   ([sidebarOpen, inspectorOpen, inspectorTab]) => {
     try {
       localStorage.setItem(LAYOUT_KEY, JSON.stringify({ sidebarOpen, inspectorOpen, inspectorTab }));

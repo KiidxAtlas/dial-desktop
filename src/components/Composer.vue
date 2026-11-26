@@ -140,30 +140,16 @@ const canSend = computed(() => ready.value && (slash.value.length > 0 || steerin
 )));
 /** Files are being dragged over the window. */
 const dropping = ref(false);
+/** A note under the composer while the engine starts or in the design preview. When the engine is
+ *  down, the banner above the conversation says so once, with Reconnect; this stays quiet. */
 const caption = computed(() => {
   const c = props.snap.connection;
-  switch (c.state) {
-    case "live":
-      return props.snap.workspace.display;
-    case "starting":
-      return `Starting Dial in ${props.snap.workspace.display}…`;
-    case "preview":
-      return "Design preview · prompts are not sent";
-    case "failed":
-      if (c.problem === "missing") return "No Dial engine found; install it from the message above the conversation";
-      if (c.problem === "incompatible") return "This Dial engine is too old or too new for the app; update it from the message above the conversation";
-      return "The Dial engine could not start. Your draft is kept.";
-    case "ended":
-      return "The Dial engine stopped. Your draft is kept.";
-  }
+  if (c.state === "starting") return `Starting Dial in ${props.snap.workspace.display}…`;
+  if (c.state === "preview") return "Design preview · prompts are not sent";
   return "";
 });
-/** The engine is down: the composer looks unavailable, and Reconnect sits right under it when it can help. */
+/** The engine is down: the composer looks unavailable. */
 const offline = computed(() => props.snap.connection.state === "failed" || props.snap.connection.state === "ended");
-const canReconnect = computed(() => {
-  const c = props.snap.connection;
-  return c.state === "ended" || (c.state === "failed" && c.problem !== "missing" && c.problem !== "incompatible");
-});
 
 function resize() {
   const el = input.value;
@@ -397,11 +383,13 @@ const TOOL_ACTIONS: Record<string, string> = {
   web: "use the web", fetch: "fetch a web page", web_search: "search the web", batch: "run several tools at once",
 };
 const approvalAction = computed(() => (approval.value ? TOOL_ACTIONS[approval.value.tool.toLowerCase()] ?? null : null));
-/** The lasting answers sit in a menu, so the card shows one clear yes and one clear no. */
+/** The lasting answers sit in a menu, so the card shows one clear yes and one clear no. Each one
+ *  names what it keeps allowing, so the rule is visible before it is made. */
 function scopeMenu(event: MouseEvent) {
+  const what = approval.value?.tool ?? "this tool";
   openMenu(event, [
-    { label: "Always allow in this project", run: () => decide("project") },
-    { label: "Always allow everywhere", run: () => decide("always") },
+    { label: `Always allow ${what} in this project`, run: () => decide("project") },
+    { label: `Always allow ${what} everywhere`, run: () => decide("always") },
   ], event.currentTarget as HTMLElement);
 }
 /** While a turn runs: the note goes now by default; queueing waits in this menu. */
@@ -470,11 +458,11 @@ onMounted(focus);
             <span v-if="requestedFolder">{{ approval.tool === 'request_sensitive_directory' ? 'Allow protected-file access in' : 'Give Dial access to' }} <strong class="mono">{{ requestedFolder }}</strong>?</span>
             <span v-else-if="approvalAction">Allow Dial to <strong>{{ approvalAction }}</strong>? <span class="tool-id mono">{{ approval.tool }}</span></span>
             <span v-else>Allow <strong>{{ approval.tool }}</strong>?</span>
-            <span v-if="snap.approvals.length > 1" class="more">+{{ snap.approvals.length - 1 }} more waiting</span>
           </div>
           <pre v-if="approval.summary" class="summary">{{ approval.summary }}</pre>
+          <!-- One counter for the rest of the queue; opening it lists them. -->
           <details v-if="snap.approvals.length > 1" class="waiting">
-            <summary>Show the {{ snap.approvals.length - 1 === 1 ? "other request" : `${snap.approvals.length - 1} other requests` }}</summary>
+            <summary>{{ snap.approvals.length - 1 }} more waiting</summary>
             <ol>
               <li v-for="other in snap.approvals.slice(1)" :key="other.approvalId" :title="other.summary">
                 <strong>{{ other.tool }}</strong> <span class="truncate">{{ firstLine(other.summary) }}</span>
@@ -519,6 +507,14 @@ onMounted(focus);
       <Transition name="pop">
         <VoicePanel v-if="snap.voice.phase !== 'off'" :voice="snap.voice" :turn-running="snap.turnRunning" @edit="editHeard" />
       </Transition>
+      <section v-if="snap.localLoadFailure && snap.connection.state === 'live'" class="card" aria-label="Model load failed">
+        <div class="card-head" role="alert"><Icon name="chip" :size="16" /><strong class="truncate" :title="snap.localLoadFailure.modelId">Couldn’t load {{ snap.localLoadFailure.modelId.split(/[\\/]/).pop() }}</strong></div>
+        <pre class="summary">{{ snap.localLoadFailure.error }}</pre>
+        <div class="actions">
+          <button class="btn btn-secondary" :disabled="!snap.canSend || snap.turnRunning" @click="engine.setModel(snap, snap.localLoadFailure.provider, snap.localLoadFailure.modelId)">Retry load</button>
+          <button class="btn btn-secondary" @click="ui.modelPickerOpen = true">Choose another model</button>
+        </div>
+      </section>
       <div class="composer" :class="{ dropping, offline }" @click="input?.focus()">
         <div v-if="dropping" class="drop-hint"><Icon name="file" :size="16" /> Drop files to attach</div>
         <Transition name="pop">
@@ -589,8 +585,11 @@ onMounted(focus);
             <span v-else-if="runningHint" class="keyhint always" role="status" :title="runningTitle"><kbd>Enter</kbd> {{ runningHint }}</span>
           </span>
           <ContextMeter
-            v-if="snap.context"
+            v-if="snap.context || snap.connection.state === 'live'"
+            :key="JSON.stringify([snap.workspace.root, snap.sessionId, snap.model?.modelId, snap.model?.provider])"
             :context="snap.context"
+            :live="snap.connection.state === 'live'"
+            :turn-running="snap.turnRunning"
             :can-compact="canCompact(snap)"
             @compact="engine.compact()"
           />
@@ -642,9 +641,8 @@ onMounted(focus);
         </div>
       </div>
       <div v-if="draft.sending && !snap.turnRunning" class="caption" role="status">Submitting prompt…</div>
-      <div v-if="snap.connection.state !== 'live'" class="caption" :class="{ offline }" :role="offline ? 'status' : undefined">
+      <div v-if="caption" class="caption" role="status">
         <span class="truncate">{{ caption }}</span>
-        <button v-if="canReconnect" class="btn btn-secondary reconnect" @click="engine.reconnect()"><Icon name="refresh" :size="13" /> Reconnect</button>
       </div>
     </div>
     <CommandPanel />
@@ -715,11 +713,6 @@ onMounted(focus);
 .card-head strong {
   font-weight: 600;
   color: var(--text);
-}
-.more {
-  margin-left: auto;
-  font-size: var(--text-sm);
-  color: var(--text-faint);
 }
 .once-note { align-self: center; font-size: var(--text-sm); color: var(--text-faint); }
 .actions .key {
@@ -877,11 +870,16 @@ onMounted(focus);
 .attach:disabled {
   opacity: 0.4;
 }
+/* The mic shows while the composer is in use, so the idle bar stays quiet. */
 .mic {
   width: 32px;
   height: 32px;
   margin-right: 4px;
   border-radius: 50%;
+  transition: opacity 140ms var(--ease);
+}
+.composer:not(:hover):not(:focus-within) .mic {
+  opacity: 0;
 }
 .slash {
   position: absolute;
@@ -1088,12 +1086,7 @@ textarea::placeholder {
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
-.caption.offline {
-  color: var(--text);
-}
-.caption .reconnect {
-  flex: none;
-}
+
 .pop-enter-active,
 .pop-leave-active {
   transition:

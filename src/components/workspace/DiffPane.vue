@@ -5,6 +5,7 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { diffHunks, type DiffHunk } from "../../diff";
 import { showToast, workspaceFiles } from "../../bridge";
 import { addToPrompt, mention, showFile } from "../../workspace";
+import { openMenu } from "../../ui";
 import { paneError, paneErrorText, type PaneError } from "../../paneErrors";
 import { relativeTo } from "../../paths";
 import { workspaceGitApi } from "../../workspaceGitApi";
@@ -42,15 +43,15 @@ async function load() {
 /** Discard every uncommitted change to this file, after the user confirms. */
 async function revert() {
   const path = relative.value, root = props.root;
-  // Without a commit to return to, the file is unstaged and deleted.
-  const untracked = view.value?.base === "untracked" || view.value?.base === "index";
+  // A staged addition can be diffed against HEAD but still has no committed version.
+  const untracked = view.value?.deleteOnRevert;
   const confirmed = await ask(
     untracked
       ? `Delete ${path}? It has no committed version, so this removes the file. Your own edits to it are lost too, not just Dial's.`
       : `Revert ${path} to the last commit? This discards every uncommitted change to the file, including your own edits and staged changes, not just Dial's.`,
     { title: untracked ? "Delete new file" : "Revert file", kind: "warning", okLabel: untracked ? "Delete file" : "Revert file" },
   );
-  if (!confirmed || root !== props.root) return;
+  if (!confirmed || root !== props.root || path !== relative.value) return;
   reverting.value = true;
   try {
     await workspaceGitApi.revert(path, root);
@@ -77,7 +78,7 @@ async function revertHunk(hunk: DiffHunk) {
     `Undo this change in ${path} (+${added} −${removed} lines at ${hunk.header.replace(/^@@ (.*?) @@.*$/, "$1")})? The rest of the file stays as it is. Your own edits in these lines are lost too.`,
     { title: "Revert hunk", kind: "warning", okLabel: "Revert hunk" },
   );
-  if (!confirmed || root !== props.root) return;
+  if (!confirmed || root !== props.root || path !== relative.value) return;
   reverting.value = true;
   try {
     await workspaceGitApi.revertHunk(path, hunkText(hunk), root);
@@ -124,37 +125,46 @@ function askAbout(hunk: DiffHunk) {
 function copy() {
   navigator.clipboard.writeText(view.value?.diff ?? "").catch(() => showToast("Could not copy to the clipboard"));
 }
+
+/** The less-used file actions, behind "⋯" so the header stays one row. */
+function more(event: MouseEvent) {
+  openMenu(event, [
+    { label: "Ask Dial about this change", icon: "chat", run: () => addToPrompt(`About the current working-tree diff for ${mention(relative.value)}: `) },
+    { label: "Open in Files", icon: "file", run: openInFiles },
+    { label: "Copy diff", icon: "copy", disabled: !view.value?.diff, run: copy },
+    { label: "Refresh", icon: "refresh", run: () => void load() },
+    ...(view.value?.nested ? [] : [
+      { divider: true as const },
+      { label: view.value?.deleteOnRevert ? "Delete file…" : "Revert file…", icon: "undo", danger: true, disabled: !view.value?.diff || reverting.value, run: () => void revert() },
+    ]),
+  ], event.currentTarget as HTMLElement);
+}
 </script>
 
 <template>
   <div class="diff">
+    <!-- One row: back, the file and its counts, file-to-file stepping, expand, and "⋯" for the rest. -->
     <div class="head">
       <button class="icon-btn" title="All changed files" aria-label="All changed files" @click="emit('back')">
         <Icon name="arrowLeft" :size="14" />
       </button>
       <span class="mono truncate" :title="relative">{{ relative }}</span>
       <span v-if="view" class="counts"><b class="add">+{{ added }}</b> <b class="del">−{{ removed }}</b></span>
-      <button class="icon-btn" title="Refresh" @click="load"><Icon name="refresh" :size="14" /></button>
-      <button class="icon-btn" title="Open in Files" @click="openInFiles"><Icon name="file" :size="14" /></button>
-      <button class="icon-btn" title="Copy diff" :disabled="!view?.diff" @click="copy"><Icon name="copy" :size="14" /></button>
-      <button class="icon-btn" title="Revert file (discards all its uncommitted changes)" aria-label="Revert file" :disabled="!view?.diff || reverting" @click="revert"><Icon name="undo" :size="14" /></button>
-      <button
-        class="icon-btn"
-        title="Ask Dial about this change"
-        @click="addToPrompt(`About the current working-tree diff for ${mention(relative)}: `)"
-      >
-        <Icon name="chat" :size="14" />
-      </button>
-    </div>
-    <div class="review-bar">
-      <div v-if="position" class="file-nav" aria-label="Changed files navigation">
-        <button class="icon-btn" title="Previous file" aria-label="Previous file" :disabled="position.index === 0" @click="emit('move', -1)"><Icon name="arrowLeft" :size="14" /></button>
-        <span>{{ position.index + 1 }} / {{ position.total }}</span>
+      <div v-if="position && position.total > 1" class="file-nav" aria-label="Changed files navigation">
+        <button class="icon-btn" title="Previous file" aria-label="Previous file" :disabled="position.index === 0" @click="emit('move', -1)"><Icon name="chevronLeft" :size="14" /></button>
+        <span>{{ position.index + 1 }}/{{ position.total }}</span>
         <button class="icon-btn" title="Next file" aria-label="Next file" :disabled="position.index + 1 === position.total" @click="emit('move', 1)"><Icon name="chevronRight" :size="14" /></button>
       </div>
-      <button class="btn btn-secondary" :aria-pressed="expanded" @click="emit('expand')">{{ expanded ? 'Shrink diff' : 'Expand diff' }}</button>
+      <button
+        class="icon-btn"
+        :title="expanded ? 'Shrink diff' : 'Expand diff'"
+        :aria-label="expanded ? 'Shrink diff' : 'Expand diff'"
+        :aria-pressed="expanded"
+        @click="emit('expand')"
+      ><Icon :name="expanded ? 'compress' : 'expand'" :size="14" /></button>
+      <button class="icon-btn" title="More: ask Dial, open in Files, copy, revert" aria-label="More file actions" @click="more"><Icon name="more" :size="14" /></button>
     </div>
-    <p v-if="view" class="note"><strong>{{ baseLabel }}</strong> · Not limited to this session or turn.</p>
+    <p v-if="view" class="note"><strong>{{ baseLabel }}</strong> · Not limited to this session or turn.<template v-if="view.nested"> Open this repository as a project to stage, revert or commit changes.</template></p>
     <div v-if="error" class="empty">
       <strong>{{ error.title }}</strong>
       <span v-if="error.hint">{{ error.hint }}</span>
@@ -171,7 +181,7 @@ function copy() {
             <span class="truncate" :title="hunk.header">{{ hunk.header }}</span>
             <span class="hunk-actions">
               <button
-                v-if="view.base !== 'untracked'"
+                v-if="view.base !== 'untracked' && !view.nested"
                 class="btn btn-secondary"
                 title="Undo just this change in the working tree"
                 :disabled="reverting"
@@ -189,7 +199,10 @@ function copy() {
       </template>
       <pre v-else class="note">{{ view.diff }}</pre>
     </div>
-    <div v-else class="empty" role="status">Loading diff…</div>
+    <!-- Lines shaped like a diff while it loads, so the pane does not jump when it arrives. -->
+    <div v-else class="lines skeleton" role="status" aria-label="Loading diff">
+      <span v-for="(w, i) in [62, 48, 80, 35, 70, 55, 44, 66]" :key="i" :class="{ add: i === 2 || i === 3, del: i === 5 }" :style="{ width: `${w}%` }" />
+    </div>
   </div>
 </template>
 
@@ -211,21 +224,35 @@ function copy() {
   flex: 1;
   min-width: 0;
 }
-.review-bar, .file-nav {
+.file-nav {
   display: flex;
+  flex: none;
   align-items: center;
-  gap: 4px;
-}
-.review-bar {
-  justify-content: space-between;
-  flex-wrap: wrap;
+  gap: 0;
   font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
 }
-.review-bar > button { margin-left: auto; }
 .counts {
   font-size: var(--text-xs);
   white-space: nowrap;
 }
+.skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 10px;
+}
+.skeleton span {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--hover);
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+.skeleton span.add { background: color-mix(in srgb, var(--success) 16%, transparent); }
+.skeleton span.del { background: color-mix(in srgb, var(--danger) 16%, transparent); }
+@keyframes shimmer { 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) { .skeleton span { animation: none; } }
 .add {
   color: var(--success);
 }

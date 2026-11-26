@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { phaseOf, runActivity, runFiles, runImages, runSummary, type RunItem, type ToolRun } from "../toolFolds";
+import { phaseOf, progressFraction, runActivity, runFiles, runHeadline, runImages, runSummary, type RunItem, type ToolRun } from "../toolFolds";
 import { entryKey, ui } from "../ui";
 import ReceivedRow from "./ReceivedRow.vue";
 import FindText from "./FindText.vue";
@@ -14,25 +14,31 @@ import type { TextMatch } from '../chatFind';
  * arrived among them. A single call or message shows as its own row; several show a summary
  * that updates in place while they run, with the files they changed and the images they made
  * beneath it. Opening the line lists every row. */
-const props = defineProps<{ run: ToolRun; open: boolean; session: string | null; match: number; occurrence?: TextMatch }>();
+const props = defineProps<{ run: ToolRun; open: boolean; session: string | null; match: number; occurrence?: TextMatch; stalled?: boolean }>();
 const emit = defineEmits<{ toggle: [event: MouseEvent] }>();
 
-const activity = computed(() => runActivity(props.run));
+const raw = computed(() => runActivity(props.run));
+/** The engine went away mid-call: the call will never report back, so stop the spinner. */
+const interrupted = computed(() => !!props.stalled && raw.value.running);
+const activity = computed(() => (interrupted.value ? { ...raw.value, running: false } : raw.value));
 const summary = computed(() => runSummary(props.run));
 const images = computed(() => runImages(props.run));
 /** Changed files, less the images already shown as thumbnails. */
 const files = computed(() =>
-  runFiles(props.run).filter((f) => !images.value.some((img) => img === f.path || img.endsWith(`/${f.path}`))),
+  runFiles(props.run).filter((f) => !images.value.some((img) => img === f.path || img.replace(/\\/g, "/").endsWith(`/${f.path}`))),
 );
 /** Failed calls stay in view under a closed run, so a failure is never two clicks away. */
 const FAILED_SHOWN = 3;
 const failedTools = computed(() => props.run.tools.filter((t) => t.state === "failed"));
-/** While calls run, the line names the phase ("Reading…", "Editing…"); once done, what was done. */
-const headline = computed(() => (activity.value.running ? `${phaseOf(activity.value.current)}…` : summary.value));
+/** While calls run, the line names the phase ("Reading…", "Editing…"); once done, what was done, weightiest
+ *  first and short enough for one line (the full list is in the tooltip and the open run). */
+const headline = computed(() => (interrupted.value ? `Interrupted · ${runHeadline(props.run)}` : activity.value.running ? `${phaseOf(activity.value.current)}…` : runHeadline(props.run)));
+/** "8 of 12 tests passed" in the running call's progress line, as a fraction for a bar. */
+const fraction = computed(() => (activity.value.running ? progressFraction(activity.value.current.progress) : null));
 /** At most this many pips; the rest show as a count. */
 const PIPS = 14;
-const tone = computed(() => (activity.value.running ? "running" : activity.value.failed ? "mixed" : activity.value.unknown ? "unknown" : "succeeded"));
-const name = (path: string) => path.split("/").pop() || path;
+const tone = computed(() => (interrupted.value ? "unknown" : activity.value.running ? "running" : activity.value.failed ? "mixed" : activity.value.unknown ? "unknown" : "succeeded"));
+const name = (path: string) => path.split(/[\\/]/).pop() || path;
 const only = computed(() => (props.run.items.length === 1 ? props.run.items[0] : null));
 const messages = computed(() => props.run.items.filter((item) => item.entry.kind === "received").length);
 const count = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
@@ -49,7 +55,7 @@ function openDiff(path: string) {
 
 <template>
   <ToolRow
-    v-if="only?.entry.kind === 'tool' && !activity.running"
+    v-if="only?.entry.kind === 'tool' && !activity.running && !interrupted"
     :tool="only.entry"
     :occurrence="hit(only)"
     :data-entry="run.start"
@@ -76,8 +82,9 @@ function openDiff(path: string) {
         <Icon v-else-if="tone === 'succeeded'" name="check" :size="12" />
         <span v-else class="dot" />
       </span>
-      <span class="summary" aria-live="polite" :title="headline">{{ headline }}</span>
-      <span class="pips" aria-hidden="true">
+      <span class="summary" aria-live="polite" :title="summary">{{ headline }}</span>
+      <!-- Pips show progress while calls run; once done, the summary and the failed count say it. -->
+      <span v-if="activity.running && fraction === null" class="pips" aria-hidden="true">
         <span
           v-for="t in run.tools.slice(-PIPS)"
           :key="t.key"
@@ -88,6 +95,7 @@ function openDiff(path: string) {
       </span>
       <span v-if="activity.failed" class="badge failed">{{ activity.failed }} failed</span>
       <span v-if="activity.unknown" class="badge">{{ activity.unknown }} unknown</span>
+      <span v-if="activity.running && fraction !== null" class="meter" aria-hidden="true"><span :style="{ width: `${Math.round(fraction * 100)}%` }" /></span>
       <span v-if="activity.running" class="current truncate">{{ activity.current.progress || activity.current.target }}</span>
       <Icon class="chevron" name="chevronRight" :size="12" />
     </button>
@@ -224,6 +232,21 @@ function openDiff(path: string) {
   min-width: 0;
   font-size: 12.5px;
   color: var(--text-faint);
+}
+/* A call that reports "8 of 12" gets a bar in place of the pips. */
+.meter {
+  flex: none;
+  width: 48px;
+  height: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--border);
+}
+.meter span {
+  display: block;
+  height: 100%;
+  background: var(--text-muted);
+  transition: width 300ms var(--ease);
 }
 .current b { font-weight: 600; color: var(--text-muted); }
 .chevron {

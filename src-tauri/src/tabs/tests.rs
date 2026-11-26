@@ -84,6 +84,22 @@ fn busy_tab_keeps_latest_model_and_effort_until_both_settle() {
 }
 
 #[test]
+fn failed_local_selection_can_retry_in_its_original_tab() {
+    let mut tab = tab("one", false);
+    let pick = Command::SetModel { session_id: "one".into(), provider: "mlx".into(), model_id: "m.gguf".into() };
+    tab.model.prepare_local_model_supported = true;
+    assert_eq!(tab.select_model_setting(pick.clone()).unwrap(), Some(pick.clone()));
+    tab.apply(Update::RequestFailed { command: pick.clone(), error: "missing llama-server".into() });
+    tab.model.toast.take();
+    let problem = tab.local_load_failure().unwrap();
+    assert_eq!((&*problem.model_id, &*problem.session_id, &*problem.error), ("m.gguf", "one", "missing llama-server"));
+    assert!(!tab.transitioning());
+    assert_eq!(tab.select_model_setting(pick.clone()).unwrap(), Some(pick));
+    assert!(tab.local_load_failure().is_none());
+    assert_eq!(tab.loading_local_model(), Some("m.gguf"));
+}
+
+#[test]
 fn an_idle_tab_opens_sessions_in_place() {
     let tabs = Tabs::new(tab("s1", false));
     assert_eq!(tabs.route_resume("s2"), Route::Here);

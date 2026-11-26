@@ -45,6 +45,7 @@ export const PATHS = {
   minus: "M5 12h14",
   chat: "M5 5h14v10H9l-4 4z",
   compress: "M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5",
+  expand: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
   globe: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18",
   arrowLeft: "M19 12H5M11 6l-6 6 6 6",
   arrowRight: "M5 12h14M13 6l6 6-6 6",

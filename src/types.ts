@@ -8,7 +8,7 @@ export type Connection =
   | { state: "ended" };
 
 /** What the UI can offer for a failed connection; mirrors `updates::EngineProblem`. */
-export type EngineProblem = "missing" | "incompatible" | "other";
+export type EngineProblem = "missing" | "unlaunchable" | "incompatible" | "other";
 
 /** `dial update --check --json`, as the engine reports it (`updates::EngineStatus`). */
 export interface EngineStatus {
@@ -27,6 +27,7 @@ export type EngineUpdateView =
   | { state: "checked"; status: EngineStatus }
   | { state: "unsupported"; detail: string }
   | { state: "missing"; error: string }
+  | { state: "unlaunchable"; error: string }
   | { state: "failed"; error: string };
 
 export interface Workspace {
@@ -216,6 +217,7 @@ export interface Snapshot {
   model: ModelInfo | null;
   approval: ApprovalMode | null;
   loadingLocalModel?: string | null;
+  localLoadFailure?: { sessionId: string; provider: string; modelId: string; error: string } | null;
   sessionId: string | null;
   historyLoading: boolean;
   showThinking: boolean;
@@ -254,7 +256,7 @@ export interface VoiceView {
 
 export interface ContextView {
   tokens: number;
-  /** The model's context window, when the model list says. */
+  /** Effective window, falling back to catalog capacity on older engines. */
   window: number | null;
   estimated: boolean;
 }
@@ -335,6 +337,8 @@ export interface DiffView {
   /** Unified diff; empty without uncommitted changes. */
   diff: string;
   base: "head" | "index" | "untracked";
+  deleteOnRevert: boolean;
+  nested?: boolean;
 }
 
 /** Where the browser panel sits, in logical window pixels. */

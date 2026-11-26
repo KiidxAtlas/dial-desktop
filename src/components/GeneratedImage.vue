@@ -16,6 +16,12 @@ import Icon from "./Icon.vue";
 /** One image a tool wrote, shown in the conversation. Click opens it larger in the viewer;
  * right-click copies or saves it. `compact`: a thumbnail under a folded run of calls. */
 const props = defineProps<{ path: string; compact?: boolean }>();
+/** A file name cut in the middle to fit under a thumbnail, keeping its start and its extension:
+ *  "128x128@2x.png" → "128…x.png". */
+function shortName(name: string, room = 9) {
+  if (name.length <= room) return name;
+  return `${name.slice(0, room - 6)}…${name.slice(-5)}`;
+}
 
 const image = ref<ImageFile | null>(null);
 const error = ref<string | null>(null);
@@ -80,6 +86,7 @@ function menu(event: MouseEvent) {
         <Icon name="folder" :size="13" />
       </button>
     </figcaption>
+    <figcaption v-if="image && compact" class="chip-name mono" :title="path">{{ shortName(image.name) }}</figcaption>
   </figure>
 </template>
 
@@ -117,6 +124,13 @@ img {
   animation: shimmer 1.4s linear infinite;
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
+/* Under a folded run: a small thumbnail named like the file chips beside it. */
+.compact {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 64px;
+}
 .compact .frame {
   transition: transform 160ms var(--ease), box-shadow 160ms var(--ease);
 }
@@ -125,14 +139,18 @@ img {
   box-shadow: inset 0 0 0 1px var(--border-strong), 0 6px 18px rgb(0 0 0 / 22%);
 }
 .compact img {
-  height: 72px;
-  max-width: 160px;
+  width: 64px;
+  height: 48px;
   object-fit: cover;
 }
 .compact .loading,
 .compact .missing {
-  width: 72px;
-  height: 72px;
+  width: 64px;
+  height: 48px;
+}
+.chip-name {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 .compact .missing {
   display: grid;

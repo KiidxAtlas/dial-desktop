@@ -1,5 +1,6 @@
 <script setup lang="ts">
 // The keyboard shortcuts sheet (⌘/).
+import { computed, ref, watch } from "vue";
 import { ui } from "../ui";
 import { SHORTCUTS } from "../commands";
 import { shortcutLabel } from "../keysGuard";
@@ -7,11 +8,27 @@ import Icon from "./Icon.vue";
 
 const mac = navigator.platform.toLowerCase().includes("mac");
 
+/** Typing filters the list by what a shortcut does, its fine print or its keys. */
+const query = ref("");
+watch(() => ui.shortcutsOpen, () => (query.value = ""));
+const groups = computed(() => {
+  const words = query.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return SHORTCUTS.map((g) => ({
+    group: g.group,
+    keys: g.keys.filter(([keys, what, detail]) => {
+      const text = `${what} ${detail ?? ""} ${keys} ${shortcutLabel(keys, mac)}`.toLowerCase();
+      return words.every((w) => text.includes(w));
+    }),
+  })).filter((g) => g.keys.length);
+});
+
 function onKey(event: KeyboardEvent) {
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopPropagation();
-    ui.shortcutsOpen = false;
+    // The first Esc clears a filter; the next closes the sheet.
+    if (query.value) query.value = "";
+    else ui.shortcutsOpen = false;
   }
 }
 </script>
@@ -20,7 +37,6 @@ function onKey(event: KeyboardEvent) {
   <Transition name="fade">
     <div v-if="ui.shortcutsOpen" class="overlay" @mousedown.self="ui.shortcutsOpen = false">
       <div
-        v-focus
         class="sheet"
         role="dialog"
         aria-label="Keyboard shortcuts"
@@ -29,26 +45,36 @@ function onKey(event: KeyboardEvent) {
       >
         <header>
           <h2>Keyboard shortcuts</h2>
+          <input
+            v-model="query"
+            v-focus
+            class="filter"
+            type="search"
+            placeholder="Filter"
+            aria-label="Filter shortcuts"
+            spellcheck="false"
+          />
           <button class="close" title="Close (Esc)" aria-label="Close" @click="ui.shortcutsOpen = false">
             <Icon name="cross" :size="13" />
           </button>
         </header>
         <div class="columns">
-          <section v-for="group in SHORTCUTS" :key="group.group">
+          <section v-for="group in groups" :key="group.group">
             <h3>{{ group.group }}</h3>
-            <div v-for="[keys, what] in group.keys" :key="what" class="row">
-              <span>{{ what }}</span>
+            <div v-for="[keys, what, detail] in group.keys" :key="what" class="row" :title="detail">
+              <span>{{ what }}<span v-if="detail" class="more" aria-hidden="true"> ⓘ</span><span v-if="detail" class="sr">. {{ detail }}</span></span>
               <kbd>{{ shortcutLabel(keys, mac) }}</kbd>
             </div>
           </section>
         </div>
+        <p v-if="!groups.length" class="none">No shortcut matches “{{ query.trim() }}”.</p>
       </div>
     </div>
   </Transition>
 </template>
 
 <script lang="ts">
-/** Focus the sheet when it opens, so Esc reaches it. */
+/** Focus the filter when the sheet opens, so typing filters and Esc reaches the sheet. */
 export const vFocus = { mounted: (el: HTMLElement) => el.focus() };
 </script>
 
@@ -58,8 +84,10 @@ export const vFocus = { mounted: (el: HTMLElement) => el.focus() };
   inset: 0;
   z-index: 70;
   display: grid;
-  place-items: center;
-  padding: 24px;
+  /* Pinned near the top, so filtering shrinks the sheet without moving it. */
+  justify-items: center;
+  align-items: start;
+  padding: 10vh 24px 24px;
   background: var(--scrim);
   -webkit-backdrop-filter: blur(2px);
   backdrop-filter: blur(2px);
@@ -78,6 +106,7 @@ export const vFocus = { mounted: (el: HTMLElement) => el.focus() };
 header {
   display: flex;
   align-items: center;
+  gap: 10px;
   margin-bottom: 8px;
 }
 h2 {
@@ -86,6 +115,22 @@ h2 {
   font-size: 15px;
   font-weight: 600;
 }
+.filter {
+  width: 180px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.filter:focus { border-color: var(--border-strong); }
+.more { color: var(--text-faint); font-size: 11px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.none { margin: 18px 0 4px; color: var(--text-faint); font-size: 13px; }
 .close {
   display: grid;
   place-items: center;

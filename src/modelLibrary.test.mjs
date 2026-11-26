@@ -34,6 +34,11 @@ test('local suggestions and default Hub format follow the native host capability
     assert.equal(html.includes('Inkling 2 Mini IQ2_M'), appleSilicon, platform);
     assert.equal(html.includes('mlx-community/'), appleSilicon, platform);
     assert.match(html, /SmolLM2 1.7B Instruct/);
+    assert.match(html, />Suggested<.*Browse Hugging Face/s, 'offline suggestions first');
+    const firstDownload = html.match(/aria-label="Download ([^"]+)"/)[1];
+    assert.equal(firstDownload, appleSilicon ? 'Qwen2.5 Coder 1.5B (MLX)' : 'SmolLM2 1.7B Instruct (GGUF)');
+    assert.match(html, /Search online/);
+    assert.ok(!html.includes('aria-label="Search Hugging Face models"'), 'online search is closed initially');
     assert.match(html, new RegExp(`aria-checked="true"[^>]*>${appleSilicon ? 'MLX' : 'GGUF'}</button>`));
   }
 });

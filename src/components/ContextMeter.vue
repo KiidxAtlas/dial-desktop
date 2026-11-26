@@ -1,18 +1,43 @@
 <script setup lang="ts">
-// How full the conversation's context is: a small ring by the send button, with the numbers on hover.
-// Clicking it compacts the conversation when that is possible.
-import { computed } from "vue";
+// A small fill bar shows usage when reported (a bar, so it never reads as a loading spinner);
+// editing the budget does not require a first turn.
+import { computed, ref, watch } from "vue";
 import type { ContextView } from "../types";
+import { resetSettingRow, saveSettingRow, settings, settingsPage } from "../bridge";
+import SettingRow from "./SettingRow.vue";
 
-const props = defineProps<{ context: ContextView; canCompact?: boolean }>();
+const props = defineProps<{ context: ContextView | null; live: boolean; turnRunning: boolean; canCompact?: boolean }>();
 const emit = defineEmits<{ compact: [] }>();
+const open = ref(false);
+const root = ref<HTMLElement | null>(null);
+const trigger = ref<HTMLButtonElement | null>(null);
+const rows = computed(() => settingsPage.value?.settings.filter(s => s.key === 'context_window' || s.key === 'local_context_window') ?? []);
 
-const R = 7;
-const CIRCUMFERENCE = 2 * Math.PI * R;
+watch(open, (shown, _, cleanup) => {
+  if (!shown) return;
+  void settings.load();
+  const outside = (event: Event) => { if (!root.value?.contains(event.target as Node)) open.value = false; };
+  document.addEventListener('pointerdown', outside);
+  document.addEventListener('focusin', outside);
+  cleanup(() => {
+    document.removeEventListener('pointerdown', outside);
+    document.removeEventListener('focusin', outside);
+  });
+});
+watch(() => props.live, () => { open.value = false; });
+function close() {
+  open.value = false;
+  trigger.value?.focus();
+}
+function escape(event: KeyboardEvent) {
+  if (!open.value) return;
+  event.stopPropagation();
+  close();
+}
 
 /** Share of the window in use, 0–1; `null` when the window is unknown. */
 const share = computed(() =>
-  props.context.window ? Math.min(1, props.context.tokens / props.context.window) : null,
+  props.context?.window ? Math.min(1, props.context.tokens / props.context.window) : null,
 );
 const tone = computed(() => (share.value === null ? "" : share.value >= 0.9 ? "danger" : share.value >= 0.75 ? "warning" : ""));
 
@@ -23,41 +48,66 @@ function count(n: number) {
 }
 
 const label = computed(() => {
+  if (!props.context) return 'Context usage not reported yet';
   const { tokens, window, estimated } = props.context;
   const about = estimated ? "About " : "";
   if (!window || share.value === null) return `${about}${count(tokens)} tokens of context in use`;
   return `${about}${count(tokens)} of ${count(window)} tokens of context in use (${Math.round(share.value * 100)}%)`;
 });
-const title = computed(() => (props.canCompact ? `${label.value}. Click to compact the conversation.` : label.value));
+const title = computed(() => props.live ? `${label.value}. Open context controls.` : label.value);
 </script>
 
 <template>
-  <button
-    type="button"
-    class="meter"
-    :class="tone"
-    :title="title"
-    :aria-label="title"
-    :disabled="!canCompact"
-    @click.stop="emit('compact')"
-  >
-    <svg width="18" height="18" viewBox="0 0 18 18">
-      <circle cx="9" cy="9" :r="R" class="track" />
-      <circle
-        v-if="share !== null"
-        cx="9"
-        cy="9"
-        :r="R"
-        class="fill"
-        :stroke-dasharray="CIRCUMFERENCE"
-        :stroke-dashoffset="CIRCUMFERENCE * (1 - share)"
-      />
-    </svg>
-    <span v-if="share !== null && share >= 0.5" class="pct">{{ Math.round(share * 100) }}%</span>
-  </button>
+  <div ref="root" class="context-control" @keydown.esc="escape">
+    <button
+      ref="trigger"
+      type="button"
+      class="meter"
+      :class="tone"
+      :title="title"
+      :aria-label="title"
+      :aria-expanded="open"
+      :disabled="!live"
+      @click.stop="open = !open"
+    >
+      <span class="bar" aria-hidden="true"><span v-if="share !== null" class="fill" :style="{ width: `${Math.max(share * 100, 4)}%` }" /></span>
+      <span v-if="share !== null && share >= 0.5" class="pct">{{ Math.round(share * 100) }}%</span>
+    </button>
+    <section v-if="open" class="context-panel" aria-label="Context window">
+      <header><strong>Context window</strong><span>{{ label }}</span></header>
+      <template v-if="rows.length">
+        <p>Changes here apply to this project.</p>
+        <SettingRow v-for="s in rows" :key="s.key" :setting="{ ...s, modified: s.modified && s.source !== 'global' }" page-scope="project"
+          @save="value => saveSettingRow(s, value, 'project', turnRunning)" @reset="resetSettingRow(s, 'project', turnRunning)" />
+      </template>
+      <p v-else>{{ settingsPage ? 'This engine does not offer context window settings.' : 'Waiting for engine settings…' }}</p>
+      <button class="btn btn-secondary" :disabled="!canCompact" @click="close(); emit('compact')">Compact conversation</button>
+    </section>
+  </div>
 </template>
 
 <style scoped>
+.context-control { display: flex; }
+.context-panel {
+  position: absolute;
+  z-index: 30;
+  right: 0;
+  bottom: calc(100% + var(--pop-gap));
+  width: min(390px, 100%);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--raised);
+  box-shadow: var(--shadow-pop);
+  cursor: default;
+}
+.context-panel header { display: grid; gap: 4px; }
+.context-panel header span, .context-panel p { color: var(--text-muted); font-size: var(--text-sm); }
+.context-panel :deep(.s-row) { flex-direction: column; align-items: stretch; gap: 7px; padding: 10px 0; border-top: 1px solid var(--border); }
+.context-panel :deep(.s-control) { max-width: none; justify-content: flex-start; flex-wrap: wrap; }
+.context-panel .btn { margin-top: 6px; }
 .meter {
   display: inline-flex;
   align-items: center;
@@ -83,20 +133,20 @@ const title = computed(() => (props.canCompact ? `${label.value}. Click to compa
   --tone: var(--danger);
   color: var(--danger);
 }
-svg {
-  transform: rotate(-90deg);
-}
-circle {
-  fill: none;
-  stroke-width: 2;
-}
-.track {
-  stroke: var(--border-strong);
+.bar {
+  position: relative;
+  width: 18px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border-strong);
 }
 .fill {
-  stroke: var(--tone);
-  stroke-linecap: round;
-  transition: stroke-dashoffset 300ms var(--ease);
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--tone);
+  transition: width 300ms var(--ease);
 }
 .pct {
   font-variant-numeric: tabular-nums;

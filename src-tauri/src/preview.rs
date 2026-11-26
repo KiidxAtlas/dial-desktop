@@ -22,6 +22,7 @@ pub fn model(kind: Preview, workspace: &str) -> Model {
     model.current_model = Some(CurrentModel {
         provider: "anthropic".into(),
         model_id: "claude-sonnet-4-5".into(),
+        context_window: None,
         thinking: None,
         default_thinking: Some("medium".into()),
         levels: ["low", "medium", "high"].map(String::from).to_vec(),

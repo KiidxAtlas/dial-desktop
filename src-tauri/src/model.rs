@@ -148,6 +148,8 @@ pub struct ToolStats {
 pub struct CurrentModel {
     pub provider: String,
     pub model_id: String,
+    /// The effective window from `state`, absent on older engines.
+    pub context_window: Option<u64>,
     /// The session's reasoning level; `None` runs the model's default.
     pub thinking: Option<String>,
     /// The model's default level, when the catalog knows it.
@@ -166,6 +168,7 @@ impl CurrentModel {
         Some(Self {
             provider: provider.to_owned(),
             model_id: model_id.to_owned(),
+            context_window: value["context_window"].as_u64().filter(|&n| n > 0),
             thinking: thinking["level"].as_str().map(str::to_owned),
             default_thinking: thinking["default_level"].as_str().map(str::to_owned),
             levels: strings(&thinking["levels"]),
@@ -561,9 +564,12 @@ impl Model {
         Ok(Command::Compact)
     }
 
-    /// The context window of the model in force, when the model list knows it.
+    /// Prefer the engine's effective limit over the model's catalog capacity.
     pub fn context_window(&self) -> Option<u64> {
         let current = self.current_model.as_ref()?;
+        if current.context_window.is_some() {
+            return current.context_window;
+        }
         self.models
             .iter()
             .find(|m| m.provider == current.provider && m.model_id == current.model_id)

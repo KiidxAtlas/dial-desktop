@@ -47,10 +47,58 @@ pub enum Source {
     /// A live engine: this binary, run as `dial rpc` plus `args` in the workspace.
     Engine {
         program: PathBuf,
+        origin: launcher::EngineOrigin,
         args: Vec<OsString>,
     },
     /// The built-in design preview.
     Preview(Preview),
+}
+
+impl Source {
+    fn project_window_args(&self, workspace: &Path) -> Vec<OsString> {
+        let mut argv = Vec::new();
+        match self {
+            Self::Engine { program, origin, args } => {
+                // Only an actual --dial flag should override the new window's settings. It
+                // inherits DIAL_BIN and resolves saved choices and automatic installs itself.
+                if *origin == launcher::EngineOrigin::Flag {
+                    argv.extend([OsString::from("--dial"), program.as_os_str().to_owned()]);
+                }
+                argv.extend([workspace.as_os_str().to_owned(), OsString::from("--")]);
+                argv.extend(args.iter().cloned());
+            }
+            Self::Preview(kind) => {
+                argv.push(match kind {
+                    Preview::Empty => "--preview=empty",
+                    Preview::Question => "--preview=question",
+                    Preview::Session => "--preview",
+                }.into());
+                argv.push(workspace.as_os_str().to_owned());
+            }
+        }
+        argv
+    }
+}
+
+/// Ready to publish for new launches: registration was attempted using this exact engine. A
+/// missing or older engine is still selectable, with its diagnostic replaced on the next retry.
+struct SelectedEngine {
+    program: PathBuf,
+    browser_warning: Option<String>,
+}
+
+impl SelectedEngine {
+    fn prepare(program: PathBuf) -> Self {
+        let browser_warning = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| crate::agent_browser::register(&program, &exe))
+            .err()
+            .map(|error| format!("Could not register the agent's browser tools with {}: {error}", program.display()));
+        if let Some(warning) = &browser_warning {
+            eprintln!("dial-desktop: {warning}");
+        }
+        Self { program, browser_warning }
+    }
 }
 
 struct Inner {
@@ -67,6 +115,9 @@ struct Inner {
 /// State shared by the pump thread and the commands.
 struct Shared {
     inner: Mutex<Inner>,
+    /// Starts not yet visible in the quit inventory. Reservation takes the write side before
+    /// checking it; a subsequent reader must pass the reserved-tabs gate before starting work.
+    service_starts: std::sync::RwLock<()>,
     source: Source,
     home: Option<String>,
     /// Wakes the pump; every engine gets a clone.
@@ -74,8 +125,8 @@ struct Shared {
     /// The Terminal panel's shells, all running in the open workspace.
     terminals: Mutex<Terminals>,
     provider_setup: Mutex<Option<ProviderSetup>>,
-    /// A signed release selected during this run, ahead of the initial launch choice.
-    installed: Mutex<Option<PathBuf>>,
+    /// The selection used for the next launch, never an engine already running in a tab.
+    selected: Mutex<Option<SelectedEngine>>,
     /// The snapshot the UI has, so each `snapshot` event carries only what changed.
     published: Mutex<Published>,
     /// The Appearance switches for what answers may draw; each new engine is told (`answer_style`).
@@ -96,9 +147,10 @@ mod project_tests {
                 parked: Default::default(),
                 workspace: None, recents: Recents::load(None), entry_views: EntryViews::default(),
             }),
+            service_starts: Default::default(),
             source: Source::Preview(Preview::Empty), home: None,
             wake: Mutex::new(mpsc::channel().0), terminals: Default::default(),
-            provider_setup: Default::default(), installed: Default::default(),
+            provider_setup: Default::default(), selected: Default::default(),
             published: Default::default(), answer_style: Default::default(), answer_support: Default::default(),
         };
         let a = Path::new("/projects/first");
@@ -115,6 +167,66 @@ mod project_tests {
         assert!(conversation.turn_running());
         assert!(matches!(conversation.entries().last(), Some(dial_client::Entry::User(u)) if u.text == "still working"));
     }
+
+    #[test]
+    fn new_project_windows_only_replay_a_real_dial_flag() {
+        use launcher::EngineOrigin::*;
+        for origin in [Flag, Env, Choice, Desktop, Path, Fallback, Missing] {
+            let program = PathBuf::from("engine with spaces");
+            let source = Source::Engine { program: program.clone(), origin, args: vec!["--model".into(), "local".into()] };
+            let cli = crate::cli::parse(source.project_window_args(std::path::Path::new("project 2"))).unwrap();
+            assert_eq!(cli.dial, (origin == Flag).then(|| program.into_os_string()));
+            assert_eq!(cli.workspace, Some("project 2".into()));
+            assert_eq!(cli.rpc_args, ["--model", "local"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selecting_an_engine_retries_browser_registration_without_overwriting_an_unreadable_or_disabled_entry() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dial = dir.path().join("new engine");
+        let prepare = || SelectedEngine::prepare(dial.clone());
+        assert!(prepare().browser_warning.is_some()); // No engine on first launch.
+        fs::write(&dial, r#"#!/bin/sh
+case "$1:$2:$3" in
+  config:get:mcp) pwd > "$0.cwd"; cat "$0.reply" ;;
+  config:set:mcp.dial_desktop) printf '%s' "$4" > "$0.written" ;;
+  *) exit 2 ;;
+esac
+"#).unwrap();
+        fs::set_permissions(&dial, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let written = dial.with_extension("written");
+        for (reply, warning, write) in [
+            (None, true, false), // Config command exits unsuccessfully.
+            (Some("not JSON"), true, false),
+            (Some(r#"{"key":"mcp","value":null}"#), true, false),
+            (Some(r#"{"key":"mcp","value":{"dial_desktop":{"enabled":false}}}"#), false, false),
+            (Some(r#"{"key":"mcp","value":{}}"#), false, true),
+        ] {
+            if let Some(reply) = reply {
+                fs::write(dial.with_extension("reply"), reply).unwrap();
+            }
+            assert_eq!(prepare().browser_warning.is_some(), warning, "{reply:?}");
+            assert_eq!(written.exists(), write, "{reply:?}");
+        }
+        let project = fs::read_to_string(dial.with_extension("cwd")).unwrap();
+        assert!(!Path::new(project.trim_end()).exists(), "the temporary config project was cleaned up");
+        assert_eq!(fs::read_to_string(written).unwrap(), crate::agent_browser::mcp_entry(&std::env::current_exe().unwrap()));
+    }
+}
+
+/// Cover the gap between beginning a service start and publishing it in the exit inventory.
+/// The guard holds no session or service mutex while an external program starts.
+pub(crate) fn starting_service(app: &AppHandle) -> Result<impl Drop + '_, String> {
+    let shared = app.state::<Shared>().inner();
+    let guard = shared.service_starts.read().unwrap_or_else(PoisonError::into_inner);
+    shared.lock().tabs.allow_work()?;
+    Ok(guard)
 }
 
 impl Shared {
@@ -197,15 +309,8 @@ impl Shared {
 
     /// The engine binary in use; `None` in the design preview.
     fn program(&self) -> Option<PathBuf> {
-        let Source::Engine { program, .. } = &self.source else {
-            return None;
-        };
-        let installed = self
-            .installed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        Some(installed.unwrap_or_else(|| program.clone()))
+        self.selected.lock().unwrap_or_else(PoisonError::into_inner)
+            .as_ref().map(|engine| engine.program.clone())
     }
     fn launch(&self, path: &Path) -> Option<Launch> {
         let Source::Engine { args, .. } = &self.source else {
@@ -318,6 +423,7 @@ fn snapshot_of(inner: &mut Inner) -> Snapshot {
     );
     snapshot.history_loading |= inner.tabs.active().opening_session();
     snapshot.loading_local_model = inner.tabs.active().loading_local_model().map(str::to_owned);
+    snapshot.local_load_failure = inner.tabs.active().local_load_failure().cloned();
     snapshot.can_send &= !inner.tabs.active().transitioning();
     snapshot.show_activity(&inner.tabs.activity());
     snapshot
@@ -652,9 +758,12 @@ fn set_answer_style(shared: State<'_, Shared>, cards: bool, diagrams: bool) -> R
 #[tauri::command]
 fn startup_diagnostics(shared: State<'_, Shared>) -> launcher::Startup {
     let mut report = launcher::startup();
-    if let Some(current) = shared.program().filter(|p| Some(p) != report.engine.as_ref()) {
-        report.engine = Some(current);
-        report.origin = Some(launcher::EngineOrigin::Desktop);
+    if let Some(engine) = shared.selected.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if Some(&engine.program) != report.engine.as_ref() {
+            report.engine = Some(engine.program.clone());
+            report.origin = Some(launcher::EngineOrigin::Desktop);
+        }
+        report.warnings.extend(engine.browser_warning.iter().cloned());
     }
     report
 }
@@ -703,7 +812,7 @@ async fn engine_choice_set(
     let home = shared.home.clone();
     let dir = launcher::app_dir(home.as_deref().map(Path::new))
         .ok_or("Could not locate the Desktop settings directory")?;
-    let (program, origin) = tauri::async_runtime::spawn_blocking(move || {
+    let selection = tauri::async_runtime::spawn_blocking(move || {
         if let Some(launcher::EngineChoice::Custom { path }) = &choice {
             if !path.is_absolute() {
                 return Err("Choose the engine by its full path".to_owned());
@@ -711,14 +820,18 @@ async fn engine_choice_set(
             launcher::engine_version(path)?;
         }
         launcher::save_choice(&dir, choice.as_ref())?;
+        if outranked().is_some() {
+            return Ok(None);
+        }
         let path = std::env::var_os("PATH");
-        Ok(launcher::locate_dial(None, None, choice.as_ref(), path.as_deref(), home.as_deref().map(Path::new)))
+        let (program, origin) = launcher::locate_dial(None, None, choice.as_ref(), path.as_deref(), home.as_deref().map(Path::new));
+        Ok(Some((SelectedEngine::prepare(program), origin)))
     })
     .await
     .map_err(|error| error.to_string())??;
-    if outranked().is_none() {
-        *shared.installed.lock().unwrap_or_else(PoisonError::into_inner) = Some(program.clone());
-        launcher::note_engine(&program, origin);
+    if let Some((engine, origin)) = selection {
+        launcher::note_engine(&engine.program, origin);
+        *shared.selected.lock().unwrap_or_else(PoisonError::into_inner) = Some(engine);
     }
     Ok(startup_diagnostics(shared))
 }
@@ -909,14 +1022,12 @@ async fn engine_install(shared: State<'_, Shared>) -> Result<String, String> {
     engine_program(&shared)?;
     let directory = launcher::app_dir(shared.home.as_deref().map(Path::new))
         .ok_or("Could not locate the Desktop settings directory")?;
-    let (found, log) =
-        tauri::async_runtime::spawn_blocking(move || updates::install_engine(&directory))
-            .await
-            .map_err(|error| error.to_string())??;
-    *shared
-        .installed
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(found);
+    let (engine, log) = tauri::async_runtime::spawn_blocking(move || {
+        updates::install_engine(&directory).map(|(program, log)| (SelectedEngine::prepare(program), log))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    *shared.selected.lock().unwrap_or_else(PoisonError::into_inner) = Some(engine);
     // Let the UI distinguish installation from reconnecting; reconnect itself protects live work.
     Ok(log)
 }
@@ -936,6 +1047,12 @@ fn app_try_reserve_restart(
     if webview.label() != "main" {
         return Err("Only the app UI can reserve a restart".into());
     }
+    let _starts = match shared.service_starts.try_write() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(crate::tabs::RestartDecision::Busy),
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    window::Inventory::services(webview.app_handle()).allow_update()?;
     let mut inner = shared.lock();
     if inner.parked.values().any(|tabs| tabs.active_session_count() != 0) {
         return Ok(crate::tabs::RestartDecision::Busy);
@@ -944,8 +1061,6 @@ fn app_try_reserve_restart(
     let decision = inner.tabs.reserve_restart(terminals.open_ids(), &confirmed)?;
     if decision == crate::tabs::RestartDecision::Reserved {
         terminals.close_all();
-        // The relaunch may skip `RunEvent::Exit`; SIGINT lets the scheduler finish on its own.
-        webview.state::<crate::scheduler::Scheduler>().stop_all(false);
     }
     Ok(decision)
 }
@@ -1039,6 +1154,8 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("label_session", 20),
     ("restart_model", 60),
     ("get_settings", 20),
+    ("get_default_thinking", 20),
+    ("set_default_thinking", 20),
     ("set_setting", 20),
     ("reset_setting", 20),
     ("extension_action", 180),
@@ -1637,27 +1754,8 @@ fn project_window(shared: State<'_, Shared>, path: String) -> Result<(), String>
 }
 
 fn launch_project_window(shared: &Shared, path: &Path) -> Result<(), String> {
-    let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    match &shared.source {
-        Source::Engine { args, .. } => {
-            child
-                .arg("--dial")
-                .arg(shared.program().ok_or("No engine configured")?)
-                .arg(path)
-                .arg("--")
-                .args(args);
-        }
-        Source::Preview(kind) => {
-            child
-                .arg(match kind {
-                    Preview::Empty => "--preview=empty",
-                    Preview::Question => "--preview=question",
-                    Preview::Session => "--preview",
-                })
-                .arg(path);
-        }
-    }
-    let mut child = child
+    let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args(shared.source.project_window_args(path))
         .spawn()
         .map_err(|e| format!("Could not open window: {e}"))?;
     thread::spawn(move || {
@@ -2377,6 +2475,7 @@ fn terminal_close(shared: State<'_, Shared>, id: u32) {
 
 /// The open project changed: stop another project's scheduler, start this one's if chosen.
 fn scheduler_project_opened(app: &AppHandle) {
+    let Ok(_start) = starting_service(app) else { return };
     let shared = app.state::<Shared>();
     let root = shared.lock().workspace.as_ref().map(|w| w.root.clone());
     if let Some(root) = root {
@@ -2405,6 +2504,7 @@ fn scheduler_status(
 /// whether to start them whenever the project opens.
 #[tauri::command]
 async fn scheduler_start(
+    app: AppHandle,
     shared: State<'_, Shared>,
     scheduler: State<'_, crate::scheduler::Scheduler>,
     workspace_root: String,
@@ -2412,13 +2512,14 @@ async fn scheduler_start(
 ) -> Result<crate::scheduler::Status, String> {
     scheduler_root(&shared, &workspace_root)?;
     let program = engine_program(&shared)?;
-    if let Some(on) = background {
-        scheduler.set_background(&workspace_root, on)?;
-    }
     let scheduler = scheduler.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || scheduler.start(&workspace_root, &program))
-        .await
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let _start = starting_service(&app)?;
+        if let Some(on) = background {
+            scheduler.set_background(&workspace_root, on)?;
+        }
+        Ok(scheduler.start(&workspace_root, &program))
+    }).await.map_err(|e| e.to_string())?
 }
 
 /// Stop the app-owned scheduler (a no-op when it is not running); `background` as for start.
@@ -2439,6 +2540,10 @@ async fn scheduler_stop(
 
 /// Open the window and run until it closes. With no `workspace` the UI asks for a folder.
 pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> tauri::Result<()> {
+    let selected = match &source {
+        Source::Engine { program, .. } => Some(SelectedEngine::prepare(program.clone())),
+        Source::Preview(_) => None,
+    };
     let home_path = launcher::home_dir();
     let endpoint = crate::agent_browser::endpoint_file(home_path.as_deref());
     let placement_file = launcher::app_dir(home_path.as_deref()).map(|dir| dir.join("window.json"));
@@ -2657,12 +2762,13 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                     recents,
                     entry_views: EntryViews::default(),
                 }),
+                service_starts: Default::default(),
                 source,
                 home,
                 wake: Mutex::new(wake_tx),
                 terminals: Mutex::new(Terminals::default()),
                 provider_setup: Mutex::new(None),
-                installed: Mutex::new(None),
+                selected: Mutex::new(selected),
                 published: Mutex::new(Published::default()),
                 answer_style: Mutex::new(answer_style),
                 answer_support: crate::answer_style::Support::default(),
