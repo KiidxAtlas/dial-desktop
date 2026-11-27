@@ -50,11 +50,13 @@ const engineLine = computed(() => {
   return "";
 });
 
+/** The copy shipped inside the app updates with the app, never through `dial update`. */
+const bundledEngine = computed(() => startup.value?.origin === "bundled");
 const canUpdateEngine = computed(
   () =>
-    (engineUpdateAvailable() && engineStatus.value?.can_update) || updates.engine?.state === "unsupported",
+    !bundledEngine.value && ((engineUpdateAvailable() && engineStatus.value?.can_update) || updates.engine?.state === "unsupported"),
 );
-const manualEngine = computed(() => engineStatus.value && !engineStatus.value.can_update && engineUpdateAvailable());
+const manualEngine = computed(() => engineStatus.value && (bundledEngine.value || !engineStatus.value.can_update) && engineUpdateAvailable());
 
 const appLine = computed(() => {
   if (!updates.appEnabled) return "This build does not update itself (development or local build).";
@@ -72,6 +74,7 @@ const ORIGINS: Record<EngineOrigin, string> = {
   desktop: "The copy Desktop installed (Install Desktop copy)",
   path: "Found on your PATH",
   fallback: "Found in a usual installation folder (not on PATH)",
+  bundled: "Shipped inside Dial Desktop (updates with the app)",
   missing: "Not found: Desktop looked for DIAL_BIN, the engine chosen here, its own copy, PATH and the usual folders",
 };
 const startup = ref<StartupReport | null>(null);

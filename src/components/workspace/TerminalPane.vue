@@ -20,8 +20,8 @@ const currentShell = ref(1);
 const shellViews = new Map<number, InstanceType<typeof PtyView>>();
 const shellVisited = ref(false);
 const tasks = ref<Partial<Record<TaskSlot, { task: TerminalTask; root: string; key: number; ended: boolean }>>>({});
-const taskSlots: TaskSlot[] = ["slash", "scheduler"];
-const slotLabel = { slash: "Command", scheduler: "Scheduler" };
+const taskSlots: TaskSlot[] = ["slash", "scheduler", "attach"];
+const slotLabel = { slash: "Command", scheduler: "Scheduler", attach: "Attached chat" };
 let nextKey = 0;
 let nextShell = 1;
 const feed = ref<HTMLElement | null>(null);
@@ -71,6 +71,11 @@ watch(terminalRequest, request => {
   const slot = request.task.kind;
   mode.value = slot;
   const active = tasks.value[slot];
+  if (request.task.kind === "attach") {
+    if (!active?.ended && active?.task.kind === "attach" && active.task.session === request.task.session) return;
+    tasks.value[slot] = { ...request, key: ++nextKey, ended: false };
+    return;
+  }
   if (active && !active.ended) return showToast(slot === "scheduler" ? "The project scheduler is already open" : "End the current command session before starting another");
   tasks.value[slot] = { ...request, key: ++nextKey, ended: false };
 }, { immediate: true });
@@ -170,6 +175,7 @@ watch(
       <button class="icon-btn" title="New shell (keeps the others running)" @click="newShell">
         <Icon name="plus" :size="14" />
       </button>
+      <button v-if="mode === 'attach'" class="btn" @click="delete tasks.attach; mode = 'shell'">Detach</button>
       <button v-if="mode === 'slash' || mode === 'scheduler'" class="btn" @click="closeTask(mode)">{{ tasks[mode]?.ended ? "Close" : "End " + slotLabel[mode].toLowerCase() }}</button>
     </div>
 

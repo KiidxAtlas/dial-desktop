@@ -3,13 +3,13 @@
 import { computed, ref, watch } from "vue";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { diffHunks, type DiffHunk } from "../../diff";
-import { showToast, workspaceFiles } from "../../bridge";
+import { showToast, workspaceChange, workspaceFiles } from "../../bridge";
 import { addToPrompt, mention, showFile } from "../../workspace";
 import { openMenu } from "../../ui";
 import { paneError, paneErrorText, type PaneError } from "../../paneErrors";
 import { relativeTo } from "../../paths";
 import { workspaceGitApi } from "../../workspaceGitApi";
-import type { DiffView } from "../../types";
+import type { DiffScope, DiffView } from "../../types";
 import Icon from "../Icon.vue";
 
 const props = defineProps<{
@@ -22,6 +22,7 @@ const props = defineProps<{
 const emit = defineEmits<{ back: []; expand: []; move: [step: -1 | 1] }>();
 
 const view = ref<DiffView | null>(null);
+const scope = ref<DiffScope>("all");
 const error = ref<PaneError | null>(null);
 const reverting = ref(false);
 
@@ -30,7 +31,7 @@ async function load() {
   const current = ++request;
   error.value = null;
   try {
-    const result = await workspaceFiles.diff(props.path, props.root);
+    const result = await workspaceFiles.diff(props.path, props.root, scope.value);
     if (current === request) view.value = result;
   } catch (e) {
     if (current === request) {
@@ -91,11 +92,72 @@ async function revertHunk(hunk: DiffHunk) {
   }
 }
 
+/** Stage just this hunk into Git's index. */
+async function stageHunk(hunk: DiffHunk) {
+  const path = relative.value, root = props.root;
+  reverting.value = true;
+  try {
+    await workspaceGitApi.stageHunk(path, hunkText(hunk), root);
+    showToast(`Staged a change in ${path}`);
+    await load();
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    reverting.value = false;
+  }
+}
+
+/** Unstage just this hunk from Git's index while keeping the working tree edit. */
+async function unstageHunk(hunk: DiffHunk) {
+  const path = relative.value, root = props.root;
+  reverting.value = true;
+  try {
+    await workspaceGitApi.unstageHunk(path, hunkText(hunk), root);
+    showToast(`Unstaged a change in ${path}`);
+    await load();
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    reverting.value = false;
+  }
+}
+
+/** Resolve an active merge conflict on this file using ours, theirs, or manual resolution. */
+async function resolveConflict(strategy: "ours" | "theirs" | "resolved") {
+  const path = relative.value, root = props.root;
+  if (strategy === "ours" || strategy === "theirs") {
+    const label = strategy === "ours" ? "Keep ours" : "Take theirs";
+    const confirmed = await ask(
+      `${label} for ${path}? This replaces the file with ${strategy === "ours" ? "your branch's" : "the incoming"} version and stages it as resolved.`,
+      { title: "Resolve merge conflict", kind: "warning", okLabel: label },
+    );
+    if (!confirmed || root !== props.root || path !== relative.value) return;
+  }
+  reverting.value = true;
+  try {
+    await workspaceGitApi.resolveConflict(path, strategy, root);
+    showToast(
+      strategy === "resolved"
+        ? `Marked ${path} as resolved`
+        : `Resolved ${path} (${strategy === "ours" ? "kept ours" : "took theirs"})`,
+    );
+    await load();
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    reverting.value = false;
+  }
+}
+
 const hunks = computed(() => diffHunks(view.value?.diff ?? ""));
 const rows = computed(() => hunks.value.flatMap((hunk) => hunk.lines));
 const added = computed(() => rows.value.filter((line) => line.kind === "add").length);
 const removed = computed(() => rows.value.filter((line) => line.kind === "del").length);
 const baseLabel = computed(() => {
+  if (scope.value === "staged") return "Staged changes (index vs. HEAD)";
+  if (scope.value === "unstaged") {
+    return view.value?.base === "untracked" ? "Untracked file vs. empty file" : "Unstaged changes (working tree vs. index)";
+  }
   switch (view.value?.base) {
     case "head": return "Working tree vs. HEAD";
     case "index": return "Working tree vs. index (no commits yet)";
@@ -108,12 +170,14 @@ function openInFiles() {
   showFile(relative.value);
 }
 
-watch([() => props.root, () => props.path, () => props.revision], ([root, path], previous) => {
+watch([() => props.root, () => props.path, () => props.revision, scope], ([root, path], previous) => {
   // Changing files unmounts the old scroll container. Refreshing the same file keeps it in place.
   if (root !== previous[0] || path !== previous[1]) view.value = null;
   void load();
 }, { immediate: true });
-
+watch(workspaceChange, ({ root }) => {
+  if (root && root === props.root) void load();
+});
 function askAbout(hunk: DiffHunk) {
   const patch = hunkText(hunk);
   const excerpt = patch.length > 4000 ? `${patch.slice(0, 4000)}\n[excerpt truncated]` : patch;
@@ -164,15 +228,31 @@ function more(event: MouseEvent) {
       ><Icon :name="expanded ? 'compress' : 'expand'" :size="14" /></button>
       <button class="icon-btn" title="More: ask Dial, open in Files, copy, revert" aria-label="More file actions" @click="more"><Icon name="more" :size="14" /></button>
     </div>
-    <p v-if="view" class="note"><strong>{{ baseLabel }}</strong> · Not limited to this session or turn.<template v-if="view.nested"> Open this repository as a project to stage, revert or commit changes.</template></p>
+    <div v-if="view" class="scope-bar">
+      <div class="scopes" role="tablist" aria-label="Diff view">
+        <button v-for="mode in (['all', 'unstaged', 'staged'] as const)" :key="mode" role="tab" :aria-selected="scope === mode" class="scope-tab" :class="{ on: scope === mode }" @click="scope = mode">
+          {{ mode === 'all' ? 'All' : mode === 'unstaged' ? 'Unstaged' : 'Staged' }}
+        </button>
+      </div>
+      <p class="note"><strong>{{ baseLabel }}</strong><template v-if="view.nested"> · Open this repository as a project to stage, revert or commit changes.</template></p>
+    </div>
+    <div v-if="view?.conflicted && !view.nested" class="conflict-bar" role="region" aria-label="Merge conflict resolution">
+      <strong>Merge conflict</strong>
+      <div class="conflict-actions">
+        <button class="btn btn-secondary" :disabled="reverting" @click="resolveConflict('ours')">Keep ours</button>
+        <button class="btn btn-secondary" :disabled="reverting" @click="resolveConflict('theirs')">Take theirs</button>
+        <button class="btn btn-secondary" :disabled="reverting" @click="resolveConflict('resolved')">Mark resolved</button>
+        <button class="btn btn-secondary" @click="openInFiles">Edit in Files</button>
+      </div>
+    </div>
     <div v-if="error" class="empty">
       <strong>{{ error.title }}</strong>
       <span v-if="error.hint">{{ error.hint }}</span>
       <span class="mono detail">{{ error.detail }}</span>
     </div>
     <div v-else-if="view && !view.diff" class="empty">
-      <strong>No uncommitted changes</strong>
-      <span>This file matches {{ view.base === 'head' ? 'the last commit' : 'Git’s index' }}. Dial’s edits may have been committed or undone.</span>
+      <strong>{{ scope === 'staged' ? 'No staged changes' : scope === 'unstaged' ? 'No unstaged changes' : 'No uncommitted changes' }}</strong>
+      <span>{{ scope === 'staged' ? 'Stage a file or hunk to include it in the next commit.' : scope === 'unstaged' ? 'Every change in this file is already staged.' : `This file matches ${view.base === 'head' ? 'the last commit' : 'Git’s index'}. Dial’s edits may have been committed or undone.` }}</span>
     </div>
     <div v-else-if="view" class="lines mono">
       <template v-if="hunks.length">
@@ -181,7 +261,21 @@ function more(event: MouseEvent) {
             <span class="truncate" :title="hunk.header">{{ hunk.header }}</span>
             <span class="hunk-actions">
               <button
-                v-if="view.base !== 'untracked' && !view.nested"
+                v-if="scope === 'staged' && !view.nested"
+                class="btn btn-secondary"
+                title="Unstage just this hunk from Git's index"
+                :disabled="reverting"
+                @click="unstageHunk(hunk)"
+              >Unstage hunk</button>
+              <button
+                v-if="scope !== 'staged' && view.base !== 'untracked' && !view.nested"
+                class="btn btn-secondary"
+                title="Stage just this hunk into Git's index"
+                :disabled="reverting"
+                @click="stageHunk(hunk)"
+              >Stage hunk</button>
+              <button
+                v-if="scope !== 'staged' && view.base !== 'untracked' && !view.nested"
                 class="btn btn-secondary"
                 title="Undo just this change in the working tree"
                 :disabled="reverting"
@@ -314,12 +408,64 @@ function more(event: MouseEvent) {
   border-block: 1px solid color-mix(in srgb, var(--info) 18%, transparent);
 }
 .hunk-actions { display: flex; gap: 4px; flex: none; }
+.scope-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 6px;
+}
+.scopes {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.scope-tab {
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: var(--text-xs);
+  padding: 2px 7px;
+  border-radius: calc(var(--radius-sm) - 1px);
+  cursor: pointer;
+}
+.scope-tab.on {
+  background: var(--active);
+  color: var(--text);
+  font-weight: 500;
+}
 .note {
   margin: 0;
-  padding: 6px 10px;
+  padding: 0 4px;
   font-family: var(--font-ui);
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+.conflict-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+  font-size: var(--text-xs);
+}
+.conflict-bar strong {
+  color: var(--warning);
+  font-weight: 600;
+}
+.conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 .empty {
   display: flex;

@@ -65,11 +65,13 @@ fn the_share_directory_is_a_plain_path_but_drive_files_escape_commas() {
     let position = argv.iter().position(|a| a == "-L").expect("-L present");
     assert_eq!(
         argv[position + 1],
-        "/opt/a,b/share",
+        root.join("share").to_string_lossy(),
         "-L takes the path unescaped"
     );
+    let escaped_drive = root.join("guest.raw").to_string_lossy().replace(',', ",,");
+    let drive_arg = format!("if=virtio,format=raw,file={escaped_drive}");
     assert!(
-        argv.iter().any(|a| a.contains("file=/opt/a,,b/guest.raw")),
+        argv.windows(2).any(|pair| pair[0] == "-drive" && pair[1] == drive_arg),
         "drive paths double commas"
     );
 }

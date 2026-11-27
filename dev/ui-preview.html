@@ -93,6 +93,74 @@
       if (cmd === 'plugin:event|unlisten') return null;
       if (cmd === 'snapshot') return { seq, snapshot: JSON.parse(JSON.stringify(snap)) };
       if (cmd === 'recent_workspaces') return recent;
+      if (cmd === 'board_usb_devices') return [
+        { product: 'Pixel', kind: 'Android device', usb_id: '18d1:4ee2', location: '1:2', functions: ['Android debugging (ADB)', 'Imaging / media transfer'], speed: '480 Mb/s', interfaces: ['#0: 06/01/01', '#1: ff/42/01'] },
+        { product: 'Travel drive', kind: 'Mass storage', usb_id: '1234:5678', location: '1:3', functions: ['Mass storage'], speed: '5 Gb/s', interfaces: ['#0: 08/06/50'] },
+        { product: 'iPad', kind: 'iPad', usb_id: '05ac:12a8', location: '1:4', functions: [], speed: null, interfaces: [] },
+      ];
+      if (cmd === 'board_android_battery') return { percent: 76, usb_powered: true, temperature_c: 24.8, voltage_mv: 4050 };
+      if (cmd === 'board_apple_info') return { model: 'iPad13,4', os_version: '18.1' };
+      if (cmd === 'board_ports') return [
+        { path: '/dev/cu.usbmodem-demo', transport: 'usb', product: 'Demo sensor', manufacturer: 'Demo Labs', serial_number: 'DEMO0001', usb_id: '2e8a:0005', kind: 'Raspberry Pi RP2040/RP2350', hint: 'Often MicroPython or CircuitPython: open the console and press Enter (or Ctrl-C) for a >>> prompt.' },
+        { path: '/dev/cu.usbmodem2101', transport: 'usb', product: 'USB JTAG/serial debug unit', manufacturer: 'Espressif', serial_number: 'DEMO:C6', usb_id: '303a:1001', kind: 'Espressif ESP32 (native USB)', hint: 'Shows the boot log and app output; MicroPython builds give a >>> prompt.' },
+        { path: '/dev/cu.usbmodemflip_Demo1', transport: 'usb', product: 'Flipper Demo', manufacturer: 'Flipper Devices Inc.', serial_number: 'flip_Demo', usb_id: '0483:5740', kind: 'Flipper Zero', hint: 'Has a command line: open the console, press Enter, then type help.' },
+        { path: '/dev/cu.Bluetooth-Incoming-Port', transport: 'bluetooth', product: null, manufacturer: null, serial_number: null, usb_id: null, kind: null, hint: null },
+      ];
+      if (cmd === 'board_connect') {
+        // A stand-in MicroPython board: prints a reading twice a second and echoes what it is sent.
+        const id = (window.__preview.boardId = (window.__preview.boardId || 0) + 1); let n = 0;
+        const say = (text) => emit('board-serial', { kind: 'data', id, bytes: [...new TextEncoder().encode(text)] });
+        clearInterval(window.__preview.board);
+        emit('board-serial', { kind: 'opened', id, path: args.path, baud: args.baud });
+        window.__preview.board = setInterval(() => say(`temp=${(21 + 3 * Math.sin(n++ / 4)).toFixed(2)} hum=${40 + (n % 7)}\r\n`), 500);
+        window.__preview.boardSay = say;
+        setTimeout(() => say(/2101/.test(args.path) ? 'ESP-ROM:esp32c6-20220919\r\nBuild:Sep 19 2022\r\nrst:0x15 (USB_UART_HPSYS),boot:0x6c (SPI_FAST_FLASH_BOOT)\r\n' : '\x1b[32mDemo firmware 1.0\x1b[0m\r\n>>> '), 50);
+        return id;
+      }
+      if (cmd === 'board_live' || cmd === 'board_job') return null;
+      if (cmd === 'board_write') { window.__preview.boardSay?.(String.fromCharCode(...args.data).replace(/\r/g, '\r\n')); return null; }
+      if (cmd === 'board_disconnect') { clearInterval(window.__preview.board); emit('board-serial', { kind: 'closed', id: args.id, reason: null }); return null; }
+      if (cmd === 'board_project' || cmd === 'board_project_set') {
+        const usual = { build: 'pio run', upload: 'pio run -t upload --upload-port {port}' };
+        if (cmd === 'board_project_set') window.__preview.boardCommands = args.commands;
+        const own = window.__preview.boardCommands;
+        return { toolchain: 'PlatformIO', commands: own || usual, custom: !!own, needs: 'Needs PlatformIO Core (pip install platformio).', python: false, sources: ['src/main.cpp', 'src/blink.py', 'platformio.ini'] };
+      }
+      if (cmd === 'read_file' || cmd === 'write_file') {
+        const files = (window.__preview.boardFiles ||= {
+          'src/main.cpp': '#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n  pinMode(LED_BUILTIN, OUTPUT);\n}\n\nvoid loop() {\n  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));\n  Serial.printf("temp=%.2f\\n", readTemp());\n  delay(500);\n}\n',
+          'src/blink.py': 'from machine import Pin\nled = Pin(25, Pin.OUT)\nled.toggle()\nprint("toggled")\n',
+          'platformio.ini': '[env:pico]\nplatform = raspberrypi\nboard = pico\nframework = arduino\n',
+        });
+        if (cmd === 'write_file') files[args.path] = args.content;
+        const text = files[args.path] ?? '';
+        return { path: args.path, text, size: text.length, truncated: false, sha256: `${text.length}-${[...text].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7)}` };
+      }
+      if (cmd === 'board_job_start') {
+        const id = (window.__preview.jobId = (window.__preview.jobId || 0) + 1);
+        const fails = /readTemp/.test(window.__preview.boardFiles?.['src/main.cpp'] ?? 'readTemp');
+        const job = { id, action: args.upload ? 'upload' : 'build', command: args.upload ? `pio run -t upload --upload-port ${args.port}` : 'pio run', running: true, code: null, log: '' };
+        const lines = fails
+          ? ['Processing pico (platform: raspberrypi; board: pico)\n', 'Compiling .pio/build/pico/src/main.cpp.o\n', "src/main.cpp:10:32: error: 'readTemp' was not declared in this scope\n", '*** [.pio/build/pico/src/main.cpp.o] Error 1\n']
+          : ['Processing pico (platform: raspberrypi; board: pico)\n', 'Compiling .pio/build/pico/src/main.cpp.o\n', 'Linking .pio/build/pico/firmware.elf\n', ...(args.upload ? ['Uploading .pio/build/pico/firmware.uf2\n', 'Wrote 73216 bytes\n'] : []), '========= [SUCCESS] Took 3.21 seconds =========\n'];
+        setTimeout(() => emit('board-job', { kind: 'started', job }), 0);
+        lines.forEach((text, i) => setTimeout(() => emit('board-job', { kind: 'data', id, text }), 150 * (i + 1)));
+        setTimeout(() => emit('board-job', { kind: 'exit', id, code: fails ? 1 : 0 }), 150 * (lines.length + 1));
+        return job;
+      }
+      if (cmd === 'board_job_stop' || cmd === 'board_put') return null;
+      if (cmd === 'board_run') return /toggle/.test(args.code) ? { stdout: 'toggled\n', stderr: '', finished: true } : { stdout: '', stderr: 'Traceback (most recent call last):\n  File "<stdin>", line 1, in <module>\nNameError: name \'x\' isn\'t defined\n', finished: true };
+      if (cmd === 'board_reset' || cmd === 'board_break' || cmd === 'board_lines') return null;
+      if (cmd === 'board_capture') {
+        if (args.line) {
+          const text = `Demo firmware received: ${args.line.text}`;
+          return { text, bytes: new TextEncoder().encode(text).length, capped: false };
+        }
+        const text = window.__preview.calls.filter(c => c === cmd).length % 2
+          ? 'Boot complete\nSensor ready\ntemp=21.4\ntemp=22.0\ntemp=21.7\ntemp=22.6'
+          : 'Boot complete\nSensor retry\ntemp=21.4\ntemp=24.0\ntemp=25.7\ntemp=26.6';
+        return { text, bytes: text.length, capped: false };
+      }
       if (cmd === 'models' || cmd.endsWith('_list')) return [];
       if (cmd === 'read_transcript_image') {
         const name = args.path.split('/').pop();
@@ -107,6 +175,10 @@
       }
       if (cmd === 'engine_call') {
         const fixtures = {
+          stats: { report: { by_tool: [
+            { tool: 'bash', calls: 20, avg_ms: 300, error_breakdown: { command_or_check: 3, execution_failure: 1, unclassified: 0 } },
+            { tool: 'edit', calls: 12, avg_ms: 50, error_breakdown: { command_or_check: 0, execution_failure: 2, unclassified: 1 } },
+          ] } },
           list_hooks: {
             events: ['session_start', 'session_end', 'user_prompt_submit', 'pre_tool_use', 'post_tool_use', 'stop'],
             hooks: [

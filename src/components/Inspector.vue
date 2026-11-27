@@ -4,8 +4,8 @@ import type { Change, OpenSnapshot, ToolEntry } from "../types";
 import { openMenu, ui, type InspectorTab } from "../ui";
 import { addToPrompt, inspectorWidth, mention, MIN_WIDTH, projectPref, setInspectorWidth, setProjectPref, showPanel } from "../workspace";
 import { changeRows, gitLabel, inNestedRepo, otherNestedChanges, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
-import { workspaceGitApi, type CommitReview } from "../workspaceGitApi";
-import { showToast } from "../bridge";
+import { workspaceGitApi, type CommitReview, type GitBranchInfo, type GitStashEntry } from "../workspaceGitApi";
+import { showToast, workspaceChange } from "../bridge";
 import { aiReviewView, gitLogView, worktreesView } from "../commandRunner";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { needsGitIdentity, paneErrorText } from "../paneErrors";
@@ -14,6 +14,7 @@ import BrowserPane from "./workspace/BrowserPane.vue";
 import DiffPane from "./workspace/DiffPane.vue";
 import FilesPane from "./workspace/FilesPane.vue";
 import TerminalPane from "./workspace/TerminalPane.vue";
+import BoardsPane from "./workspace/BoardsPane.vue";
 import AppPane from "./workspace/AppPane.vue";
 import JobDiscovery from './JobDiscovery.vue';
 import ActivityWatch from './ActivityWatch.vue';
@@ -40,6 +41,7 @@ const auxiliary = [
   { id: "activity", label: "Activity", icon: "activity" },
   ...rosters,
   { id: "app", label: "App", icon: "monitor" },
+  { id: "boards", label: "Boards", icon: "chip" },
 ] as const;
 const watchKind = computed(() => ui.inspectorTab === "workers" ? "worker" : ui.inspectorTab === "peers" ? "peer" : null);
 const modifier = navigator.platform.includes("Mac") ? "⌘" : "Ctrl+";
@@ -73,7 +75,11 @@ const gitFiles = ref<GitFileStatus[]>([]);
 const gitRepo = ref(false);
 const nestedRepos = ref<string[]>([]);
 /** The checked-out branch from the latest status. */
+/** The checked-out branch from the latest status. */
 const gitBranch = ref<string | null>(null);
+const branchInfo = ref<GitBranchInfo | null>(null);
+const stashes = ref<GitStashEntry[]>([]);
+const syncing = ref(false);
 /** Files with something staged, across the whole project (a commit takes them all). */
 const staged = computed(() => stagedCount(gitFiles.value.filter(f => !inNestedRepo(f.path, nestedRepos.value))));
 const commitMessage = ref("");
@@ -86,7 +92,7 @@ function dismissReview() {
   review.value = null;
 }
 watch([() => props.snap.workspace.root, () => props.snap.sessionId, commitMessage, () => shown("changes")], dismissReview, { flush: "sync" });
-watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; author.value = null; });
+watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; author.value = null; branchInfo.value = null; stashes.value = []; });
 let gitRequest = 0;
 async function loadGit() {
   const root = props.snap.workspace.root, id = ++gitRequest;
@@ -98,13 +104,103 @@ async function loadGit() {
       gitRepo.value = view.repo;
       gitBranch.value = view.branch ?? null;
     }
+    if (view.repo) {
+      const [branches, stashList] = await Promise.all([
+        workspaceGitApi.branches(root).catch(() => null),
+        workspaceGitApi.stash("list", root).catch(() => []),
+      ]);
+      if (id === gitRequest && root === props.snap.workspace.root) {
+        branchInfo.value = branches;
+        stashes.value = stashList;
+      }
+    } else if (id === gitRequest) {
+      branchInfo.value = null;
+      stashes.value = [];
+    }
   } catch {
     if (id === gitRequest) {
       gitFiles.value = [];
       nestedRepos.value = [];
       gitRepo.value = false;
       gitBranch.value = null;
+      branchInfo.value = null;
+      stashes.value = [];
     }
+  }
+}
+
+async function switchBranch(name: string, create = false) {
+  const target = name.trim();
+  if (!target || gitBusy.value || syncing.value) return;
+  const root = props.snap.workspace.root;
+  gitBusy.value = true;
+  try {
+    const active = await workspaceGitApi.checkout(target, create, root);
+    showToast(create ? `Created and switched to ${active}` : `Switched to ${active}`);
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    gitBusy.value = false;
+    if (root === props.snap.workspace.root) await loadGit();
+  }
+}
+
+function newBranchMenu(event: MouseEvent) {
+  openMenu(
+    event,
+    [
+      {
+        label: "Create branch",
+        icon: "plus",
+        prompt: {
+          label: "New branch name",
+          placeholder: "feat/my-change",
+          maxLength: 120,
+          confirm: "Create & switch",
+          submit: (value) => void switchBranch(value, true),
+        },
+      },
+    ],
+    event.currentTarget as HTMLElement,
+  );
+}
+
+async function syncGit(action: "fetch" | "pull" | "push") {
+  if (gitBusy.value || syncing.value) return;
+  const root = props.snap.workspace.root;
+  syncing.value = true;
+  try {
+    const summary = await workspaceGitApi.sync(action, root);
+    showToast(summary.split("\n")[0] || `git ${action} complete`);
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    syncing.value = false;
+    if (root === props.snap.workspace.root) await loadGit();
+  }
+}
+
+async function cancelSyncGit() {
+  if (!syncing.value) return;
+  try {
+    await workspaceGitApi.cancelSync(props.snap.workspace.root);
+  } catch (e) {
+    showToast(paneErrorText(e));
+  }
+}
+
+async function runStash(action: "push" | "pop") {
+  if (gitBusy.value || syncing.value) return;
+  const root = props.snap.workspace.root;
+  gitBusy.value = true;
+  try {
+    stashes.value = await workspaceGitApi.stash(action, root);
+    showToast(action === "push" ? "Stashed uncommitted changes" : "Restored latest stash");
+  } catch (e) {
+    showToast(paneErrorText(e));
+  } finally {
+    gitBusy.value = false;
+    if (root === props.snap.workspace.root) await loadGit();
   }
 }
 
@@ -204,6 +300,9 @@ watch(
   ([visible]) => { if (visible) void loadGit(); },
   { immediate: true },
 );
+watch(workspaceChange, ({ root }) => {
+  if (shown("changes") && root && root === props.snap.workspace.root) void loadGit();
+});
 /** Session-touched files; those git no longer reports as changed (committed or reverted) last. */
 const sessionPath = (c: Change) => (c.dir + c.name).replaceAll("\\", "/");
 const rows = computed(() => changeRows(props.snap.changes, sessionPath, gitFiles.value, gitRepo.value, nestedRepos.value));
@@ -335,7 +434,7 @@ function resizeByKey(event: KeyboardEvent) {
       </button>
     </div>
 
-    <div v-show="['files', 'terminal', 'browser', 'app'].includes(ui.inspectorTab)" class="panel">
+    <div v-show="['files', 'terminal', 'browser', 'app', 'boards'].includes(ui.inspectorTab)" class="panel">
       <FilesPane v-if="visited.has('files')" v-show="ui.inspectorTab === 'files'" :snap="snap" />
       <KeepAlive>
         <TerminalPane
@@ -348,6 +447,7 @@ function resizeByKey(event: KeyboardEvent) {
       </KeepAlive>
       <BrowserPane v-if="visited.has('browser')" v-show="ui.inspectorTab === 'browser'" :active="shown('browser')" />
       <AppPane v-if="visited.has('app')" v-show="ui.inspectorTab === 'app'" :root="snap.workspace.root" :active="shown('app')" />
+      <BoardsPane v-if="visited.has('boards')" v-show="ui.inspectorTab === 'boards'" :key="snap.workspace.root" :root="snap.workspace.root" :active="shown('boards')" />
     </div>
 
     <div v-if="ui.inspectorTab === 'changes' && ui.diffPath" class="panel">
@@ -447,6 +547,36 @@ function resizeByKey(event: KeyboardEvent) {
             </button>
           </div>
         </template>
+        <div v-if="gitRepo" class="git-bar" aria-label="Branch and remote actions">
+          <div class="git-bar-row">
+            <select
+              v-if="branchInfo?.local.length"
+              class="s-input git-branch-select mono"
+              aria-label="Current Git branch"
+              :value="branchInfo.current ?? ''"
+              :disabled="gitBusy || syncing"
+              @change="switchBranch(($event.target as HTMLSelectElement).value)"
+            >
+              <option v-if="!branchInfo.current" value="" disabled>{{ gitBranch || "detached HEAD" }}</option>
+              <option v-for="b in branchInfo.local" :key="b" :value="b">{{ b }}</option>
+            </select>
+            <span v-else-if="gitBranch" class="faint mono truncate">{{ gitBranch }}</span>
+            <button type="button" class="s-link" :disabled="gitBusy || syncing" title="Create and switch to a new branch" @click="newBranchMenu">+ Branch</button>
+            <span v-if="branchInfo?.upstream && (branchInfo.ahead || branchInfo.behind)" class="faint mono git-sync-counts" :title="`Tracking ${branchInfo.upstream}`">
+              <template v-if="branchInfo.ahead">↑{{ branchInfo.ahead }}</template>
+              <template v-if="branchInfo.ahead && branchInfo.behind"> </template>
+              <template v-if="branchInfo.behind">↓{{ branchInfo.behind }}</template>
+            </span>
+          </div>
+          <div class="git-bar-row git-bar-actions">
+            <button type="button" class="s-link" :disabled="gitBusy || syncing" title="Fetch remote branches and prune deleted refs" @click="syncGit('fetch')">Fetch</button>
+            <button type="button" class="s-link" :disabled="gitBusy || syncing" title="Fast-forward pull from upstream" @click="syncGit('pull')">Pull</button>
+            <button type="button" class="s-link" :disabled="gitBusy || syncing" title="Push current branch to remote" @click="syncGit('push')">Push</button>
+            <button v-if="syncing" type="button" class="s-link" title="Cancel the running Git sync" @click="cancelSyncGit">Cancel</button>
+            <button type="button" class="s-link" :disabled="gitBusy || syncing || !gitFiles.length" title="Stash uncommitted changes (including untracked files)" @click="runStash('push')">Stash</button>
+            <button v-if="stashes.length" type="button" class="s-link" :disabled="gitBusy || syncing" :title="`Pop latest stash (${stashes[0]?.summary ?? ''})`" @click="runStash('pop')">Pop stash ({{ stashes.length }})</button>
+          </div>
+        </div>
         <form v-if="gitRepo" class="commit" @submit.prevent="!review && reviewStaged()">
           <div class="commit-head">
             <span class="section-label">Commit</span>
@@ -778,6 +908,40 @@ function resizeByKey(event: KeyboardEvent) {
   margin-top: var(--space-lg);
   padding-top: var(--space-md);
   border-top: 1px solid var(--border);
+}
+.git-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: var(--space-md);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+}
+.git-bar-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.git-branch-select {
+  flex: 1 1 120px;
+  min-width: 0;
+  max-width: 200px;
+  height: 26px;
+  padding: 0 6px;
+  font-size: var(--text-xs);
+}
+.git-bar-actions .s-link {
+  color: var(--accent);
+  font-size: var(--text-xs);
+}
+.git-bar-actions .s-link:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+.git-sync-counts {
+  font-size: var(--text-xs);
+  margin-left: auto;
 }
 .commit-head,
 .commit-foot {

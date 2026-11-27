@@ -57,6 +57,14 @@ export type SchedulerStatus = {
   log: string[];
 }
 
+/** The OS service (launchd, systemd --user) that runs a project's schedules after the app quits. */
+export type SchedulerService = {
+  supported: boolean;
+  installed: boolean;
+  log: string | null;
+  detail: string | null;
+}
+
 /** When an interval schedule is next due (Unix seconds), as the engine decides: the later of its
  * creation and last run, plus the interval. Watch-only schedules have no time. */
 export function nextRun(entry: { every_secs?: number | null; created?: number | null }, lastRun?: number | null): number | null {

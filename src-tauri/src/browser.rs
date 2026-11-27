@@ -462,31 +462,21 @@ pub fn browser_set_search(
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserFeatures {
-    /// Web Inspector is compiled in (debug builds).
+    /// Web Inspector is compiled in (via the `tauri/devtools` feature).
     pub devtools: bool,
 }
 
 #[tauri::command]
 pub fn browser_features() -> BrowserFeatures {
-    BrowserFeatures {
-        devtools: cfg!(debug_assertions),
-    }
+    BrowserFeatures { devtools: true }
 }
 
-/// Open the page's Web Inspector (debug builds only).
+/// Open the page's Web Inspector.
 #[tauri::command]
 pub async fn browser_devtools(app: AppHandle) -> Result<(), String> {
     let view = webview(&app)?;
-    #[cfg(debug_assertions)]
-    {
-        view.open_devtools();
-        Ok(())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = view;
-        Err("This build of Dial has no page inspector".into())
-    }
+    view.open_devtools();
+    Ok(())
 }
 
 /// **Open file…**: pick a local HTML file in a native dialog and serve its folder on loopback.

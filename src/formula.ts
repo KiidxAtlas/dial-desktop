@@ -83,7 +83,13 @@ export function parseFormula(source: string): Formula {
       depth--;
       return { op: sym === "-" ? "neg" : "not", arg };
     }
-    if (peek() === "+") { take(); return unary(); }
+    if (peek() === "+") {
+      take();
+      if (++depth > MAX_DEPTH) throw new Error("formula is nested too deeply");
+      const arg = unary();
+      depth--;
+      return arg;
+    }
     return power();
   };
   // Right-associative, and binds tighter than a leading minus on its left: -2^2 is -4.
@@ -91,7 +97,10 @@ export function parseFormula(source: string): Formula {
     const base = atom();
     if (peek() !== "^") return base;
     take("^");
-    return { op: "bin", sym: "^", left: base, right: unary() };
+    if (++depth > MAX_DEPTH) throw new Error("formula is nested too deeply");
+    const right = unary();
+    depth--;
+    return { op: "bin", sym: "^", left: base, right };
   };
   const product = binary(unary, ["*", "/", "%"]);
   const sum = binary(product, ["+", "-"]);
@@ -104,8 +113,8 @@ export function parseFormula(source: string): Formula {
     if (/^[\d.]/.test(tok)) return { op: "num", value: Number(tok) };
     if (/^[A-Za-z_]/.test(tok)) {
       if (peek() !== "(") return { op: "var", name: tok };
+      if (!Object.hasOwn(FUNCTIONS, tok)) throw new Error(`unknown function "${tok}"`);
       const fn = FUNCTIONS[tok];
-      if (!fn) throw new Error(`unknown function "${tok}"`);
       take("(");
       const args: Formula[] = [];
       if (peek() !== ")") {
@@ -144,7 +153,7 @@ export function evaluate(f: Formula, values: Record<string, number>): number {
     case "neg": return -evaluate(f.arg, values);
     case "not": return evaluate(f.arg, values) ? 0 : 1;
     case "if": return evaluate(f.test, values) ? evaluate(f.then, values) : evaluate(f.else, values);
-    case "call": return FUNCTIONS[f.fn].run(...f.args.map(a => evaluate(a, values)));
+    case "call": return Object.hasOwn(FUNCTIONS, f.fn) ? FUNCTIONS[f.fn].run(...f.args.map(a => evaluate(a, values))) : NaN;
     case "bin": {
       const a = evaluate(f.left, values);
       if (f.sym === "&&") return a ? (evaluate(f.right, values) ? 1 : 0) : 0;

@@ -5,6 +5,13 @@ import type { Attachment } from './types';
 export const MAX_ATTACHMENTS = 10;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+const imageDataPrefix = /^data:image\/(?:png|jpeg|gif|webp);base64,/i;
+
+/** Picker, drop and paste previews contain the full image selected by the user. */
+function previewBytes(url: string): string | null {
+  const prefix = url.match(imageDataPrefix);
+  return prefix ? url.slice(prefix[0].length) || null : null;
+}
 
 export function imageMime(file: File): string | null {
   if (!file.size) return null;
@@ -15,17 +22,19 @@ export function imageMime(file: File): string | null {
 
 /** A thumbnail URL also identifies existing image-only drafts saved before file support. */
 export function attachmentPayload(attachments: readonly Attachment[], acceptsImages: boolean | null | undefined) {
-  const images: string[] = [], inlineImages: string[] = [];
+  const inlineImages: string[] = [];
   const documents: Pick<Attachment, 'name' | 'path' | 'data'>[] = [];
   for (const { name, url, path, data } of attachments) {
-    if (url && acceptsImages !== false) {
-      if (path !== null) images.push(path);
-      else if (data !== null) inlineImages.push(data);
+    if (url) {
+      if (acceptsImages === false) throw new Error('This model cannot view images. Choose a vision-capable model or remove the image before sending.');
+      const bytes = previewBytes(url);
+      if (!bytes) throw new Error(`Could not read the attached image ${name}. Attach it again before sending.`);
+      inlineImages.push(bytes);
     } else {
       documents.push({ name, path, data });
     }
   }
-  return { images, inlineImages, documents };
+  return { images: [], inlineImages, documents };
 }
 
 type PasteAction = { kind: 'files'; files: File[]; hasDirectory: boolean } | { kind: 'nativeFiles' | 'macImage' | 'text' };

@@ -296,11 +296,14 @@ pub struct RunOutput {
     pub stderr: String,
 }
 
+/// Maximum stdout/stderr bytes captured by [`run_bounded`] per stream.
+const MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Run `command` without stdin, capturing both streams; killed after `timeout`. `Err` when it
-/// cannot be started or runs out of time.
+/// cannot be started, runs out of time or exceeds [`MAX_CAPTURE_BYTES`].
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Result<RunOutput, String> {
     let shown = format!("{:?}", command.get_program());
-    let output = crate::launcher::run_captured(command, timeout, u64::MAX, |error| {
+    let output = crate::launcher::run_captured(command, timeout, MAX_CAPTURE_BYTES, |error| {
         format!("could not start {shown}: {error}")
     })?;
     Ok(RunOutput {

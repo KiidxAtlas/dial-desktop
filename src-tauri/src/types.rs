@@ -19,11 +19,16 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
 
+mod commands;
 pub mod live;
+mod protocol;
 #[cfg(test)]
 mod tests;
+
+pub use commands::*;
+pub use protocol::*;
 
 pub const VERSION: u32 = 2;
 /// List invalidation (`null`), a changed id, or an agent build step with its progress.
@@ -421,11 +426,15 @@ fn image_ext(head: &[u8]) -> Option<&'static str> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
     let dir = path.parent().ok_or("No folder")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let partial = path.with_extension("partial");
-    std::fs::write(&partial, bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&partial, path).map_err(|e| e.to_string())
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    tmp.write_all(bytes)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| e.to_string())?;
+    tmp.persist(path).map_err(|e| e.error.to_string())?;
+    Ok(())
 }
 
 fn random_suffix() -> String {
@@ -506,7 +515,12 @@ impl Store {
 
     /// The store in the app's per-user folder, with the saved choice of where new types go.
     pub fn for_home(home: Option<&Path>) -> Self {
-        let app = crate::launcher::app_dir(home);
+        Self::in_app_dir(crate::launcher::app_dir(home))
+    }
+
+    /// A store rooted at `app` (the app's folder, holding `types/` and the saved choice). Split
+    /// from `for_home` so tests can pin the folder instead of reading the host's config env.
+    fn in_app_dir(app: Option<PathBuf>) -> Self {
         let prefs = app.as_ref().map(|d| d.join("types-location.json"));
         let saved: Prefs = prefs
             .as_deref()
@@ -1077,186 +1091,10 @@ fn build_step(def: &TypeDef, patch: &Value) -> Value {
     Value::Object(choices)
 }
 
-#[tauri::command]
-pub fn types_list(store: State<'_, Store>) -> Result<Vec<Summary>, String> {
-    store.list()
-}
-
-#[tauri::command]
-pub fn types_get(store: State<'_, Store>, id: String) -> Result<Full, String> {
-    store.get(&id)
-}
-
-/// Where new types are kept, and the open project's folder for them.
-#[tauri::command]
-pub fn types_location(store: State<'_, Store>) -> Location {
-    store.location()
-}
-
-/// Choose where new types are kept: with the app, or in the open project.
-#[tauri::command]
-pub fn types_set_location(store: State<'_, Store>, save_in: Scope) -> Result<Location, String> {
-    store.set_save_in(save_in)?;
-    Ok(store.location())
-}
-
 /// The project the user opened: its types join the list, and new ones go there when chosen.
 pub fn follow_project(app: &AppHandle, store: &Store, project: &Path) {
     store.set_project(Some(project));
     changed(app, None);
-}
-
-#[tauri::command]
-pub fn types_create(
-    app: AppHandle,
-    store: State<'_, Store>,
-    def: TypeDef,
-) -> Result<TypeDef, String> {
-    let def = store.create(def)?;
-    changed(&app, Some(&def.id));
-    Ok(def)
-}
-
-#[tauri::command]
-pub fn types_update(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    patch: Value,
-) -> Result<TypeDef, String> {
-    let mut def = store.update(&id, &patch)?;
-    changed(&app, Some(&id));
-    def.html.clear();
-    Ok(def)
-}
-
-#[tauri::command]
-pub fn types_claim_session(app: AppHandle, store: State<'_, Store>, id: String, root: String, session: String) -> Result<(), String> {
-    store.claim_session(&id, root, session)?;
-    changed(&app, Some(&id));
-    Ok(())
-}
-
-#[tauri::command]
-pub fn types_delete(app: AppHandle, store: State<'_, Store>, id: String) -> Result<(), String> {
-    store.delete(&id)?;
-    changed(&app, None);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn types_add_item(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    fields: Map<String, Value>,
-    source: Option<Source>,
-    allow_import: Option<bool>,
-) -> Result<Item, String> {
-    let (item, _) = store.add_item_with(&id, fields, source, allow_import.unwrap_or(true))?;
-    changed(&app, Some(&id));
-    Ok(item)
-}
-
-#[tauri::command]
-pub fn types_update_item(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    item_id: String,
-    patch: ItemPatch,
-    allow_import: Option<bool>,
-) -> Result<Item, String> {
-    let item = store.update_item_with(&id, &item_id, patch, allow_import.unwrap_or(true))?;
-    changed(&app, Some(&id));
-    Ok(item)
-}
-
-#[tauri::command]
-pub fn types_remove_item(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    item_id: String,
-) -> Result<(), String> {
-    store.remove_item(&id, &item_id)?;
-    changed(&app, Some(&id));
-    Ok(())
-}
-
-#[tauri::command]
-pub fn types_move_item(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    item_id: String,
-    to: usize,
-) -> Result<(), String> {
-    store.move_item(&id, &item_id, to)?;
-    changed(&app, Some(&id));
-    Ok(())
-}
-
-/// The app saves its own state (`dial.setState`).
-#[tauri::command]
-pub fn types_set_state(
-    app: AppHandle,
-    store: State<'_, Store>,
-    id: String,
-    state: Value,
-) -> Result<(), String> {
-    // No change event: the app already holds this state, and a reload of it would re-render the
-    // app from its own write.
-    let _ = app;
-    store.set_state(&id, &state)
-}
-
-#[tauri::command]
-pub fn types_import_image(
-    store: State<'_, Store>,
-    id: String,
-    path: String,
-) -> Result<String, String> {
-    store.import_image(&id, Path::new(&path))
-}
-
-/// Save pasted or generated bytes (base64) as an asset.
-#[tauri::command]
-pub fn types_import_image_data(
-    store: State<'_, Store>,
-    id: String,
-    data: String,
-) -> Result<String, String> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
-        .map_err(|_| "Not base64 image data".to_owned())?;
-    if bytes.len() as u64 > MAX_IMAGE {
-        return Err("Images are at most 25 MB".into());
-    }
-    store.store_image(&id, &bytes)
-}
-
-/// Open a saved type asset image in the system's default viewer.
-#[tauri::command]
-pub async fn types_open_asset(
-    webview: tauri::Webview,
-    store: State<'_, Store>,
-    path: String,
-) -> Result<(), String> {
-    if webview.label() != "main" {
-        return Err("Type images are only available in the app UI".into());
-    }
-    let resolved = store.resolve_asset(Path::new(&path))?;
-    if crate::attachments::image_mime(&resolved).is_none() {
-        return Err("That file is not an image".into());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        tauri_plugin_opener::open_path(&resolved, None::<&str>)
-            .map_err(|e| format!("Could not open image: {e}"))
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 
@@ -1801,65 +1639,4 @@ pub fn tools() -> Vec<Value> {
             json!({"type": "object", "properties": {"type": which(), "state": {}}, "required": ["type"]}),
         ),
     ]
-}
-
-/// The scheme a type's app loads from, in a sandboxed frame of the types view.
-pub const CUSTOM_SCHEME: &str = "dialtype";
-/// A type's app runs its own code and may use the web over https (APIs with CORS, CDNs, fonts),
-/// in a frame without same-origin access: it cannot reach the app, its files or its IPC.
-pub const CUSTOM_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https: blob:; \
-style-src 'unsafe-inline' https:; img-src data: blob: https:; font-src data: https:; \
-media-src data: blob: https:; connect-src https: wss:; worker-src blob:; \
-form-action 'none'; base-uri 'none'; frame-ancestors *";
-
-/// The `window.dial` runtime injected into every app.
-const RUNTIME: &str = include_str!("types/runtime.js");
-
-/// `html` with the runtime's script first in its head, before any of the app's own scripts.
-pub fn with_runtime(html: &str) -> String {
-    let script = format!("<script>{RUNTIME}</script>");
-    let lower = html.to_ascii_lowercase();
-    let after_tag = |name: &str| -> Option<usize> {
-        let mut from = 0;
-        while let Some(at) = lower[from..].find(name) {
-            let at = from + at;
-            let next = lower.as_bytes().get(at + name.len()).copied();
-            if matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r')) {
-                return lower[at..].find('>').map(|end| at + end + 1);
-            }
-            from = at + name.len();
-        }
-        None
-    };
-    let at = after_tag("<head")
-        .or_else(|| after_tag("<html"))
-        .or_else(|| after_tag("<!doctype"))
-        .unwrap_or(0);
-    let mut out = String::with_capacity(html.len() + script.len());
-    out.push_str(&html[..at]);
-    out.push_str(&script);
-    out.push_str(&html[at..]);
-    out
-}
-
-/// Answer `dialtype://localhost/<id>`: type `id`'s app under [`CUSTOM_CSP`], with the runtime.
-pub fn custom_page(store: &Store, path: &str) -> tauri::http::Response<Vec<u8>> {
-    let id = path
-        .trim_start_matches('/')
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("");
-    let page = store.app_html(id).ok().filter(|html| !html.trim().is_empty());
-    let (status, body) = match page {
-        Some(html) => (200, with_runtime(&html).into_bytes()),
-        None => (404, b"This type has no app yet".to_vec()),
-    };
-    tauri::http::Response::builder()
-        .status(status)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .header("Content-Security-Policy", CUSTOM_CSP)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .body(body)
-        .unwrap_or_default()
 }

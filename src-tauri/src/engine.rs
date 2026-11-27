@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests;
@@ -19,8 +19,14 @@ pub(crate) mod watch;
 
 /// Engine startup can include model discovery; give it room before calling it failed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Poll interval while idle; short enough that commands feel immediate.
-const POLL: Duration = Duration::from_millis(25);
+/// Poll interval while active/streaming or immediately after a command; keeps UI clicks crisp.
+const POLL_ACTIVE: Duration = Duration::from_millis(2);
+/// Poll interval when completely idle (no recent commands or engine messages).
+const POLL_IDLE: Duration = Duration::from_millis(15);
+/// Keep using `POLL_ACTIVE` this long after any command or message activity.
+const ACTIVE_WINDOW: Duration = Duration::from_millis(250);
+/// Maximum ready engine messages drained in one batch before re-checking outbound UI commands.
+const MAX_DRAIN_BATCH: usize = 32;
 /// Grace for a graceful `shutdown` before the engine is killed.
 const SHUTDOWN: Duration = Duration::from_secs(5);
 /// Sessions fetched for the sidebar.
@@ -500,6 +506,14 @@ impl Engine {
     }
 
     pub fn spawn_after(launch: Launch, waker: Waker, previous: Option<Weak<AtomicBool>>) -> Self {
+        Self::spawn_with(move || launch, waker, previous)
+    }
+
+    pub(crate) fn spawn_with(
+        prepare: impl FnOnce() -> Launch + Send + 'static,
+        waker: Waker,
+        previous: Option<Weak<AtomicBool>>,
+    ) -> Self {
         let (commands, command_rx) = mpsc::channel();
         let (update_tx, updates) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
@@ -519,10 +533,13 @@ impl Engine {
                             waker();
                             return;
                         }
-                        thread::sleep(POLL);
+                        thread::sleep(POLL_ACTIVE);
                     }
                 }
-                run(&launch, &command_rx, &update_tx, &worker_stop, &waker);
+                let launch = prepare();
+                if !worker_stop.load(Ordering::SeqCst) {
+                    run(&launch, &command_rx, &update_tx, &worker_stop, &waker);
+                }
                 let _ = done_tx.send(());
                 waker();
             })
@@ -722,6 +739,7 @@ fn run(
     let mut board = watch::Board::new(client.ready().session_id.clone());
     emit(Update::Connected(Box::new(client.ready().clone())));
     let mut replies = HashMap::new();
+    let mut last_activity = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = client.shutdown(SHUTDOWN);
@@ -730,6 +748,7 @@ fn run(
         loop {
             match commands.try_recv() {
                 Ok(Work { call, reply }) => {
+                    last_activity = Instant::now();
                     let mut board_read = None;
                     let (command, method, params) = match call {
                         Call::Command(command) => {
@@ -799,7 +818,23 @@ fn run(
                 }
             }
         }
-        if let Some(message) = client.poll(POLL) {
+        let poll_timeout = if last_activity.elapsed() < ACTIVE_WINDOW {
+            POLL_ACTIVE
+        } else {
+            POLL_IDLE
+        };
+        let mut first = true;
+        for _ in 0..MAX_DRAIN_BATCH {
+            if stop.load(Ordering::SeqCst) {
+                let _ = client.shutdown(SHUTDOWN);
+                return;
+            }
+            let wait = if first { poll_timeout } else { Duration::ZERO };
+            first = false;
+            let Some(message) = client.poll(wait) else {
+                break;
+            };
+            last_activity = Instant::now();
             board.observe(&message, client.lost_events());
             let ended = matches!(message, Message::Disconnected { .. });
             if let Message::Response { id, result, .. } = &message

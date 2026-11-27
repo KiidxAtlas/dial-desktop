@@ -1,8 +1,7 @@
 // Backend calls for Git-aware file panels (`files.rs`), beside the shared bridge.
 import { invoke } from "@tauri-apps/api/core";
 import type { GitStatusView, GrepMatch } from "./workspaceGit";
-import type { DirEntry } from "./types";
-
+import type { DirEntry, FileView } from "./types";
 /** A listed entry; `ignored` is set only when ignored entries were asked for. */
 export interface GitDirEntry extends DirEntry {
   ignored?: boolean;
@@ -20,6 +19,19 @@ export interface GitIdentity {
   email: string;
 }
 
+export interface GitBranchInfo {
+  current: string | null;
+  local: string[];
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+}
+
+export interface GitStashEntry {
+  reference: string;
+  summary: string;
+}
+
 export const workspaceGitApi = {
   /** Folder `path` (`""` is the root); `.gitignore`d entries are left out unless `showIgnored`. */
   list: (path: string, workspaceRoot: string, showIgnored: boolean) =>
@@ -28,9 +40,43 @@ export const workspaceGitApi = {
   status: (workspaceRoot: string, counts = false) => invoke<GitStatusView>("file_git_status", { workspaceRoot, counts }),
   /** Discard every uncommitted change to `path`. Confirm with the user first. */
   revert: (path: string, workspaceRoot: string) => invoke<void>("file_revert", { path, workspaceRoot }),
+  /** Save inline edits atomically to a workspace text file and return the refreshed file view. */
+  write: (path: string, content: string, workspaceRoot: string, expectedSha256?: string) =>
+    invoke<FileView>("write_file", { path, content, workspaceRoot, expectedSha256: expectedSha256 ?? null }),
+  /** Create a new text file inside the workspace and return its file view. */
+  createFile: (path: string, content: string, workspaceRoot: string) =>
+    invoke<FileView>("file_create", { path, content, workspaceRoot }),
+  /** Rename or move a file or folder inside the workspace; returns the new relative path. */
+  renameFile: (from: string, to: string, workspaceRoot: string) =>
+    invoke<string>("file_rename", { from, to, workspaceRoot }),
+  /** Delete a plain file or empty folder inside the workspace. Confirm first. */
+  deleteFile: (path: string, workspaceRoot: string) =>
+    invoke<void>("file_delete", { path, workspaceRoot }),
   /** Undo one hunk (as the diff showed it: header and lines) in the working tree. Confirm first. */
   revertHunk: (path: string, hunk: string, workspaceRoot: string) =>
     invoke<void>("file_revert_hunk", { path, hunk, workspaceRoot }),
+  /** Stage one hunk (as the diff showed it: header and lines) into Git's index. */
+  stageHunk: (path: string, hunk: string, workspaceRoot: string) =>
+    invoke<void>("file_stage_hunk", { path, hunk, workspaceRoot }),
+  /** Unstage one hunk (as the staged diff showed it) from Git's index. */
+  unstageHunk: (path: string, hunk: string, workspaceRoot: string) =>
+    invoke<void>("file_unstage_hunk", { path, hunk, workspaceRoot }),
+  /** Local branches and upstream ahead/behind counts for the repository. */
+  branches: (workspaceRoot: string) => invoke<GitBranchInfo>("file_git_branches", { workspaceRoot }),
+  /** Switch to a local branch, or create and switch to a new one. */
+  checkout: (branch: string, create: boolean, workspaceRoot: string) =>
+    invoke<string>("file_git_checkout", { branch, create, workspaceRoot }),
+  /** Run `fetch`, `pull` (`--ff-only`) or `push` for the repository. */
+  sync: (action: "fetch" | "pull" | "push", workspaceRoot: string) =>
+    invoke<string>("file_git_sync", { action, workspaceRoot }),
+  /** Cancel an in-flight `fetch`, `pull`, or `push` for the repository. */
+  cancelSync: (workspaceRoot: string) =>
+    invoke<boolean>("file_git_sync_cancel", { workspaceRoot }),
+  stash: (action: "list" | "push" | "pop", workspaceRoot: string, message?: string) =>
+    invoke<GitStashEntry[]>("file_git_stash", { action, message: message ?? null, workspaceRoot }),
+  /** Resolve an unmerged Git conflict using `ours`, `theirs`, or `resolved`. */
+  resolveConflict: (path: string, strategy: "ours" | "theirs" | "resolved", workspaceRoot: string) =>
+    invoke<void>("file_git_resolve_conflict", { path, strategy, workspaceRoot }),
   /** Stage (`staged`) or unstage `paths`; unstaging keeps the working tree. */
   stage: (paths: string[], staged: boolean, workspaceRoot: string) =>
     invoke<void>("file_stage", { paths, staged, workspaceRoot }),

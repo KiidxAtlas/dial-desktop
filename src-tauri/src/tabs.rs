@@ -457,7 +457,10 @@ impl Tabs {
 
     /// Where starting a fresh session goes.
     pub fn route_new(&self) -> Route {
-        if self.active().busy() || self.active().transitioning() {
+        let tab = self.active();
+        if tab.busy() || tab.transitioning()
+            || matches!(tab.model.connection(), crate::model::Connection::Ended | crate::model::Connection::Failed(_))
+        {
             Route::Spawn
         } else {
             Route::Here

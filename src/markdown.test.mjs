@@ -40,6 +40,11 @@ test('a closed rich fence renders in a live reply; a partial fence stays source'
     assert.deepEqual(partial.slice(0, -1), longer.slice(0, -1));
     assert.match(longer[1], /<ul>[\s\S]*<\/ul>/);
     assert.match(renderMarkdownParts(source + '[ref]: https://example.org', true)[0], /href="https:\/\/example.org"/);
+    // Oversized code blocks bypass Shiki and still render safely escaped plain HTML.
+    const huge = `<script>${'x'.repeat(130 * 1024)}</script>`;
+    const rendered = renderMarkdown(`\`\`\`ts\n${huge}\n\`\`\``);
+    assert.ok(rendered.includes('<pre class="plain"><code>'));
+    assert.ok(!rendered.includes('<script>'));
   } finally {
     await vite.close();
   }

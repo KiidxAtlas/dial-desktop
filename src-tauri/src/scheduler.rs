@@ -667,5 +667,7 @@ fn supervise(core: &Arc<Core>, id: u64, stop: &AtomicBool) {
     }
 }
 
+pub mod service;
+
 #[cfg(test)]
 mod tests;

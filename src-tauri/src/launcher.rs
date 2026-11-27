@@ -255,6 +255,8 @@ pub enum EngineOrigin {
     Path,
     /// Found in one of the usual installation folders.
     Fallback,
+    /// The copy shipped inside Dial Desktop, next to the app's executable.
+    Bundled,
     /// Nowhere: the bare name, which fails to start.
     Missing,
 }
@@ -344,7 +346,20 @@ pub fn locate_dial(
     path: Option<&OsStr>,
     home: Option<&Path>,
 ) -> (PathBuf, EngineOrigin) {
-    locate_dial_in(flag, env, choice, path, home, app_dir(home).as_deref())
+    let bundled = std::env::current_exe().ok().and_then(|exe| bundled_engine(&exe));
+    locate_dial_in(flag, env, choice, path, home, app_dir(home).as_deref(), bundled.as_deref())
+}
+
+/// The engine shipped beside the app's own executable (Tauri `bundle.externalBin`): Contents/MacOS
+/// in a macOS bundle, the install folder on Windows, `usr/bin` on Linux.
+pub fn bundled_engine(exe: &Path) -> Option<PathBuf> {
+    let candidate = exe.parent()?.join(DIAL_NAME);
+    (candidate != exe && is_executable(&candidate)).then_some(candidate)
+}
+
+/// Whether `program` is the copy shipped inside this app, which updates with the app.
+pub fn is_bundled(program: &Path) -> bool {
+    std::env::current_exe().ok().and_then(|exe| bundled_engine(&exe)).is_some_and(|b| b == program)
 }
 
 fn locate_dial_in(
@@ -354,6 +369,7 @@ fn locate_dial_in(
     path: Option<&OsStr>,
     home: Option<&Path>,
     desktop_dir: Option<&Path>,
+    bundled: Option<&Path>,
 ) -> (PathBuf, EngineOrigin) {
     if let Some(flag) = flag.filter(|p| !p.is_empty()) {
         return (PathBuf::from(flag), EngineOrigin::Flag);
@@ -389,7 +405,11 @@ fn locate_dial_in(
     });
     match found(&mut fallback) {
         Some(usual) => (usual, EngineOrigin::Fallback),
-        None => (PathBuf::from(name), EngineOrigin::Missing),
+        // User installs win; the shipped copy guarantees a fresh install works.
+        None => match bundled {
+            Some(bundled) => (bundled.to_owned(), EngineOrigin::Bundled),
+            None => (PathBuf::from(name), EngineOrigin::Missing),
+        },
     }
 }
 

@@ -6,11 +6,11 @@
 //! out). The server stops when the panel navigates elsewhere, opens another file or closes.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -18,8 +18,9 @@ use std::time::Duration;
 const MAX_FILE: u64 = 256 << 20;
 /// Longest request head read.
 const MAX_HEAD: usize = 16 << 10;
+/// Concurrent connections served at once; excess connections are closed immediately.
+const MAX_CONNECTIONS: usize = 32;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// A running server for one folder. Dropping it stops the server.
 pub struct LocalServer {
     addr: SocketAddr,
@@ -82,6 +83,14 @@ impl Drop for LocalServer {
     }
 }
 
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn accept_loop(
     listener: TcpListener,
     root: PathBuf,
@@ -91,6 +100,7 @@ fn accept_loop(
 ) {
     let root = Arc::new(root);
     let token = Arc::new(token);
+    let active = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -98,12 +108,19 @@ fn accept_loop(
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let slot = Slot(active.clone());
                 let root = root.clone();
                 let token = token.clone();
                 let stop = stop.clone();
                 let _ = thread::Builder::new()
                     .name("dial-browser-file".into())
                     .spawn(move || {
+                        let _slot = slot;
                         if !stop.load(Ordering::SeqCst) {
                             let _ = handle(stream, &root, &token, addr);
                         }
@@ -150,16 +167,22 @@ fn handle(mut stream: TcpStream, root: &Path, token: &str, addr: SocketAddr) -> 
         Ok(path) => path,
         Err(status) => return respond(&mut stream, status, "text/plain", reason(status).as_bytes(), &[]),
     };
-    let Ok(meta) = fs::metadata(&path) else {
+    let Ok(file) = fs::File::open(&path) else {
         return respond(&mut stream, 404, "text/plain", b"Not found", &[]);
     };
-    if meta.len() > MAX_FILE {
+    let Ok(meta) = file.metadata() else {
+        return respond(&mut stream, 404, "text/plain", b"Not found", &[]);
+    };
+    if !meta.is_file() {
+        return respond(&mut stream, 404, "text/plain", b"Not found", &[]);
+    }
+    let len = meta.len();
+    if len > MAX_FILE {
         return respond(&mut stream, 413, "text/plain", b"File too large", &[]);
     }
-    match fs::read(&path) {
-        Ok(body) => respond(&mut stream, 200, content_type(&path), &body, &[]),
-        Err(_) => respond(&mut stream, 404, "text/plain", b"Not found", &[]),
-    }
+    write_head(&mut stream, 200, content_type(&path), len, &[])?;
+    io::copy(&mut file.take(len), &mut stream)?;
+    stream.flush()
 }
 
 fn reason(status: u16) -> &'static str {
@@ -174,6 +197,24 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+fn write_head(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    len: u64,
+    extra: &[(&str, &str)],
+) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        reason(status),
+    );
+    for (name, value) in extra {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())
+}
+
 fn respond(
     stream: &mut TcpStream,
     status: u16,
@@ -181,16 +222,7 @@ fn respond(
     body: &[u8],
     extra: &[(&str, &str)],
 ) -> std::io::Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
-        reason(status),
-        body.len()
-    );
-    for (name, value) in extra {
-        head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
+    write_head(stream, status, content_type, body.len() as u64, extra)?;
     stream.write_all(body)?;
     stream.flush()
 }

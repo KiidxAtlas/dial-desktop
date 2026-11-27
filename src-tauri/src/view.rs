@@ -917,7 +917,7 @@ impl Published {
 pub struct EntryViews {
     workspace: Option<Workspace>,
     rows: Vec<(Entry, Arc<EntryView>)>,
-    received_from: HashMap<usize, String>,
+    received_from: HashMap<usize, (String, bool)>,
 }
 
 impl EntryViews {
@@ -938,7 +938,7 @@ impl EntryViews {
             {
                 continue;
             }
-            let sender = model.received_from.get(&index).map(String::as_str);
+            let sender = model.received_from.get(&index).map(|(from, journal)| (from.as_str(), *journal));
             let row = (entry.clone(), Arc::new(entry_view(index, entry, workspace, sender)));
             match self.rows.get_mut(index) {
                 Some(old) => *old = row,
@@ -950,9 +950,9 @@ impl EntryViews {
     }
 }
 
-fn entry_view(index: usize, entry: &Entry, workspace: &Workspace, sender: Option<&str>) -> EntryView {
+fn entry_view(index: usize, entry: &Entry, workspace: &Workspace, sender: Option<(&str, bool)>) -> EntryView {
     match entry {
-        Entry::User(user) if let Some(sender) = sender => EntryView::Received {
+        Entry::User(user) if let Some((sender, _)) = sender => EntryView::Received {
             sender: sender.to_owned(), text: user.text.clone(), source: ReceivedSource::Journal,
         },
         Entry::User(user) => EntryView::User {
@@ -966,8 +966,10 @@ fn entry_view(index: usize, entry: &Entry, workspace: &Workspace, sender: Option
             abandoned: answer.abandoned,
         },
         Entry::Tool(tool) => EntryView::Tool(Box::new(ToolView::new(index, tool, workspace))),
-        Entry::Notice(notice) if let Some(sender) = sender => EntryView::Received {
-            sender: sender.to_owned(), text: notice.message.clone(), source: ReceivedSource::Live,
+        Entry::Notice(notice) if let Some((sender, from_journal)) = sender => EntryView::Received {
+            sender: sender.to_owned(),
+            text: notice.message.clone(),
+            source: if from_journal { ReceivedSource::Journal } else { ReceivedSource::Live },
         },
         Entry::Notice(notice) if notice.kind.is_none() && notice.lane.is_none() && let Some((sender, source)) = notice_sender(&notice.message) => EntryView::Received {
             sender: sender.to_owned(), text: notice.message.clone(), source,

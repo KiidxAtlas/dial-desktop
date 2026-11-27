@@ -828,6 +828,7 @@ fn questions_are_acknowledged_once_then_answered() {
         id: "a".into(),
         selected: vec!["origin".into()],
         custom: Some("  ".into()),
+        ..Default::default()
     }];
     assert!(
         model
@@ -870,6 +871,15 @@ fn questions_are_acknowledged_once_then_answered() {
     assert_eq!(kind, "answers");
     // Blank free text is not sent.
     assert_eq!(results, [json!({"id": "a", "selectedOptions": ["origin"]})]);
+    // Attached images go by path with the answer's free text.
+    let pictured = [Answer { images: vec!["/tmp/a.png".into()], ..answers[0].clone() }];
+    let Command::AnswerQuestion { results, .. } = model
+        .answer_question("q1", Reply::Answers, &pictured)
+        .unwrap()
+    else {
+        panic!("an answer");
+    };
+    assert_eq!(results, [json!({"id": "a", "selectedOptions": ["origin"], "customInputImages": ["/tmp/a.png"]})]);
     let Command::AnswerQuestion { kind, results, .. } =
         model.answer_question("q1", Reply::Cancel, &[]).unwrap()
     else {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { computerSetting, engineTooOld, hookFromDraft, joinCommand, savedHook, splitCommand, sshFromDraft } from './integrations.ts';
+import { computerSetting, engineTooOld, hookFromDraft, joinCommand, retryIntegrationRead, savedHook, splitCommand, sshFromDraft } from './integrations.ts';
 
 test('commands split on spaces, group quoted words and round-trip through join', () => {
   assert.deepEqual(splitCommand('  ./check.sh --fast  '), ['./check.sh', '--fast']);
@@ -47,4 +47,22 @@ test('computer use changes only its entry in the effective settings layer', () =
     assert.deepEqual(computerSetting(off, true).value, ['browser', 'git', 'computer']);
   }
   for (const value of [null, 'browser', [1]]) assert.throws(() => computerSetting({ value }, true), /no settings were changed/);
+});
+
+test('computer settings recover from occupied read slots, not permission or connection failures', async () => {
+  const full = new Error('busy: 4 reads are already running; retry when one finishes');
+  let calls = 0;
+  assert.equal(await retryIntegrationRead(async () => {
+    if (++calls === 1) throw full;
+    return 'off';
+  }, () => true), 'off');
+  assert.equal(calls, 2);
+  for (const failure of ['busy: the control connection is closing', 'access denied']) {
+    calls = 0;
+    await assert.rejects(retryIntegrationRead(async () => { calls++; throw Error(failure); }, () => true), { message: failure });
+    assert.equal(calls, 1);
+  }
+  calls = 0;
+  await assert.rejects(retryIntegrationRead(async () => { calls++; throw full; }, () => calls === 0), /Settings page changed/);
+  assert.equal(calls, 1);
 });

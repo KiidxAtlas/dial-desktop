@@ -107,6 +107,19 @@ fn an_idle_tab_opens_sessions_in_place() {
 }
 
 #[test]
+fn engine_stall_followed_by_failure_allows_opening_another_session() {
+    let mut tabs = Tabs::new(tab("s1", false));
+    for update in [
+        Update::ConnectFailed("no ready".into()),
+        Update::Message(Message::Disconnected { outstanding: vec![] }),
+    ] {
+        tabs.active_mut().apply(update);
+        assert_eq!(tabs.route_resume("s2"), Route::Spawn);
+        assert_eq!(tabs.route_new(), Route::Spawn);
+    }
+}
+
+#[test]
 fn a_busy_tab_keeps_working_while_another_session_opens() {
     let mut tabs = Tabs::new(tab("s1", true));
     assert_eq!(tabs.route_resume("s2"), Route::Spawn);

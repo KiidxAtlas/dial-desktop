@@ -202,7 +202,8 @@ fn probe_drains_large_stdout_without_waiting_for_a_descendant() {
             std::io::stdout().flush().unwrap();
             std::io::stderr().write_all(PAYLOAD).unwrap();
             // Deliberately inherit stdout in a process that outlives the direct child.
-            let _holder = command().env(ROLE, "holder").spawn().unwrap();
+            #[allow(clippy::zombie_processes)]
+            let _ = command().env(ROLE, "holder").spawn().unwrap();
         }
         _ => {
             let longest = |bytes: &[u8]| bytes.split(|b| *b != b'x').map(<[u8]>::len).max();
@@ -273,7 +274,7 @@ fn dial_is_found_on_path_then_in_install_folders() {
         std::fs::set_permissions(plain, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let path = std::env::join_paths([&bin]).unwrap();
-    let find = |flag| locate_dial_in(flag, None, None, Some(&path), Some(root.path()), None).0;
+    let find = |flag| locate_dial_in(flag, None, None, Some(&path), Some(root.path()), None, None).0;
 
     // Not on PATH: the ~/.local/bin fallback.
     assert_eq!(find(None), local.join(DIAL_NAME));
@@ -295,7 +296,7 @@ fn engine_origin_names_the_rule_that_chose_it() {
     write_engine(&local);
     let path = std::env::join_paths([&bin]).unwrap();
     let at = |flag: Option<&str>, env: Option<&str>| {
-        locate_dial_in(flag.map(Into::into), env.map(Into::into), None, Some(&path), Some(root.path()), None).1
+        locate_dial_in(flag.map(Into::into), env.map(Into::into), None, Some(&path), Some(root.path()), None, None).1
     };
 
     assert_eq!(at(None, None), EngineOrigin::Fallback);
@@ -304,6 +305,27 @@ fn engine_origin_names_the_rule_that_chose_it() {
     assert_eq!(at(None, Some("/opt/x/dial")), EngineOrigin::Env);
     assert_eq!(at(Some("/opt/y/dial"), Some("/opt/x/dial")), EngineOrigin::Flag);
     assert_eq!(at(Some(""), Some("")), EngineOrigin::Path);
+}
+
+#[test]
+fn the_shipped_engine_is_used_only_when_none_is_installed() {
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("Dial.app/Contents/MacOS");
+    let local = root.path().join(".local/bin");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    let exe = app.join("dial-desktop");
+    std::fs::write(&exe, b"").unwrap();
+    assert_eq!(bundled_engine(&exe), None);
+    write_engine(&app);
+    let shipped = bundled_engine(&exe).expect("the engine beside the app");
+    assert_eq!(shipped, app.join(DIAL_NAME));
+    let empty = std::env::join_paths([root.path().join("nothing")]).unwrap();
+    let at = || locate_dial_in(None, None, None, Some(&empty), Some(root.path()), None, Some(&shipped));
+    assert_eq!(at(), (shipped.clone(), EngineOrigin::Bundled));
+    write_engine(&local);
+    assert_eq!(at(), (local.join(DIAL_NAME), EngineOrigin::Fallback));
+    assert_eq!(locate_dial_in(None, None, None, Some(&empty), Some(root.path()), None, None).1, EngineOrigin::Fallback);
 }
 
 #[test]
@@ -322,7 +344,7 @@ fn settings_choice_ranks_below_flag_and_env_but_above_the_usual_order() {
     let path = std::env::join_paths([&bin]).unwrap();
     let picked = custom.join(DIAL_NAME);
     let at = |flag: Option<&str>, env: Option<&str>, choice: Option<EngineChoice>| {
-        locate_dial_in(flag.map(Into::into), env.map(Into::into), choice.as_ref(), Some(&path), Some(home), Some(&desktop))
+        locate_dial_in(flag.map(Into::into), env.map(Into::into), choice.as_ref(), Some(&path), Some(home), Some(&desktop), None)
     };
     let custom_choice = || Some(EngineChoice::Custom { path: picked.clone() });
 
@@ -345,7 +367,7 @@ fn settings_choice_ranks_below_flag_and_env_but_above_the_usual_order() {
     assert!(choice_ignored(gone.as_ref(), origin).is_some());
     // PATH asked for but empty: the usual order, with a warning.
     let empty = std::env::join_paths([home.join("nothing")]).unwrap();
-    let origin = locate_dial_in(None, None, Some(&EngineChoice::Path), Some(&empty), Some(home), Some(&desktop)).1;
+    let origin = locate_dial_in(None, None, Some(&EngineChoice::Path), Some(&empty), Some(home), Some(&desktop), None).1;
     assert_eq!(origin, EngineOrigin::Desktop);
     assert!(choice_ignored(Some(&EngineChoice::Path), origin).is_some());
 }

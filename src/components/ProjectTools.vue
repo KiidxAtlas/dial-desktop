@@ -22,7 +22,7 @@ import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { OpenSnapshot } from "../types";
 import { openExternal, providerApi, showToast, type ProviderEvent } from "../bridge";
 import { mcpLoginRequest, openTaskTerminal, words as commandWords } from "../commandRunner";
-import { dueLabel, nextRun, saveSchedule, schedulerHeadline, type SchedulerStatus } from "../schedules";
+import { dueLabel, nextRun, saveSchedule, schedulerHeadline, type SchedulerService, type SchedulerStatus } from "../schedules";
 import { applySaved, count, engineCall, loadEngineCommands, readable, tryEngine, usd } from "../engineTools";
 import { installedPackages, listedSkills, type SkillPackage } from "../skills";
 import SPage from "./settings/SPage.vue";
@@ -141,7 +141,7 @@ const overall = computed(() => {
     ["Sessions", count(s.sessions)],
     ["Tool calls", count(s.tool_calls)],
     ["Cost", usd(o.cost_usd)],
-    ["Errors", o.error_rate != null ? `${o.error_rate.toFixed(1)}%` : "—"],
+    ["Request errors", o.error_rate != null ? `${o.error_rate.toFixed(1)}%` : "—"],
   ];
 });
 const daily = computed<{ day: string; requests: number }[]>(() => report.value?.daily ?? []);
@@ -358,6 +358,7 @@ watch([mcpLoginRequest, () => props.which, live], ([server, which, connected]) =
 const customName = ref("");
 const customKind = ref<"command" | "url">("command");
 const customTarget = ref("");
+const customSandbox = ref(false);
 /** Save a server that is not in the catalog: a command to run, or a remote address. */
 async function addCustomServer() {
   const name = customName.value.trim();
@@ -370,16 +371,21 @@ async function addCustomServer() {
   } else {
     const [program, ...args] = commandWords(target);
     if (!program) return showToast("Enter the command that starts the server");
-    value = { program, args };
+    value = customSandbox.value ? { program, args, sandbox: true } : { program, args };
   }
   const exists = (data.value?.mcp ?? []).some((x: any) => x.id === name);
-  const what = customKind.value === "url" ? "connects to this address" : "runs this command on your computer";
+  const what = customKind.value === "url"
+    ? "connects to this address"
+    : customSandbox.value
+      ? "runs this command inside Dial's OS sandbox"
+      : "runs this command on your computer";
   if (!(await ask(`${exists ? "Replace" : "Add"} the MCP server ${name}?\n\n${target}\n\nDial ${what} whenever a session starts, in every project.`, { title: "Add MCP server", kind: "warning", okLabel: exists ? "Replace" : "Add" }))) return;
   busy.value = "custom";
   try {
     await engineCall("set_setting", { key: `mcp.${name}`, value, scope: "global" });
     await applySaved().catch(reloadFailed);
     customName.value = customTarget.value = "";
+    customSandbox.value = false;
     showToast(`Added ${name}`);
     await load();
   } catch (e) {
@@ -534,6 +540,10 @@ async function refreshRunner(withEngine = false) {
     const status = await invoke<SchedulerStatus>("scheduler_status", { workspaceRoot: root });
     if (props.snap.workspace.root === root) runner.value = status;
   } catch { /* an older app build: the card shows the engine's view only */ }
+  try {
+    const svc = await invoke<SchedulerService>("scheduler_service_status", { workspaceRoot: root });
+    if (props.snap.workspace.root === root) service.value = svc;
+  } catch { service.value = null; }
   // The engine's lease probe also sees schedulers this app does not own (a Terminal tab).
   if (withEngine && live.value && props.which === "schedules") {
     const [status, list] = await Promise.all([engineCall("schedule_status", {}, root).catch(() => undefined), engineCall("list_schedules", {}, root).catch(() => undefined)]);
@@ -568,6 +578,18 @@ async function offerBackground(root: string) {
   if (props.snap.workspace.root !== root || runner.value?.background != null || runnerActive.value || extra.value?.running) return;
   const yes = await consent(root, "Run schedules in the background");
   if (props.snap.workspace.root === root) await callRunner(yes ? "scheduler_start" : "scheduler_stop", yes);
+}
+// A scheduler registered with launchd / systemd keeps running after the app quits.
+const service = ref<SchedulerService | null>(null);
+async function setService(on: boolean) {
+  const root = props.snap.workspace.root;
+  if (on && !(await ask(`Keep running ${root}'s saved schedules after Dial quits? Dial registers a background service that starts at login and runs due tasks with each schedule's saved tool approvals. A sleeping computer runs nothing; due tasks run when it wakes. Turn this off here to remove the service.`, { title: "Keep running after Dial quits", kind: "warning", okLabel: "Keep running", cancelLabel: "Not now" }))) return;
+  runnerBusy.value = true;
+  try {
+    service.value = await invoke<SchedulerService>("scheduler_service_set", { workspaceRoot: root, on });
+    await refreshRunner(true);
+  } catch (e) { showToast(readable(e)); }
+  finally { runnerBusy.value = false; }
 }
 let timer: ReturnType<typeof setInterval> | undefined;
 let ticks = 0;
@@ -642,9 +664,9 @@ onBeforeUnmount(() => {
             </tbody>
           </table>
           <table v-if="tools.length" class="table">
-            <thead><tr><th>Tool</th><th>Calls</th><th>Errors</th><th>Avg time</th></tr></thead>
+            <thead><tr><th>Tool</th><th>Calls</th><th title="Commands that exited nonzero or checks that reported a failure">Command/check findings</th><th>Execution failures</th><th>Unclassified errors</th><th>Avg time</th></tr></thead>
             <tbody>
-              <tr v-for="t in tools" :key="t.key ?? t.label"><td class="mono">{{ t.label ?? t.key }}</td><td>{{ count(t.calls) }}</td><td>{{ (t.error_rate ?? 0).toFixed(1) }}%</td><td>{{ ((t.avg_ms ?? 0) / 1000).toFixed(1) }}s</td></tr>
+              <tr v-for="t in tools" :key="t.tool"><td class="mono">{{ t.tool }}</td><td>{{ count(t.calls) }}</td><td>{{ count(t.error_breakdown?.command_or_check) }}</td><td>{{ count(t.error_breakdown?.execution_failure) }}</td><td>{{ count(t.error_breakdown?.unclassified) }}</td><td>{{ ((t.avg_ms ?? 0) / 1000).toFixed(1) }}s</td></tr>
             </tbody>
           </table>
         </SGroup>
@@ -792,6 +814,10 @@ onBeforeUnmount(() => {
               <input v-model="customTarget" class="s-input grow mono" :aria-label="customKind === 'url' ? 'Server address' : 'Command'" required spellcheck="false" :placeholder="customKind === 'url' ? 'https://example.com/mcp' : 'npx -y @scope/server --flag'" />
               <button class="btn btn-primary" :disabled="busy === 'custom' || !customName.trim() || !customTarget.trim()">{{ busy === "custom" ? "Adding…" : "Add server" }}</button>
             </div>
+            <label v-if="customKind === 'command'" class="opt">
+              <input v-model="customSandbox" type="checkbox" />
+              Run inside OS sandbox (blocks ~/.ssh, ~/.aws, and Dial credentials)
+            </label>
           </form>
         </SGroup>
       </template>
@@ -885,8 +911,11 @@ onBeforeUnmount(() => {
             <button v-if="headline.ours" class="btn btn-secondary" :disabled="runnerBusy" @click="callRunner('scheduler_stop')">Stop</button>
             <button v-else class="btn btn-secondary" :disabled="runnerBusy || !schedules.length || !!extra?.running" @click="startBackground">Start</button>
           </div>
-          <SRow label="Run schedules in the background while this project is open">
+          <SRow v-if="!service?.installed" label="Run schedules in the background while this project is open">
             <SSwitch :model-value="runner?.background === true" label="Run schedules in the background" :disabled="runnerBusy" @update:model-value="setBackground" />
+          </SRow>
+          <SRow v-if="service" label="Keep running after Dial quits" :description="[service.detail, service.installed && service.log && `Log: ${service.log}`].filter(Boolean).join(' ')">
+            <SSwitch :model-value="service.installed" label="Keep running after Dial quits" :disabled="runnerBusy || !service.supported || (!service.installed && !schedules.length)" @update:model-value="setService" />
           </SRow>
           <div class="s-row stacked">
             <div class="inline">

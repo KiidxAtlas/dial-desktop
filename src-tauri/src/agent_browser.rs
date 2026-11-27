@@ -131,7 +131,13 @@ Dial Desktop itself: desktop_view shows what the window shows (add screenshot fo
 desktop_commands lists every palette action (sessions, panels, settings pages, theme, zoom, \
 projects) and desktop_run runs one; desktop_settings reads Dial's settings and \
 desktop_set_setting changes one, except permission and credential settings, which stay the \
-user's. Use them when the user asks you to show, open, switch or change something in the app.";
+user's. Use them when the user asks you to show, open, switch or change something in the app. \
+The board_* tools work with microcontroller boards and other serial devices through the Boards \
+panel: board_list shows the devices and this folder's firmware project, board_connect opens the \
+console the user watches, board_read and board_send talk to the device, board_build and \
+board_flash run the project's build and upload commands (the console's port is freed and reopened \
+for you), and board_run and board_put run and save code on MicroPython boards. Edit the firmware \
+source with your ordinary file tools, flash it, then read the console to check that it works.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -284,6 +290,7 @@ pub fn tools() -> Value {
     if let Value::Array(items) = &mut list {
         items.extend(desktop::tools());
         items.extend(crate::types::tools());
+        items.extend(crate::boards::agent_tools());
     }
     list
 }
@@ -858,8 +865,23 @@ pub fn remove_endpoint(file: &Path) {
     }
 }
 
+/// Concurrent local MCP bridge requests served at once; excess connections are dropped.
+const MAX_BRIDGE_CONNECTIONS: usize = 32;
+
+struct BridgeSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for BridgeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Serve tool calls on a loopback port and publish it in `file`.
 pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let endpoint = Endpoint {
         port: listener.local_addr()?.port(),
@@ -869,13 +891,24 @@ pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
     write_endpoint(file, &endpoint)?;
     let app = app.clone();
     let token = endpoint.token.clone();
+    let active = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name("agent-browser".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_BRIDGE_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let slot = BridgeSlot(active.clone());
                 let app = app.clone();
                 let token = token.clone();
-                thread::spawn(move || serve(&app, &stream, &token));
+                let _ = thread::Builder::new()
+                    .name("agent-browser-call".into())
+                    .spawn(move || {
+                        let _slot = slot;
+                        serve(&app, &stream, &token);
+                    });
             }
         })?;
     Ok(endpoint)
@@ -883,6 +916,7 @@ pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
 
 fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut line = String::new();
     if BufReader::new(stream.take(MAX_REQUEST))
         .read_line(&mut line)
@@ -906,6 +940,9 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
             if tool.starts_with("types_") {
                 let store = app.state::<crate::types::Store>();
                 return crate::types::agent_call(app, &store, tool, args).map(Reply::text);
+            }
+            if tool.starts_with("board_") {
+                return crate::boards::agent_call(app, &request.workspace, tool, args);
             }
             if desktop::TOOLS.contains(&tool) {
                 return desktop::call(app, tool, args);

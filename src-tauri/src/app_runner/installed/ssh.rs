@@ -105,13 +105,17 @@ pub(crate) fn save(data_dir: &Path, vm_id: &str, host: Option<&str>) -> Result<(
     }
     let file = links_file(data_dir);
     let write = || -> std::io::Result<()> {
-        if let Some(dir) = file.parent() {
-            fs::create_dir_all(dir)?;
-        }
+        use std::io::Write;
+        let dir = file
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no parent folder"))?;
+        fs::create_dir_all(dir)?;
         let json = serde_json::to_vec_pretty(&links).map_err(std::io::Error::other)?;
-        let tmp = file.with_extension("tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, &file)
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(&json)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&file).map_err(|e| e.error)?;
+        Ok(())
     };
     write().map_err(|_| "Dial could not save the VM's SSH link.".to_owned())
 }

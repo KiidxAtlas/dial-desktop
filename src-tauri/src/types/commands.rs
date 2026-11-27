@@ -1,0 +1,232 @@
+//! Tauri UI commands for Types. Every command is restricted to the main desktop webview.
+
+use super::{
+    Full, Item, ItemPatch, Location, MAX_IMAGE, Scope, Source, Store, Summary, TypeDef, changed,
+};
+use serde_json::{Map, Value};
+use std::path::Path;
+use tauri::{AppHandle, State};
+
+#[tauri::command]
+pub fn types_list(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+) -> Result<Vec<Summary>, String> {
+    crate::app::main_only(&webview, "list types")?;
+    store.list()
+}
+
+#[tauri::command]
+pub fn types_get(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    id: String,
+) -> Result<Full, String> {
+    crate::app::main_only(&webview, "open types")?;
+    store.get(&id)
+}
+
+/// Where new types are kept, and the open project's folder for them.
+#[tauri::command]
+pub fn types_location(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+) -> Result<Location, String> {
+    crate::app::main_only(&webview, "read type storage location")?;
+    Ok(store.location())
+}
+
+/// Choose where new types are kept: with the app, or in the open project.
+#[tauri::command]
+pub fn types_set_location(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    save_in: Scope,
+) -> Result<Location, String> {
+    crate::app::main_only(&webview, "change type storage location")?;
+    store.set_save_in(save_in)?;
+    Ok(store.location())
+}
+
+#[tauri::command]
+pub fn types_create(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    def: TypeDef,
+) -> Result<TypeDef, String> {
+    crate::app::main_only(&webview, "create types")?;
+    let def = store.create(def)?;
+    changed(&app, Some(&def.id));
+    Ok(def)
+}
+
+#[tauri::command]
+pub fn types_update(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    patch: Value,
+) -> Result<TypeDef, String> {
+    crate::app::main_only(&webview, "update types")?;
+    let mut def = store.update(&id, &patch)?;
+    changed(&app, Some(&id));
+    def.html.clear();
+    Ok(def)
+}
+
+#[tauri::command]
+pub fn types_claim_session(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    root: String,
+    session: String,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "link type sessions")?;
+    store.claim_session(&id, root, session)?;
+    changed(&app, Some(&id));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn types_delete(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "delete types")?;
+    store.delete(&id)?;
+    changed(&app, None);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn types_add_item(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    fields: Map<String, Value>,
+    source: Option<Source>,
+    allow_import: Option<bool>,
+) -> Result<Item, String> {
+    crate::app::main_only(&webview, "add type items")?;
+    let (item, _) = store.add_item_with(&id, fields, source, allow_import.unwrap_or(true))?;
+    changed(&app, Some(&id));
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn types_update_item(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    item_id: String,
+    patch: ItemPatch,
+    allow_import: Option<bool>,
+) -> Result<Item, String> {
+    crate::app::main_only(&webview, "update type items")?;
+    let item = store.update_item_with(&id, &item_id, patch, allow_import.unwrap_or(true))?;
+    changed(&app, Some(&id));
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn types_remove_item(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    item_id: String,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "remove type items")?;
+    store.remove_item(&id, &item_id)?;
+    changed(&app, Some(&id));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn types_move_item(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    item_id: String,
+    to: usize,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "reorder type items")?;
+    store.move_item(&id, &item_id, to)?;
+    changed(&app, Some(&id));
+    Ok(())
+}
+
+/// The app saves its own state (`dial.setState`).
+#[tauri::command]
+pub fn types_set_state(
+    webview: tauri::Webview,
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+    state: Value,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "save type state")?;
+    // No change event: the app already holds this state, and a reload of it would re-render the
+    // app from its own write.
+    let _ = app;
+    store.set_state(&id, &state)
+}
+
+#[tauri::command]
+pub fn types_import_image(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    id: String,
+    path: String,
+) -> Result<String, String> {
+    crate::app::main_only(&webview, "import type images")?;
+    store.import_image(&id, Path::new(&path))
+}
+
+/// Save pasted or generated bytes (base64) as an asset.
+#[tauri::command]
+pub fn types_import_image_data(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    id: String,
+    data: String,
+) -> Result<String, String> {
+    crate::app::main_only(&webview, "import type images")?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|_| "Not base64 image data".to_owned())?;
+    if bytes.len() as u64 > MAX_IMAGE {
+        return Err("Images are at most 25 MB".into());
+    }
+    store.store_image(&id, &bytes)
+}
+
+/// Open a saved type asset image in the system's default viewer.
+#[tauri::command]
+pub async fn types_open_asset(
+    webview: tauri::Webview,
+    store: State<'_, Store>,
+    path: String,
+) -> Result<(), String> {
+    crate::app::main_only(&webview, "open type images")?;
+    let resolved = store.resolve_asset(Path::new(&path))?;
+    if crate::attachments::image_mime(&resolved).is_none() {
+        return Err("That file is not an image".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        tauri_plugin_opener::open_path(&resolved, None::<&str>)
+            .map_err(|e| format!("Could not open image: {e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

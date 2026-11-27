@@ -8,10 +8,11 @@ import { ask } from "@tauri-apps/plugin-dialog";
 import { sessionToolsApi, showToast, snapshot } from "../bridge";
 import { applySaved, engineCall, readable } from "../engineTools";
 import {
-  computerSetting, engineTooOld, hookFromDraft, joinCommand, savedHook, sshFromDraft,
+  engineTooOld, hookFromDraft, joinCommand, savedHook, sshFromDraft,
   type Hook, type HookDraft, type SshDraft, type SshHost,
 } from "../integrations";
 import Icon from "./Icon.vue";
+import ComputerUseSettings from "./ComputerUseSettings.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
 
@@ -223,50 +224,6 @@ const profileAbout = (p: Profile) =>
   [p.provider && p.model ? `${p.provider}/${p.model}` : p.model, p.reasoning_effort ? `${p.reasoning_effort} reasoning` : "", p.context_window ? `${Math.round(p.context_window / 1000)}k context` : ""]
     .filter(Boolean).join(" · ");
 
-// ── Computer use (`/computer`) ───────────────────────────────────────────────
-interface ComputerStatus { enabled: boolean; max_width: number; max_height: number; capabilities: Record<string, unknown> | null; unavailable: string | null }
-const computer = ref<ComputerStatus | null>(null);
-const computerError = ref("");
-const computerBusy = ref(false);
-
-async function loadComputer() {
-  computerError.value = "";
-  try {
-    computer.value = await engineCall<ComputerStatus>("computer_status");
-  } catch (e) {
-    if (engineTooOld(e)) computerError.value = "Update the engine in Settings → Updates to manage computer use here; until then /computer works in the terminal.";
-    else computerError.value = readable(e);
-  }
-}
-
-const denied = computed(() => {
-  const caps = computer.value?.capabilities ?? {};
-  return ([["capturePermission", "Screen Recording"], ["inputPermission", "Accessibility"]] as const)
-    .filter(([key]) => caps[key] === "denied").map(([, label]) => label);
-});
-
-/** Add or remove `computer` in the saved `integrations` list, as `/computer on|off` does. */
-async function setComputer(on: boolean) {
-  if (computerBusy.value || !computer.value) return;
-  const root = snapshot.value?.workspace?.root;
-  if (!root) return;
-  computerBusy.value = true;
-  computerError.value = "";
-  try {
-    if (on && !(await ask("Let Dial see the screen and use the mouse and keyboard? Every run and input action asks for approval first; screenshots and window lists do not.", { title: "Turn on computer use", kind: "warning", okLabel: "Turn on" }))) return;
-    const current = await engineCall<Parameters<typeof computerSetting>[0]>("get_settings", { key: "integrations" }, root);
-    await engineCall("set_setting", computerSetting(current, on), root);
-    if (snapshot.value?.workspace?.root !== root) return;
-    await applySaved(); // Uses Desktop's existing deferred reload if a turn is in progress.
-    showToast(`Computer use preference saved: ${on ? "on" : "off"}`);
-    await loadComputer();
-  } catch (e) {
-    computerError.value = readable(e);
-  } finally {
-    computerBusy.value = false;
-  }
-}
-
 // ── Collaboration relay (`dial relay`) ───────────────────────────────────────
 const relayBind = ref<string | null>(null);
 const relayAddress = ref("127.0.0.1:7331");
@@ -288,13 +245,13 @@ async function relay(action: "status" | "start" | "stop") {
   }
 }
 
-function load() {
+async function load() {
   void relay("status");
   if (!live.value) return;
-  void loadHooks();
-  void loadHosts();
-  void loadProfiles();
-  void loadComputer();
+  // Profiles needs two reads; don't launch both alongside hooks, hosts and computer status.
+  const root = snapshot.value?.workspace?.root;
+  await Promise.all([loadHooks(), loadHosts()]);
+  if (live.value && snapshot.value?.workspace?.root === root && !tooOld.value) await loadProfiles();
 }
 onMounted(load);
 </script>
@@ -420,25 +377,8 @@ onMounted(load);
         <button v-else class="btn btn-secondary" :disabled="profileBusy" @click="useProfile(String(name))">Use</button>
       </SRow>
     </SGroup>
-
-    <SGroup title="Computer use" description="Lets Dial take screenshots and control the mouse and keyboard on this machine.">
-      <SRow v-if="computerError" label="Could not check computer use" :description="computerError" />
-      <SRow v-else-if="!computer" label="Checking…" />
-      <SRow v-else-if="computer.unavailable && !computer.enabled" label="Not available here" :description="computer.unavailable" />
-      <template v-else>
-        <SRow
-          :label="computer.enabled ? 'On' : 'Off'"
-          :description="computer.enabled
-            ? `Screenshots are scaled to at most ${computer.max_width}×${computer.max_height}. Each run and input action asks first.`
-            : 'Turn on to let Dial operate apps on screen, with your approval for each action.'"
-        >
-          <button class="btn btn-secondary" :disabled="computerBusy" @click="setComputer(!computer.enabled)">{{ computerBusy ? "Saving…" : computer.enabled ? "Turn off" : "Turn on" }}</button>
-        </SRow>
-        <SRow v-if="computer.unavailable" label="Not available here" :description="computer.unavailable" />
-        <SRow v-if="denied.length" label="Permission needed" :description="`Grant ${denied.join(' and ')} to Dial in System Settings → Privacy & Security, then restart Dial.`" />
-      </template>
-    </SGroup>
   </template>
+  <ComputerUseSettings v-if="live && snapshot?.workspace" :key="snapshot.workspace.root" :root="snapshot.workspace.root" />
 
   <SGroup title="Collaboration relay" description="A relay others can join your shared sessions through. Rooms stay end-to-end encrypted; the relay only forwards them. It stops when Dial quits.">
     <SRow v-if="relayBind" label="Running" :description="`Listening on ${relayBind}`">

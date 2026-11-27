@@ -1,6 +1,6 @@
 [package]
 name = "dial-desktop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 description = "Native desktop interface for the Dial coding agent"
@@ -21,8 +21,8 @@ tauri-build = { version = "2", features = [] }
 # The only link to Dial: the versioned `dial rpc` wire protocol through its Rust client. Pinned to
 # a commit of Dial's main branch; bump `rev` deliberately. To develop against a local Dial checkout,
 # see "Developing against a local Dial" in README.md.
-dial-client = { git = "https://github.com/KiidxAtlas/dial.git", rev = "ec9cc3c29eee54a36d9ac324d95522a04136bb28" }
-tauri = { version = "2", features = ["unstable"] }
+dial-client = { git = "https://github.com/KiidxAtlas/dial.git", rev = "4766540c1ddd81d446223edb0ea5bc7fe5d3602a" }
+tauri = { version = "2", features = ["unstable", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive", "rc"] }
@@ -35,8 +35,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 base64 = "0.23"
 portable-pty = "0.9"
+serialport = { version = "4.8", default-features = false }
+nusb = "0.2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+notify = "8"
 
 # Signals to child processes (`scheduler::end`).
 [target.'cfg(unix)'.dependencies]

@@ -4,6 +4,9 @@ import { IMAGE_FILE, imageMime, MAX_ATTACHMENTS, MAX_FILE_BYTES } from './attach
 import type { Draft } from './drafts';
 import type { Attachment } from './types';
 
+/** Anything holding a list of attachments: the composer's draft, a question's answer. */
+type Target = Pick<Draft, 'attachments'>;
+
 export { IMAGE_FILE } from './attachmentFormats';
 
 // A persisted draft key, not a credential. getRandomValues is available on older WebKit too.
@@ -11,14 +14,14 @@ function attachmentKey(): string {
   return Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, '0')).join('');
 }
 
-function hasRoom(draft: Draft): boolean {
+function hasRoom(draft: Target): boolean {
   if (draft.attachments.length < MAX_ATTACHMENTS) return true;
   showToast(`Attach at most ${MAX_ATTACHMENTS} files to one prompt`);
   return false;
 }
 
 /** Check again after async reads: another batch may have filled the draft. */
-function append(draft: Draft, attachment: Attachment): boolean {
+function append(draft: Target, attachment: Attachment): boolean {
   if (attachment.path !== null && draft.attachments.some(a => a.path === attachment.path)) return true;
   if (!hasRoom(draft)) return false;
   draft.attachments.push(attachment);
@@ -26,7 +29,7 @@ function append(draft: Draft, attachment: Attachment): boolean {
 }
 
 /** Check path-only files now for useful feedback; send still validates the current file. */
-export async function addPaths(draft: Draft, paths: string[]) {
+export async function addPaths(draft: Target, paths: string[]) {
   for (const path of new Set(paths)) {
     if (draft.attachments.some(a => a.path === path)) continue;
     if (!hasRoom(draft)) return;
@@ -57,7 +60,7 @@ function readBase64(file: File): Promise<string> {
 }
 
 /** DOM clipboard files expose bytes rather than a local path. */
-export async function addBlobs(draft: Draft, blobs: File[]) {
+export async function addBlobs(draft: Target, blobs: File[]) {
   for (const blob of blobs) {
     const mime = imageMime(blob);
     const name = blob.name || (mime ? `Pasted image.${mime.slice(6)}` : 'Pasted file');

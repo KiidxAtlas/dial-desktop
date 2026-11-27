@@ -10,6 +10,21 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+mod diff;
+mod git_ops;
+mod search;
+pub use diff::{diff, diff_scoped, revert_hunk, stage_hunk, unstage_hunk};
+pub use git_ops::{
+    GitSyncCanceller, git_branches, git_checkout, git_resolve_conflict, git_stash, git_sync,
+    git_sync_cancellable,
+};
+pub use search::grep;
+#[cfg(test)]
+use diff::split_hunks;
+#[cfg(test)]
+use git_ops::format_git_sync_error;
 
 /// Larger files are shown truncated.
 const MAX_READ: u64 = 512 * 1024;
@@ -102,6 +117,9 @@ pub struct FileView {
     pub size: u64,
     /// Only the first part of a large file is in `text`.
     pub truncated: bool,
+    /// SHA-256 hex digest of the complete file on disk, used for optimistic conflict detection on save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// The uncommitted changes of one file, as a unified diff.
@@ -117,14 +135,48 @@ pub struct DiffView {
     pub delete_on_revert: bool,
     /// Child repositories can be inspected without authorizing writes to their indexes.
     pub nested: bool,
+    /// Whether this file currently has unresolved Git merge conflicts in the index.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub conflicted: bool,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DiffBase {
     Head,
     Index,
     Untracked,
+}
+
+/// Which side of Git's index a file diff inspects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffScope {
+    /// Working tree against `HEAD` (both staged and unstaged changes).
+    #[default]
+    All,
+    /// Working tree against Git's index (unstaged changes only).
+    Unstaged,
+    /// Git's index against `HEAD` (staged changes only).
+    Staged,
+}
+
+/// Local branches and upstream sync state for the workspace repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchInfo {
+    pub current: Option<String>,
+    pub local: Vec<String>,
+    pub upstream: Option<String>,
+    pub ahead: u64,
+    pub behind: u64,
+}
+
+/// One saved entry from `git stash list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStashEntry {
+    pub reference: String,
+    pub summary: String,
 }
 
 /// `path` (absolute, or relative to `root`) as an absolute path inside `root`; refuses anything
@@ -163,14 +215,19 @@ fn outside(path: &str) -> String {
     format!("{path} is outside the project folder")
 }
 
-/// `path` relative to `root`, `/`-separated.
-fn relative(root: &Path, path: &Path) -> String {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let rel = path.strip_prefix(&root).unwrap_or(path);
+/// `path` relative to an already-canonicalized `canonical_root`, `/`-separated.
+fn relative_to(canonical_root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(canonical_root).unwrap_or(path);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// `path` relative to `root`, `/`-separated.
+fn relative(root: &Path, path: &Path) -> String {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    relative_to(&canonical_root, path)
 }
 
 /// The entries of folder `path` (empty for the project root): folders first, then by name.
@@ -185,6 +242,7 @@ pub fn list_with(root: &Path, path: &str, show_ignored: bool) -> Result<Vec<DirE
     let dir = panel_entry(root, path)?;
     let meta = fs::symlink_metadata(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
     if !meta.is_dir() || directory_reparse_point(&meta) { return Err(format!("{path} is not a plain folder")); }
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let entries = fs::read_dir(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
     let mut out: Vec<DirEntryView> = entries
         .flatten()
@@ -197,7 +255,7 @@ pub fn list_with(root: &Path, path: &str, show_ignored: bool) -> Result<Vec<DirE
             let meta = entry.metadata().ok()?;
             let is_dir = meta.is_dir() && !directory_reparse_point(&meta);
             Some(DirEntryView {
-                path: relative(root, &dir.join(&name)),
+                path: relative_to(&canonical_root, &dir.join(&name)),
                 name,
                 dir: is_dir,
                 ignored: false,
@@ -663,55 +721,176 @@ pub fn revert(root: &Path, path: &str) -> Result<(), String> {
     }
 }
 
-/// Undo one hunk of file `path`'s uncommitted changes in the working tree. `hunk` is the hunk as
-/// the diff panel showed it (its `@@` header and lines); it must still be in the file's current
-/// diff, so a stale or edited hunk is refused rather than guessed at. The UI confirms first.
-pub fn revert_hunk(root: &Path, path: &str, hunk: &str) -> Result<(), String> {
-    let shown = diff(root, path)?;
-    if shown.nested { return Err("Open the nested repository as a project to change it".into()); }
-    if shown.base == DiffBase::Untracked {
-        return Err(format!("{path} is a new file; revert the whole file instead"));
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
     }
-    let (head, hunks) = split_hunks(&shown.diff);
-    let wanted = hunk.trim_end_matches('\n');
-    let Some(found) = hunks.into_iter().find(|h| h.trim_end_matches('\n') == wanted) else {
-        return Err("That change is no longer in the file. Refresh the diff and try again.".into());
-    };
-    let top = git_in(root, &["rev-parse", "--show-toplevel"])?;
-    let top = std::str::from_utf8(&top.stdout).map_err(|_| "Cannot address the Git work tree")?;
-    let top = PathBuf::from(top.trim_end_matches(['\n', '\r']));
-    let mut patch = format!("{head}{found}");
-    if !patch.ends_with('\n') {
-        patch.push('\n');
-    }
-    let output = git_with_input(&top, &["apply", "-R", "--whitespace=nowarn", "-"], patch.into_bytes())
-        .map_err(|e| format!("Could not run git: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "The change could not be undone cleanly: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    hex
 }
 
-/// A one-file unified diff split into its header (everything before the first `@@`) and hunks,
-/// each with its trailing newline.
-fn split_hunks(diff: &str) -> (&str, Vec<&str>) {
-    let Some(first) = diff.find("\n@@ ").map(|i| i + 1).or_else(|| diff.starts_with("@@ ").then_some(0))
-    else {
-        return (diff, Vec::new());
-    };
-    let mut hunks = Vec::new();
-    let mut start = first;
-    while let Some(next) = diff[start + 1..].find("\n@@ ") {
-        let end = start + 1 + next + 1;
-        hunks.push(&diff[start..end]);
-        start = end;
+/// Atomically replace `target` via a sibling temp file + `sync_all` + `rename`.
+fn atomic_write(
+    target: &Path,
+    bytes: &[u8],
+    preserve_perms: Option<fs::Permissions>,
+    label: &str,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("Cannot determine parent folder for {label}"))?;
+    let pid = std::process::id();
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for _ in 0..16 {
+        let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".dial-tmp-{pid}-{seq}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Cannot stage save for {label}: {e}")),
+        }
     }
-    hunks.push(&diff[start..]);
-    (&diff[..first], hunks)
+    let (temp_path, mut file) = match (temp_path, temp_file) {
+        (Some(p), Some(f)) => (p, f),
+        _ => return Err(format!("Cannot create temporary file for {label}")),
+    };
+    let result = (|| -> Result<(), String> {
+        file.write_all(bytes)
+            .map_err(|e| format!("Cannot save {label}: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Cannot flush {label}: {e}"))?;
+        if let Some(perms) = preserve_perms {
+            let _ = file.set_permissions(perms);
+        }
+        drop(file);
+        fs::rename(&temp_path, target).map_err(|e| format!("Cannot save {label}: {e}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+/// Write text `content` atomically to an existing plain file inside the workspace, refusing
+/// escapes, `.git` metadata, symlinks, oversized payloads and stale writes when `expected_sha256`
+/// no longer matches the file on disk. Returns the refreshed [`FileView`].
+pub fn write(
+    root: &Path,
+    path: &str,
+    content: &str,
+    expected_sha256: Option<&str>,
+) -> Result<FileView, String> {
+    if content.len() as u64 > MAX_READ {
+        return Err(format!(
+            "File is larger than the {} KB inline editor limit",
+            MAX_READ / 1024
+        ));
+    }
+    let entry = panel_entry(root, path)?;
+    let meta = fs::symlink_metadata(&entry).map_err(|e| format!("Cannot open {path}: {e}"))?;
+    if meta.is_symlink() {
+        return Err(format!("Cannot edit symlink {path} inline"));
+    }
+    if meta.is_dir() {
+        return Err(format!("{path} is a folder"));
+    }
+    if let Some(expected) = expected_sha256 {
+        let current = fs::read(&entry).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        if sha256_hex(&current) != expected {
+            return Err(format!(
+                "{path} changed on disk since you opened it. Reload the file and try again."
+            ));
+        }
+    }
+    atomic_write(&entry, content.as_bytes(), Some(meta.permissions()), path)?;
+    read(root, path)
+}
+/// Create a new text file atomically inside the workspace, refusing escapes, `.git`, symlinks,
+/// existing paths and oversized payloads. Creates missing parent directories safely.
+pub fn create_file(root: &Path, path: &str, content: &str) -> Result<FileView, String> {
+    if path.trim().is_empty() {
+        return Err("Enter a file path".into());
+    }
+    if content.len() as u64 > MAX_READ {
+        return Err(format!(
+            "File is larger than the {} KB inline editor limit",
+            MAX_READ / 1024
+        ));
+    }
+    let entry = panel_entry(root, path)?;
+    if fs::symlink_metadata(&entry).is_ok() {
+        return Err(format!("{path} already exists"));
+    }
+    if let Some(parent) = entry.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create folder for {path}: {e}"))?;
+    }
+    atomic_write(&entry, content.as_bytes(), None, path)?;
+    read(root, path)
+}
+
+/// Rename or move a file or folder inside the workspace, refusing escapes, `.git`, symlinks
+/// and overwriting an existing destination. Returns the new workspace-relative path.
+pub fn rename_file(root: &Path, from: &str, to: &str) -> Result<String, String> {
+    if to.trim().is_empty() {
+        return Err("Enter a destination path".into());
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
+    let src = panel_entry(root, from)?;
+    if src == canonical {
+        return Err("Cannot rename the project root".into());
+    }
+    let src_meta = fs::symlink_metadata(&src).map_err(|e| format!("Cannot open {from}: {e}"))?;
+    if src_meta.is_symlink() {
+        return Err(format!("Cannot rename symlink {from}"));
+    }
+    let dst = panel_entry(root, to)?;
+    if dst == canonical {
+        return Err("Cannot overwrite the project root".into());
+    }
+    if fs::symlink_metadata(&dst).is_ok() {
+        return Err(format!("{to} already exists"));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create folder for {to}: {e}"))?;
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("Cannot rename {from}: {e}"))?;
+    Ok(relative(&canonical, &dst))
+}
+
+/// Delete a plain file or empty folder inside the workspace, refusing escapes, `.git`,
+/// symlinks and the project root.
+pub fn delete_file(root: &Path, path: &str) -> Result<(), String> {
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
+    let entry = panel_entry(root, path)?;
+    if entry == canonical {
+        return Err("Cannot delete the project root".into());
+    }
+    let meta = fs::symlink_metadata(&entry).map_err(|e| format!("Cannot open {path}: {e}"))?;
+    if meta.is_symlink() {
+        return Err(format!("Cannot delete symlink {path}"));
+    }
+    if meta.is_dir() {
+        fs::remove_dir(&entry).map_err(|e| format!("Cannot delete folder {path}: {e}"))
+    } else {
+        fs::remove_file(&entry).map_err(|e| format!("Cannot delete {path}: {e}"))
+    }
 }
 
 /// Stage (`git add`) or unstage files `paths`; unstaging keeps the working tree as it is.
@@ -927,123 +1106,6 @@ pub fn set_identity(root: &Path, name: &str, email: &str, everywhere: bool) -> R
     identity(root)
 }
 
-/// Longest line text a content search returns.
-const GREP_TEXT: usize = 200;
-/// Most matching lines a content search returns from one file.
-const GREP_PER_FILE: usize = 20;
-/// Bytes the non-Git content search reads at most, across all files.
-const GREP_WALK_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Lines containing `query` (case-insensitive, literal), up to `limit`: `git grep` over tracked and
-/// non-ignored files in a repository, else a bounded walk that skips build folders and reads text
-/// files up to [`MAX_READ`].
-pub fn grep(root: &Path, query: &str, limit: usize) -> Result<Vec<GrepMatch>, String> {
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("The project folder is unavailable: {e}"))?;
-    let query = query.trim();
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-    let cap = limit.clamp(1, 500);
-    if git_prefix(&root).is_some()
-        && let Some(found) = git_grep(&root, query, cap)
-    {
-        return Ok(found);
-    }
-    Ok(walk_grep(&root, query, cap))
-}
-
-fn grep_match(path: String, line: u64, text: &str) -> GrepMatch {
-    let text = text.trim_end_matches('\r').trim_start();
-    let text = match text.char_indices().nth(GREP_TEXT) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_owned(),
-    };
-    GrepMatch { path, line, text }
-}
-
-/// `git grep`, read as it streams and stopped at `cap`; `None` when Git fails.
-fn git_grep(root: &Path, query: &str, cap: usize) -> Option<Vec<GrepMatch>> {
-    use std::io::BufRead;
-    let mut child = crate::launcher::without_console(&mut Command::new("git"))
-        .arg("-C")
-        .arg(root)
-        // Paths relative to the workspace and no column field, whatever the user's settings.
-        .args(["-c", "grep.fullName=false", "-c", "grep.column=false"])
-        .args(["grep", "-n", "-I", "-i", "-F", "--untracked", "--no-color", "-z", "-e", query, "--", "."])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let reader = std::io::BufReader::new(child.stdout.take()?);
-    let mut out = Vec::new();
-    let mut per_file: HashMap<String, usize> = HashMap::new();
-    for line in reader.split(b'\n') {
-        let Ok(line) = line else { break };
-        let mut parts = line.splitn(3, |&b| b == 0);
-        let (Some(path), Some(number), Some(text)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let (Ok(path), Some(number)) = (
-            std::str::from_utf8(path),
-            std::str::from_utf8(number).ok().and_then(|n| n.parse().ok()),
-        ) else {
-            continue;
-        };
-        let seen = per_file.entry(path.to_owned()).or_default();
-        if *seen >= GREP_PER_FILE || resolve(root, path).is_err() {
-            continue;
-        }
-        *seen += 1;
-        out.push(grep_match(path.to_owned(), number, &String::from_utf8_lossy(text)));
-        if out.len() >= cap {
-            break;
-        }
-    }
-    let _ = child.kill();
-    let status = child.wait().ok()?;
-    // 1 means no match; anything else without results is a failure the walk may cover.
-    if out.is_empty() && !matches!(status.code(), Some(0 | 1)) {
-        return None;
-    }
-    Some(out)
-}
-
-/// The content search for folders outside Git.
-fn walk_grep(root: &Path, query: &str, cap: usize) -> Vec<GrepMatch> {
-    let needle = query.to_lowercase();
-    let mut out = Vec::new();
-    let mut budget = GREP_WALK_BYTES;
-    for path in walk_files(root) {
-        let Ok(file) = resolve(root, &path) else { continue };
-        let mut bytes = Vec::new();
-        let Ok(read) = fs::File::open(&file).and_then(|f| f.take(MAX_READ.min(budget)).read_to_end(&mut bytes)) else {
-            continue;
-        };
-        budget = budget.saturating_sub(read as u64);
-        if let Some(text) = decode_text(&bytes, true) {
-            let mut found = 0;
-            for (i, line) in text.lines().enumerate() {
-                if line.to_lowercase().contains(&needle) {
-                    out.push(grep_match(path.clone(), i as u64 + 1, line));
-                    found += 1;
-                    if out.len() >= cap {
-                        return out;
-                    }
-                    if found >= GREP_PER_FILE {
-                        break;
-                    }
-                }
-            }
-        }
-        if budget == 0 {
-            break;
-        }
-    }
-    out
-}
 
 
 /// Extensions the system would run rather than show, so "Open in editor" refuses them.
@@ -1090,11 +1152,13 @@ pub fn read(root: &Path, path: &str) -> Result<FileView, String> {
         .map_err(|e| format!("Cannot read {path}: {e}"))?;
     let truncated = size > MAX_READ;
     let text = decode_text(&bytes, truncated);
+    let sha256 = (!truncated).then(|| sha256_hex(&bytes));
     Ok(FileView {
         path: relative(root, &workspace_entry(root, path)?),
         text,
         size,
         truncated,
+        sha256,
     })
 }
 
@@ -1111,61 +1175,6 @@ fn decode_text(bytes: &[u8], truncated: bool) -> Option<String> {
         }
         Err(_) => None,
     }
-}
-
-/// The uncommitted changes of file `path` against Git's `HEAD` (or the index in a repository
-/// without commits). Untracked files show as entirely added.
-pub fn diff(root: &Path, path: &str) -> Result<DiffView, String> {
-    let workspace = root.canonicalize().map_err(|e| e.to_string())?;
-    let entry = panel_entry(root, path)?;
-    let nested = nested_owner(&workspace, &entry);
-    let root = nested.as_deref().unwrap_or(&workspace);
-    if nested.is_some() && !(worktree_marker(root) && is_worktree_root(root)) {
-        return Err("Cannot identify this nested Git worktree".into());
-    }
-    let file = git_file(root, &relative(root, &entry))?;
-    let (output, base) = if file.in_head || file.in_index {
-        // Hunk revert applies this single-file patch from the repository top.
-        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"];
-        if file.has_head { args.push("HEAD"); }
-        args.extend(["--", &file.rel]);
-        (git_in(root, &args)?, if file.has_head { DiffBase::Head } else { DiffBase::Index })
-    } else {
-        // `git diff --no-index` treats a symlink to a directory as the directory itself.
-        if file.entry.is_dir() { return Err(format!("Cannot diff {path} as an untracked directory link")); }
-        // Exit status 1 just means the files differ.
-        (
-            git_in(root, &[
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-index",
-                "--",
-                null_device(),
-                &file.rel,
-            ])?,
-            DiffBase::Untracked,
-        )
-    };
-    let differs = base == DiffBase::Untracked && output.status.code() == Some(1) && !output.stdout.is_empty();
-    if !output.status.success() && !differs {
-        return Err(format!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(DiffView {
-        path: relative(&workspace, &entry),
-        nested: nested.is_some(),
-        delete_on_revert: !file.in_head,
-        diff: String::from_utf8_lossy(&output.stdout).into_owned(),
-        base,
-    })
-}
-
-fn null_device() -> &'static str {
-    if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
 /// Fuzzy-search workspace files for `@` mentions in the composer, returning up to `limit`

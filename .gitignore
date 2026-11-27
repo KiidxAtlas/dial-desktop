@@ -8,3 +8,4 @@
 .DS_Store
 /src-tauri/resources/qemu/
 /src-tauri/resources/macos-guest/
+/src-tauri/binaries/

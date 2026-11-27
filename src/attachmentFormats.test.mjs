@@ -41,12 +41,16 @@ test('only trusted text-free pastes use native fallbacks; macOS TIFF screenshots
   ]) assert.equal(clipboardAction(event, platform).kind, kind, platform);
 });
 
-test('mixed sources marshal separately, including empty pasted files; text models get files instead of image inputs', () => {
+test('picked and pasted images send their preview bytes in order; only documents use workspace copies', () => {
   const documents = [{ name: 'report.pdf', path: '/report.pdf', data: null }, { name: 'data.bin', path: null, data: 'AP8=' }, { name: 'empty', path: null, data: '' }];
   const images = [{ name: 'photo.png', path: '/photo.png', data: null }, { name: 'Paste.png', path: null, data: 'aW1n' }];
-  const draft = [...images, ...documents].map((a, i) => ({ ...a, key: String(i), url: i < images.length ? 'data:image/png;base64,aW1n' : null }));
+  const draft = [...images, ...documents].map((a, i) => ({ ...a, key: String(i), url: ['data:image/png;base64,cGljaw==', 'data:image/png;base64,aW1n'][i] ?? null }));
   for (const vision of [true, null, undefined]) {
-    assert.deepEqual(attachmentPayload(draft, vision), { documents, images: ['/photo.png'], inlineImages: ['aW1n'] });
+    assert.deepEqual(attachmentPayload(draft, vision), { documents, images: [], inlineImages: ['cGljaw==', 'aW1n'] });
   }
-  assert.deepEqual(attachmentPayload(draft, false), { documents: [...images, ...documents], images: [], inlineImages: [] });
+  assert.throws(() => attachmentPayload(draft, false), /choose a vision-capable model/i);
+  assert.deepEqual(attachmentPayload(draft.slice(2), false), { documents, images: [], inlineImages: [] });
+  for (const url of ['file:///photo.png', 'data:image/png;base64,']) {
+    assert.throws(() => attachmentPayload([{ ...draft[0], url }], true), /attach it again/i);
+  }
 });

@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
-import type { Answer, Question, QuestionItem } from "../types";
-import { engine } from "../bridge";
+import type { Answer, Attachment, Question, QuestionItem } from "../types";
+import { engine, files, showToast, snapshot } from "../bridge";
+import { addBlobs, addPaths, IMAGE_FILE } from "../attachments";
+import { imageMime } from "../attachmentFormats";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ question: Question }>();
 
-/** Per question id: chosen option labels and free text. */
-const picks = reactive<Record<string, { selected: string[]; custom: string }>>({});
+/** Per question id: chosen option labels, free text and images attached to it. */
+const picks = reactive<Record<string, { selected: string[]; custom: string; attachments: Attachment[] }>>({});
+/** Images need a model that can see them; unknown (`null`) is allowed and the engine decides. */
+const canAttach = computed(() => snapshot.value?.model?.acceptsImages !== false);
 /** Set once an answer or skip went out, until the engine closes the question. */
 const sent = ref(false);
 /** With several questions, the one on screen; they are answered one at a time. */
@@ -21,7 +25,7 @@ function reset() {
   for (const key of Object.keys(picks)) delete picks[key];
   for (const item of props.question.items) {
     const suggested = item.recommended === null ? null : item.options[item.recommended]?.label;
-    picks[item.id] = { selected: suggested ? [suggested] : [], custom: "" };
+    picks[item.id] = { selected: suggested ? [suggested] : [], custom: "", attachments: [] };
   }
   sent.value = false;
   step.value = 0;
@@ -49,20 +53,47 @@ function toggle(item: QuestionItem, label: string) {
   }
 }
 
-/** Whether `item` can be sent: a single choice needs a pick or text; "any that apply" may be none. */
+/** Whether `item` can be sent: a single choice needs a pick, text or an image; "any that apply" may be none. */
 function done(item: QuestionItem) {
   const pick = picks[item.id];
-  return !!pick && (item.multi || pick.selected.length > 0 || pick.custom.trim() !== "");
+  return !!pick && (item.multi || pick.selected.length > 0 || pick.custom.trim() !== "" || pick.attachments.length > 0);
 }
 
 const canSubmit = computed(() => answerable.value && !sent.value && props.question.items.every(done));
+
+async function chooseImages(item: QuestionItem) {
+  const pick = picks[item.id];
+  if (!pick || sent.value) return;
+  try {
+    const paths = (await files.chooseFiles()).filter((path) => IMAGE_FILE.test(path));
+    await addPaths(pick, paths);
+  } catch (error) {
+    showToast(`Could not attach the image: ${error}`);
+  }
+}
+
+/** Pasting an image into the answer attaches it; text pastes stay normal. */
+function onPaste(item: QuestionItem, event: ClipboardEvent) {
+  const pick = picks[item.id];
+  const images = Array.from(event.clipboardData?.files ?? []).filter((f) => imageMime(f));
+  if (!pick || sent.value || !images.length || !canAttach.value) return;
+  event.preventDefault();
+  void addBlobs(pick, images);
+}
+
+function detach(item: QuestionItem, key: string) {
+  const pick = picks[item.id];
+  if (pick && !sent.value) pick.attachments = pick.attachments.filter((a) => a.key !== key);
+}
 
 async function submit() {
   if (!canSubmit.value) return;
   const answers: Answer[] = props.question.items.map((item) => {
     const pick = picks[item.id];
     const custom = pick.custom.trim();
-    return { id: item.id, selected: pick.selected, custom: custom || null };
+    const images = pick.attachments.flatMap((a) => (a.path !== null ? [a.path] : []));
+    const inlineImages = pick.attachments.flatMap((a) => (a.data !== null ? [a.data] : []));
+    return { id: item.id, selected: pick.selected, custom: custom || null, images, inlineImages };
   });
   sent.value = true;
   const id = props.question.id;
@@ -131,17 +162,37 @@ function onKey(event: KeyboardEvent) {
               </span>
             </button>
           </div>
-          <input
-            v-if="picks[item.id]"
-            v-model="picks[item.id].custom"
-            class="custom"
-            type="text"
-            data-prose
-            :disabled="sent"
-            :aria-label="item.text"
-            :placeholder="item.options.length ? 'Or type your own answer…' : 'Type your answer…'"
-            @keydown="onKey"
-          />
+          <div v-if="picks[item.id]" class="custom-row">
+            <input
+              v-model="picks[item.id].custom"
+              class="custom"
+              type="text"
+              data-prose
+              :disabled="sent"
+              :aria-label="item.text"
+              :placeholder="item.options.length ? 'Or type your own answer…' : 'Type your answer…'"
+              @keydown="onKey"
+              @paste="onPaste(item, $event)"
+            />
+            <button
+              v-if="canAttach"
+              class="btn btn-secondary attach"
+              :disabled="sent"
+              title="Attach an image to your answer (or paste one)"
+              aria-label="Attach an image"
+              @click="chooseImages(item)"
+            >
+              <Icon name="image" :size="14" />
+            </button>
+          </div>
+          <div v-if="picks[item.id]?.attachments.length" class="thumbs">
+            <span v-for="a in picks[item.id].attachments" :key="a.key" class="thumb" :title="a.name">
+              <img v-if="a.url" :src="a.url" :alt="a.name" />
+              <button class="remove" :disabled="sent" :aria-label="`Remove ${a.name}`" @click="detach(item, a.key)">
+                <Icon name="cross" :size="10" />
+              </button>
+            </span>
+          </div>
         </template>
       </div>
     </div>
@@ -296,10 +347,15 @@ function onKey(event: KeyboardEvent) {
   max-height: 120px;
   overflow: auto;
 }
+.custom-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
 .custom {
   display: block;
-  width: 100%;
-  margin-top: 8px;
+  flex: 1;
+  min-width: 0;
   padding: 7px 10px;
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
@@ -307,6 +363,40 @@ function onKey(event: KeyboardEvent) {
   color: var(--text);
   font: inherit;
   outline: none;
+}
+.attach {
+  flex: none;
+}
+.thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.thumb {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.thumb .remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--glass);
+  color: var(--text);
 }
 .custom:focus {
   border-color: var(--border-strong);

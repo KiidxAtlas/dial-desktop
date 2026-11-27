@@ -9,8 +9,24 @@ impl Scratch {
             std::env::temp_dir().join(format!("dial-desktop-files-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        Self(dir.canonicalize().unwrap())
+        Self(plain_canonical(&dir))
     }
+}
+
+/// `canonicalize` yields a `\\?\` verbatim path on Windows, which git refuses as a worktree or
+/// remote location; strip it so the fixtures hand git ordinary paths.
+fn plain_canonical(dir: &Path) -> PathBuf {
+    let canonical = dir.canonicalize().unwrap();
+    #[cfg(windows)]
+    {
+        let text = canonical.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && !rest.starts_with(r"UNC\")
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    canonical
 }
 
 impl Drop for Scratch {
@@ -25,13 +41,11 @@ fn paths_stay_inside_the_workspace() {
     fs::create_dir_all(root.0.join("src")).unwrap();
     fs::write(root.0.join("src/main.rs"), "fn main() {}").unwrap();
 
+    let path = root.0.join("src/main.rs");
+    let absolute = path.canonicalize().unwrap();
+    assert_eq!(resolve(&root.0, "src/main.rs").unwrap(), absolute);
     assert_eq!(
-        resolve(&root.0, "src/main.rs").unwrap(),
-        root.0.join("src/main.rs")
-    );
-    let absolute = root.0.join("src/main.rs");
-    assert_eq!(
-        resolve(&root.0, &absolute.to_string_lossy()).unwrap(),
+        resolve(&root.0, &path.to_string_lossy()).unwrap(),
         absolute
     );
     assert!(
@@ -740,4 +754,280 @@ fn log_records_split_on_separators_and_skip_noise() {
     assert_eq!(rows[0].author, "Ada");
     assert_eq!(rows[1].sha, "fedcba9");
     assert_eq!(rows[1].refs, "");
+}
+
+#[test]
+fn write_updates_workspace_files_and_refuses_escapes_and_links() {
+    let root = Scratch::new("write-inline");
+    let outside = Scratch::new("write-inline-outside");
+    fs::write(root.0.join("note.txt"), "before\n").unwrap();
+    fs::write(outside.0.join("secret.txt"), "keep\n").unwrap();
+
+    let initial = read(&root.0, "note.txt").unwrap();
+    assert!(initial.sha256.as_deref().is_some_and(|h| h.len() == 64));
+    let saved = write(&root.0, "note.txt", "after\n", initial.sha256.as_deref()).unwrap();
+    assert_eq!(saved.text.as_deref(), Some("after\n"));
+    assert_ne!(saved.sha256, initial.sha256);
+    assert_eq!(fs::read_to_string(root.0.join("note.txt")).unwrap(), "after\n");
+
+    // Concurrent external modification is refused rather than silently clobbered.
+    fs::write(root.0.join("note.txt"), "external edit\n").unwrap();
+    let conflict = write(&root.0, "note.txt", "stale save\n", saved.sha256.as_deref()).unwrap_err();
+    assert!(conflict.contains("changed on disk"), "{conflict}");
+    assert_eq!(fs::read_to_string(root.0.join("note.txt")).unwrap(), "external edit\n");
+
+    assert!(write(&root.0, "../secret.txt", "bad", None).is_err());
+    assert!(write(&root.0, ".git/config", "bad", None).is_err());
+    assert!(write(&root.0, "missing.txt", "bad", None).is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.0.join("secret.txt"), root.0.join("out.link")).unwrap();
+        std::os::unix::fs::symlink(root.0.join("note.txt"), root.0.join("in.link")).unwrap();
+        assert!(write(&root.0, "out.link", "bad", None).is_err());
+        assert!(write(&root.0, "in.link", "bad", None).is_err());
+        assert_eq!(fs::read_to_string(outside.0.join("secret.txt")).unwrap(), "keep\n");
+    }
+}
+
+#[test]
+fn git_sync_errors_give_actionable_hints() {
+    assert!(format_git_sync_error("push", "fatal: could not read Username for 'https://github.com': terminal prompts disabled").contains("authentication"));
+    assert!(format_git_sync_error("pull", "fatal: Not possible to fast-forward, aborting.").contains("diverged"));
+    assert!(format_git_sync_error("pull", "error: Your local changes to the following files would be overwritten by merge").contains("stash"));
+}
+
+#[test]
+fn stage_hunk_stages_only_the_selected_hunk_and_refuses_stale_hunks() {
+    let root = Scratch::new("stage-hunk");
+    git_ok(&root.0, &["init", "-q"]);
+    let original: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    fs::write(root.0.join("a.txt"), &original).unwrap();
+    git_ok(&root.0, &["add", "a.txt"]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+
+    let edited = original
+        .replace("line 2\n", "line 2 edited\nextra top\n")
+        .replace("line 18\n", "line 18 edited\n");
+    fs::write(root.0.join("a.txt"), &edited).unwrap();
+
+    let shown = diff(&root.0, "a.txt").unwrap();
+    let (_, hunks) = split_hunks(&shown.diff);
+    assert_eq!(hunks.len(), 2, "{}", shown.diff);
+
+    // Stage only the first hunk.
+    stage_hunk(&root.0, "a.txt", hunks[0]).unwrap();
+    let staged = String::from_utf8(git_in(&root.0, &["diff", "--cached", "--", "a.txt"]).unwrap().stdout).unwrap();
+    let unstaged = String::from_utf8(git_in(&root.0, &["diff", "--", "a.txt"]).unwrap().stdout).unwrap();
+    assert!(staged.contains("+line 2 edited"), "{staged}");
+    assert!(!staged.contains("+line 18 edited"), "{staged}");
+    assert!(unstaged.contains("+line 18 edited"), "{unstaged}");
+
+    // Staging the same hunk again is refused cleanly as already staged.
+    let dup = stage_hunk(&root.0, "a.txt", hunks[0]).unwrap_err();
+    assert!(dup.contains("already staged"), "{dup}");
+
+    // Staging the second hunk from the HEAD diff adjusts cleanly against the index.
+    stage_hunk(&root.0, "a.txt", hunks[1]).unwrap();
+    let unstaged_after = String::from_utf8(git_in(&root.0, &["diff", "--", "a.txt"]).unwrap().stdout).unwrap();
+    assert!(unstaged_after.trim().is_empty(), "{unstaged_after}");
+
+    // Stale hunk is refused.
+    assert!(stage_hunk(&root.0, "a.txt", "@@ -1,1 +1,1 @@\n-bogus\n+nope\n").is_err());
+}
+
+#[test]
+fn diff_scoped_and_unstage_hunk_split_staged_and_unstaged_changes() {
+    let root = Scratch::new("diff-scoped-unstage");
+    git_ok(&root.0, &["init", "-q"]);
+    let original: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    fs::write(root.0.join("a.txt"), &original).unwrap();
+    git_ok(&root.0, &["add", "a.txt"]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+
+    let edited = original
+        .replace("line 2\n", "line 2 edited\n")
+        .replace("line 18\n", "line 18 edited\n");
+    fs::write(root.0.join("a.txt"), &edited).unwrap();
+
+    let unstaged = diff_scoped(&root.0, "a.txt", DiffScope::Unstaged).unwrap();
+    let (_, hunks) = split_hunks(&unstaged.diff);
+    assert_eq!(hunks.len(), 2);
+    stage_hunk(&root.0, "a.txt", hunks[0]).unwrap();
+
+    let staged = diff_scoped(&root.0, "a.txt", DiffScope::Staged).unwrap();
+    assert!(staged.diff.contains("+line 2 edited"));
+    assert!(!staged.diff.contains("+line 18 edited"));
+    let remaining_unstaged = diff_scoped(&root.0, "a.txt", DiffScope::Unstaged).unwrap();
+    assert!(!remaining_unstaged.diff.contains("+line 2 edited"));
+    assert!(remaining_unstaged.diff.contains("+line 18 edited"));
+
+    // Unstage the first hunk; working tree keeps the edit while index clears.
+    let (_, staged_hunks) = split_hunks(&staged.diff);
+    assert_eq!(staged_hunks.len(), 1);
+    unstage_hunk(&root.0, "a.txt", staged_hunks[0]).unwrap();
+    assert!(diff_scoped(&root.0, "a.txt", DiffScope::Staged).unwrap().diff.trim().is_empty());
+    assert!(fs::read_to_string(root.0.join("a.txt")).unwrap().contains("line 2 edited"));
+}
+
+#[test]
+fn create_rename_and_delete_file_enforce_workspace_guards() {
+    let root = Scratch::new("file-crud");
+    let created = create_file(&root.0, "nested/hello.txt", "hi\n").unwrap();
+    assert_eq!(created.path, "nested/hello.txt");
+    assert_eq!(created.text.as_deref(), Some("hi\n"));
+    // Refuses duplicate, escapes, and .git.
+    assert!(create_file(&root.0, "nested/hello.txt", "dup").is_err());
+    assert!(create_file(&root.0, "../escape.txt", "no").is_err());
+    assert!(create_file(&root.0, ".git/evil", "no").is_err());
+
+    let moved = rename_file(&root.0, "nested/hello.txt", "nested/world.txt").unwrap();
+    assert_eq!(moved, "nested/world.txt");
+    assert!(!root.0.join("nested/hello.txt").exists());
+    assert_eq!(fs::read_to_string(root.0.join("nested/world.txt")).unwrap(), "hi\n");
+    assert!(rename_file(&root.0, "nested/world.txt", "../out.txt").is_err());
+
+    delete_file(&root.0, "nested/world.txt").unwrap();
+    assert!(!root.0.join("nested/world.txt").exists());
+    assert!(delete_file(&root.0, "../outside").is_err());
+}
+
+#[test]
+fn git_branches_checkout_sync_and_stash_work_end_to_end() {
+    let remote = Scratch::new("git-remote");
+    git_ok(&remote.0, &["init", "--bare", "-q"]);
+
+    let root = Scratch::new("git-ops");
+    git_ok(&root.0, &["init", "-q", "-b", "main"]);
+    fs::write(root.0.join("a.txt"), "one\n").unwrap();
+    git_ok(&root.0, &["add", "a.txt"]);
+    git_ok(&root.0, &["commit", "-qm", "init"]);
+    git_ok(&root.0, &["remote", "add", "origin", remote.0.to_str().unwrap()]);
+
+    // Push sets upstream on main.
+    git_sync(&root.0, "push").unwrap();
+    let info = git_branches(&root.0).unwrap();
+    assert_eq!(info.current.as_deref(), Some("main"));
+    assert_eq!(info.local, vec!["main".to_owned()]);
+    assert_eq!(info.upstream.as_deref(), Some("origin/main"));
+    assert_eq!((info.ahead, info.behind), (0, 0));
+
+    // Create and switch branches, and reject invalid names.
+    assert!(git_checkout(&root.0, "-bad", true).is_err());
+    assert!(git_checkout(&root.0, "does-not-exist", false).is_err());
+    git_checkout(&root.0, "feature/test", true).unwrap();
+    assert_eq!(git_branches(&root.0).unwrap().current.as_deref(), Some("feature/test"));
+    git_checkout(&root.0, "main", false).unwrap();
+    assert_eq!(git_branches(&root.0).unwrap().current.as_deref(), Some("main"));
+
+    // Stash push & pop round-trip.
+    fs::write(root.0.join("a.txt"), "dirty\n").unwrap();
+    let stashes = git_stash(&root.0, "push", Some("wip")).unwrap();
+    assert_eq!(stashes.len(), 1);
+    assert!(stashes[0].summary.contains("wip"));
+    assert_eq!(fs::read_to_string(root.0.join("a.txt")).unwrap(), "one\n");
+    let after_pop = git_stash(&root.0, "pop", None).unwrap();
+    assert!(after_pop.is_empty());
+    assert_eq!(fs::read_to_string(root.0.join("a.txt")).unwrap(), "dirty\n");
+
+    // Fetch & fast-forward pull succeed against the local bare remote.
+    git_sync(&root.0, "fetch").unwrap();
+    git_sync(&root.0, "pull").unwrap();
+}
+
+#[test]
+fn git_conflict_detection_and_resolution_support_ours_theirs_and_manual() {
+    let root = Scratch::new("git-conflict");
+    git_ok(&root.0, &["init", "-q", "-b", "main"]);
+    // The merge itself must get a committer identity even on a fresh CI account.
+    git_ok(&root.0, &["config", "user.name", "t"]);
+    git_ok(&root.0, &["config", "user.email", "t@t"]);
+    git_ok(&root.0, &["config", "commit.gpgsign", "false"]);
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(root.0.join(f), "base\n").unwrap();
+    }
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "base"]);
+
+    git_ok(&root.0, &["checkout", "-qb", "other"]);
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(root.0.join(f), "theirs\n").unwrap();
+    }
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "theirs"]);
+
+    git_ok(&root.0, &["checkout", "-q", "main"]);
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(root.0.join(f), "ours\n").unwrap();
+    }
+    git_ok(&root.0, &["add", "."]);
+    git_ok(&root.0, &["commit", "-qm", "ours"]);
+
+    // Merge fails with conflicts on all three files.
+    let merge = git_in(&root.0, &["merge", "other"]).unwrap();
+    assert!(!merge.status.success(), "{merge:?}");
+    let unmerged = git_in(&root.0, &["ls-files", "--unmerged", "--", "a.txt"]).unwrap();
+    assert!(unmerged.status.success(), "{unmerged:?}");
+    assert!(!unmerged.stdout.is_empty(), "merge did not create a conflict: {merge:?}");
+
+    let shown = diff_scoped(&root.0, "a.txt", DiffScope::All).unwrap();
+    assert!(shown.conflicted, "unmerged file must report conflicted=true");
+    assert!(
+        git_resolve_conflict(&root.0, "a.txt", "resolved").is_err(),
+        "marking resolved must refuse while conflict markers remain"
+    );
+
+    git_resolve_conflict(&root.0, "a.txt", "ours").unwrap();
+    assert_eq!(fs::read_to_string(root.0.join("a.txt")).unwrap(), "ours\n");
+    assert!(!diff_scoped(&root.0, "a.txt", DiffScope::All).unwrap().conflicted);
+
+    git_resolve_conflict(&root.0, "b.txt", "theirs").unwrap();
+    assert_eq!(fs::read_to_string(root.0.join("b.txt")).unwrap(), "theirs\n");
+    assert!(!diff_scoped(&root.0, "b.txt", DiffScope::All).unwrap().conflicted);
+
+    fs::write(root.0.join("c.txt"), "merged cleanly\n").unwrap();
+    git_resolve_conflict(&root.0, "c.txt", "resolved").unwrap();
+    assert!(!diff_scoped(&root.0, "c.txt", DiffScope::All).unwrap().conflicted);
+    assert!(git_resolve_conflict(&root.0, "c.txt", "ours").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn git_sync_cancellation_kills_running_command_promptly() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let root = Scratch::new("git-sync-cancel");
+    git_ok(&root.0, &["init", "-q"]);
+    // Configure an SSH remote whose ssh command sleeps so `git fetch` blocks without network.
+    git_ok(&root.0, &["remote", "add", "origin", "ssh://example.invalid/repo.git"]);
+    git_ok(&root.0, &["config", "core.sshCommand", "sh -c 'sleep 30' --"]);
+
+    let canceller = Arc::new(GitSyncCanceller::default());
+    let guard = canceller.begin(&root.0);
+    let cancel_clone = Arc::clone(&canceller);
+    let root_clone = root.0.clone();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(cancel_clone.cancel(&root_clone));
+    });
+
+    let started = Instant::now();
+    let err = git_sync_cancellable(&root.0, "fetch", guard.flag()).unwrap_err();
+    killer.join().unwrap();
+    assert!(
+        err.to_ascii_lowercase().contains("cancel"),
+        "expected cancellation error, got: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancelled git_sync should abort promptly, took {:?}",
+        started.elapsed()
+    );
+    drop(guard);
+    assert!(!canceller.cancel(&root.0), "guard drop must unregister active sync");
+
+    // Pre-cancelled flag aborts before spawning git.
+    let pre = AtomicBool::new(true);
+    assert!(git_sync_cancellable(&root.0, "fetch", &pre).unwrap_err().contains("cancelled"));
 }

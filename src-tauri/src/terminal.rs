@@ -75,6 +75,7 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Task {
     Slash { command: String },
+    Attach { session: String },
     Scheduler {
         /// Run the entries that are due now, then exit (`schedule run --once`).
         #[serde(default)]
@@ -86,6 +87,14 @@ impl Task {
     pub fn child(self, program: &Path, cwd: &Path) -> Result<CommandBuilder, String> {
         match self {
             Self::Slash { command } => slash_command(program, cwd, &command),
+            Self::Attach { session } => {
+                if session.is_empty() || !session.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("Invalid session ID".into()); }
+                let mut child = CommandBuilder::new(program);
+                child.args(["attach", "--", &session]);
+                child.cwd(cwd);
+                child.env("TERM", "xterm-256color");
+                Ok(child)
+            }
             Self::Scheduler { once } => {
                 let mut child = CommandBuilder::new(program);
                 child.args(["schedule", "run"]);

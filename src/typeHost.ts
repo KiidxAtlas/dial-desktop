@@ -15,7 +15,7 @@ interface Entry {
 }
 
 type Outcome = { ok: true; value: unknown } | { ok: false; error: string };
-interface Run { id: string; logs: Log[]; outcome: Outcome | null }
+interface Run { id: string; logs: Log[]; outcome: Outcome | null; timer: ReturnType<typeof setTimeout> }
 
 const MAX_LOGS = 200;
 const entries = new Map<string, Entry>();
@@ -46,7 +46,12 @@ export function log(id: string, entry: Log) {
   if (!target) return;
   target.logs.push(entry);
   if (target.logs.length > MAX_LOGS) target.logs.splice(0, target.logs.length - MAX_LOGS);
-  for (const run of runs.values()) if (run.id === id && !run.outcome) run.logs.push(entry);
+  for (const run of runs.values()) {
+    if (run.id === id && !run.outcome) {
+      run.logs.push(entry);
+      if (run.logs.length > MAX_LOGS) run.logs.splice(0, run.logs.length - MAX_LOGS);
+    }
+  }
 }
 
 export function settle(key: number, outcome: Outcome) {
@@ -77,16 +82,17 @@ export const host = {
     const entry = entries.get(id);
     if (!entry?.post || !entry.loaded) return JSON.stringify({ error: "The Type's app is not open; open it with types_open" });
     const key = ++seq;
-    runs.set(key, { id, logs: [], outcome: null });
+    const timer = setTimeout(() => runs.delete(key), 60_000);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    runs.set(key, { id, logs: [], outcome: null, timer });
     entry.post({ kind: "eval", id: key, script });
-    const cleanup = setTimeout(() => runs.delete(key), 60_000) as unknown as { unref?: () => void };
-    cleanup.unref?.();
     return JSON.stringify({ key });
   },
   result(key: number) {
     const run = runs.get(key);
     if (!run) return JSON.stringify({ error: "The script's result was lost" });
     if (!run.outcome) return JSON.stringify({ pending: true });
+    clearTimeout(run.timer);
     runs.delete(key);
     return JSON.stringify({ ...run.outcome, logs: run.logs });
   },

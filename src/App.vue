@@ -7,7 +7,7 @@ import { installEngine, needsEngineInstall, updateEngine, updates } from "./upda
 import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey, typingIn } from "./keysGuard";
 import { focusComposer, ui, type InspectorTab } from "./ui";
 import { copyText, goToSession, openSession, sessionOrder, startRename, stepSession } from "./sessionActions";
-import { followAgentApp, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
+import { followAgentApp, followAgentBoards, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -374,21 +374,31 @@ function scanOnReturn() {
   if (opened.value?.connection.state === "live") void engine.discoverModels();
 }
 
+let unmounted = false;
 let stopFollowing: (() => void) | null = null;
 let stopFollowingApp: (() => void) | null = null;
+let stopFollowingBoards: (() => void) | null = null;
 let stopFullscreen: (() => void) | null = null;
-onMounted(async () => {
+function trackStop(promise: Promise<(() => void) | null>, assign: (stop: (() => void) | null) => void) {
+  void promise.then((stop) => {
+    if (unmounted) stop?.();
+    else assign(stop);
+  });
+}
+onMounted(() => {
   window.addEventListener("keydown", onKey);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", hideHints);
   window.addEventListener("focus", scanOnReturn);
   restoreImage();
   startUpdateChecks();
-  void followFullscreen().then((stop) => (stopFullscreen = stop));
-  stopFollowing = await followAgentBrowser();
-  stopFollowingApp = await followAgentApp();
+  trackStop(followFullscreen(), (stop) => (stopFullscreen = stop));
+  trackStop(followAgentBrowser(), (stop) => (stopFollowing = stop));
+  trackStop(followAgentApp(), (stop) => (stopFollowingApp = stop));
+  trackStop(followAgentBoards(), (stop) => (stopFollowingBoards = stop));
 });
 onBeforeUnmount(() => {
+  unmounted = true;
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", hideHints);
@@ -397,6 +407,8 @@ onBeforeUnmount(() => {
   stopFullscreen?.();
   stopFollowing?.();
   stopFollowingApp?.();
+  stopFollowingBoards?.();
+  stopFullscreen = stopFollowing = stopFollowingApp = stopFollowingBoards = null;
 });
 </script>
 
