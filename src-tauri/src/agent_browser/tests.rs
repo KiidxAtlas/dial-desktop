@@ -5,7 +5,7 @@ use super::*;
 fn tool_list_is_well_formed() {
     let tools = tools();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 43);
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for name in desktop::TOOLS {
         assert!(names.contains(&name), "{name} is listed");

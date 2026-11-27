@@ -5,16 +5,20 @@ import { nextTick, reactive, shallowRef, watch } from "vue";
 import type { Entry, OpenSnapshot } from "./types";
 import { focusComposer, ui, type InspectorTab, type LineRange } from "./ui";
 import { appRevealRequest, appRunnerApi } from "./appRunner";
+import { listen } from "@tauri-apps/api/event";
 import { browserApi, showToast, snapshot } from "./bridge";
 import { draftFor } from "./drafts";
 import { MIN_WIDTH, maxInspectorWidth, sidebarFits } from "./layoutRoom";
+import { DraftStore } from "./workspaceDrafts";
 
 export { MIN_WIDTH };
+/** Workspace-level inline file editor drafts, preserved across file and panel switches. */
+export const workspaceDrafts = reactive(new DraftStore());
 
 const KEY = "dial.workspace";
 
 /** Panels that need room: the inspector widens while they show (Files only with a file open). */
-const WIDE: InspectorTab[] = ["terminal", "browser", "app"];
+const WIDE: InspectorTab[] = ["terminal", "browser", "app", "boards"];
 
 interface Prefs {
   /** Inspector width for the plan, changes and activity lists. */
@@ -212,6 +216,16 @@ export async function followAgentBrowser(): Promise<() => void> {
     });
   } catch {
     // Outside Tauri there is no browser.
+    return () => {};
+  }
+}
+
+/** Show the Boards panel when the agent acts on a device, so the user watches what it does. */
+export async function followAgentBoards(): Promise<() => void> {
+  try {
+    return await listen("agent-board", () => showPanel("boards"));
+  } catch {
+    // Outside Tauri there are no boards.
     return () => {};
   }
 }

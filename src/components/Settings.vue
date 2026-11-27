@@ -27,6 +27,7 @@ import ImageSettings from "./ImageSettings.vue";
 import ProjectTools, { PROJECT_TABS, type ProjectTab } from "./ProjectTools.vue";
 import SettingsTransfer from "./SettingsTransfer.vue";
 import IntegrationsSettings from "./IntegrationsSettings.vue";
+import ComputerUseSettings from "./ComputerUseSettings.vue";
 import SPage from "./settings/SPage.vue";
 import SGroup from "./settings/SGroup.vue";
 import SRow from "./settings/SRow.vue";
@@ -132,12 +133,12 @@ for (const p of DESKTOP[3].pages) p.about = PROJECT_ABOUT[p.id as ProjectTab];
 const MODEL_PAGES = DESKTOP[2].pages;
 const isModelPage = (id: PageId) => MODEL_PAGES.some((p) => p.id === id);
 
-// Without a project (the welcome screen) only the app's own pages show: the engine's settings,
-// providers and models need an engine, which runs in a project.
+// Without a project (the welcome screen) global pages work directly, including providers and the
+// local model library; engine settings and per-project tools open once a project is chosen.
 const props = defineProps<{ snap: Snapshot }>();
 const project = computed(() => (props.snap.workspace ? (props.snap as OpenSnapshot) : null));
 /** Pages that work without a project. */
-const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates", "health", "providers"]);
+const NO_PROJECT = new Set<PageId>(["overview", "appearance", "notifications", "updates", "health", "providers", "library"]);
 const groupsShown = computed(() =>
   project.value ? DESKTOP : DESKTOP.map((g) => ({ ...g, pages: g.pages.filter((p) => NO_PROJECT.has(p.id)) })).filter((g) => g.pages.length),
 );
@@ -231,6 +232,7 @@ function isRawTable(s: Setting) {
 const terms = computed(() => query.value.trim().toLowerCase().split(/\s+/).filter(Boolean));
 const searching = computed(() => terms.value.length > 0);
 const has = (hay: string) => terms.value.every((t) => hay.toLowerCase().includes(t));
+const computerHit = computed(() => searching.value && live.value && !!project.value && has("computer use desktop control mouse keyboard screenshots"));
 
 const pageHits = computed(() => {
   if (!searching.value) return [];
@@ -465,6 +467,7 @@ async function restartEngine() {
             <button v-if="!searching && shownChanged.length" class="btn btn-secondary" @click="resetShown">Reset all shown</button>
             <button class="btn btn-secondary" @click="query = ''; listing = ''">Done</button>
           </template>
+          <ComputerUseSettings v-if="computerHit && project" :key="project.workspace.root" :root="project.workspace.root" />
           <SGroup v-if="pageHits.length" title="Pages">
             <button v-for="p in pageHits" :key="p.id" class="s-row link-row" @click="go(p.id)">
               <Icon :name="p.icon" :size="15" />
@@ -493,9 +496,9 @@ async function restartEngine() {
               @reset="reset(s)"
             />
           </SGroup>
-          <p v-if="!pageHits.length && !groups.length" class="nothing">Nothing matches. Try a shorter word.</p>
+          <p v-if="!computerHit && !pageHits.length && !groups.length" class="nothing">Nothing matches. Try a shorter word.</p>
           <p v-if="searching && project && !page" class="s-note">Engine settings are searchable once the engine is connected.</p>
-          <p v-else-if="searching && !project" class="s-note">Open a project to search engine settings and the model library.</p>
+          <p v-else-if="searching && !project" class="s-note">Open a project to search engine settings.</p>
         </SPage>
 
         <!-- Overview -->
@@ -535,7 +538,7 @@ async function restartEngine() {
             </template>
           </SGroup>
           <SettingsTransfer v-if="project && page" :snap="project" :rows="all" />
-          <p v-if="!project" class="s-note">Engine settings and models live with a project’s engine. Sign in to a provider and check your setup here; open a project to change the rest.</p>
+          <p v-if="!project" class="s-note">Engine settings live with a project’s engine. Sign in to a provider, download local models, and check your setup here; open a project to change the rest.</p>
           <SGroup title="Needs a look" plain>
             <div v-if="attention.length" class="tiles">
               <button v-for="a in attention" :key="a.title" class="tile" @click="go(a.id)">
@@ -558,9 +561,9 @@ async function restartEngine() {
         </template>
 
         <!-- Pages that draw their own header. -->
-        <div v-else-if="project && (current === 'library' || current === 'images')" class="s-page own">
+        <div v-else-if="current === 'library' || (project && current === 'images')" class="s-page own">
           <ModelLibrary v-if="current === 'library'" :preview="snap.connection.state === 'preview'" />
-          <ImageSettings v-else :snap="project" />
+          <ImageSettings v-else-if="project" :snap="project" />
         </div>
 
         <!-- Desktop pages. -->

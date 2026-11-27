@@ -105,3 +105,8 @@ fn opening_a_file_serves_its_folder_until_the_page_leaves() {
     assert!(browser.local.lock().unwrap().is_none());
     assert!(serve_file(&browser, dir.path()).is_err());
 }
+
+#[test]
+fn browser_features_enables_devtools() {
+    assert!(browser_features().devtools);
+}

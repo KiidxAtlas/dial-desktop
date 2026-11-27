@@ -6,36 +6,42 @@
 //! parse are kept as notes rather than dropped.
 
 use crate::updates::{RunOutput, last_lines, run_bounded};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod relay;
+pub use relay::{RelayManager, RelayStatus};
+
 #[cfg(test)]
 mod tests;
-
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Installing a language server or runtime downloads and may build.
 const FIX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const OUTPUT_TAIL: usize = 6000;
 
 /// One optional capability from `dial doctor --all`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capability {
-    /// The id `dial doctor --fix` takes; empty for installed ones (the doctor prints none).
+    /// The id `dial doctor --fix` takes; empty for installed ones in legacy text output.
+    #[serde(default)]
     pub id: String,
     pub name: String,
     pub installed: bool,
     /// Where it was found, for installed ones.
+    #[serde(default)]
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
+    #[serde(default)]
     pub capabilities: Vec<Capability>,
     /// Everything after the capability lists (memory backends and the like), as printed.
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
@@ -125,8 +131,41 @@ fn dial(program: &Path, cwd: Option<&Path>) -> Command {
     command
 }
 
-/// `dial doctor --all`.
+/// Parse the structured JSON output of `dial doctor --all --json`.
+pub fn parse_doctor_json(text: &str) -> Result<DoctorReport, serde_json::Error> {
+    serde_json::from_str(text)
+}
+
+/// Whether `output` failed because an older engine rejected the `--json` flag itself.
+/// Only then is it safe to retry without `--json`; genuine runtime failures must not
+/// re-execute commands like `commit` or `share`.
+fn rejects_json_flag(output: &RunOutput) -> bool {
+    if output.success {
+        return false;
+    }
+    let text = format!("{}\n{}", output.stderr, output.stdout).to_ascii_lowercase();
+    text.contains("--json")
+        && (text.contains("unexpected argument")
+            || text.contains("unrecognized option")
+            || text.contains("unknown option")
+            || text.contains("unknown flag")
+            || text.contains("found argument")
+            || text.contains("wasn't expected"))
+}
+
+/// `dial doctor --all --json`, falling back to legacy text parsing for older engines.
 pub fn doctor(program: &Path, cwd: Option<&Path>) -> Result<DoctorReport, String> {
+    let json_output = run_bounded(
+        dial(program, cwd).args(["doctor", "--all", "--json"]),
+        LIST_TIMEOUT,
+    )?;
+    if json_output.success {
+        return Ok(parse_doctor_json(&json_output.stdout)
+            .unwrap_or_else(|_| parse_doctor(&json_output.stdout)));
+    }
+    if !rejects_json_flag(&json_output) {
+        return Err(failed(&json_output, "dial doctor"));
+    }
     let output = run_bounded(dial(program, cwd).args(["doctor", "--all"]), LIST_TIMEOUT)?;
     if !output.success {
         return Err(failed(&output, "dial doctor"));
@@ -146,7 +185,21 @@ pub struct CommitPreview {
 const COMMIT_PREVIEW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// `dial commit --dry-run` in the project: the engine's AI message for what is staged.
+/// Tries `--json` first and falls back to legacy stdout parsing for older engines.
 pub fn commit_message(program: &Path, cwd: &Path) -> Result<CommitPreview, String> {
+    let json_out = run_bounded(
+        dial(program, Some(cwd)).args(["commit", "--dry-run", "--no-changelog", "--json"]),
+        COMMIT_PREVIEW_TIMEOUT,
+    )?;
+    if json_out.success {
+        return match parse_commit_preview_json(&json_out.stdout) {
+            Ok(preview) => preview,
+            Err(_) => parse_commit_preview(&json_out.stdout),
+        };
+    }
+    if !rejects_json_flag(&json_out) {
+        return Err(failed(&json_out, "dial commit --dry-run"));
+    }
     let output = run_bounded(
         dial(program, Some(cwd)).args(["commit", "--dry-run", "--no-changelog"]),
         COMMIT_PREVIEW_TIMEOUT,
@@ -155,6 +208,34 @@ pub fn commit_message(program: &Path, cwd: &Path) -> Result<CommitPreview, Strin
         return Err(failed(&output, "dial commit --dry-run"));
     }
     parse_commit_preview(&output.stdout)
+}
+
+/// Parse structured JSON from `dial commit --dry-run --json`.
+pub fn parse_commit_preview_json(stdout: &str) -> Result<Result<CommitPreview, String>, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct WireCommit {
+        kind: String,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        warning: Option<String>,
+    }
+    let wire: WireCommit = serde_json::from_str(stdout.trim())?;
+    Ok(match wire.kind.as_str() {
+        "dry_run" => {
+            let message = wire.message.unwrap_or_default().trim().to_owned();
+            if message.is_empty() {
+                Err("Dial wrote no commit message".into())
+            } else {
+                Ok(CommitPreview {
+                    message,
+                    warning: wire.warning.map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()),
+                })
+            }
+        }
+        "nothing_to_commit" | "would_push" => Err("There are no changes to describe".into()),
+        _ => Err("Dial wrote no commit message".into()),
+    })
 }
 
 /// The message in `dial commit --dry-run` output (`Dry run. Message:` then the message, then an
@@ -220,6 +301,38 @@ pub struct Account {
     pub active: bool,
 }
 
+#[derive(Deserialize)]
+struct JsonAccount {
+    key: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    cooling: bool,
+}
+
+/// Parse structured JSON from `dial auth accounts <provider> list --json`.
+pub fn parse_accounts_json(text: &str) -> Result<Vec<Account>, serde_json::Error> {
+    let raw: Vec<JsonAccount> = serde_json::from_str(text)?;
+    Ok(raw
+        .into_iter()
+        .map(|row| {
+            let label = row.label.trim();
+            let detail = match (label.is_empty(), row.cooling) {
+                (false, true) => format!("{label} (cooling down)"),
+                (true, true) => "(cooling down)".to_owned(),
+                (_, false) => label.to_owned(),
+            };
+            Account {
+                key: row.key,
+                detail,
+                active: row.active,
+            }
+        })
+        .collect())
+}
+
 /// Parse `dial auth accounts <provider> list`: one account per line, the active one marked `*`.
 /// A line without a key-like first word (a "no stored accounts" sentence) is not an account.
 pub fn parse_accounts(text: &str) -> Vec<Account> {
@@ -282,6 +395,16 @@ pub fn accounts(
         }
         AccountAction::Select(key) => drop(run(&["select", key])?),
         AccountAction::Remove(key) => drop(run(&["remove", key])?),
+    }
+    let mut json_cmd = dial(program, cwd);
+    json_cmd.args(["auth", "accounts", provider, "list", "--json"]);
+    let json_out = run_bounded(&mut json_cmd, LIST_TIMEOUT)?;
+    if json_out.success {
+        return Ok(parse_accounts_json(&json_out.stdout)
+            .unwrap_or_else(|_| parse_accounts(&json_out.stdout)));
+    }
+    if !rejects_json_flag(&json_out) {
+        return Err(failed(&json_out, "dial auth accounts"));
     }
     Ok(parse_accounts(&run(&["list"])?.stdout))
 }
@@ -747,22 +870,39 @@ pub fn review(program: &Path, cwd: &Path, target: &ReviewTarget, focus: &str) ->
 }
 
 /// A link `dial share` uploaded the session to, with what was trimmed to fit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ShareLink {
     pub url: String,
     /// Everything else it printed: the key warning and any trim note.
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
-/// The `Share URL: …` line and the notes after it.
+/// Parse structured JSON from `dial share --json`.
+pub fn parse_share_json(stdout: &str) -> Result<ShareLink, String> {
+    let link: ShareLink = serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
+    if link.url.starts_with("https://") || link.url.starts_with("http://") {
+        Ok(link)
+    } else {
+        Err("Dial did not return a valid share link".into())
+    }
+}
+
+/// The `Share URL: …` line (or bare `https://…` URL from `dial share`) and any notes after it.
 pub fn parse_share(stdout: &str) -> Result<ShareLink, String> {
     let mut url = None;
     let mut notes = Vec::new();
     for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        match line.strip_prefix("Share URL:") {
-            Some(link) if url.is_none() => url = Some(link.trim().to_owned()),
-            _ => notes.push(line.trim_start_matches("Note: ").to_owned()),
+        if let Some(link) = line.strip_prefix("Share URL:") {
+            if url.is_none() {
+                url = Some(link.trim().to_owned());
+                continue;
+            }
+        } else if url.is_none() && (line.starts_with("https://") || line.starts_with("http://")) {
+            url = Some(line.to_owned());
+            continue;
         }
+        notes.push(line.trim_start_matches("Note: ").to_owned());
     }
     match url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
         Some(url) => Ok(ShareLink { url, notes }),
@@ -779,9 +919,23 @@ fn valid_session(id: &str) -> bool {
 }
 
 /// `dial share <session>`: an encrypted upload of the active branch, or a secret gist via `gh`.
+/// Tries `--json` first and falls back to plain output for older engines.
 pub fn share(program: &Path, cwd: &Path, session: &str, gist: bool) -> Result<ShareLink, String> {
     if !valid_session(session) {
         return Err("Open a saved session first".into());
+    }
+    let mut json_cmd = dial(program, Some(cwd));
+    json_cmd.args(["share", session, "--json"]);
+    if gist {
+        json_cmd.arg("--gist");
+    }
+    let json_out = run_bounded(&mut json_cmd, LIST_TIMEOUT)?;
+    if json_out.success {
+        return parse_share_json(&json_out.stdout)
+            .or_else(|_| parse_share(&json_out.stdout));
+    }
+    if !rejects_json_flag(&json_out) {
+        return Err(failed(&json_out, "dial share"));
     }
     let mut command = dial(program, Some(cwd));
     command.args(["share", session]);
@@ -795,87 +949,3 @@ pub fn share(program: &Path, cwd: &Path, session: &str, gist: bool) -> Result<Sh
     parse_share(&output.stdout)
 }
 
-/// The collaboration relay Desktop started, kept until stopped or the app quits.
-static RELAY: std::sync::Mutex<Option<(std::process::Child, String)>> = std::sync::Mutex::new(None);
-const RELAY_READY: &str = "Dial collaboration relay listening on ";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RelayStatus {
-    /// The address it listens on, while running.
-    pub bind: Option<String>,
-}
-
-fn relay_slot() -> std::sync::MutexGuard<'static, Option<(std::process::Child, String)>> {
-    let mut slot = RELAY.lock().unwrap_or_else(|p| p.into_inner());
-    // Forget a relay that exited on its own.
-    if slot.as_mut().is_some_and(|(child, _)| !matches!(child.try_wait(), Ok(None))) {
-        *slot = None;
-    }
-    slot
-}
-
-pub fn relay_status() -> RelayStatus {
-    RelayStatus { bind: relay_slot().as_ref().map(|(_, bind)| bind.clone()) }
-}
-
-/// `dial relay --bind <addr>`, waiting until it reports it is listening.
-pub fn relay_start(program: &Path, cwd: Option<&Path>, bind: &str) -> Result<RelayStatus, String> {
-    use std::io::{BufRead, BufReader};
-    let bind = bind.trim();
-    bind.parse::<std::net::SocketAddr>()
-        .map_err(|_| format!("`{bind}` is not an address like 127.0.0.1:7331"))?;
-    let mut slot = relay_slot();
-    if let Some((_, running)) = slot.as_ref() {
-        return Ok(RelayStatus { bind: Some(running.clone()) });
-    }
-    let mut command = dial(program, cwd);
-    command
-        .args(["relay", "--bind", bind])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = crate::launcher::without_console(&mut command)
-        .spawn()
-        .map_err(|e| format!("Could not start the relay: {e}"))?;
-    let stderr = child.stderr.take().ok_or("The relay has no output to watch")?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut said = String::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.starts_with(RELAY_READY) {
-                let _ = tx.send(Ok(()));
-                // Keep draining so the relay never blocks on a full pipe.
-                continue;
-            }
-            if said.len() < 4096 {
-                said.push_str(&line);
-                said.push('\n');
-            }
-        }
-        let _ = tx.send(Err(said));
-    });
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => {
-            *slot = Some((child, bind.to_owned()));
-            Ok(RelayStatus { bind: Some(bind.to_owned()) })
-        }
-        outcome => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(match outcome {
-                Ok(Err(said)) if !said.trim().is_empty() => format!("The relay stopped: {}", said.trim()),
-                Ok(Err(_)) => "The relay stopped before listening".into(),
-                _ => "The relay did not report that it is listening".into(),
-            })
-        }
-    }
-}
-
-/// Stop the relay Desktop started; also called when the app exits.
-pub fn relay_stop() -> RelayStatus {
-    if let Some((mut child, _)) = relay_slot().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    RelayStatus { bind: None }
-}

@@ -42,6 +42,8 @@ export const snapshot = shallowRef<Snapshot | null>(null);
 export const lastSubmission = new LastSubmission();
 export const startupError = ref<string | null>(null);
 export const connecting = ref(false);
+/** Incremented whenever the native workspace filesystem watcher reports external changes. */
+export const workspaceChange = ref<{ root: string; rev: number }>({ root: "", rev: 0 });
 
 /**
  * `next`, reusing every object or array of `prev` that holds the same data. The app republishes the
@@ -282,6 +284,14 @@ export async function connect() {
       partial.push(await listen<ModelOption[]>("models", e => { models.value = e.payload; }));
       partial.push(await listen<SettingsPage>("settings", e => { settingsPage.value = e.payload; settleSaves(); }));
       partial.push(await listen<string>("toast", e => showToast(nameFailure(e.payload))));
+      partial.push(await listen<{ root: string; session: string }>("attach-session", async ({ payload }) => {
+        if (snapshot.value?.workspace?.root !== payload.root) return;
+        const { openTaskTerminal } = await import("./commandRunner");
+        openTaskTerminal({ kind: "attach", session: payload.session }, payload.root);
+      }));
+      partial.push(await listen<string>("workspace-changed", e => {
+        workspaceChange.value = { root: e.payload, rev: workspaceChange.value.rev + 1 };
+      }));
       subscribed = true;
     }
     await resync();
@@ -607,7 +617,7 @@ export async function resetSettingRow(s: Setting, scope: SettingScope, turnRunni
 }
 
 /** How the engine binary was chosen (`launcher::EngineOrigin`). */
-export type EngineOrigin = "flag" | "env" | "choice" | "desktop" | "path" | "fallback" | "missing";
+export type EngineOrigin = "flag" | "env" | "choice" | "desktop" | "path" | "fallback" | "bundled" | "missing";
 /** Which engine Desktop runs and what went wrong while starting (`launcher::Startup`). */
 export interface StartupReport {
   engine: string | null;
@@ -669,8 +679,8 @@ export const workspaceFiles = {
   list: (path: string, workspaceRoot: string) => invoke<DirEntry[]>("list_dir", { path, workspaceRoot }),
   read: (path: string, workspaceRoot: string) => invoke<FileView>("read_file", { path, workspaceRoot }),
   /** Uncommitted changes of `path` (relative or absolute inside the project). */
-  diff: (path: string, workspaceRoot: string) => invoke<DiffView>("file_diff", { path, workspaceRoot }),
-  /** Fuzzy-search workspace files for `@` mentions in the composer. */
+  diff: (path: string, workspaceRoot: string, scope: "all" | "unstaged" | "staged" = "all") =>
+    invoke<DiffView>("file_diff", { path, workspaceRoot, scope }),
   search: (query: string, limit = 20) => invoke<string[]>("search_files", { query, limit }),
 };
 
@@ -723,7 +733,7 @@ export const providerApi = {
 };
 
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
-export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler"; once?: boolean };
+export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler"; once?: boolean } | { kind: "attach"; session: string };
 /** Session and collaboration tools that run the engine's own commands (`src-tauri/src/engine_cli.rs`). Calls throw a readable message. */
 export const sessionToolsApi = {
   /** `dial share`: an encrypted link to the session's active branch, or a secret gist through `gh`. */

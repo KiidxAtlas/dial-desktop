@@ -3,10 +3,11 @@
 // be mentioned in the prompt so the agent reads it. Git-ignored entries are hidden unless asked for,
 // and changed files carry their Git status letter.
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { files as fileActions, showToast, workspaceFiles } from "../../bridge";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { files as fileActions, showToast, workspaceChange, workspaceFiles } from "../../bridge";
 import { useFileTreeSearch } from "../../fileTreeSearch";
 import { openMenu, ui, type MenuItem } from "../../ui";
-import { addToPrompt, canGoBackFromFile, goBackFromFile, mention, projectPref, setProjectPref, showFile, showPanel } from "../../workspace";
+import { addToPrompt, canGoBackFromFile, goBackFromFile, mention, projectPref, setProjectPref, showFile, showPanel, workspaceDrafts } from "../../workspace";
 import { paneError, paneErrorText, type PaneError } from "../../paneErrors";
 import { joinPath } from "../../paths";
 import { gitMarkers, type GitFileStatus, type GrepMatch } from "../../workspaceGit";
@@ -25,8 +26,17 @@ let request = 0, fileRequest = 0, statusRequest = 0;
 const { filter, query, paths, status, refreshSearch } = useFileTreeSearch(workspaceFiles.search);
 const file = ref<FileView | null>(null);
 const fileError = ref<PaneError | null>(null);
+const editing = ref(false);
+const draft = ref("");
+const saving = ref(false);
+const dirty = computed(() => {
+  if (!editing.value || !file.value) return false;
+  const saved = workspaceDrafts.get(props.snap.workspace.root, file.value.path);
+  const baseline = saved ? saved.baseText : file.value.text;
+  return baseline !== null && draft.value !== baseline;
+});
+const canEdit = computed(() => !!file.value && file.value.text !== null && !file.value.truncated);
 const reader = computed(() => !!ui.fileLines || canGoBackFromFile());
-
 const IGNORED_KEY = "dial.files.showIgnored";
 const WIDTH_KEY = "dial.files.treeWidth";
 function stored(key: string): string | null {
@@ -140,19 +150,107 @@ function toggle(entry: DirEntry) {
   if (!children.has(entry.path)) void load(entry.path);
 }
 
+async function confirmDiscardChanges(): Promise<boolean> {
+  if (!dirty.value) return true;
+  return ask(`Discard unsaved changes to ${file.value?.path ?? "this file"}?`, {
+    title: "Unsaved changes",
+    kind: "warning",
+    okLabel: "Discard",
+  });
+}
+
 async function openFile(path: string) {
   const root = props.snap.workspace.root;
+  // Never overwrite the active file's baseline sha256 while the user is editing it; doing so
+  // would defeat optimistic conflict detection on save and clobber external or agent edits.
+  if (editing.value && file.value?.path === path) return;
   const id = ++fileRequest;
   const current = () => id === fileRequest && ui.filePath === path && props.snap.workspace.root === root;
-  if (file.value?.path !== path) file.value = null;
+  if (file.value?.path !== path) {
+    file.value = null;
+    editing.value = false;
+  }
   fileError.value = null;
   try {
     const result = await workspaceFiles.read(path, root);
-    if (current()) file.value = result;
+    if (current() && !(editing.value && file.value?.path === path)) {
+      file.value = result;
+      const saved = workspaceDrafts.get(root, path);
+      if (saved && result.text !== null) {
+        draft.value = saved.text;
+        editing.value = true;
+      } else if (result.text !== null) {
+        draft.value = result.text;
+        editing.value = false;
+      }
+    }
   } catch (error) {
     if (!current()) return;
     file.value = null;
+    editing.value = false;
     fileError.value = paneError(error);
+  }
+}
+
+function startEdit() {
+  if (!file.value || file.value.text === null || file.value.truncated) return;
+  const saved = workspaceDrafts.get(props.snap.workspace.root, file.value.path);
+  draft.value = saved ? saved.text : file.value.text;
+  editing.value = true;
+}
+
+async function cancelEdit() {
+  if (!(await confirmDiscardChanges())) return;
+  if (file.value) workspaceDrafts.clear(props.snap.workspace.root, file.value.path);
+  editing.value = false;
+  if (file.value?.text !== null && file.value?.text !== undefined) draft.value = file.value.text;
+}
+
+function closeFile() {
+  editing.value = false;
+  ui.filePath = null;
+}
+
+async function saveEdit() {
+  if (!file.value || !editing.value || saving.value) return;
+  const path = file.value.path, root = props.snap.workspace.root;
+  const saved = workspaceDrafts.get(root, path);
+  const expectedSha = saved?.baseSha256 ?? file.value.sha256;
+  saving.value = true;
+  try {
+    const updated = await workspaceGitApi.write(path, draft.value, root, expectedSha);
+    workspaceDrafts.clear(root, path);
+    if (props.snap.workspace.root === root && ui.filePath === path) {
+      file.value = updated;
+      draft.value = updated.text ?? draft.value;
+      editing.value = false;
+    }
+    showToast(`Saved ${path}`);
+    void loadStatus();
+  } catch (error) {
+    showToast(paneErrorText(error));
+  } finally {
+    saving.value = false;
+  }
+}
+
+watch(draft, (text) => {
+  if (!editing.value || !file.value || file.value.text === null) return;
+  workspaceDrafts.update(
+    props.snap.workspace.root,
+    file.value.path,
+    text,
+    file.value.text,
+    file.value.sha256,
+  );
+});
+function onEditorKeydown(event: KeyboardEvent) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    if (dirty.value) void saveEdit();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    void cancelEdit();
   }
 }
 
@@ -163,9 +261,12 @@ async function refresh() {
   const open = ["", ...expanded];
   children.clear();
   loading.clear();
-  await Promise.all([...open.map((path) => load(path, path !== "")), loadStatus(), ui.filePath && openFile(ui.filePath)]);
+  await Promise.all([
+    ...open.map((path) => load(path, path !== "")),
+    loadStatus(),
+    ui.filePath && !editing.value && openFile(ui.filePath),
+  ]);
 }
-
 /** Search rows show ranked project-relative paths; browsing keeps the expanded tree intact. */
 const rows = computed(() => {
   const out: { entry: GitDirEntry; depth: number }[] = [];
@@ -193,23 +294,126 @@ function showChanges(path: string) {
   ui.diffPath = path;
   showPanel("changes");
 }
+async function createWorkspaceFile(rawPath: string) {
+  const path = rawPath.trim().replace(/^\/+/, "");
+  if (!path) return;
+  const root = props.snap.workspace.root;
+  try {
+    const created = await workspaceGitApi.createFile(path, "", root);
+    if (root !== props.snap.workspace.root) return;
+    await refresh();
+    ui.filePath = created.path;
+    file.value = created;
+    draft.value = created.text ?? "";
+    editing.value = true;
+    showToast(`Created ${created.path}`);
+  } catch (error) {
+    showToast(paneErrorText(error));
+  }
+}
+
+async function renameEntry(from: string, rawTo: string) {
+  const to = rawTo.trim().replace(/^\/+/, "");
+  if (!to || to === from) return;
+  const root = props.snap.workspace.root;
+  try {
+    const next = await workspaceGitApi.renameFile(from, to, root);
+    if (root !== props.snap.workspace.root) return;
+    workspaceDrafts.rename(root, from, next);
+    if (ui.filePath === from) ui.filePath = next;
+    await refresh();
+    showToast(`Renamed to ${next}`);
+  } catch (error) {
+    showToast(paneErrorText(error));
+  }
+}
+
+async function deleteEntry(entryPath: string, isDir: boolean) {
+  const root = props.snap.workspace.root;
+  const confirmed = await ask(
+    isDir
+      ? `Delete empty folder ${entryPath}?`
+      : `Delete ${entryPath}? This removes the file from disk.`,
+    { title: isDir ? "Delete folder" : "Delete file", kind: "warning", okLabel: "Delete" },
+  );
+  if (!confirmed || root !== props.snap.workspace.root) return;
+  try {
+    await workspaceGitApi.deleteFile(entryPath, root);
+    if (root !== props.snap.workspace.root) return;
+    workspaceDrafts.clear(root, entryPath);
+    if (ui.filePath === entryPath) {
+      editing.value = false;
+      file.value = null;
+      ui.filePath = null;
+    }
+    await refresh();
+    showToast(`Deleted ${entryPath}`);
+  } catch (error) {
+    showToast(paneErrorText(error));
+  }
+}
+
+function newFileMenu(event: MouseEvent, dir = "") {
+  const prefix = dir ? `${dir}/` : "";
+  openMenu(
+    event,
+    [
+      {
+        label: dir ? `New file in ${dir}` : "New file",
+        icon: "plus",
+        prompt: {
+          label: "File path",
+          placeholder: `${prefix}example.ts`,
+          maxLength: 240,
+          confirm: "Create",
+          submit: (value) => void createWorkspaceFile(value),
+        },
+      },
+    ],
+    event.currentTarget as HTMLElement,
+  );
+}
 
 function menu(event: MouseEvent, entry: GitDirEntry) {
   const changed = !entry.dir && !!marker.value(entry.path, false);
   const items: MenuItem[] = [
     { label: "Mention in prompt", icon: "chat", run: () => addToPrompt(mention(entry.path)) },
-    ...(entry.dir ? [] : [{ label: "Open in editor", icon: "external", run: () => openInEditor(entry.path) }]),
+    ...(entry.dir
+      ? [{
+          label: "New file here…",
+          icon: "plus",
+          prompt: {
+            label: "New file path",
+            placeholder: `${entry.path}/file.ts`,
+            maxLength: 240,
+            confirm: "Create",
+            submit: (value) => void createWorkspaceFile(value.includes("/") ? value : `${entry.path}/${value}`),
+          },
+        } as MenuItem]
+      : [{ label: "Open in editor", icon: "external", run: () => openInEditor(entry.path) }]),
     ...(changed ? [{ label: "Show changes", icon: "diff", run: () => showChanges(entry.path) }] : []),
+    {
+      label: "Rename…",
+      icon: "file",
+      prompt: {
+        label: `Rename ${entry.path}`,
+        placeholder: entry.path,
+        maxLength: 240,
+        confirm: "Rename",
+        submit: (value) => void renameEntry(entry.path, value),
+      },
+    },
     {
       label: "Copy path",
       icon: "copy",
       run: () => navigator.clipboard.writeText(entry.path).catch(() => showToast("Could not copy to the clipboard")),
     },
     { label: "Show in file manager", icon: "folder", run: () => fileActions.reveal(absolute(entry.path)) },
+    { divider: true },
+    { label: entry.dir ? "Delete empty folder…" : "Delete file…", icon: "trash", danger: true, run: () => void deleteEntry(entry.path, entry.dir) },
   ];
   openMenu(event, items);
 }
-
 /** Drag the splitter to resize the tree; the width is kept for next time. */
 function startResize(event: PointerEvent) {
   event.preventDefault();
@@ -244,6 +448,7 @@ watch(
     ui.fileLines = null;
     restoreExpanded();
     file.value = null;
+    editing.value = false;
     ui.filePath = null;
     loadTree();
     void loadStatus();
@@ -258,7 +463,7 @@ watch(() => props.snap.changes, (changes, previous) => {
   const folders = new Set<string>();
   for (const c of affected) {
     const path = (c.dir + c.name).replaceAll('\\', '/');
-    if (path === ui.filePath) void openFile(path);
+    if (path === ui.filePath && !editing.value) void openFile(path);
     // Refresh the nearest visible parent, including when a new subtree was created.
     let dir = path.split('/').slice(0, -1).join('/');
     while (dir && !expanded.has(dir)) dir = dir.split('/').slice(0, -1).join('/');
@@ -267,7 +472,16 @@ watch(() => props.snap.changes, (changes, previous) => {
   if (affected.length) { refreshSearch(); void loadStatus(); }
   for (const dir of folders) void load(dir);
 });
-watch(() => ui.filePath, path => { if (path) void openFile(path); });
+watch(() => ui.filePath, (path) => {
+  if (path) void openFile(path);
+});
+watch(workspaceChange, ({ root }) => {
+  if (!root || root !== props.snap.workspace.root) return;
+  refreshSearch();
+  void loadStatus();
+  for (const dir of ["", ...expanded]) void load(dir, dir !== "");
+  if (ui.filePath && !editing.value) void openFile(ui.filePath);
+});
 
 onMounted(() => {
   restoreExpanded();
@@ -289,6 +503,9 @@ onMounted(() => {
         </button>
         <button class="icon-btn" :class="{ on: showIgnored }" :aria-pressed="showIgnored" :title="showIgnored ? 'Hide files .gitignore excludes' : 'Show files .gitignore excludes'" @click="toggleIgnored">
           <Icon name="files" :size="14" />
+        </button>
+        <button class="icon-btn" title="New file" aria-label="New file" @click="newFileMenu($event)">
+          <Icon name="plus" :size="14" />
         </button>
         <button class="icon-btn" title="Refresh" @click="refresh">
           <Icon name="refresh" :size="14" />
@@ -331,6 +548,7 @@ onMounted(() => {
           <span v-else class="chev" />
           <Icon :name="entry.dir ? 'folder' : 'file'" :size="13" class="kind" />
           <span class="truncate">{{ entry.name }}</span>
+          <span v-if="!entry.dir && workspaceDrafts.isDirty(snap.workspace.root, entry.path)" class="draft-dot" title="Unsaved draft">●</span>
           <span v-if="marker(entry.path, entry.dir)" class="git" :class="'git-' + marker(entry.path, entry.dir)!.code" :title="marker(entry.path, entry.dir)!.title">{{ marker(entry.path, entry.dir)!.text }}</span>
         </button>
       </div>
@@ -344,13 +562,23 @@ onMounted(() => {
         <button class="btn btn-secondary" @click="showPanel('files')">Browse files</button>
         <span class="mono truncate" :title="ui.filePath ?? ''">{{ ui.filePath }}</span>
         <span v-if="ui.fileLines" class="faint">{{ ui.fileLines.end === ui.fileLines.start ? `line ${ui.fileLines.start}` : `lines ${ui.fileLines.start}–${ui.fileLines.end}` }}</span>
-        <button v-if="ui.filePath && ui.fileLines && file" class="btn btn-secondary" @click="openInEditor(ui.filePath, ui.fileLines.start)">Open line in VS Code</button>
+        <button v-if="canEdit && !editing" class="btn btn-secondary" @click="startEdit">Edit</button>
+        <template v-else-if="editing">
+          <button class="btn btn-secondary" :disabled="saving" @click="cancelEdit">Cancel</button>
+          <button class="btn" :disabled="!dirty || saving" @click="saveEdit">{{ saving ? "Saving…" : "Save" }}</button>
+        </template>
+        <button v-if="ui.filePath && ui.fileLines && file && !editing" class="btn btn-secondary" @click="openInEditor(ui.filePath, ui.fileLines.start)">Open line in VS Code</button>
         <button v-if="ui.filePath && file" class="icon-btn" title="Open in default app" aria-label="Open in default app" @click="openInEditor(ui.filePath)"><Icon name="external" :size="14" /></button>
       </div>
       <template v-if="file">
         <div v-if="!reader" class="viewer-head">
           <span class="mono truncate" :title="file.path">{{ file.path }}</span>
           <span class="faint">{{ size(file.size) }}</span>
+          <button v-if="canEdit && !editing" class="btn btn-secondary" title="Edit this file inline" @click="startEdit">Edit</button>
+          <template v-else-if="editing">
+            <button class="btn btn-secondary" :disabled="saving" @click="cancelEdit">Cancel</button>
+            <button class="btn" :disabled="!dirty || saving" @click="saveEdit">{{ saving ? "Saving…" : "Save" }}</button>
+          </template>
           <button class="icon-btn" title="Mention in prompt" @click="addToPrompt(mention(file.path))">
             <Icon name="chat" :size="14" />
           </button>
@@ -363,7 +591,7 @@ onMounted(() => {
           <button class="icon-btn" title="Show in file manager" @click="fileActions.reveal(absolute(file.path))">
             <Icon name="folder" :size="14" />
           </button>
-          <button class="icon-btn" title="Close the file" aria-label="Close the file" @click="ui.filePath = null">
+          <button class="icon-btn" title="Close the file" aria-label="Close the file" @click="closeFile()">
             <Icon name="cross" :size="14" />
           </button>
         </div>
@@ -371,6 +599,15 @@ onMounted(() => {
           <strong>Binary file</strong>
           <span>It cannot be shown as text.</span>
           <button class="btn btn-secondary" @click="openInEditor(file.path)">Open in its app</button>
+        </div>
+        <div v-else-if="editing" class="code editing">
+          <textarea
+            v-model="draft"
+            class="editor mono"
+            :aria-label="`Edit ${file.path}`"
+            spellcheck="false"
+            @keydown="onEditorKeydown"
+          />
         </div>
         <div v-else class="code">
           <CodeBlock :caption="lang(file.path) || 'text'" :text="file.text" :lang="lang(file.path)" :max-height="100000" :lines="ui.fileLines" />
@@ -546,6 +783,28 @@ onMounted(() => {
   flex: 1;
   overflow: auto;
 }
+.code.editing {
+  display: flex;
+  overflow: hidden;
+}
+.editor {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+  tab-size: 2;
+}
+.editor:focus {
+  outline: none;
+  border-color: var(--border-strong);
+}
 .empty {
   display: flex;
   flex-direction: column;
@@ -562,6 +821,11 @@ onMounted(() => {
 .faint {
   font-size: var(--text-sm);
   color: var(--text-faint);
+}
+.draft-dot {
+  flex: none;
+  font-size: 9px;
+  color: var(--accent, var(--text-muted));
 }
 .pad {
   padding: 6px;

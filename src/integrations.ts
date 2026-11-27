@@ -112,3 +112,16 @@ export function computerSetting(current: { value: unknown; scope?: "global" | "p
   if (on) value.push("computer");
   return { key: "integrations", scope: current.scope ?? "global", value };
 }
+
+/** Only retry reads refused before admission, never writes or a generic busy/closing error. */
+export async function retryIntegrationRead<T>(read: () => Promise<T>, current: () => boolean): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    if (!current()) throw new Error("Settings page changed");
+    try {
+      return await read();
+    } catch (error) {
+      if (attempt >= 5 || !/\b\d+ reads are already running; retry when one finishes\b/.test(String(error))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+    }
+  }
+}

@@ -2,7 +2,7 @@
 
 import { reactive, watch } from "vue";
 
-const INSPECTOR_TABS = ["plan", "changes", "activity", "workers", "peers", "files", "terminal", "browser", "app"] as const;
+const INSPECTOR_TABS = ["plan", "changes", "activity", "workers", "peers", "files", "terminal", "browser", "app", "boards"] as const;
 export type InspectorTab = (typeof INSPECTOR_TABS)[number];
 export interface LineRange { start: number; end: number }
 

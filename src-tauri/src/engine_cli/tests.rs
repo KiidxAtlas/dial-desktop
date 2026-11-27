@@ -71,6 +71,56 @@ fn accounts_mark_the_active_one_and_skip_sentences() {
 }
 
 #[test]
+fn structured_doctor_json_preserves_ids_paths_and_notes() {
+    let report = parse_doctor_json(
+        r#"{
+            "capabilities": [
+                {"id": "bun", "name": "Bun", "installed": true, "path": "/opt/homebrew/bin/bun"},
+                {"id": "gopls", "name": "Go language server", "installed": false, "path": null}
+            ],
+            "notes": ["Memory: local"]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(report.capabilities.len(), 2);
+    assert_eq!(report.capabilities[0].id, "bun");
+    assert!(report.capabilities[0].installed);
+    assert_eq!(
+        report.capabilities[0].path.as_deref(),
+        Some("/opt/homebrew/bin/bun")
+    );
+    assert_eq!(report.capabilities[1].id, "gopls");
+    assert!(!report.capabilities[1].installed);
+    assert_eq!(report.capabilities[1].path, None);
+    assert_eq!(report.notes, ["Memory: local"]);
+}
+
+#[test]
+fn structured_accounts_json_maps_labels_active_and_cooling() {
+    let list = parse_accounts_json(
+        r#"[
+            {"key": "a1", "label": "one@example.com", "active": true, "cooling": false},
+            {"key": "a2", "label": "two@example.com", "active": false, "cooling": true},
+            {"key": "a3", "label": "", "active": false, "cooling": true}
+        ]"#,
+    )
+    .unwrap();
+    assert_eq!(list.len(), 3);
+    assert_eq!(
+        (list[0].key.as_str(), list[0].detail.as_str(), list[0].active),
+        ("a1", "one@example.com", true)
+    );
+    assert_eq!(
+        (list[1].key.as_str(), list[1].detail.as_str(), list[1].active),
+        ("a2", "two@example.com (cooling down)", false)
+    );
+    assert_eq!(
+        (list[2].key.as_str(), list[2].detail.as_str(), list[2].active),
+        ("a3", "(cooling down)", false)
+    );
+}
+
+#[test]
 fn link_paths_follow_the_platform() {
     let home = if cfg!(windows) {
         Path::new("C:\\Users\\me")
@@ -292,6 +342,16 @@ fn commit_previews_keep_the_message_and_split_off_the_warning() {
     assert_eq!(parse_commit_preview("No changes to commit.\n").unwrap_err(), "There are no changes to describe");
     assert!(parse_commit_preview("Dry run. Message:\n  \n").is_err());
     assert!(parse_commit_preview("").is_err());
+
+    let json_ok = parse_commit_preview_json(r#"{"kind":"dry_run","message":"feat: json","warning":"short"}"#)
+        .unwrap()
+        .unwrap();
+    assert_eq!(json_ok.message, "feat: json");
+    assert_eq!(json_ok.warning.as_deref(), Some("short"));
+    let json_empty = parse_commit_preview_json(r#"{"kind":"nothing_to_commit","pushed":false}"#)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(json_empty, "There are no changes to describe");
 }
 
 #[test]
@@ -311,10 +371,16 @@ fn share_output_yields_the_link_and_its_notes() {
     let link = parse_share("Share URL: https://share.example/s/abc#key\nNote: the key is only in the URL fragment.\nTrimmed to fit the size cap: images.\n").unwrap();
     assert_eq!(link.url, "https://share.example/s/abc#key");
     assert_eq!(link.notes, ["the key is only in the URL fragment.", "Trimmed to fit the size cap: images."]);
+    let bare = parse_share("https://gist.github.com/u/123#k\n").unwrap();
+    assert_eq!(bare.url, "https://gist.github.com/u/123#k");
+    assert!(bare.notes.is_empty());
+    let json = parse_share_json(r#"{"url":"https://share.example/s/xyz#k","notes":["fragment only"]}"#).unwrap();
+    assert_eq!(json.url, "https://share.example/s/xyz#k");
+    assert_eq!(json.notes, ["fragment only"]);
+    assert!(parse_share_json(r#"{"url":"javascript:alert(1)","notes":[]}"#).is_err());
     assert!(parse_share("").is_err());
     assert_eq!(parse_share("gh: not logged in").unwrap_err(), "gh: not logged in");
 }
-
 #[test]
 fn understanding_queries_are_words_and_relays_need_an_address() {
     let (args, changes) = report_args("understanding", false, Some("architecture")).unwrap();
@@ -322,5 +388,44 @@ fn understanding_queries_are_words_and_relays_need_an_address() {
     assert!(!changes);
     assert!(report_args("understanding", false, Some("--dir=/")).is_err());
     assert_eq!(report_args("experience", false, None).unwrap().0, ["experience", "--json"]);
-    assert!(relay_start(Path::new("/nonexistent/dial"), None, "not an address").is_err());
+    assert!(RelayManager::default().start(Path::new("/nonexistent/dial"), None, "not an address").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn json_fallback_only_retries_when_engine_rejects_json_flag() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = root.path().join("calls");
+    let failing = root.path().join("dial-fail");
+    executable_at(
+        &failing,
+        format!(
+            "#!/bin/sh\necho x >> '{}'\necho 'network timeout' >&2\nexit 1\n",
+            calls.display()
+        )
+        .as_bytes(),
+    );
+    let err = commit_message(&failing, root.path()).unwrap_err();
+    assert!(err.contains("network timeout"), "{err}");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+    std::fs::remove_file(&calls).unwrap();
+    let err = share(&failing, root.path(), "sess1", false).unwrap_err();
+    assert!(err.contains("network timeout"), "{err}");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+    // An older engine rejecting `--json` falls back cleanly once to legacy output.
+    let legacy = root.path().join("dial-legacy");
+    executable_at(
+        &legacy,
+        format!(
+            "#!/bin/sh\necho x >> '{}'\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--json\" ]; then\n    echo \"error: unexpected argument '--json' found\" >&2\n    exit 2\n  fi\ndone\nprintf 'Share URL: https://share.example/s/ok#k\\n'\n",
+            calls.display()
+        )
+        .as_bytes(),
+    );
+    std::fs::remove_file(&calls).unwrap();
+    let link = share(&legacy, root.path(), "sess1", false).unwrap();
+    assert_eq!(link.url, "https://share.example/s/ok#k");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
 }

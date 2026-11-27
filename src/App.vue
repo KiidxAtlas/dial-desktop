@@ -7,7 +7,7 @@ import { installEngine, needsEngineInstall, updateEngine, updates } from "./upda
 import { commandKey, escapeStopsTurn, inTerminal, terminalOwnsKey, typingIn } from "./keysGuard";
 import { focusComposer, ui, type InspectorTab } from "./ui";
 import { copyText, goToSession, openSession, sessionOrder, startRename, stepSession } from "./sessionActions";
-import { followAgentApp, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
+import { followAgentApp, followAgentBoards, followAgentBrowser, inspectorFloats, showPanel, showSidebar, sidebarShown, toggleSidebar, trackPreviews } from "./workspace";
 import { zoomBy } from "./appearance";
 import { startNewSession } from "./commands";
 import { background, hasBackground, restoreImage } from "./backgrounds";
@@ -376,6 +376,7 @@ function scanOnReturn() {
 
 let stopFollowing: (() => void) | null = null;
 let stopFollowingApp: (() => void) | null = null;
+let stopFollowingBoards: (() => void) | null = null;
 let stopFullscreen: (() => void) | null = null;
 onMounted(async () => {
   window.addEventListener("keydown", onKey);
@@ -387,6 +388,7 @@ onMounted(async () => {
   void followFullscreen().then((stop) => (stopFullscreen = stop));
   stopFollowing = await followAgentBrowser();
   stopFollowingApp = await followAgentApp();
+  stopFollowingBoards = await followAgentBoards();
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
@@ -397,6 +399,7 @@ onBeforeUnmount(() => {
   stopFullscreen?.();
   stopFollowing?.();
   stopFollowingApp?.();
+  stopFollowingBoards?.();
 });
 </script>
 

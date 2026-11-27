@@ -33,5 +33,17 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
 
+    def test_release_workflow_covers_x64_and_arm64_for_all_desktop_platforms(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text()
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ]:
+            self.assertIn(target, workflow, f"missing release target {target}")
+
 if __name__ == "__main__":
     unittest.main()

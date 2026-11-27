@@ -249,7 +249,7 @@ fn strings(value: &Value) -> Vec<String> {
 }
 
 /// The user's answer to one question of the open `ask` request.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Answer {
     /// The question's `id`.
@@ -260,6 +260,12 @@ pub struct Answer {
     /// Free text instead of, or besides, an option.
     #[serde(default)]
     pub custom: Option<String>,
+    /// Image files attached to the free text, by path (the engine reads and verifies them).
+    #[serde(default)]
+    pub images: Vec<String>,
+    /// Pasted images as base64; the app saves them to files and sends their paths.
+    #[serde(default)]
+    pub inline_images: Vec<String>,
 }
 
 /// How the user closes the open question.
@@ -277,9 +283,10 @@ pub enum Reply {
 pub struct Model {
     pub connection: Option<Connection>,
     pub conversation: Conversation,
-    /// Senders of delivery notices and controller-authored journal records. The wire client
-    /// retains the text but not its provenance. Index only rows it actually appended.
-    pub(crate) received_from: HashMap<usize, String>,
+    /// Senders of delivery notices and controller-authored journal records, with whether the
+    /// record came from the session journal (`true`) or a live arrival notice (`false`).
+    /// The wire client retains the text but not its provenance. Index only rows it actually appended.
+    pub(crate) received_from: HashMap<usize, (String, bool)>,
     pub sessions: Vec<SessionSummary>,
     /// Ignore late pages from a history refresh superseded by a new one.
     session_page: Option<(RequestId, u64)>,
@@ -678,6 +685,9 @@ impl Model {
                     if let Some(custom) = custom {
                         result["customInput"] = json!(custom);
                     }
+                    if !answer.images.is_empty() {
+                        result["customInputImages"] = json!(answer.images);
+                    }
                     results.push(result);
                 }
                 results
@@ -768,13 +778,13 @@ impl Model {
                     Message::Event(event) if event.kind == "notice" && event.body["kind"].is_null() && event.body["lane"].is_null() => {
                         let mail = &event.body["received_message"];
                         if let (Some(from), Some(text)) = (mail["from"].as_str().filter(|s| !s.trim().is_empty()), mail["text"].as_str()) {
-                            sender = Some(from.to_owned());
+                            sender = Some((from.to_owned(), false));
                             event.body["message"] = Value::String(text.to_owned());
                         }
                     }
                     Message::Event(event) if event.kind == "replay_message" => {
                         replay_images(&mut event.body["message"]);
-                        sender = journal_sender(&event.body["message"]).map(str::to_owned);
+                        sender = journal_sender(&event.body["message"]).map(|from| (from.to_owned(), true));
                         if sender.is_none() { crate::legacy_text::project_user_message(&mut event.body["message"]); }
                     }
                     Message::Response { result: Ok(body), .. } if body.get("messages").is_some() => {
@@ -887,13 +897,23 @@ impl Model {
                         if !self.conversation.load_snapshot(snapshot) {
                             self.toast = Some("The engine's recovery snapshot was incomplete; the view may be out of date".into());
                         } else {
-                            // User-role records each produce one user row in order. Tool/assistant
-                            // records need not, so never use a wire message offset as a row index.
-                            self.received_from = snapshot["messages"].as_array().into_iter().flatten()
-                                .filter(|m| m["role"] == "user")
-                                .zip(self.conversation.entries().iter().enumerate().filter(|(_, e)| matches!(e, Entry::User(_))))
-                                .filter_map(|(m, (i, _))| journal_sender(m).map(|from| (i, from.to_owned())))
-                                .collect();
+                            // Replay into a scratch Conversation so harness user-role records
+                            // (worker results, hidden reminders, compaction summaries) stay aligned
+                            // with the exact row indices produced by `load_snapshot`.
+                            let mut replay = Conversation::default();
+                            let mut senders = HashMap::new();
+                            for message in snapshot["messages"].as_array().into_iter().flatten() {
+                                let index = replay.entries().len();
+                                let sender = journal_sender(message).map(str::to_owned);
+                                replay.apply(&Message::Event(dial_client::Event {
+                                    kind: "replay_message".into(),
+                                    body: json!({ "message": message }),
+                                }));
+                                if let Some(from) = sender && replay.entries().len() == index + 1 {
+                                    senders.insert(index, (from, true));
+                                }
+                            }
+                            self.received_from = senders;
                         }
                     }
                     (Purpose::LiveStart, result) => {

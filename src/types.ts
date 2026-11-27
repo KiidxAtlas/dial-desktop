@@ -115,6 +115,10 @@ export interface Answer {
   id: string;
   selected: string[];
   custom: string | null;
+  /** Image files attached to the free text, by path. */
+  images?: string[];
+  /** Pasted images as base64; the app saves them and sends their paths. */
+  inlineImages?: string[];
 }
 
 export interface Task {
@@ -330,7 +334,11 @@ export interface FileView {
   text: string | null;
   size: number;
   truncated: boolean;
+  /** SHA-256 hex digest of the complete file when not truncated. */
+  sha256?: string;
 }
+
+export type DiffScope = "all" | "unstaged" | "staged";
 
 export interface DiffView {
   path: string;
@@ -339,6 +347,7 @@ export interface DiffView {
   base: "head" | "index" | "untracked";
   deleteOnRevert: boolean;
   nested?: boolean;
+  conflicted?: boolean;
 }
 
 /** Where the browser panel sits, in logical window pixels. */

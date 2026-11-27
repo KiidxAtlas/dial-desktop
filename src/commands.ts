@@ -167,6 +167,7 @@ export function commands(snap: OpenSnapshot): Command[] {
     run: () => (ui.inspectorOpen = !ui.inspectorOpen),
   });
   add({ id: "browser", group: "View", label: "Open the browser", icon: "globe", hint: "⇧⌘B", keywords: "web page preview localhost url", run: () => showPanel("browser") });
+  add({ id: "boards", group: "View", label: "Open Boards", icon: "chip", keywords: "hardware serial USB Arduino ESP32 monitor capture", run: () => showPanel("boards") });
   add({ id: "files", group: "View", label: "Browse files", icon: "folder", hint: "⇧⌘E", keywords: "explorer tree project open file", run: () => showPanel("files") });
   add({ id: "quick-open", group: "View", label: "Quick-open project file", icon: "file", hint: "⌘P", run: () => { ui.filePalette = true; ui.paletteOpen = true; } });
   add({ id: "terminal", group: "View", label: "Open the terminal", icon: "terminal", hint: "⌃`", keywords: "shell console commands run", run: () => showPanel("terminal") });

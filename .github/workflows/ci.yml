@@ -28,15 +28,11 @@ jobs:
           workspaces: src-tauri -> target
       - run: npm ci
       - run: npm run build:web
-      - run: node --test src/paths.test.mjs src/commandRunner.test.mjs src/terminalLinks.test.mjs src/modelLibrary.test.mjs src/integrations.test.mjs
-      - run: node --test --test-name-pattern="answers name the local images" src/typeDesign.test.mjs
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib agent_browser::screenshot_wire
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib launcher::tests
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib engine_cli::tests::command_files_survive_engine_updates
-      - if: runner.os != 'Windows'
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib selecting_an_engine_retries_browser_registration
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib terminal::tests
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib browser_mcp::tests
+      - name: Run full JS test suite
+        shell: bash
+        run: node --test src/*.test.mjs packaging/runtime/*.test.mjs
+      - name: Run full Rust test suite
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Check workspace file selection, engine recovery and update guards
         shell: bash
         run: |

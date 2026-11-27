@@ -65,11 +65,17 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             guest_config: ''
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            guest_config: ''
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             guest_config: ''
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            guest_config: ''
     runs-on: ${{ matrix.os }}
-    environment: ${{ matrix.os == 'windows-latest' && 'windows-signing' || 'desktop-build' }}
+    environment: ${{ startsWith(matrix.os, 'windows') && 'windows-signing' || 'desktop-build' }}
     permissions:
       contents: write
       id-token: write
@@ -135,6 +141,14 @@ jobs:
         shell: pwsh
         run: Install-Module ArtifactSigning -RequiredVersion 0.1.8 -Scope CurrentUser -Repository PSGallery -Force -ErrorAction Stop
 
+      # Ship the engine inside the app (`bundle.externalBin`), so a fresh install works without a
+      # separate `dial` install. The release key verifies the engine's signed SHA256SUMS.
+      - name: Fetch the bundled Dial engine
+        shell: bash
+        env:
+          DIAL_RELEASE_PUBLIC_KEY: ${{ vars.DIAL_RELEASE_PUBLIC_KEY }}
+        run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} packaging/engine/fetch.py ${{ matrix.target }}
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -148,12 +162,12 @@ jobs:
           releaseName: Dial Desktop ${{ github.ref_name }}
           releaseBody: |
             Download Dial Desktop for your platform below, or from https://dial.rootatlas.dev/download.
-            Installed apps update themselves. The app runs the Dial engine (`dial`); if none is installed it offers to install it, and it keeps the engine updated through `dial update`.
+            Installed apps update themselves. The app ships with the Dial engine (`dial`) and keeps any engine you installed separately updated through `dial update`.
             Terminal only? `curl -fsSL https://dial.rootatlas.dev/install | sh`
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json${{ matrix.guest_config != '' && format(' --config {0}', matrix.guest_config) || '' }}
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.engine.conf.json${{ matrix.guest_config != '' && format(' --config {0}', matrix.guest_config) || '' }}
 
       - name: Check the bundled virtual Mac helper before publication
         if: matrix.target == 'aarch64-apple-darwin'

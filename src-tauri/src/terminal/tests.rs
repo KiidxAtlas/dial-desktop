@@ -82,6 +82,14 @@ fn slash_command_preserves_literal_argument_and_configured_program() {
 }
 
 #[test]
+fn attached_chat_targets_a_literal_session_in_the_selected_project() {
+    let child = Task::Attach { session: "abcd1234".into() }.child(Path::new("dial"), Path::new("project")).unwrap();
+    assert_eq!(child.get_argv(), &[OsStr::new("dial"), OsStr::new("attach"), OsStr::new("--"), OsStr::new("abcd1234")]);
+    assert_eq!(child.get_cwd().map(Path::new), Some(Path::new("project")));
+    assert!(Task::Attach { session: "--help".into() }.child(Path::new("dial"), Path::new("project")).is_err());
+}
+
+#[test]
 fn windows_honors_resolvable_shells_and_falls_back_from_msys_paths() {
     let dir = tempfile::tempdir().unwrap();
     let path = std::env::join_paths([dir.path()]).unwrap();

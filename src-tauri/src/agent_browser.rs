@@ -131,7 +131,13 @@ Dial Desktop itself: desktop_view shows what the window shows (add screenshot fo
 desktop_commands lists every palette action (sessions, panels, settings pages, theme, zoom, \
 projects) and desktop_run runs one; desktop_settings reads Dial's settings and \
 desktop_set_setting changes one, except permission and credential settings, which stay the \
-user's. Use them when the user asks you to show, open, switch or change something in the app.";
+user's. Use them when the user asks you to show, open, switch or change something in the app. \
+The board_* tools work with microcontroller boards and other serial devices through the Boards \
+panel: board_list shows the devices and this folder's firmware project, board_connect opens the \
+console the user watches, board_read and board_send talk to the device, board_build and \
+board_flash run the project's build and upload commands (the console's port is freed and reopened \
+for you), and board_run and board_put run and save code on MicroPython boards. Edit the firmware \
+source with your ordinary file tools, flash it, then read the console to check that it works.";
 
 /// The MCP tool list.
 pub fn tools() -> Value {
@@ -284,6 +290,7 @@ pub fn tools() -> Value {
     if let Value::Array(items) = &mut list {
         items.extend(desktop::tools());
         items.extend(crate::types::tools());
+        items.extend(crate::boards::agent_tools());
     }
     list
 }
@@ -906,6 +913,9 @@ fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
             if tool.starts_with("types_") {
                 let store = app.state::<crate::types::Store>();
                 return crate::types::agent_call(app, &store, tool, args).map(Reply::text);
+            }
+            if tool.starts_with("board_") {
+                return crate::boards::agent_call(app, &request.workspace, tool, args);
             }
             if desktop::TOOLS.contains(&tool) {
                 return desktop::call(app, tool, args);

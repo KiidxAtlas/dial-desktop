@@ -1,8 +1,8 @@
 //! Files attached to a prompt. Images use the engine's vision input; other files are read from workspace copies.
 //!
-//! A file chosen in the picker or dropped on the window stays a path: the engine reads it when the
-//! turn starts. The UI still needs to show it, so [`read_image`] returns a small data URL preview
-//! of the same bytes. Pasted images have no file and travel as base64 (`inline_images`).
+//! Desktop submits the bytes shown in the image preview (picker, drop or paste). Private files
+//! carry those bytes across the size-limited engine RPC; their paths belong to the structured
+//! image input, not the prompt text. The engine encodes the pixels for inference.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -20,13 +20,13 @@ pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// Attachments per prompt.
 pub const MAX_IMAGES: usize = 10;
 
-/// A readable image file, ready to show and to send by path.
+/// A readable image file with its source identity and full image data for the composer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageFile {
     pub path: String,
     pub name: String,
-    /// `data:` URL of the file, for the thumbnail.
+    /// Full `data:` URL used both to preview the image and to submit those exact bytes.
     pub url: String,
 }
 
