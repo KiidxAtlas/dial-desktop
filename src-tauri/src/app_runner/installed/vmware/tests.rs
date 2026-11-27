@@ -124,13 +124,14 @@ fn vmx_text(enabled: &str, port: &str, ip: Option<&str>) -> String {
     text
 }
 
-/// A VM directory holding `a.vmx`; returns the guard and the canonical `.vmx` path.
+/// A VM directory holding `a.vmx`; returns the guard and the `.vmx` path in the plain form the
+/// console receives after `vmx::load` (verbatim `\\?\` prefix stripped on Windows).
 fn write_vmx(text: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.vmx");
     fs::write(&path, text).unwrap();
     let canonical = fs::canonicalize(&path).unwrap();
-    (dir, canonical.to_str().unwrap().to_owned())
+    (dir, vmx::normalize(&canonical).to_str().unwrap().to_owned())
 }
 
 // ---- VMX settings ----

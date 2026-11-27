@@ -515,7 +515,12 @@ impl Store {
 
     /// The store in the app's per-user folder, with the saved choice of where new types go.
     pub fn for_home(home: Option<&Path>) -> Self {
-        let app = crate::launcher::app_dir(home);
+        Self::in_app_dir(crate::launcher::app_dir(home))
+    }
+
+    /// A store rooted at `app` (the app's folder, holding `types/` and the saved choice). Split
+    /// from `for_home` so tests can pin the folder instead of reading the host's config env.
+    fn in_app_dir(app: Option<PathBuf>) -> Self {
         let prefs = app.as_ref().map(|d| d.join("types-location.json"));
         let saved: Prefs = prefs
             .as_deref()

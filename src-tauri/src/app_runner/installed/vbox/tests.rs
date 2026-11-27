@@ -239,7 +239,7 @@ fn sdk_must_sit_beside_the_trusted_tool() {
     fs::write(xpcom.join("vboxxpcom.py"), "").unwrap();
     fs::write(api.join("__init__.py"), "").unwrap();
     let layout = SdkLayout::for_tool(&tool).unwrap();
-    assert_eq!(layout.bin, fs::canonicalize(&bin).unwrap());
+    assert_eq!(layout.bin, strip_verbatim(&fs::canonicalize(&bin).unwrap()));
     assert_eq!(layout.sdk, layout.bin.join("sdk"));
     assert!(SdkLayout::for_tool(&bin.join("absent")).is_err());
 }

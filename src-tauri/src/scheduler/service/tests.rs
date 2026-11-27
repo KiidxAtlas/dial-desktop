@@ -73,7 +73,10 @@ fn definitions_live_where_each_manager_looks() {
     );
     assert_eq!(
         paths.log(Manager::Launchd, "l"),
-        "/h/app/schedule-logs/l.log"
+        Path::new("/h/app")
+            .join("schedule-logs")
+            .join("l.log")
+            .to_string_lossy()
     );
     assert_eq!(Manager::for_os("windows"), None);
 }
@@ -102,8 +105,9 @@ fn refuses_engines_that_would_not_outlive_the_app() {
             .unwrap_err()
             .contains("not an installed executable")
     );
-    assert!(validate(Path::new("/bin/sh"), "relative").is_err());
-    assert!(validate(Path::new("/bin/sh"), root).is_ok());
+    let executable = std::env::current_exe().unwrap();
+    assert!(validate(&executable, "relative").is_err());
+    assert!(validate(&executable, root).is_ok());
 }
 
 /// Registers a real LaunchAgent for a temporary project: `cargo test -- --ignored live_launchd`.

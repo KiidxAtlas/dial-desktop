@@ -97,7 +97,9 @@ fn generated_images_show_inline_from_changed_paths_else_the_output_argument() {
     let resumed = image_call(args, Some(outcome(None, &[])));
     assert_eq!(
         ToolView::new(0, &resumed, &w).images,
-        ["/home/ada/work/app/art/kite.png"]
+        [std::path::Path::new("/home/ada/work/app")
+            .join("art/kite.png")
+            .to_string_lossy()]
     );
     // Running, failed, escaping or non-image outputs, and other tools, show nothing.
     assert!(
@@ -151,9 +153,18 @@ fn a_read_shows_the_images_it_viewed() {
     // Each viewed image inside the workspace, once, in order; converted sources and prose are not.
     assert_eq!(
         ToolView::new(0, &read(Some(true), receipt), &w).images,
-        ["/home/ada/work/app/shots/a.png", "/home/ada/work/app/shots/b (1).jpg"]
+        ["shots/a.png", "shots/b (1).jpg"].map(|path| {
+            std::path::Path::new("/home/ada/work/app")
+                .join(path)
+                .to_string_lossy()
+                .into_owned()
+        })
     );
-    assert!(ToolView::new(0, &read(Some(false), receipt), &w).images.is_empty());
+    assert!(
+        ToolView::new(0, &read(Some(false), receipt), &w)
+            .images
+            .is_empty()
+    );
     // Text from other tools that looks like a receipt shows nothing.
     let mut bash = read(Some(true), receipt);
     bash.name = "bash".into();
@@ -162,7 +173,10 @@ fn a_read_shows_the_images_it_viewed() {
     let many: String = (0..20)
         .map(|i| format!("Image: shots/{i}.png (1 bytes; attached)\n"))
         .collect();
-    assert_eq!(ToolView::new(0, &read(Some(true), &many), &w).images.len(), 8);
+    assert_eq!(
+        ToolView::new(0, &read(Some(true), &many), &w).images.len(),
+        8
+    );
 }
 
 #[test]
@@ -173,9 +187,19 @@ fn retained_tool_images_survive_live_and_replayed_results() {
         json!({"event":"tool_result", "call_id":"live", "name":"browser", "is_error":false, "data":{"artifact":{"uri":uri}}}),
         json!({"event":"replay_message", "message":{"role":"tool", "tool_call_id":"replayed", "dial_images":[{"uri":uri}, {"uri":"artifact://../outside"}]}}),
     ] {
-        model.apply(crate::engine::Update::Message(dial_client::Message::Event(dial_client::Event { kind:event["event"].as_str().unwrap().into(), body:event })));
-        let Some(Entry::Tool(tool)) = model.conversation.entries().last() else { panic!("missing tool row") };
-        assert_eq!(ToolView::new(0, tool, &workspace()).images.as_slice(), std::slice::from_ref(&uri));
+        model.apply(crate::engine::Update::Message(dial_client::Message::Event(
+            dial_client::Event {
+                kind: event["event"].as_str().unwrap().into(),
+                body: event,
+            },
+        )));
+        let Some(Entry::Tool(tool)) = model.conversation.entries().last() else {
+            panic!("missing tool row")
+        };
+        assert_eq!(
+            ToolView::new(0, tool, &workspace()).images.as_slice(),
+            std::slice::from_ref(&uri)
+        );
     }
 }
 
@@ -187,10 +211,19 @@ fn received_mail_from_live_notices_keeps_every_available_character_but_not_typed
     for message in [preview, peer, "Message from an unknown source"] {
         feed(&mut model, json!({"event":"notice", "message":message}));
     }
-    feed(&mut model, json!({"event":"notice", "kind":"interrupted", "lane":"alert", "message":preview}));
+    feed(
+        &mut model,
+        json!({"event":"notice", "kind":"interrupted", "lane":"alert", "message":preview}),
+    );
     let rows = serde_json::to_value(Snapshot::new(&model, Some(&workspace()), 0).entries).unwrap();
-    assert_eq!(rows[0], json!({"kind":"received", "source":"workerNotice", "sender":"task-1 (reviewer)", "text":preview}));
-    assert_eq!(rows[1], json!({"kind":"received", "source":"peerNotice", "sender":"session-42", "text":peer}));
+    assert_eq!(
+        rows[0],
+        json!({"kind":"received", "source":"workerNotice", "sender":"task-1 (reviewer)", "text":preview})
+    );
+    assert_eq!(
+        rows[1],
+        json!({"kind":"received", "source":"peerNotice", "sender":"session-42", "text":peer})
+    );
     assert_eq!(rows[2]["kind"], "notice");
     assert_eq!(rows[3]["lane"], "alert");
 }
@@ -320,7 +353,10 @@ fn apply(prev: &Snapshot, patch: &serde_json::Map<String, Value>) -> Value {
 fn reasoning_preference_projects_only_the_effective_boolean_into_snapshot_updates() {
     let mut model = Model::starting();
     let default = Snapshot::new(&model, None, 0);
-    assert_eq!(serde_json::to_value(&default).unwrap()["showThinking"], true);
+    assert_eq!(
+        serde_json::to_value(&default).unwrap()["showThinking"],
+        true
+    );
 
     let folded = crate::model::SavedSetting {
         value: json!(false),
@@ -349,7 +385,10 @@ fn published_snapshots_send_only_what_changed() {
     let event = published.advance(first.clone()).unwrap();
     assert_eq!((event.seq, event.base), (1, 0));
     assert_eq!(event.full.as_ref(), Some(&first));
-    assert!(published.advance(first.clone()).is_none(), "nothing changed");
+    assert!(
+        published.advance(first.clone()).is_none(),
+        "nothing changed"
+    );
 
     // A reply streams: only the last entry and the title change.
     let mut next = first.clone();
@@ -376,7 +415,10 @@ fn published_snapshots_send_only_what_changed() {
     let patch = published.advance(shorter.clone()).unwrap().patch.unwrap();
     assert_eq!(patch["entriesFrom"], 2);
     assert_eq!(patch["entriesTail"], json!([]));
-    assert_eq!(apply(&next, &patch), serde_json::to_value(&shorter).unwrap());
+    assert_eq!(
+        apply(&next, &patch),
+        serde_json::to_value(&shorter).unwrap()
+    );
 
     let at = published.current(|| unreachable!("already published"));
     assert_eq!((at.seq, &at.snapshot), (3, &shorter));
@@ -632,7 +674,9 @@ fn the_empty_preview_has_no_selected_session() {
 
 fn feed(model: &mut Model, body: Value) {
     let kind = body["event"].as_str().unwrap_or_default().to_owned();
-    model.conversation.apply_event(&dial_client::Event { kind, body });
+    model
+        .conversation
+        .apply_event(&dial_client::Event { kind, body });
 }
 
 /// A session with `turns` turns, each an answer and three settled `read` calls.
@@ -641,11 +685,20 @@ fn long_session(w: &Workspace, turns: usize, output: &str) -> Model {
     feed(&mut model, json!({"event": "ready", "session_id": "long"}));
     for turn in 0..turns {
         model.conversation.push_user(&format!("prompt {turn}"), 0);
-        feed(&mut model, json!({"event": "text", "delta": "word ".repeat(400)}));
+        feed(
+            &mut model,
+            json!({"event": "text", "delta": "word ".repeat(400)}),
+        );
         for call in 0..3 {
             let id = format!("c{turn}-{call}");
-            feed(&mut model, json!({"event": "tool_call", "call_id": id, "name": "read", "summary": "src/lib.rs"}));
-            feed(&mut model, json!({"event": "tool_result", "call_id": id, "name": "read", "text": output, "is_error": false, "status": "ok", "changed_paths": []}));
+            feed(
+                &mut model,
+                json!({"event": "tool_call", "call_id": id, "name": "read", "summary": "src/lib.rs"}),
+            );
+            feed(
+                &mut model,
+                json!({"event": "tool_result", "call_id": id, "name": "read", "text": output, "is_error": false, "status": "ok", "changed_paths": []}),
+            );
         }
     }
     model
@@ -655,37 +708,64 @@ fn long_session(w: &Workspace, turns: usize, output: &str) -> Model {
 fn reused_rows_match_a_fresh_build_and_only_changed_rows_are_rebuilt() {
     let w = workspace();
     let mut model = long_session(&w, 2, "output");
-    feed(&mut model, json!({"event": "tool_call", "call_id": "run", "name": "bash", "summary": "cargo test"}));
+    feed(
+        &mut model,
+        json!({"event": "tool_call", "call_id": "run", "name": "bash", "summary": "cargo test"}),
+    );
     let mut views = EntryViews::default();
     let first = Snapshot::reusing(&model, Some(&w), 0, &mut views);
     assert_eq!(first, Snapshot::new(&model, Some(&w), 0));
     let running = first.entries.len() - 1;
 
     // The running call settles and an answer starts: earlier rows are shared, the rest rebuilt.
-    feed(&mut model, json!({"event": "tool_result", "call_id": "run", "name": "bash", "text": "ok", "is_error": false, "status": "ok", "changed_paths": []}));
-    feed(&mut model, json!({"event": "text", "delta": "All tests pass."}));
+    feed(
+        &mut model,
+        json!({"event": "tool_result", "call_id": "run", "name": "bash", "text": "ok", "is_error": false, "status": "ok", "changed_paths": []}),
+    );
+    feed(
+        &mut model,
+        json!({"event": "text", "delta": "All tests pass."}),
+    );
     let next = Snapshot::reusing(&model, Some(&w), 0, &mut views);
     assert_eq!(next, Snapshot::new(&model, Some(&w), 0));
     assert_eq!(next.entries.len(), running + 2);
     assert!((0..running).all(|i| Arc::ptr_eq(&first.entries[i], &next.entries[i])));
-    assert!(!Arc::ptr_eq(&first.entries[running], &next.entries[running]));
+    assert!(!Arc::ptr_eq(
+        &first.entries[running],
+        &next.entries[running]
+    ));
 
     // A shorter transcript (an undone turn) drops the rows past its end.
-    model.conversation.load_history(Some("long"), &[json!({"role": "user", "content": "only this"})]);
+    model.conversation.load_history(
+        Some("long"),
+        &[json!({"role": "user", "content": "only this"})],
+    );
     let shorter = Snapshot::reusing(&model, Some(&w), 0, &mut views);
     assert_eq!(shorter, Snapshot::new(&model, Some(&w), 0));
     assert_eq!(shorter.entries.len(), 1);
 
     // Rows show paths relative to the workspace, so a different workspace rebuilds every row.
-    let mut model = long_session(&w, 1, "Image: /home/ada/work/app/shot.png (10 bytes; image/png)");
+    let mut model = long_session(
+        &w,
+        1,
+        "Image: /home/ada/work/app/shot.png (10 bytes; image/png)",
+    );
     let mut views = EntryViews::default();
     let here = Snapshot::reusing(&model, Some(&w), 0, &mut views);
     let other = Workspace::new("/home/ada/elsewhere", Some("/home/ada"));
     feed(&mut model, json!({"event": "text", "delta": "."}));
     let there = Snapshot::reusing(&model, Some(&other), 0, &mut views);
     assert_eq!(there, Snapshot::new(&model, Some(&other), 0));
-    assert!(here.entries.iter().zip(&there.entries).all(|(a, b)| !Arc::ptr_eq(a, b)));
-    assert_ne!(here.entries[2], there.entries[2], "the image is outside the other workspace");
+    assert!(
+        here.entries
+            .iter()
+            .zip(&there.entries)
+            .all(|(a, b)| !Arc::ptr_eq(a, b))
+    );
+    assert_ne!(
+        here.entries[2], there.entries[2],
+        "the image is outside the other workspace"
+    );
 }
 
 #[test]
@@ -701,7 +781,10 @@ fn snapshot_cost_on_a_long_session() {
         published.advance(Snapshot::reusing(&model, Some(&w), 0, &mut views));
         let start = std::time::Instant::now();
         for i in 0..frames {
-            feed(&mut model, json!({"event": "text", "delta": format!("token{i} ")}));
+            feed(
+                &mut model,
+                json!({"event": "text", "delta": format!("token{i} ")}),
+            );
             let snap = if reuse {
                 Snapshot::reusing(&model, Some(&w), 0, &mut views)
             } else {
@@ -710,6 +793,9 @@ fn snapshot_cost_on_a_long_session() {
             assert!(published.advance(snap).is_some());
         }
         let per_frame = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
-        println!("{} entries, {name}: {per_frame:.2} ms per frame", model.conversation.entries().len());
+        println!(
+            "{} entries, {name}: {per_frame:.2} ms per frame",
+            model.conversation.entries().len()
+        );
     }
 }

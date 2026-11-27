@@ -9,8 +9,24 @@ impl Scratch {
             std::env::temp_dir().join(format!("dial-desktop-files-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        Self(dir.canonicalize().unwrap())
+        Self(plain_canonical(&dir))
     }
+}
+
+/// `canonicalize` yields a `\\?\` verbatim path on Windows, which git refuses as a worktree or
+/// remote location; strip it so the fixtures hand git ordinary paths.
+fn plain_canonical(dir: &Path) -> PathBuf {
+    let canonical = dir.canonicalize().unwrap();
+    #[cfg(windows)]
+    {
+        let text = canonical.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && !rest.starts_with(r"UNC\")
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    canonical
 }
 
 impl Drop for Scratch {
@@ -924,6 +940,10 @@ fn git_branches_checkout_sync_and_stash_work_end_to_end() {
 fn git_conflict_detection_and_resolution_support_ours_theirs_and_manual() {
     let root = Scratch::new("git-conflict");
     git_ok(&root.0, &["init", "-q", "-b", "main"]);
+    // The merge itself must get a committer identity even on a fresh CI account.
+    git_ok(&root.0, &["config", "user.name", "t"]);
+    git_ok(&root.0, &["config", "user.email", "t@t"]);
+    git_ok(&root.0, &["config", "commit.gpgsign", "false"]);
     for f in ["a.txt", "b.txt", "c.txt"] {
         fs::write(root.0.join(f), "base\n").unwrap();
     }
@@ -946,7 +966,10 @@ fn git_conflict_detection_and_resolution_support_ours_theirs_and_manual() {
 
     // Merge fails with conflicts on all three files.
     let merge = git_in(&root.0, &["merge", "other"]).unwrap();
-    assert!(!merge.status.success());
+    assert!(!merge.status.success(), "{merge:?}");
+    let unmerged = git_in(&root.0, &["ls-files", "--unmerged", "--", "a.txt"]).unwrap();
+    assert!(unmerged.status.success(), "{unmerged:?}");
+    assert!(!unmerged.stdout.is_empty(), "merge did not create a conflict: {merge:?}");
 
     let shown = diff_scoped(&root.0, "a.txt", DiffScope::All).unwrap();
     assert!(shown.conflicted, "unmerged file must report conflicted=true");

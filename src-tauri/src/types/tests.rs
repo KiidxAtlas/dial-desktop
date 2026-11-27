@@ -381,14 +381,15 @@ fn new_types_go_where_the_user_chose_and_both_places_are_listed() {
 #[test]
 fn the_choice_of_where_to_save_is_remembered() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::for_home(Some(dir.path()));
+    let store = Store::in_app_dir(Some(dir.path().join("app")));
     assert_eq!(store.location().save_in, Scope::App);
     assert_eq!(store.location().project, None);
     store.set_save_in(Scope::Project).unwrap();
     store.set_project(Some(Path::new("/work/site")));
-    let again = Store::for_home(Some(dir.path()));
+    let again = Store::in_app_dir(Some(dir.path().join("app")));
     assert_eq!(again.location().save_in, Scope::Project);
-    assert_eq!(store.location().project.as_deref(), Some("/work/site/.dial/types"));
+    let project_types = Path::new("/work/site").join(".dial").join("types");
+    assert_eq!(store.location().project.as_deref(), Some(project_types.to_string_lossy().as_ref()));
 }
 
 #[test]
@@ -504,8 +505,9 @@ fn resolve_asset_allows_only_store_assets_and_refuses_outside_files() {
 #[test]
 fn two_windows_see_save_location_changes_immediately() {
     let dir = tempfile::tempdir().unwrap();
-    let first = Store::for_home(Some(dir.path()));
-    let second = Store::for_home(Some(dir.path()));
+    let app = dir.path().join("app");
+    let first = Store::in_app_dir(Some(app.clone()));
+    let second = Store::in_app_dir(Some(app));
     assert_eq!(second.location().save_in, Scope::App);
     first.set_save_in(Scope::Project).unwrap();
     assert_eq!(second.location().save_in, Scope::Project);

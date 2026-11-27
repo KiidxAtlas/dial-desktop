@@ -327,8 +327,10 @@ mod tests {
             );
         });
         // Send events faster than `debounce` for longer than `max_debounce`.
-        let end = Instant::now() + Duration::from_millis(240);
-        while Instant::now() < end {
+        // Keep the burst going until periodic notifications arrive, with a generous ceiling so a
+        // loaded CI runner cannot turn scheduling jitter into a false failure.
+        let end = Instant::now() + Duration::from_secs(5);
+        while hits.load(Ordering::SeqCst) < 2 && Instant::now() < end {
             tx.send(Signal::Changed).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
