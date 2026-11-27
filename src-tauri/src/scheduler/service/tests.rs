@@ -36,6 +36,16 @@ fn systemd_unit_quotes_paths_and_specifiers() {
     assert!(unit.contains("Environment=\"PATH=/bin\"\n"));
     assert!(unit.contains("KillSignal=SIGINT"));
     assert!(unit.contains("WantedBy=default.target"));
+
+    // Newlines and carriage returns cannot inject extra unit directives.
+    let injected = systemd_unit(
+        Path::new("/opt/dial"),
+        "/p/a\nExecStartPre=/bin/evil\r",
+        Some("/bin\nUser=root"),
+    );
+    assert!(!injected.contains("\nExecStartPre="));
+    assert!(!injected.contains("\nUser=root"));
+    assert!(injected.contains("Description=Dial schedules for /p/a ExecStartPre=/bin/evil \n"));
 }
 
 #[test]

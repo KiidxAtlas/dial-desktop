@@ -133,7 +133,7 @@ struct Shared {
     published: Mutex<Published>,
     /// The Appearance switches for what answers may draw; each new engine is told (`answer_style`).
     answer_style: Mutex<crate::answer_style::AnswerStyle>,
-    answer_support: crate::answer_style::Support,
+    answer_support: Arc<crate::answer_style::Support>,
     /// Collaboration relay process managed by this app instance.
     relay: Arc<crate::engine_cli::RelayManager>,
     /// Active `git_sync` operations by workspace root, for UI cancellation.
@@ -145,22 +145,51 @@ struct Shared {
 mod project_tests {
     use super::*;
 
-    #[test]
-    fn switching_projects_keeps_the_original_running_session_in_this_window() {
-        let shared = Shared {
+    fn test_shared(source: Source) -> Shared {
+        Shared {
             inner: Mutex::new(Inner {
                 tabs: Tabs::new(Tab::new(Model::default(), None)),
                 parked: Default::default(),
                 workspace: None, recents: Recents::load(None), entry_views: EntryViews::default(),
             }),
             service_starts: Default::default(),
-            source: Source::Preview(Preview::Empty), home: None,
+            source, home: None,
             wake: Mutex::new(mpsc::channel().0), terminals: Default::default(),
             provider_setup: Default::default(), selected: Default::default(),
             published: Default::default(), answer_style: Default::default(), answer_support: Default::default(),
             relay: Default::default(),
             git_syncs: Default::default(),
-        };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_stall_during_probe_does_not_block_project_navigation() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("engine");
+        fs::write(&program, "#!/bin/sh\ncase \"$*\" in *--help) touch \"$0.probing\"; while [ ! -e \"$0.release\" ]; do sleep 0.02; done;; esac\nexit 1\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = test_shared(Source::Engine { program: program.clone(), origin: launcher::EngineOrigin::Flag, args: vec![] });
+        *shared.selected.lock().unwrap() = Some(SelectedEngine { program: program.clone(), browser_warning: None });
+        thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let (shared, path) = (&shared, dir.path());
+            scope.spawn(move || { let _ = tx.send(shared.open(path)); });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !program.with_extension("probing").exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let opened = rx.recv_timeout(Duration::from_secs(1));
+            fs::write(program.with_extension("release"), "").unwrap();
+            assert!(program.with_extension("probing").exists(), "engine probe did not run");
+            assert_eq!(opened, Ok(Ok(true)), "opening the project waited for the probe");
+        });
+    }
+
+    #[test]
+    fn switching_projects_keeps_the_original_running_session_in_this_window() {
+        let shared = test_shared(Source::Preview(Preview::Empty));
         let a = Path::new("/projects/first");
         let b = Path::new("/projects/second");
         shared.open(a).unwrap();
@@ -320,7 +349,8 @@ impl Shared {
         self.selected.lock().unwrap_or_else(PoisonError::into_inner)
             .as_ref().map(|engine| engine.program.clone())
     }
-    fn launch(&self, path: &Path) -> Option<Launch> {
+    /// Capture the selection now, but run any compatibility probe on the engine worker.
+    fn launch(&self, path: &Path) -> Option<impl FnOnce() -> Launch + Send + use<>> {
         let Source::Engine { args, .. } = &self.source else {
             return None;
         };
@@ -329,20 +359,19 @@ impl Shared {
             .answer_style
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // Engines that predate the flag would refuse to start with it, so they go without.
-        let guidance = style
-            .guidance()
-            .filter(|_| self.answer_support.accepts(&program));
-        let mut launch = Launch::new(program).args(args.iter().cloned());
-        if let Some(text) = guidance {
-            launch = launch.arg(crate::answer_style::FLAG).arg(text);
-        }
-        Some(
-            launch
-                .current_dir(path)
-                .diagnostics(Diagnostics::Inherit)
-                .interactive(true),
-        )
+        let support = Arc::clone(&self.answer_support);
+        let launch = Launch::new(program.clone())
+            .args(args.iter().cloned())
+            .current_dir(path)
+            .diagnostics(Diagnostics::Inherit)
+            .interactive(true);
+        Some(move || {
+            // Older engines refuse the flag; don't pass it unless the probe succeeds.
+            match style.guidance().filter(|_| support.accepts(&program)) {
+                Some(text) => launch.arg(crate::answer_style::FLAG).arg(text),
+                None => launch,
+            }
+        })
     }
 
     /// A new engine in `path`; `None` in the design preview.
@@ -364,10 +393,7 @@ impl Shared {
         let waker = Arc::new(move || {
             let _ = wake.send(());
         });
-        Some(match previous {
-            Some(previous) => Engine::spawn_after(launch, waker, Some(previous)),
-            None => Engine::spawn(launch, waker),
-        })
+        Some(Engine::spawn_with(launch, waker, previous))
     }
 
     /// Show a new engine for the open workspace that runs `first`; the busy tab keeps going.
@@ -1794,7 +1820,7 @@ async fn fork_before(
             .ok_or(PREVIEW_NOTICE)?
     };
     tauri::async_runtime::spawn_blocking(move || {
-        engine::fork_before(&launch, &session_id, &prompt, occurrence, matches)
+        engine::fork_before(&launch(), &session_id, &prompt, occurrence, matches)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2673,7 +2699,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                 selected: Mutex::new(selected),
                 published: Mutex::new(Published::default()),
                 answer_style: Mutex::new(answer_style),
-                answer_support: crate::answer_style::Support::default(),
+                answer_support: Default::default(),
                 relay: Default::default(),
                 git_syncs: Default::default(),
             });
@@ -2741,8 +2767,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             webview.show()?;
             Ok(())
         })
-        .build(tauri::generate_context!())?;
-
+        .build(context())?;
     app.run(move |app, event| {
         match &event {
             RunEvent::WindowEvent { label, event, .. } if label == "main" => {
@@ -2793,4 +2818,9 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
         }
     });
     Ok(())
+}
+
+/// Shared Tauri application context so library and integration tests embed Info.plist only once.
+pub fn context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }

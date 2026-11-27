@@ -175,6 +175,10 @@
       }
       if (cmd === 'engine_call') {
         const fixtures = {
+          stats: { report: { by_tool: [
+            { tool: 'bash', calls: 20, avg_ms: 300, error_breakdown: { command_or_check: 3, execution_failure: 1, unclassified: 0 } },
+            { tool: 'edit', calls: 12, avg_ms: 50, error_breakdown: { command_or_check: 0, execution_failure: 2, unclassified: 1 } },
+          ] } },
           list_hooks: {
             events: ['session_start', 'session_end', 'user_prompt_submit', 'pre_tool_use', 'post_tool_use', 'stop'],
             hooks: [

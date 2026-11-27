@@ -141,7 +141,7 @@ const overall = computed(() => {
     ["Sessions", count(s.sessions)],
     ["Tool calls", count(s.tool_calls)],
     ["Cost", usd(o.cost_usd)],
-    ["Errors", o.error_rate != null ? `${o.error_rate.toFixed(1)}%` : "—"],
+    ["Request errors", o.error_rate != null ? `${o.error_rate.toFixed(1)}%` : "—"],
   ];
 });
 const daily = computed<{ day: string; requests: number }[]>(() => report.value?.daily ?? []);
@@ -664,9 +664,9 @@ onBeforeUnmount(() => {
             </tbody>
           </table>
           <table v-if="tools.length" class="table">
-            <thead><tr><th>Tool</th><th>Calls</th><th>Errors</th><th>Avg time</th></tr></thead>
+            <thead><tr><th>Tool</th><th>Calls</th><th title="Commands that exited nonzero or checks that reported a failure">Command/check findings</th><th>Execution failures</th><th>Unclassified errors</th><th>Avg time</th></tr></thead>
             <tbody>
-              <tr v-for="t in tools" :key="t.key ?? t.label"><td class="mono">{{ t.label ?? t.key }}</td><td>{{ count(t.calls) }}</td><td>{{ (t.error_rate ?? 0).toFixed(1) }}%</td><td>{{ ((t.avg_ms ?? 0) / 1000).toFixed(1) }}s</td></tr>
+              <tr v-for="t in tools" :key="t.tool"><td class="mono">{{ t.tool }}</td><td>{{ count(t.calls) }}</td><td>{{ count(t.error_breakdown?.command_or_check) }}</td><td>{{ count(t.error_breakdown?.execution_failure) }}</td><td>{{ count(t.error_breakdown?.unclassified) }}</td><td>{{ ((t.avg_ms ?? 0) / 1000).toFixed(1) }}s</td></tr>
             </tbody>
           </table>
         </SGroup>

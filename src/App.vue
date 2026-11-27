@@ -374,23 +374,31 @@ function scanOnReturn() {
   if (opened.value?.connection.state === "live") void engine.discoverModels();
 }
 
+let unmounted = false;
 let stopFollowing: (() => void) | null = null;
 let stopFollowingApp: (() => void) | null = null;
 let stopFollowingBoards: (() => void) | null = null;
 let stopFullscreen: (() => void) | null = null;
-onMounted(async () => {
+function trackStop(promise: Promise<(() => void) | null>, assign: (stop: (() => void) | null) => void) {
+  void promise.then((stop) => {
+    if (unmounted) stop?.();
+    else assign(stop);
+  });
+}
+onMounted(() => {
   window.addEventListener("keydown", onKey);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", hideHints);
   window.addEventListener("focus", scanOnReturn);
   restoreImage();
   startUpdateChecks();
-  void followFullscreen().then((stop) => (stopFullscreen = stop));
-  stopFollowing = await followAgentBrowser();
-  stopFollowingApp = await followAgentApp();
-  stopFollowingBoards = await followAgentBoards();
+  trackStop(followFullscreen(), (stop) => (stopFullscreen = stop));
+  trackStop(followAgentBrowser(), (stop) => (stopFollowing = stop));
+  trackStop(followAgentApp(), (stop) => (stopFollowingApp = stop));
+  trackStop(followAgentBoards(), (stop) => (stopFollowingBoards = stop));
 });
 onBeforeUnmount(() => {
+  unmounted = true;
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("keyup", onKeyUp);
   window.removeEventListener("blur", hideHints);
@@ -400,6 +408,7 @@ onBeforeUnmount(() => {
   stopFollowing?.();
   stopFollowingApp?.();
   stopFollowingBoards?.();
+  stopFullscreen = stopFollowing = stopFollowingApp = stopFollowingBoards = null;
 });
 </script>
 

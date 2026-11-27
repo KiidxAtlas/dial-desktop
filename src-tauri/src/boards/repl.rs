@@ -22,18 +22,32 @@ pub struct Output {
 
 const BANNER: &[u8] = b"raw REPL; CTRL-B to exit\r\n>";
 const NOT_PYTHON: &str = "The device did not answer as a MicroPython or CircuitPython prompt. Check that it runs one of them and that the baud rate is right.";
+/// Cap kept output per stream so runaway firmware output cannot grow host memory unboundedly.
+const MAX_OUTPUT: usize = 256 * 1024;
+/// Cap bytes scanned while waiting for the short raw-REPL banner or `OK` ack.
+const MAX_HANDSHAKE_WINDOW: usize = 4096;
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Collect input into `seen` until `done` accepts it or `limit` passes.
-fn wait(wire: &mut impl Wire, seen: &mut Vec<u8>, limit: Duration, done: impl Fn(&[u8]) -> bool) -> Result<bool, String> {
+/// Collect input into `seen` (keeping only the newest `MAX_HANDSHAKE_WINDOW` bytes) until `done`
+/// accepts it or `limit` passes.
+fn wait_handshake(
+    wire: &mut impl Wire,
+    seen: &mut Vec<u8>,
+    limit: Duration,
+    done: impl Fn(&[u8]) -> bool,
+) -> Result<bool, String> {
     let start = Instant::now();
     loop {
         seen.extend(wire.recv()?);
         if done(seen) {
             return Ok(true);
+        }
+        if seen.len() > MAX_HANDSHAKE_WINDOW {
+            let drop = seen.len() - MAX_HANDSHAKE_WINDOW;
+            seen.drain(..drop);
         }
         if start.elapsed() >= limit {
             return Ok(false);
@@ -49,7 +63,7 @@ fn enter(wire: &mut impl Wire) -> Result<(), String> {
     wire.recv()?;
     wire.send(b"\r\x01")?;
     let mut seen = Vec::new();
-    if wait(wire, &mut seen, Duration::from_secs(2), |s| find(s, BANNER).is_some())? {
+    if wait_handshake(wire, &mut seen, Duration::from_secs(2), |s| find(s, BANNER).is_some())? {
         Ok(())
     } else {
         Err(NOT_PYTHON.into())
@@ -66,14 +80,46 @@ pub fn exec(wire: &mut impl Wire, code: &str, limit: Duration) -> Result<Output,
     }
     wire.send(b"\x04")?;
     let mut seen = Vec::new();
-    if !wait(wire, &mut seen, Duration::from_secs(3), |s| find(s, b"OK").is_some())? {
+    if !wait_handshake(wire, &mut seen, Duration::from_secs(3), |s| find(s, b"OK").is_some())? {
         return Err("The device did not accept the code".into());
     }
     let start = find(&seen, b"OK").unwrap_or(0) + 2;
-    // The reply is the output, an end mark, the error text, and another end mark.
-    let finished = wait(wire, &mut seen, limit, |s| s[start..].iter().filter(|&&b| b == 4).count() >= 2)?;
-    let mut parts = seen[start..].split(|&b| b == 4).map(|part| String::from_utf8_lossy(part).replace("\r\n", "\n"));
-    let output = Output { stdout: parts.next().unwrap_or_default(), stderr: parts.next().unwrap_or_default(), finished };
+    // The reply is stdout, \x04, stderr, \x04. Stream into bounded buffers so noisy output
+    // cannot exhaust host memory while still observing both end markers.
+    fn ingest(bytes: &[u8], stage: &mut u8, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+        for &b in bytes {
+            if b == 4 {
+                *stage = stage.saturating_add(1);
+                continue;
+            }
+            match *stage {
+                0 if stdout.len() < MAX_OUTPUT => stdout.push(b),
+                1 if stderr.len() < MAX_OUTPUT => stderr.push(b),
+                _ => {}
+            }
+        }
+    }
+    let mut stage = 0u8;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    ingest(&seen[start..], &mut stage, &mut stdout, &mut stderr);
+    let start_wait = Instant::now();
+    let finished = loop {
+        if stage >= 2 {
+            break true;
+        }
+        if start_wait.elapsed() >= limit {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        let chunk = wire.recv()?;
+        ingest(&chunk, &mut stage, &mut stdout, &mut stderr);
+    };
+    let output = Output {
+        stdout: String::from_utf8_lossy(&stdout).replace("\r\n", "\n"),
+        stderr: String::from_utf8_lossy(&stderr).replace("\r\n", "\n"),
+        finished,
+    };
     if finished {
         wire.send(b"\x02")?;
     }
@@ -81,26 +127,10 @@ pub fn exec(wire: &mut impl Wire, code: &str, limit: Duration) -> Result<Output,
 }
 
 const MAX_FILE: usize = 256 * 1024;
+/// Bytes written per raw-REPL execution so MicroPython never has to buffer/compile a huge script in MCU RAM.
+const PUT_CHUNK: usize = 1024;
 
-/// Save `data` as file `name` on the board's own filesystem.
-pub fn put(wire: &mut impl Wire, name: &str, data: &[u8]) -> Result<(), String> {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
-    if name.is_empty() || name.len() > 96 || !name.chars().all(plain) || name.split('/').any(|part| part.is_empty() || part.starts_with('.')) {
-        return Err("Use a plain file name such as main.py".into());
-    }
-    if data.len() > MAX_FILE {
-        return Err("Files saved this way can be at most 256 KiB".into());
-    }
-    let mut code = format!("f=open('{name}','wb')\nw=f.write\n");
-    for chunk in data.chunks(64) {
-        code.push_str("w(b'");
-        for byte in chunk {
-            code.push_str(&format!("\\x{byte:02x}"));
-        }
-        code.push_str("')\n");
-    }
-    code.push_str("f.close()\n");
-    let result = exec(wire, &code, Duration::from_secs(20 + data.len() as u64 / 2048))?;
+fn check_put_result(name: &str, result: Output) -> Result<(), String> {
     if !result.finished {
         return Err("The device did not finish saving the file".into());
     }
@@ -112,6 +142,42 @@ pub fn put(wire: &mut impl Wire, name: &str, data: &[u8]) -> Result<(), String> 
         )),
         Some(error) => Err(format!("The device could not save {name}: {error}")),
     }
+}
+
+/// Save `data` as file `name` on the board's own filesystem, streamed in bounded raw-REPL chunks.
+pub fn put(wire: &mut impl Wire, name: &str, data: &[u8]) -> Result<(), String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
+    if name.is_empty() || name.len() > 96 || !name.chars().all(plain) || name.split('/').any(|part| part.is_empty() || part.starts_with('.')) {
+        return Err("Use a plain file name such as main.py".into());
+    }
+    if data.len() > MAX_FILE {
+        return Err("Files saved this way can be at most 256 KiB".into());
+    }
+    let slices: Vec<&[u8]> = if data.is_empty() {
+        vec![&[]]
+    } else {
+        data.chunks(PUT_CHUNK).collect()
+    };
+    for (index, piece) in slices.into_iter().enumerate() {
+        let mode = if index == 0 { "wb" } else { "ab" };
+        let mut code = format!("f=open('{name}','{mode}')\ntry:\n");
+        if piece.is_empty() {
+            code.push_str(" pass\n");
+        } else {
+            code.push_str(" w=f.write\n");
+            for chunk in piece.chunks(64) {
+                code.push_str(" w(b'");
+                for byte in chunk {
+                    code.push_str(&format!("\\x{byte:02x}"));
+                }
+                code.push_str("')\n");
+            }
+        }
+        code.push_str("finally:\n f.close()\n");
+        let result = exec(wire, &code, Duration::from_secs(15))?;
+        check_put_result(name, result)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -193,11 +259,25 @@ mod tests {
     fn saves_a_file_as_bytes_and_explains_refusals() {
         let mut board = Board::new(|_| Some(("", "")));
         put(&mut board, "lib/main.py", b"a='\n\xff").unwrap();
-        assert_eq!(board.programs, ["f=open('lib/main.py','wb')\nw=f.write\nw(b'\\x61\\x3d\\x27\\x0a\\xff')\nf.close()\n"]);
+        assert_eq!(
+            board.programs,
+            ["f=open('lib/main.py','wb')\ntry:\n w=f.write\n w(b'\\x61\\x3d\\x27\\x0a\\xff')\nfinally:\n f.close()\n"]
+        );
         for name in ["", "a b.py", "../x", "a'.py", "/main.py", ".hidden"] {
             assert!(put(&mut board, name, b"").is_err(), "{name}");
         }
         let mut locked = Board::new(|_| Some(("", "Traceback\r\nOSError: [Errno 30] Read-only filesystem\r\n")));
         assert!(put(&mut locked, "code.py", b"x").unwrap_err().contains("CIRCUITPY"));
+    }
+
+    #[test]
+    fn streams_large_files_in_multiple_chunks_with_try_finally() {
+        let mut board = Board::new(|_| Some(("", "")));
+        let payload = vec![b'A'; PUT_CHUNK + 10];
+        put(&mut board, "big.bin", &payload).unwrap();
+        assert_eq!(board.programs.len(), 2);
+        assert!(board.programs[0].starts_with("f=open('big.bin','wb')\ntry:\n"));
+        assert!(board.programs[1].starts_with("f=open('big.bin','ab')\ntry:\n"));
+        assert!(board.programs.iter().all(|p| p.ends_with("finally:\n f.close()\n")));
     }
 }

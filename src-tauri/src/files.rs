@@ -215,14 +215,19 @@ fn outside(path: &str) -> String {
     format!("{path} is outside the project folder")
 }
 
-/// `path` relative to `root`, `/`-separated.
-fn relative(root: &Path, path: &Path) -> String {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let rel = path.strip_prefix(&root).unwrap_or(path);
+/// `path` relative to an already-canonicalized `canonical_root`, `/`-separated.
+fn relative_to(canonical_root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(canonical_root).unwrap_or(path);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// `path` relative to `root`, `/`-separated.
+fn relative(root: &Path, path: &Path) -> String {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    relative_to(&canonical_root, path)
 }
 
 /// The entries of folder `path` (empty for the project root): folders first, then by name.
@@ -237,6 +242,7 @@ pub fn list_with(root: &Path, path: &str, show_ignored: bool) -> Result<Vec<DirE
     let dir = panel_entry(root, path)?;
     let meta = fs::symlink_metadata(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
     if !meta.is_dir() || directory_reparse_point(&meta) { return Err(format!("{path} is not a plain folder")); }
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let entries = fs::read_dir(&dir).map_err(|e| format!("Cannot list {path}: {e}"))?;
     let mut out: Vec<DirEntryView> = entries
         .flatten()
@@ -249,7 +255,7 @@ pub fn list_with(root: &Path, path: &str, show_ignored: bool) -> Result<Vec<DirE
             let meta = entry.metadata().ok()?;
             let is_dir = meta.is_dir() && !directory_reparse_point(&meta);
             Some(DirEntryView {
-                path: relative(root, &dir.join(&name)),
+                path: relative_to(&canonical_root, &dir.join(&name)),
                 name,
                 dir: is_dir,
                 ignored: false,

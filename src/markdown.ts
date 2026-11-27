@@ -49,6 +49,7 @@ export async function loadHighlighter() {
     engine: createJavaScriptRegexEngine(),
   });
   highlighted.clear();
+  highlightedBytes = 0;
   highlighterVersion.value++;
 }
 
@@ -58,20 +59,23 @@ function escape(text: string) {
 
 /** Highlighted code by language and text. A streamed answer is re-rendered about once a frame, and
  * highlighting its finished code blocks again each time was the costliest part of that. */
-const highlighted = new Map<string, string | null>();
+const highlighted = new Map<string, { html: string | null; bytes: number }>();
 const HIGHLIGHT_CACHE = 300;
+const HIGHLIGHT_CACHE_BYTES = 4 * 1024 * 1024;
+const MAX_HIGHLIGHT_BYTES = 128 * 1024;
+let highlightedBytes = 0;
 
-/** Highlighted `<pre>` for `code`, or `null` when the language is unknown. */
+/** Highlighted `<pre>` for `code`, or `null` when the language is unknown or oversized. */
 export function highlight(code: string, lang: string): string | null {
   const name = lang.trim().toLowerCase();
-  if (!highlighter || !name) return null;
+  if (!highlighter || !name || code.length > MAX_HIGHLIGHT_BYTES) return null;
   const key = `${name}\0${code}`;
   const cached = highlighted.get(key);
   if (cached !== undefined) {
     // Most recently used last, so the oldest goes first.
     highlighted.delete(key);
     highlighted.set(key, cached);
-    return cached;
+    return cached.html;
   }
   let html: string | null = null;
   if (highlighter.getLoadedLanguages().includes(name)) {
@@ -81,8 +85,18 @@ export function highlight(code: string, lang: string): string | null {
       html = null;
     }
   }
-  highlighted.set(key, html);
-  if (highlighted.size > HIGHLIGHT_CACHE) highlighted.delete(highlighted.keys().next().value!);
+  const bytes = key.length + (html?.length ?? 0);
+  if (bytes <= HIGHLIGHT_CACHE_BYTES) {
+    highlighted.set(key, { html, bytes });
+    highlightedBytes += bytes;
+    while (highlighted.size > HIGHLIGHT_CACHE || highlightedBytes > HIGHLIGHT_CACHE_BYTES) {
+      const oldestKey = highlighted.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = highlighted.get(oldestKey);
+      highlighted.delete(oldestKey);
+      if (oldest) highlightedBytes = Math.max(0, highlightedBytes - oldest.bytes);
+    }
+  }
   return html;
 }
 

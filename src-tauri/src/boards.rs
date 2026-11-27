@@ -327,6 +327,7 @@ struct Live {
     log: Arc<Mutex<Log>>,
 }
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+static CONNECT: Mutex<()> = Mutex::new(());
 static NEXT_LIVE: AtomicU32 = AtomicU32::new(0);
 
 fn live() -> std::sync::MutexGuard<'static, Option<Live>> {
@@ -365,14 +366,17 @@ fn pump(reader: &mut impl Read, stop: &AtomicBool, sink: impl Fn(&[u8])) -> Opti
 
 /// Open `path` as the live, two-way console, replacing any console already open. Returns the
 /// session id; output follows as `board-serial` events and is kept for `log_since`.
-fn connect(app: &AppHandle, path: String, baud: u32, framing: Framing) -> Result<u32, String> {
+fn connect_locked(app: &AppHandle, path: String, baud: u32, framing: Framing) -> Result<u32, String> {
     disconnect(None);
     let mut reader = open_port(&path, baud, &framing)?;
     let writer = reader.try_clone().map_err(|e| format!("Could not open port for writing: {e}"))?;
     let id = NEXT_LIVE.fetch_add(1, Ordering::Relaxed) + 1;
     let stop = Arc::new(AtomicBool::new(false));
     let log = Arc::new(Mutex::new(Log::default()));
-    *live() = Some(Live { id, path: path.clone(), baud, framing, writer, stop: Arc::clone(&stop), log: Arc::clone(&log) });
+    let prev = live().replace(Live { id, path: path.clone(), baud, framing, writer, stop: Arc::clone(&stop), log: Arc::clone(&log) });
+    if let Some(prev) = prev {
+        prev.stop.store(true, Ordering::Relaxed);
+    }
     let _ = app.emit(SERIAL_EVENT, SerialEvent::Opened { id, path, baud });
     let app = app.clone();
     std::thread::Builder::new()
@@ -391,6 +395,11 @@ fn connect(app: &AppHandle, path: String, baud: u32, framing: Framing) -> Result
             format!("Could not start the serial reader: {e}")
         })?;
     Ok(id)
+}
+
+fn connect(app: &AppHandle, path: String, baud: u32, framing: Framing) -> Result<u32, String> {
+    let _guard = CONNECT.lock().unwrap_or_else(PoisonError::into_inner);
+    connect_locked(app, path, baud, framing)
 }
 
 #[tauri::command]
@@ -430,10 +439,10 @@ pub fn board_live(webview: tauri::Webview) -> Result<Option<LiveView>, String> {
 /// Close console `id` (or whichever is open); closing one that already ended is fine.
 fn disconnect(id: Option<u32>) {
     let mut slot = live();
-    if slot.as_ref().is_some_and(|l| id.is_none_or(|id| l.id == id)) {
-        if let Some(l) = slot.take() {
-            l.stop.store(true, Ordering::Relaxed);
-        }
+    if slot.as_ref().is_some_and(|l| id.is_none_or(|id| l.id == id))
+        && let Some(l) = slot.take()
+    {
+        l.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -449,7 +458,11 @@ fn suspend() -> Option<(String, u32, Framing)> {
 /// Reopen a suspended console, waiting for a board that restarts after flashing to come back.
 fn resume(app: &AppHandle, (path, baud, framing): (String, u32, Framing)) {
     for _ in 0..40 {
-        if live().is_some() || connect(app, path.clone(), baud, framing.clone()).is_ok() {
+        let connected = {
+            let _guard = CONNECT.lock().unwrap_or_else(PoisonError::into_inner);
+            live().is_some() || connect_locked(app, path.clone(), baud, framing.clone()).is_ok()
+        };
+        if connected {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -475,12 +488,14 @@ fn write_live(id: u32, data: &[u8]) -> Result<(), String> {
 
 /// Send `data` (keystrokes, a paste, a line or raw bytes) to console `id`.
 #[tauri::command]
-pub fn board_write(webview: tauri::Webview, id: u32, data: Vec<u8>) -> Result<(), String> {
+pub async fn board_write(webview: tauri::Webview, id: u32, data: Vec<u8>) -> Result<(), String> {
     crate::app::main_only(&webview, "write to a serial console")?;
     if data.len() > 16 * 1024 {
         return Err("Send at most 16 KiB at a time".into());
     }
-    write_live(id, &data)
+    tauri::async_runtime::spawn_blocking(move || write_live(id, &data))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Run `change` on console `id`'s port, reporting failures as a control-line problem.
@@ -492,12 +507,16 @@ fn with_live(id: u32, change: impl FnOnce(&mut dyn SerialPort) -> serialport::Re
 
 /// Hold the DTR and RTS lines as given. Many boards wire them to reset or bootloader pins.
 #[tauri::command]
-pub fn board_lines(webview: tauri::Webview, id: u32, dtr: bool, rts: bool) -> Result<(), String> {
+pub async fn board_lines(webview: tauri::Webview, id: u32, dtr: bool, rts: bool) -> Result<(), String> {
     crate::app::main_only(&webview, "set serial control lines")?;
-    with_live(id, |port| {
-        port.write_data_terminal_ready(dtr)?;
-        port.write_request_to_send(rts)
+    tauri::async_runtime::spawn_blocking(move || {
+        with_live(id, |port| {
+            port.write_data_terminal_ready(dtr)?;
+            port.write_request_to_send(rts)
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Send a break (the data line held low for a quarter second), which some bootloaders, consoles

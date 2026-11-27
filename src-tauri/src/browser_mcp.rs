@@ -3,11 +3,10 @@
 //! running app over its loopback port (`agent_browser`). Without a running app it lists no tools,
 //! so Dial sessions outside the app see nothing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
-
 use serde_json::{Value, json};
 
 use crate::agent_browser::{self, INSTRUCTIONS, PING, Reply, Request};
@@ -110,6 +109,9 @@ pub fn content(reply: Reply) -> Value {
     json!({"content": blocks, "isError": !reply.ok})
 }
 
+/// Largest reply line accepted from Dial Desktop (screenshots are base64 PNGs).
+const MAX_REPLY: u64 = 32 << 20;
+
 /// Send one call to the app and read its reply.
 pub fn exchange(
     endpoint: &agent_browser::Endpoint,
@@ -124,6 +126,9 @@ pub fn exchange(
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
     let request = Request {
         token: endpoint.token.clone(),
         workspace: workspace.to_string_lossy().into_owned(),
@@ -136,12 +141,11 @@ pub fn exchange(
         .write_all(line.as_bytes())
         .map_err(|e| e.to_string())?;
     let mut answer = String::new();
-    BufReader::new(stream)
+    BufReader::new(stream.take(MAX_REPLY))
         .read_line(&mut answer)
         .map_err(|e| format!("Dial Desktop did not answer: {e}"))?;
     serde_json::from_str(&answer).map_err(|_| "Dial Desktop gave no answer".to_owned())
 }
-
 const NOT_RUNNING: &str = "Dial Desktop is not running, so its Browser panel is not available";
 
 /// Never route a call to an arbitrary window when two windows have the same workspace.

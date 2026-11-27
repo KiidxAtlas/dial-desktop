@@ -2,7 +2,7 @@ use tauri::ipc::Origin;
 
 #[test]
 fn desktop_plugins_are_granted_only_to_the_local_app_webview() {
-    let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+    let mut context: tauri::Context<tauri::Wry> = dial_desktop::app::context();
     let acl = context.runtime_authority_mut();
     let remote = Origin::Remote {
         url: "https://example.org/".parse().unwrap(),

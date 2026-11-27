@@ -173,12 +173,14 @@ pub fn launchd_plist(
     )
 }
 
-/// systemd quoting: a double-quoted word with `\` and `"` escaped and `%` specifiers doubled.
+/// systemd quoting: a double-quoted word with `\`, `"`, newlines and `%` specifiers escaped.
 fn unit_word(text: &str) -> String {
     format!(
         "\"{}\"",
         text.replace('\\', "\\\\")
             .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
             .replace('%', "%%")
     )
 }
@@ -190,7 +192,7 @@ pub fn systemd_unit(program: &Path, root: &str, path_env: Option<&str>) -> Strin
     });
     format!(
         "[Unit]\nDescription=Dial schedules for {}\n\n[Service]\nType=simple\nWorkingDirectory={}\n{env}ExecStart={} schedule run -C {}\nRestart=on-failure\nRestartSec=60\nKillSignal=SIGINT\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n",
-        root.replace('%', "%%").replace('\n', " "),
+        root.replace('%', "%%").replace(['\r', '\n'], " "),
         unit_word(root),
         unit_word(&program.to_string_lossy()),
         unit_word(root),
@@ -246,6 +248,13 @@ pub fn validate(program: &Path, root: &str) -> Result<(), String> {
     if std::env::var_os("APPDIR").is_some_and(|dir| !dir.is_empty() && program.starts_with(&dir)) {
         return Err("The engine runs from inside the AppImage, which is gone once Dial quits. Install the engine in Settings › Updates first.".into());
     }
+    if program
+        .to_string_lossy()
+        .contains(['\n', '\r', '\0'])
+        || root.contains(['\n', '\r', '\0'])
+    {
+        return Err("Service paths cannot contain newlines or control characters".into());
+    }
     if !Path::new(root).is_absolute() || !Path::new(root).is_dir() {
         return Err(format!("{root} is not a folder"));
     }
@@ -263,12 +272,17 @@ fn run(command: &mut Command, what: &str) -> Result<(), String> {
 }
 
 fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
     let dir = file.parent().ok_or("The service file has no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-    let partial = file.with_extension("partial");
-    std::fs::write(&partial, text)
-        .map_err(|e| format!("Could not write {}: {e}", partial.display()))?;
-    std::fs::rename(&partial, file).map_err(|e| format!("Could not write {}: {e}", file.display()))
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Could not create temporary file in {}: {e}", dir.display()))?;
+    tmp.write_all(text.as_bytes())
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| format!("Could not write {}: {e}", file.display()))?;
+    tmp.persist(file)
+        .map_err(|e| format!("Could not write {}: {}", file.display(), e.error))?;
+    Ok(())
 }
 
 #[cfg(unix)]

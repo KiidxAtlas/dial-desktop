@@ -141,6 +141,11 @@ jobs:
         shell: pwsh
         run: Install-Module ArtifactSigning -RequiredVersion 0.1.8 -Scope CurrentUser -Repository PSGallery -Force -ErrorAction Stop
 
+      # macOS's system LibreSSL does not support the Ed25519 pkeyutl verification used here.
+      - name: Select OpenSSL 3 for engine signature verification
+        if: runner.os == 'macOS'
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
       # Ship the engine inside the app (`bundle.externalBin`), so a fresh install works without a
       # separate `dial` install. The release key verifies the engine's signed SHA256SUMS.
       - name: Fetch the bundled Dial engine

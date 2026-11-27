@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -148,18 +148,27 @@ fn saved_file() -> Option<PathBuf> {
 fn load(file: &Path) -> BTreeMap<String, Commands> {
     std::fs::read(file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
 fn save(file: &Path, root: &Path, commands: Option<Commands>) -> Result<(), String> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let mut all = load(file);
     let key = root.to_string_lossy().into_owned();
     match commands {
         Some(commands) => all.insert(key, commands),
         None => all.remove(&key),
     };
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
+    let dir = file.parent().ok_or("Board commands file has no parent folder")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec_pretty(&all).map_err(|e| e.to_string())?;
-    std::fs::write(file, bytes).map_err(|e| format!("Could not save the board commands: {e}"))
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Could not create temporary board commands file: {e}"))?;
+    std::io::Write::write_all(&mut tmp, &bytes)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| format!("Could not save the board commands: {e}"))?;
+    tmp.persist(file)
+        .map(|_| ())
+        .map_err(|e| format!("Could not save the board commands: {}", e.error))
 }
 
 fn describe(root: &Path, saved: Option<Commands>) -> Project {
@@ -220,6 +229,8 @@ enum JobEvent {
 }
 const JOB_EVENT: &str = "board-job";
 const JOB_LOG_LIMIT: usize = 200_000;
+/// Trim in chunks so streaming compiler output does not memmove the whole buffer per read.
+const JOB_LOG_SLACK: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JobView {
@@ -235,18 +246,39 @@ pub struct JobView {
 
 struct Job {
     view: JobView,
-    pid: u32,
+    cancel: Arc<AtomicBool>,
 }
-static JOB: Mutex<Option<Job>> = Mutex::new(None);
+#[derive(Default)]
+struct JobState {
+    starting: bool,
+    current: Option<Job>,
+}
+static JOB: Mutex<JobState> = Mutex::new(JobState { starting: false, current: None });
 static NEXT_JOB: AtomicU32 = AtomicU32::new(0);
 
-fn job() -> std::sync::MutexGuard<'static, Option<Job>> {
+fn job() -> std::sync::MutexGuard<'static, JobState> {
     JOB.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct StartingGuard {
+    active: bool,
+}
+impl StartingGuard {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        if self.active {
+            job().starting = false;
+        }
+    }
 }
 
 /// The newest or running job.
 pub fn current() -> Option<JobView> {
-    job().as_ref().map(|j| j.view.clone())
+    job().current.as_ref().map(|j| j.view.clone())
 }
 
 /// `template` with `{port}` filled in. Ports are checked so a device name cannot add shell words.
@@ -297,13 +329,15 @@ fn forward(app: AppHandle, id: u32, mut stream: impl Read + Send + 'static) -> s
             if text.is_empty() {
                 continue;
             }
-            if let Some(j) = job().as_mut().filter(|j| j.view.id == id) {
+            if let Some(j) = job().current.as_mut().filter(|j| j.view.id == id) {
                 j.view.log.push_str(&text);
-                let mut cut = j.view.log.len().saturating_sub(JOB_LOG_LIMIT);
-                while !j.view.log.is_char_boundary(cut) {
-                    cut += 1;
+                if j.view.log.len() > JOB_LOG_LIMIT + JOB_LOG_SLACK {
+                    let mut cut = j.view.log.len().saturating_sub(JOB_LOG_LIMIT);
+                    while !j.view.log.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    j.view.log.drain(..cut);
                 }
-                j.view.log.drain(..cut);
             }
             let _ = app.emit(JOB_EVENT, JobEvent::Data { id, text });
         }
@@ -332,15 +366,20 @@ pub fn start(app: &AppHandle, root: &Path, upload: bool, port: Option<String>) -
         return Err(format!("Serial port {port} is not connected"));
     }
     let command = fill(&template, port.as_deref())?;
-    let mut slot = job();
-    if slot.as_ref().is_some_and(|j| j.view.running) {
-        return Err("A build or upload is already running".into());
+    {
+        let mut state = job();
+        if state.starting || state.current.as_ref().is_some_and(|j| j.view.running) {
+            return Err("A build or upload is already running".into());
+        }
+        state.starting = true;
     }
-    // The uploader needs the port the console holds.
+    let mut starting = StartingGuard { active: true };
+    // The uploader needs the port the console holds. Run outside `JOB` so status/stop stay responsive.
     let console = if upload { suspend() } else { None };
     let mut child = match shell(&command, root, port.as_deref()).spawn() {
         Ok(child) => child,
         Err(e) => {
+            drop(starting);
             if let Some(console) = console {
                 resume(app, console);
             }
@@ -348,9 +387,14 @@ pub fn start(app: &AppHandle, root: &Path, upload: bool, port: Option<String>) -
         }
     };
     let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed) + 1;
+    let cancel = Arc::new(AtomicBool::new(false));
     let view = JobView { id, action: action.into(), command, running: true, code: None, log: String::new() };
-    *slot = Some(Job { view: view.clone(), pid: child.id() });
-    drop(slot);
+    {
+        let mut state = job();
+        state.current = Some(Job { view: view.clone(), cancel: Arc::clone(&cancel) });
+        state.starting = false;
+        starting.disarm();
+    }
     let _ = app.emit(JOB_EVENT, JobEvent::Started { job: view.clone() });
     let readers = [
         child.stdout.take().map(|s| forward(app.clone(), id, s)),
@@ -358,11 +402,11 @@ pub fn start(app: &AppHandle, root: &Path, upload: bool, port: Option<String>) -
     ];
     let app = app.clone();
     std::thread::spawn(move || {
-        let code = child.wait().ok().and_then(|status| status.code());
+        let code = wait_or_cancel(&mut child, &cancel);
         for reader in readers.into_iter().flatten() {
             let _ = reader.join();
         }
-        if let Some(j) = job().as_mut().filter(|j| j.view.id == id) {
+        if let Some(j) = job().current.as_mut().filter(|j| j.view.id == id) {
             j.view.running = false;
             j.view.code = code;
         }
@@ -372,6 +416,46 @@ pub fn start(app: &AppHandle, root: &Path, upload: bool, port: Option<String>) -
         }
     });
     Ok(view)
+}
+
+/// Wait for `child` to finish, or terminate its whole process group if `cancel` is set.
+/// Because only this thread signals and reaps `child`, the PID can never be reused before signaling.
+fn wait_or_cancel(child: &mut std::process::Child, cancel: &AtomicBool) -> Option<i32> {
+    let mut term_sent: Option<Instant> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let pid = child.id();
+            match term_sent {
+                None => {
+                    #[cfg(unix)]
+                    // SAFETY: `child` leads its own process group (`process_group(0)`) and has not
+                    // been reaped yet, so `pid` still names that live process group.
+                    unsafe {
+                        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                    #[cfg(windows)]
+                    let _ = crate::launcher::without_console(Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"])).status();
+                    term_sent = Some(Instant::now());
+                }
+                Some(at) if at.elapsed() >= Duration::from_millis(500) => {
+                    #[cfg(unix)]
+                    // SAFETY: `child` still has not been reaped, so its process group is still valid.
+                    unsafe {
+                        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    return child.wait().ok().and_then(|status| status.code());
+                }
+                Some(_) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Wait up to `limit` for job `id` to end, then report it.
@@ -388,15 +472,9 @@ pub fn wait(id: u32, limit: Duration) -> Option<JobView> {
 
 /// Stop the running job and everything it started.
 pub fn stop() {
-    let Some(pid) = job().as_ref().filter(|j| j.view.running).map(|j| j.pid) else { return };
-    #[cfg(unix)]
-    // SAFETY: the job leads its own process group, and it is not reaped until its waiter thread
-    // sees it exit, so the id still names it.
-    unsafe {
-        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    if let Some(j) = job().current.as_ref().filter(|j| j.view.running) {
+        j.cancel.store(true, Ordering::SeqCst);
     }
-    #[cfg(windows)]
-    let _ = crate::launcher::without_console(Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"])).status();
 }
 
 #[tauri::command]

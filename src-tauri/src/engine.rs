@@ -506,6 +506,14 @@ impl Engine {
     }
 
     pub fn spawn_after(launch: Launch, waker: Waker, previous: Option<Weak<AtomicBool>>) -> Self {
+        Self::spawn_with(move || launch, waker, previous)
+    }
+
+    pub(crate) fn spawn_with(
+        prepare: impl FnOnce() -> Launch + Send + 'static,
+        waker: Waker,
+        previous: Option<Weak<AtomicBool>>,
+    ) -> Self {
         let (commands, command_rx) = mpsc::channel();
         let (update_tx, updates) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
@@ -528,7 +536,10 @@ impl Engine {
                         thread::sleep(POLL_ACTIVE);
                     }
                 }
-                run(&launch, &command_rx, &update_tx, &worker_stop, &waker);
+                let launch = prepare();
+                if !worker_stop.load(Ordering::SeqCst) {
+                    run(&launch, &command_rx, &update_tx, &worker_stop, &waker);
+                }
                 let _ = done_tx.send(());
                 waker();
             })

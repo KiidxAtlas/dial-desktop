@@ -865,8 +865,23 @@ pub fn remove_endpoint(file: &Path) {
     }
 }
 
+/// Concurrent local MCP bridge requests served at once; excess connections are dropped.
+const MAX_BRIDGE_CONNECTIONS: usize = 32;
+
+struct BridgeSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for BridgeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Serve tool calls on a loopback port and publish it in `file`.
 pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let endpoint = Endpoint {
         port: listener.local_addr()?.port(),
@@ -876,13 +891,24 @@ pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
     write_endpoint(file, &endpoint)?;
     let app = app.clone();
     let token = endpoint.token.clone();
+    let active = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name("agent-browser".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_BRIDGE_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let slot = BridgeSlot(active.clone());
                 let app = app.clone();
                 let token = token.clone();
-                thread::spawn(move || serve(&app, &stream, &token));
+                let _ = thread::Builder::new()
+                    .name("agent-browser-call".into())
+                    .spawn(move || {
+                        let _slot = slot;
+                        serve(&app, &stream, &token);
+                    });
             }
         })?;
     Ok(endpoint)
@@ -890,6 +916,7 @@ pub fn start(app: &AppHandle, file: &Path) -> std::io::Result<Endpoint> {
 
 fn serve(app: &AppHandle, stream: &TcpStream, token: &str) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut line = String::new();
     if BufReader::new(stream.take(MAX_REQUEST))
         .read_line(&mut line)

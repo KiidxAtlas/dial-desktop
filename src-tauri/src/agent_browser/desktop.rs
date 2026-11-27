@@ -78,8 +78,11 @@ pub fn protected(key: &str) -> bool {
     }
     PROTECTED.iter().any(|p| {
         key == *p
-            || key.strip_prefix(p).is_some_and(|rest| rest.starts_with('.'))
-            || p.strip_prefix(key.as_str()).is_some_and(|rest| rest.starts_with('.'))
+            || key
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with('.'))
+            || p.strip_prefix(key.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
     })
 }
 
@@ -166,7 +169,11 @@ fn frontend(app: &AppHandle, call: &str, args: &Value) -> Result<Value, String> 
         json!(call),
         args
     );
-    parse_outcome(&crate::browser::eval_view_raw(&view, &script, SCRIPT_TIMEOUT)?)
+    parse_outcome(&crate::browser::eval_view_raw(
+        &view,
+        &script,
+        SCRIPT_TIMEOUT,
+    )?)
 }
 
 fn pretty(value: &Value) -> String {
@@ -247,7 +254,9 @@ pub fn plan_change(
         .find(|r| r.key == key)
         .ok_or_else(|| format!("No setting `{key}`; find keys with desktop_settings"))?;
     if row.redacted {
-        return Err(format!("`{key}` holds a credential; only the user changes it"));
+        return Err(format!(
+            "`{key}` holds a credential; only the user changes it"
+        ));
     }
     let scope = match args.get("scope").and_then(Value::as_str) {
         Some("global") => "global",
@@ -288,7 +297,11 @@ pub fn list_settings(rows: &[SettingView], args: &Value) -> String {
         })
         .collect();
     let filtered = query.is_some() || tab.is_some() || changed;
-    let limit = if filtered { matching.len() } else { SETTINGS_LIMIT };
+    let limit = if filtered {
+        matching.len()
+    } else {
+        SETTINGS_LIMIT
+    };
     let mut out = String::new();
     for row in matching.iter().take(limit) {
         let value = if row.redacted {

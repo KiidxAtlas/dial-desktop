@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Burst coalescing window before notifying the UI.
+/// Quiet window before notifying the UI (trailing-edge debounce).
 const DEBOUNCE: Duration = Duration::from_millis(250);
-
+/// Maximum wait under sustained event bursts so continuous writes never starve UI refreshes.
+const MAX_DEBOUNCE: Duration = Duration::from_millis(1000);
 /// Directory names whose internal churn is never worth refreshing the workspace UI for.
 const IGNORED_DIRS: &[&str] = &[
     "node_modules",
@@ -151,21 +152,52 @@ fn start_watch(canonical: &Path, emit_root: String, on_change: Callback) -> Resu
 }
 
 fn debounce_loop(rx: mpsc::Receiver<Signal>, root: String, on_change: Callback) {
-    let mut pending_since: Option<Instant> = None;
+    debounce_loop_with(rx, root, on_change, DEBOUNCE, MAX_DEBOUNCE);
+}
+
+fn debounce_loop_with(
+    rx: mpsc::Receiver<Signal>,
+    root: String,
+    on_change: Callback,
+    debounce: Duration,
+    max_debounce: Duration,
+) {
+    let mut first_pending: Option<Instant> = None;
+    let mut last_event: Option<Instant> = None;
     loop {
-        let wait = pending_since.map(|since| DEBOUNCE.saturating_sub(since.elapsed()));
-        let next = match wait {
-            Some(remaining) => rx.recv_timeout(remaining),
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        let deadline = match (first_pending, last_event) {
+            (Some(first), Some(last)) => Some((last + debounce).min(first + max_debounce)),
+            _ => None,
         };
-        match next {
-            Ok(Signal::Changed) => {
-                pending_since.get_or_insert_with(Instant::now);
-            }
-            Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {
-                pending_since = None;
+        if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                first_pending = None;
+                last_event = None;
                 on_change(root.clone());
+                continue;
+            }
+            match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                Ok(Signal::Changed) => {
+                    let at = Instant::now();
+                    first_pending.get_or_insert(at);
+                    last_event = Some(at);
+                }
+                Ok(Signal::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {
+                    first_pending = None;
+                    last_event = None;
+                    on_change(root.clone());
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(Signal::Changed) => {
+                    let at = Instant::now();
+                    first_pending = Some(at);
+                    last_event = Some(at);
+                }
+                Ok(Signal::Stop) | Err(_) => return,
             }
         }
     }
@@ -276,5 +308,35 @@ mod tests {
             .expect("watcher should notify through symlinked workspace root");
         assert_eq!(notified, link.to_string_lossy());
         watcher.stop();
+    }
+
+    #[test]
+    fn continuous_event_burst_does_not_starve_notifications() {
+        let (tx, rx) = mpsc::channel();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cb = Arc::clone(&hits);
+        let handle = thread::spawn(move || {
+            debounce_loop_with(
+                rx,
+                "/repo".into(),
+                Arc::new(move |_| {
+                    hits_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+                Duration::from_millis(40),
+                Duration::from_millis(90),
+            );
+        });
+        // Send events faster than `debounce` for longer than `max_debounce`.
+        let end = Instant::now() + Duration::from_millis(240);
+        while Instant::now() < end {
+            tx.send(Signal::Changed).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = tx.send(Signal::Stop);
+        handle.join().unwrap();
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "expected sustained burst to trigger periodic notifications instead of starving"
+        );
     }
 }

@@ -98,8 +98,19 @@ def main() -> int:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     dest = out / (f"dial-{args.target}" + (".exe" if "windows" in args.target else ""))
-    dest.write_bytes(binary)
-    dest.chmod(0o755)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=out, prefix=".dial-fetch-", delete=False) as tmp:
+            tmp_path = pathlib.Path(tmp.name)
+            tmp.write(binary)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        tmp_path.chmod(0o755)
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
     print(f"{dest} ({args.version}, {len(binary)} bytes)")
     return 0
 
