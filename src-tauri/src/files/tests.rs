@@ -41,13 +41,11 @@ fn paths_stay_inside_the_workspace() {
     fs::create_dir_all(root.0.join("src")).unwrap();
     fs::write(root.0.join("src/main.rs"), "fn main() {}").unwrap();
 
+    let path = root.0.join("src/main.rs");
+    let absolute = path.canonicalize().unwrap();
+    assert_eq!(resolve(&root.0, "src/main.rs").unwrap(), absolute);
     assert_eq!(
-        resolve(&root.0, "src/main.rs").unwrap(),
-        root.0.join("src/main.rs")
-    );
-    let absolute = root.0.join("src/main.rs");
-    assert_eq!(
-        resolve(&root.0, &absolute.to_string_lossy()).unwrap(),
+        resolve(&root.0, &path.to_string_lossy()).unwrap(),
         absolute
     );
     assert!(
