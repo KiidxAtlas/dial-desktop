@@ -41,6 +41,7 @@ export interface Session {
   title: string;
   meta: string;
   empty?: boolean;
+  openElsewhere?: boolean;
   pinned: boolean;
   selected: boolean;
   /** A turn runs in it, on screen or in the background. */
@@ -144,6 +145,10 @@ export interface ModelInfo {
   provider: string;
   modelId: string;
   label: string;
+  local?: boolean;
+  managedLocal?: boolean;
+  resident?: boolean;
+  systemMemoryBytes?: number | null;
   /** The session's reasoning level; `null` runs the model's default. */
   thinking: string | null;
   defaultThinking: string | null;
@@ -153,6 +158,15 @@ export interface ModelInfo {
   acceptsImages: boolean | null;
 }
 
+export interface MemoryFit {
+  fit: "fits" | "tight" | "wont_fit" | "unknown" | string;
+  weightsBytes: number;
+  kvBytes: number;
+  residentBytes: number;
+  memoryBytes: number | null;
+  contextTokens: number;
+  maxContextTokens: number;
+}
 /** One model the user can switch to (the `models` event). */
 export interface ModelOption {
   provider: string;
@@ -168,9 +182,15 @@ export interface ModelOption {
   listed?: boolean;
   /** Only from a static bundled catalog (not configured, local, or live-listed). */
   catalogOnly?: boolean;
-  localEngine?: { selected: string; choices: string[]; setting: string } | null;
+  localEngine?: {
+    selected: string;
+    choices: string[];
+    setting: string;
+    default?: string | null;
+    installed?: Record<string, boolean>;
+  } | null;
+  memoryFit?: MemoryFit | null;
 }
-
 export interface TranscriptHit {
   session_id: string;
   entry_id: string;
@@ -206,9 +226,11 @@ export interface ModelProgress {
   processedTokens?: number | null;
   promptTokens?: number | null;
   outputTokens?: number | null;
+  tokensPerSecond?: number | null;
+  cachedTokens?: number | null;
+  etaSecs?: number | null;
   estimated?: boolean;
 }
-
 export type ApprovalMode = "readonly" | "ask" | "write" | "auto";
 
 export interface Snapshot {
@@ -223,10 +245,12 @@ export interface Snapshot {
   loadingLocalModel?: string | null;
   localLoadFailure?: { sessionId: string; provider: string; modelId: string; error: string } | null;
   sessionId: string | null;
+  startupDraftKey?: string | null;
   historyLoading: boolean;
   showThinking: boolean;
   turnRunning: boolean;
   modelProgress?: ModelProgress | null;
+  lastInference?: ModelProgress | null;
   canSend: boolean;
   sessions: Session[];
   entries: Entry[];
@@ -262,9 +286,12 @@ export interface ContextView {
   tokens: number;
   /** Effective window, falling back to catalog capacity on older engines. */
   window: number | null;
+  /** Actual loaded window reported by a local server, when probed. */
+  loadedWindow?: number | null;
+  /** Requested window from settings before server/hardware capping. */
+  requestedWindow?: number | null;
   estimated: boolean;
 }
-
 /** A snapshot with an open folder; everything but the welcome screen renders one. */
 export type OpenSnapshot = Snapshot & { workspace: Workspace };
 
@@ -362,6 +389,8 @@ export interface BrowserState {
   url: string;
   title: string;
   loading: boolean;
+  activeTab: number;
+  tabs: { id: number; url: string; title: string }[];
 }
 
 export interface PageInfo {

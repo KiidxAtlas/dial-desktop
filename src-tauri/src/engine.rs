@@ -31,7 +31,8 @@ const MAX_DRAIN_BATCH: usize = 32;
 const SHUTDOWN: Duration = Duration::from_secs(5);
 /// Sessions fetched for the sidebar.
 const SESSION_PAGE: u64 = 100;
-
+/// Messages fetched per `messages_page` request when recovering full archived history.
+const MESSAGES_PAGE: u64 = 500;
 /// Wakes the UI after an update is queued (the Tauri pump thread).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -82,6 +83,8 @@ pub enum Command {
     NewSession,
     /// Switch to a persisted session.
     Resume(String),
+    /// Read a saved session's conversation without opening it (`session_messages`).
+    SessionMessages(String),
     /// Delete another session of this project; the engine refuses the active one.
     DeleteSession(String),
     /// Load the settings reference: every setting's kind, constraints and default.
@@ -101,8 +104,13 @@ pub enum Command {
     },
     /// Reload the saved settings into the running session.
     ApplySettings,
-    /// Replace the view with an authoritative snapshot after lost events.
+/// Replace the view with an authoritative snapshot after lost events.
     Recover,
+    /// Fetch one page of the active session's full archived history (`messages_page`).
+    MessagesPage {
+        offset: u64,
+        after: Option<RequestId>,
+    },
     /// Read the model, thinking level and approval mode in force.
     State,
     /// Load the models after the engine re-queries signed-in and configured providers
@@ -202,6 +210,7 @@ pub enum Purpose {
     Sessions,
     NewSession,
     Resume,
+    SessionMessages,
     DeleteSession,
     SettingsSchema,
     Settings,
@@ -209,6 +218,7 @@ pub enum Purpose {
     ResetSetting,
     ApplySettings,
     Recover,
+    MessagesPage,
     State,
     Models,
     ImageModels,
@@ -314,6 +324,7 @@ impl Command {
             ),
             Self::NewSession => (Purpose::NewSession, "new_session", json!({})),
             Self::Resume(id) => (Purpose::Resume, "resume", json!({ "session_id": id })),
+            Self::SessionMessages(id) => (Purpose::SessionMessages, "session_messages", json!({ "session_id": id })),
             Self::DeleteSession(id) => (
                 Purpose::DeleteSession,
                 "delete_session",
@@ -333,6 +344,11 @@ impl Command {
             ),
             Self::ApplySettings => (Purpose::ApplySettings, "apply_settings", json!({})),
             Self::Recover => (Purpose::Recover, "recovery_snapshot", json!({})),
+            Self::MessagesPage { offset, .. } => (
+                Purpose::MessagesPage,
+                "messages_page",
+                json!({ "offset": offset, "limit": MESSAGES_PAGE }),
+            ),
             Self::State => (Purpose::State, "state", json!({})),
             Self::DiscoverModels => (Purpose::Models, "list_models", json!({ "refresh": true })),
             Self::ListImageModels => (

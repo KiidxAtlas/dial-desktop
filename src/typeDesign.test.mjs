@@ -82,4 +82,21 @@ test('recent sessions group by age once they span more than one', async t => {
   assert.deepEqual(names(rows), ['Pinned:p', 'Today:a,b', 'Yesterday:c', 'This week:d', 'Older:e']);
   assert.deepEqual(names(rows.slice(0, 2)), ['Recents:a,b']);
   assert.deepEqual(names(rows, 'a'), ['Recents:a']);
+  const external = row('external', 'just now', { openElsewhere: true });
+  assert.deepEqual(names([...rows, external]), names(rows));
+  assert.deepEqual(names([external], 'external'), ['Recents:external'], 'explicit search still allows attachment');
+  assert.deepEqual(names([row('attach 1234567890abcdef', ''), row('attach -- 1234567890abcdef', ''), row('attach a file', '')]), ['Recents:attach a file']);
+});
+
+test('switching selection keeps the same rows in Recents, including around a blank session', async t => {
+  const vite = await createServer({ configFile: false, optimizeDeps: { noDiscovery: true }, server: { middlewareMode: true, ws: false } });
+  t.after(() => vite.close());
+  const { sessionGroups } = await vite.ssrLoadModule('/src/sessionActions.ts');
+  const rows = ['blank', 'one', 'two'].map(id => ({ id, title: id, empty: id === 'blank', meta: 'just now' }));
+  for (const selected of ['one', 'blank', 'two', 'one']) {
+    const groups = sessionGroups({ sessions: rows.map(s => ({ ...s, selected: s.id === selected })), workspace: { root: 'grouping' } });
+    assert.deepEqual(groups.find(g => g.name === 'Recents')?.sessions.map(s => s.id), ['one', 'two']);
+    assert.equal(groups[0].name, 'Recents', 'selecting the blank must not shift Recents down');
+    assert.equal(groups.some(g => g.sessions.some(s => s.id === 'blank')), selected === 'blank');
+  }
 });

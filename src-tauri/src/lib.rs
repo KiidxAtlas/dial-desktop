@@ -23,6 +23,7 @@ pub mod model;
 mod model_library;
 mod notifications;
 pub mod preview;
+pub mod session_preview;
 pub mod settings;
 pub mod scheduler;
 pub mod tabs;

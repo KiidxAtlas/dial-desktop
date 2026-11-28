@@ -202,6 +202,7 @@ export function typeScopedSnapshot(snap: OpenSnapshot): OpenSnapshot {
   return {
     ...snap,
     sessionId: `type:${open.id}`,
+    startupDraftKey: null,
     title: `${open.icon} ${open.name}`.trim(),
     historyLoading: false,
     turnRunning: false,

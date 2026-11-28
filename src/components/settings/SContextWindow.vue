@@ -31,7 +31,7 @@ function apply() {
     <SSegmented :model-value="custom ? 'set' : 'auto'" :options="[{ value: 'auto', label: 'Auto' }, { value: 'set', label: 'Custom' }]" :label="`${label} mode`" @update:model-value="choose" />
     <form v-if="custom" @submit.prevent="apply">
       <input v-model="draft" class="s-input mono" inputmode="numeric" :aria-label="`${label} (tokens)`" placeholder="Tokens" />
-      <button class="btn btn-secondary" :disabled="!valid || tokens === value">Apply</button>
+      <button class="btn btn-secondary" :disabled="!valid || tokens === value" :title="tokens === value ? 'This cap is already in effect' : undefined">{{ tokens === value ? 'Applied' : 'Apply' }}</button>
     </form>
     <small v-if="custom && draft && !valid" role="status">Enter a whole number from {{ min }} to {{ max }} tokens.</small>
   </div>

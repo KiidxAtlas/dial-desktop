@@ -168,7 +168,7 @@ jobs:
           releaseBody: |
             Download Dial Desktop for your platform below, or from https://dial.rootatlas.dev/download.
             Installed apps update themselves. The app ships with the Dial engine (`dial`) and keeps any engine you installed separately updated through `dial update`.
-            Terminal only? `curl -fsSL https://dial.rootatlas.dev/install | sh`
+            Terminal only? `curl -fsSL https://dial.rootatlas.dev/install | sh -s -- --cli`
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

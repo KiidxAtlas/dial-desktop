@@ -24,6 +24,7 @@ import ModelLibrary from "./ModelLibrary.vue";
 import ProviderSettings from "./ProviderSettings.vue";
 import RolesPresets from "./RolesPresets.vue";
 import ImageSettings from "./ImageSettings.vue";
+import LoraTraining from "./LoraTraining.vue";
 import ProjectTools, { PROJECT_TABS, type ProjectTab } from "./ProjectTools.vue";
 import SettingsTransfer from "./SettingsTransfer.vue";
 import IntegrationsSettings from "./IntegrationsSettings.vue";
@@ -37,7 +38,7 @@ import SSegmented from "./settings/SSegmented.vue";
 import "./settings/settings.css";
 
 type IconName = keyof typeof PATHS;
-type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "health" | "maintenance" | "library" | "providers" | "roles" | "images" | "integrations" | ProjectTab;
+type DesktopPage = "overview" | "appearance" | "notifications" | "types" | "updates" | "health" | "maintenance" | "library" | "providers" | "roles" | "images" | "training" | "integrations" | ProjectTab;
 /** A desktop page, or `engine:<tab>` for one of the engine's tabs. */
 type PageId = DesktopPage | `engine:${string}`;
 
@@ -85,6 +86,7 @@ const DESKTOP: { title: string; pages: PageInfo[] }[] = [
       { id: "library", label: "Model library", icon: "brain", about: "Models you have, and downloading more.", words: "models download hugging face local delete mlx gguf cache" },
       { id: "roles", label: "Roles & presets", icon: "list", about: "Which model handles which job, and saved setups to switch between.", words: "models role preset profile embedding thinking helper model" },
       { id: "images", label: "Image generation", icon: "image", about: "Which model makes images, and how it renders them.", words: "models image picture flux diffusion steps seed lora strength size quality moderation edit background mlx serve stable" },
+      { id: "training", label: "LoRA training", icon: "activity", about: "Train a local adapter from approved examples, then test it against the base model.", words: "models fine tune finetune dataset learn lora mlx gguf adapter training" },
     ],
   },
   {
@@ -555,6 +557,7 @@ async function restartEngine() {
 
         <!-- Project pages drawn on SPage themselves. -->
         <RolesPresets v-else-if="project && current === 'roles'" :snap="project" />
+        <LoraTraining v-else-if="project && current === 'training'" :key="JSON.stringify([project.workspace.root, project.sessionId, project.connection.state])" :snap="project" @library="go('library')" @settings="go('engine:Learning')" />
         <template v-else-if="project && PROJECT_TABS.some((t) => t.id === current)">
           <ProjectTools :key="current" :which="current as ProjectTab" :snap="project" />
           <ProjectTools v-if="current === 'permissions'" key="folders" which="folders" :snap="project" embedded />

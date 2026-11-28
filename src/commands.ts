@@ -239,6 +239,7 @@ export function commands(snap: OpenSnapshot): Command[] {
   add({ id: "computer-on", group: "Autonomy", label: "Computer use: turn on", icon: "monitor", keywords: "computer use desktop control enable /computer", run: page("integrations") }, live);
   add({ id: "computer-off", group: "Autonomy", label: "Computer use: turn off", icon: "monitor", keywords: "computer use desktop control disable /computer", run: page("integrations") }, live);
   add({ id: "learn", group: "Learning", label: "Learning panel", icon: "activity", keywords: "learn train self improvement versions rollback jobs /learn", run: inTerminal("/learn panel") }, live);
+  add({ id: "lora-training", group: "Learning", label: "Train a LoRA adapter", icon: "activity", keywords: "learn train fine tune mlx gguf examples base model", run: page("training") }, live);
   add({ id: "learn-status", group: "Learning", label: "Learning status", icon: "activity", keywords: "learn status jobs cycle /learn", run: () => { ui.settingsOpen = false; void learningStatus(); } }, live);
   add({ id: "understanding", group: "Learning", label: "How this project fits together", icon: "brain", keywords: "understanding architecture components map /understanding", run: () => void understandingView() }, live);
   add({ id: "understanding-build", group: "Learning", label: "Build the project understanding", icon: "brain", keywords: "understanding build index notes /understanding", run: inTerminal("/understanding build") }, live);

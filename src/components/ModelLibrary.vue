@@ -43,7 +43,18 @@ async function loadCached() {
 }
 const elapsed = (s: number) => s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 const count = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
-
+const systemRam = computed(() => snapshot.value?.model?.systemMemoryBytes ?? null);
+/** Rough RAM-fit classification from on-disk weight size (weights + ~25% KV/overhead + 1.5 GiB). */
+function weightFit(bytes: number): { label: string; tone: string; tip: string } | null {
+  const ram = systemRam.value;
+  if (!ram || !bytes) return null;
+  const est = bytes * 1.25 + 1.5 * 1024 ** 3;
+  const ramGb = Math.round(ram / 1024 ** 3);
+  const tip = `Rough estimate ~${size(est)} resident against ${ramGb} GB system RAM (actual KV usage depends on context length)`;
+  if (est <= ram * 0.6) return { label: 'Fits RAM', tone: 'fits', tip };
+  if (est <= ram * 0.75) return { label: 'Tight in RAM', tone: 'tight', tip };
+  return { label: 'Large for RAM', tone: 'wont', tip };
+}
 // Hugging Face search: the most downloaded MLX or GGUF models matching the words typed.
 const hubQuery = ref(''), hubFormat = ref<'MLX' | 'GGUF'>(snapshot.value?.appleSilicon ? 'MLX' : 'GGUF');
 const hub = ref<HubModel[] | null>(null), hubBusy = ref(false), hubError = ref('');
@@ -169,9 +180,12 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
         </details>
       </article>
     </template>
-    <h3>Suggested</h3><p class="note">Smallest downloads first. File size is not a memory requirement.</p>
+    <h3>Suggested <span v-if="systemRam" class="head-tools"><span>{{ Math.round(systemRam / 1024 ** 3) }} GB RAM detected</span></span></h3><p class="note">Smallest downloads first. File size is not a memory requirement.</p>
     <article v-for="m in results" :key="m.repo">
-      <div><strong>{{ m.name }}</strong><p>{{ m.description }} · {{ m.format }} · {{ size(m.bytes) }}</p><small>{{ m.repo }}</small></div>
+      <div>
+        <strong>{{ m.name }} <span v-if="weightFit(m.bytes)" class="fit-pill" :class="weightFit(m.bytes)!.tone" :title="weightFit(m.bytes)!.tip">{{ weightFit(m.bytes)!.label }}</span></strong>
+        <p>{{ m.description }} · {{ m.format }} · {{ size(m.bytes) }}</p><small>{{ m.repo }}</small>
+      </div>
       <button class="btn btn-secondary" :aria-label="`Download ${m.name} (${m.format})`" :disabled="preview || pending || status?.running" @click="act(m)">{{ status?.running && status.repo === m.repo ? 'Downloading…' : suggestedCached(m) ? 'Update' : 'Download' }}</button>
     </article>
     <p v-if="!results.length">No matches. Try another name or format.</p>
@@ -230,4 +244,8 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(timer); clearTimeout(typin
 .library summary {cursor:pointer;color:var(--text-muted);} details .file {margin-top:8px;} progress {width:100%;accent-color:var(--accent);}
 .progress-detail {color:var(--text);font-variant-numeric:tabular-nums;}
 .segmented {display:inline-flex;flex:none;border:1px solid var(--border-strong);border-radius:var(--radius-sm);overflow:hidden;} .segmented button {padding:6px 12px;font-size:var(--text-sm);color:var(--text-muted);} .segmented button.on {background:var(--active);color:var(--text);}
+.fit-pill {display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;font-size:var(--text-xs);font-weight:500;vertical-align:middle;border:1px solid var(--border);}
+.fit-pill.fits {color:var(--success, #2ea043);border-color:color-mix(in srgb, var(--success, #2ea043) 35%, transparent);}
+.fit-pill.tight {color:var(--warning);border-color:color-mix(in srgb, var(--warning) 35%, transparent);}
+.fit-pill.wont {color:var(--danger);border-color:color-mix(in srgb, var(--danger) 35%, transparent);}
 </style>

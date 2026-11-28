@@ -107,7 +107,7 @@ watch(opened, (s) => {
   if (!s) return;
   trackPreviews(s);
   syncQueue(s);
-});
+}, { immediate: true });
 
 /** Show panel `tab`, or close the inspector when it already shows it. */
 function togglePanel(tab: InspectorTab) {
@@ -285,7 +285,7 @@ function onKey(event: KeyboardEvent) {
   }
   if (plain && key === "n") {
     event.preventDefault();
-    startNewSession(s);
+    if (!event.repeat) startNewSession(s);
   } else if (plain && key === "k") {
     event.preventDefault();
     ui.menu = null;

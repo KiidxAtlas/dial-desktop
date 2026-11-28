@@ -142,6 +142,47 @@ function context(m: ModelOption) {
   return n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}K`;
 }
 
+function gib(bytes: number) {
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function fitBadge(m: ModelOption): { label: string; tone: string; tip: string } | null {
+  const f = m.memoryFit;
+  if (!f || f.fit === "unknown") return null;
+  const ctxK = f.maxContextTokens >= 1000 ? `${Math.round(f.maxContextTokens / 1000)}K` : String(f.maxContextTokens);
+  const ram = f.memoryBytes ? ` of ${gib(f.memoryBytes)} RAM` : "";
+  const tip = `Est. ${gib(f.residentBytes)} resident (${gib(f.weightsBytes)} weights + ${gib(f.kvBytes)} KV)${ram} · comfortable up to ${ctxK} context`;
+  if (f.fit === "fits") return { label: "Fits", tone: "fits", tip };
+  if (f.fit === "tight") return { label: "Tight", tone: "tight", tip };
+  return { label: "Won't fit", tone: "wont", tip };
+}
+
+const unloading = ref(false);
+async function unloadCurrentModel() {
+  if (unloading.value || props.snap.turnRunning || !current.value?.managedLocal) return;
+  unloading.value = true;
+  try {
+    await engineCall("restart_model", {}, props.snap.workspace.root);
+    showToast(`Unloaded ${current.value.label}. Memory freed.`);
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    unloading.value = false;
+  }
+}
+const warming = ref(false);
+async function warmCurrentModel() {
+  if (warming.value || props.snap.turnRunning || !current.value?.managedLocal || current.value.resident) return;
+  warming.value = true;
+  try {
+    const res = await engineCall<{ warmed?: boolean; resident?: boolean }>("warm_local_model", {}, props.snap.workspace.root);
+    if (res?.resident || res?.warmed) showToast(`${current.value.label} is loaded and ready.`);
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    warming.value = false;
+  }
+}
 function open() {
   if (!usable.value) return;
   ui.modelPickerOpen = true;
@@ -155,7 +196,58 @@ function close(refocus = true) {
 }
 
 const changingEngine = ref(false);
-const engineNames: Record<string, string> = { auto: 'Automatic', mlx: 'MLX', 'llama-cpp': 'llama.cpp', atomic: 'Atomic Engine' };
+const settingUpEngineLabel = ref('');
+const engineNames: Record<string, string> = {
+  auto: 'Automatic',
+  mlx: 'MLX',
+  'mlx-serve': 'MLX-Serve',
+  'vllm-mlx': 'vLLM-MLX',
+  'llama-cpp': 'llama.cpp',
+  atomic: 'Atomic Engine',
+  'ik-llama': 'ik_llama.cpp',
+  'mistral-rs': 'mistral.rs',
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  exl3: 'ExLlamaV3',
+};
+const sourceBuildEngines = new Set(['atomic', 'ik-llama']);
+
+function engineOptionLabel(
+  pin: NonNullable<ModelOption['localEngine']>,
+  id: string,
+): string {
+  const name = engineNames[id] ?? id;
+  const installed = pin.installed;
+  if (!installed) return name;
+  if (id === 'auto') {
+    const def = pin.default;
+    if (def && installed[def] === false) {
+      const verb = sourceBuildEngines.has(def) ? 'Build' : 'Download';
+      return `${name} (${verb} ${engineNames[def] ?? def})`;
+    }
+    return name;
+  }
+  if (installed[id] === false) {
+    return `${name} · ${sourceBuildEngines.has(id) ? 'Build' : 'Download'}`;
+  }
+  return name;
+}
+
+async function ensureRuntimeInstalled(
+  pin: NonNullable<ModelOption['localEngine']>,
+  choice: string,
+): Promise<boolean> {
+  const target = choice === 'auto' ? (pin.default ?? '') : choice;
+  if (!target) return true;
+  const already = pin.installed ? pin.installed[target] !== false : target !== 'atomic';
+  if (already) return true;
+  settingUpEngineLabel.value = engineNames[target] ?? target;
+  try {
+    return await engine.setupRuntime(target);
+  } finally {
+    settingUpEngineLabel.value = '';
+  }
+}
 
 async function changeEngine(m: ModelOption, event: Event) {
   const select = event.target as HTMLSelectElement;
@@ -167,19 +259,38 @@ async function changeEngine(m: ModelOption, event: Event) {
   const root = props.snap.workspace.root;
   changingEngine.value = true;
   try {
-    if (choice === 'atomic' && !await engine.setupAtomic()) return;
+    if (!await ensureRuntimeInstalled(pin, choice)) return;
     if (props.snap.workspace.root !== root) return;
     await engineCall('set_setting', { key: pin.setting, value: choice, scope: 'global' }, root);
     if (props.snap.workspace.root === root) {
       await engine.refreshModels();
-      showToast(`${m.label} will use ${engineNames[choice]} on load.`);
+      showToast(`${m.label} will use ${engineNames[choice] ?? choice} on load.`);
     }
   } catch (error) { showToast(String(error)); }
   finally { changingEngine.value = false; }
 }
 
-function choose(m: ModelOption) {
+async function choose(m: ModelOption) {
   if (changingEngine.value) return;
+  const pin = m.local ? m.localEngine : null;
+  if (pin && props.snap.connection.state === 'live') {
+    const selected = pin.choices.includes(pin.selected) ? pin.selected : (pin.default ?? '');
+    const target = selected === 'auto' ? (pin.default ?? '') : selected;
+    if (target && pin.installed?.[target] === false) {
+      const root = props.snap.workspace.root;
+      changingEngine.value = true;
+      try {
+        if (!await ensureRuntimeInstalled(pin, selected)) return;
+        if (props.snap.workspace.root !== root) return;
+        await engine.refreshModels();
+      } catch (error) {
+        showToast(String(error));
+        return;
+      } finally {
+        changingEngine.value = false;
+      }
+    }
+  }
   if (props.snap.turnRunning || !isCurrent(m) || m.local || m.provider === 'mlx') {
     const snap = props.snap;
     void engine.setModel(snap, m.provider, m.modelId).then(ok => {
@@ -188,7 +299,6 @@ function choose(m: ModelOption) {
   }
   close();
 }
-
 function think(level: string) {
   const snap = props.snap;
   void engine.setThinking(snap, level).then(ok => {
@@ -280,6 +390,19 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         </div>
         <ModesMenu v-if="modesPage && snap.connection.state === 'live'" :snap="snap" />
         <template v-else>
+        <div v-if="current?.managedLocal && snap.connection.state === 'live'" class="resident-bar">
+          <span class="resident-status">
+            <span class="dot" :class="{ on: current.resident }" aria-hidden="true" />
+            {{ current.resident ? 'Loaded in memory' : 'Idle (loads on next turn)' }}
+            <template v-if="current.systemMemoryBytes"> · {{ Math.round(current.systemMemoryBytes / 1024 ** 3) }} GB RAM</template>
+          </span>
+          <button v-if="current.resident" class="btn btn-secondary unload-btn" :disabled="unloading || snap.turnRunning" @click="unloadCurrentModel">
+            {{ unloading ? 'Unloading…' : 'Unload' }}
+          </button>
+          <button v-else class="btn btn-secondary unload-btn" :disabled="warming || snap.turnRunning" title="Load weights into memory now so your first message starts immediately" @click="warmCurrentModel">
+            {{ warming ? 'Loading…' : 'Pre-warm' }}
+          </button>
+        </div>
         <p v-if="snap.turnRunning" class="empty">Changes apply to this session after the running turn.</p>
         <label class="search">
           <Icon name="search" :size="14" />
@@ -332,20 +455,21 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
                 <span class="name truncate">{{ m.label }}</span>
                 <span class="id truncate">{{ m.provider }}/{{ m.modelId }}</span>
                 <span class="tags">
+                  <span v-if="fitBadge(m)" class="tag fit" :class="fitBadge(m)!.tone" :title="fitBadge(m)!.tip">{{ fitBadge(m)!.label }}</span>
                   <span v-if="m.reasoning" class="tag" title="Supports reasoning"><Icon name="brain" :size="11" /></span>
                   <span v-if="context(m)" class="tag">{{ context(m) }}</span>
                 </span>
                 <Icon v-if="isCurrent(m)" class="tick" name="check" :size="14" />
               </button>
-              <select v-if="m.local && m.localEngine && snap.connection.state === 'live'" class="engine-select" :aria-label="`Inference engine for ${m.label}`" title="Remember an inference engine for this model" :value="m.localEngine.choices.includes(m.localEngine.selected) ? m.localEngine.selected : ''" :disabled="changingEngine || snap.turnRunning" @change="changeEngine(m, $event)">
+              <select v-if="m.local && m.localEngine && snap.connection.state === 'live'" class="engine-select" :aria-label="`Inference engine for ${m.label}`" title="Choose an inference engine for this model (uninstalled runtimes download on select)" :value="m.localEngine.choices.includes(m.localEngine.selected) ? m.localEngine.selected : ''" :disabled="changingEngine || snap.turnRunning" @change="changeEngine(m, $event)">
                 <option v-if="!m.localEngine.choices.includes(m.localEngine.selected)" value="" disabled>Choose an engine…</option>
-                <option v-for="id in m.localEngine.choices" :key="id" :value="id">{{ engineNames[id] ?? id }}</option>
+                <option v-for="id in m.localEngine.choices" :key="id" :value="id">{{ engineOptionLabel(m.localEngine, id) }}</option>
               </select>
               <button v-if="downloadedOnly && snap.connection.state === 'live'" class="refresh" :aria-label="`Details for ${m.label}`" title="Model details" @click="inspectModel(m)">···</button>
             </div>
           </template>
         </div>
-        <p v-if="changingEngine" class="empty" role="status">Preparing the engine choice…</p>
+        <p v-if="changingEngine" class="empty" role="status">{{ settingUpEngineLabel ? `Downloading & setting up ${settingUpEngineLabel}…` : 'Preparing the engine choice…' }}</p>
         <div v-if="downloadedOnly" class="model-details">
           <p v-if="!details">Choose a model above to load it, or get more from the model library.</p>
           <template v-else>
@@ -354,6 +478,9 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
             <p v-else-if="!details.plan" role="status">Looking up model details…</p>
             <template v-if="details.plan">
               <p>{{ details.plan.source }} · {{ (details.plan.bytes / 1024 ** 3).toFixed(2) }} GiB</p>
+              <p v-if="details.row.memoryFit && details.row.memoryFit.fit !== 'unknown'">
+                Est. {{ gib(details.row.memoryFit.residentBytes) }} resident ({{ gib(details.row.memoryFit.weightsBytes) }} weights + {{ gib(details.row.memoryFit.kvBytes) }} KV) · comfortable up to {{ Math.round(details.row.memoryFit.maxContextTokens / 1000) }}K context
+              </p>
               <p class="mono" :title="details.plan.folder">{{ details.plan.folder }}</p>
               <p v-if="cannotRemove(details.row)">{{ cannotRemove(details.row) }}</p>
               <button v-else class="btn btn-danger" :disabled="managing" @click="removeModel">Remove from disk…</button>
@@ -364,8 +491,13 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
         <div v-if="levels.length" class="thinking">
           <span class="section-label">Reasoning</span>
           <div class="chips">
-            <button class="chip" :class="{ on: !current?.thinking }" @click="think('default')">
-              Default<span v-if="current?.defaultThinking" class="faint"> ({{ current.defaultThinking }})</span>
+            <button
+              class="chip"
+              :class="{ on: !current?.thinking }"
+              :title="current?.local ? 'Adaptive local effort: medium for planning, low for routine tool steps, minimal on recovery' : undefined"
+              @click="think('default')"
+            >
+              {{ current?.local ? 'Auto' : 'Default' }}<span v-if="current?.defaultThinking" class="faint"> ({{ current.defaultThinking }})</span>
             </button>
             <button
               v-for="level in levels"
@@ -398,6 +530,14 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onOutside));
 
 <style scoped>
 .engine-select { max-width: 9em; align-self: center; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); padding: 3px; font-size: var(--text-xs); }
+.resident-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: var(--text-xs); color: var(--text-muted); }
+.resident-status { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.resident-status .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--border-strong); flex: none; }
+.resident-status .dot.on { background: var(--success, #2ea043); }
+.unload-btn { padding: 2px 8px; font-size: var(--text-xs); height: 22px; }
+.tag.fit.fits { color: var(--success, #2ea043); }
+.tag.fit.tight { color: var(--warning); }
+.tag.fit.wont { color: var(--danger); }
 .picker {
   position: relative;
   display: flex;

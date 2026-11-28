@@ -112,6 +112,9 @@ struct Inner {
     recents: Recents,
     /// The on-screen tab's transcript rows, reused by the next snapshot where unchanged.
     entry_views: EntryViews,
+    /// Saved conversations shown while their session opens, and the copies kept for that.
+    previews: crate::session_preview::Previews,
+    preview_views: EntryViews,
 }
 
 /// State shared by the pump thread and the commands.
@@ -151,6 +154,7 @@ mod project_tests {
                 tabs: Tabs::new(Tab::new(Model::default(), None)),
                 parked: Default::default(),
                 workspace: None, recents: Recents::load(None), entry_views: EntryViews::default(),
+                previews: Default::default(), preview_views: EntryViews::default(),
             }),
             service_starts: Default::default(),
             source, home: None,
@@ -185,6 +189,27 @@ mod project_tests {
             assert!(program.with_extension("probing").exists(), "engine probe did not run");
             assert_eq!(opened, Ok(Ok(true)), "opening the project waited for the probe");
         });
+    }
+
+    #[test]
+    fn an_opening_session_shows_its_saved_conversation_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = test_shared(Source::Preview(Preview::Empty));
+        shared.open(Path::new("/projects/first")).unwrap();
+        let mut inner = shared.lock();
+        let root = inner.workspace.as_ref().unwrap().root.clone();
+        inner.previews = crate::session_preview::Previews::new(Some(dir.path().to_owned()));
+        let messages = [serde_json::json!({"role":"user","content":"hi"}), serde_json::json!({"role":"assistant","content":"hello"})];
+        inner.previews.update(&root, "s1", &messages);
+        inner.previews.begin(&root, "s1");
+        inner.tabs.active_mut().opening = Some(("s1".into(), None));
+        let shown = snapshot_of(&mut inner);
+        assert_eq!(shown.entries.len(), 2);
+        assert_eq!(shown.session_id.as_deref(), Some("s1"));
+        assert!(shown.history_loading && !shown.can_send && shown.startup_draft_key.is_none());
+        // Once the session is open (or opening stopped), the engine's own conversation shows.
+        inner.tabs.active_mut().opening = None;
+        assert!(snapshot_of(&mut inner).entries.is_empty());
     }
 
     #[test]
@@ -334,10 +359,15 @@ impl Shared {
             .ok_or(PREVIEW_NOTICE)?;
         let mut tab = Tab::new(Model::starting(), Some(engine));
         tab.model.sessions = active.model.sessions.clone();
-        if let Some(id) = target {
+        if let Some(id) = target.clone() {
             tab.restore_on_connect(id)?;
+        } else {
+            tab.inherit_unbound_draft(active);
         }
         let old = std::mem::replace(active, tab);
+        if let Some(id) = &target {
+            inner.previews.begin(&root, id);
+        }
         drop(inner);
         retire(vec![old]);
         self.poke();
@@ -456,11 +486,33 @@ fn snapshot_of(inner: &mut Inner) -> Snapshot {
         &mut inner.entry_views,
     );
     snapshot.history_loading |= inner.tabs.active().opening_session();
+    snapshot.startup_draft_key = inner.tabs.active().startup_draft_key().map(str::to_owned);
+    // While a session opens, show its saved conversation; the snapshot stays `history_loading`.
+    if let Some(w) = inner.workspace.as_ref()
+        && let Some(shown) = inner.previews.shown(&w.root, inner.tabs.active().opening_id())
+    {
+        snapshot.entries = Snapshot::reusing(&shown.model, Some(w), time::now(), &mut inner.preview_views).entries;
+        snapshot.session_id = Some(shown.id.clone());
+        snapshot.startup_draft_key = snapshot.startup_draft_key.filter(|key| key == &shown.id);
+        snapshot.plan = Vec::new();
+        snapshot.approvals = Vec::new();
+        snapshot.question = None;
+        snapshot.can_send = false;
+    }
     snapshot.loading_local_model = inner.tabs.active().loading_local_model().map(str::to_owned);
     snapshot.local_load_failure = inner.tabs.active().local_load_failure().cloned();
     snapshot.can_send &= !inner.tabs.active().transitioning();
     snapshot.show_activity(&inner.tabs.activity());
     snapshot
+}
+
+/// Keep (and show, when it is opening) each saved conversation the project's engines read.
+fn take_reads(tabs: &mut Tabs, root: &str, previews: &mut crate::session_preview::Previews) {
+    for tab in tabs.iter_mut() {
+        for (id, messages) in std::mem::take(&mut tab.model.read_sessions) {
+            previews.update(root, &id, &messages);
+        }
+    }
 }
 
 /// Run the same reducer and follow-up commands for visible and hidden projects.
@@ -490,13 +542,38 @@ fn publish(app: &AppHandle) {
     let (snapshot, models, settings, messages, closed, notices) = {
         let mut inner = shared.lock();
         let (mut messages, mut closed, active_notices) = drain_project(app, &mut inner.tabs);
+        // An engine that refused to open a session while busy keeps its work; open the
+        // session in a second engine, as for a turn Desktop already knows is running.
+        let refused: Vec<(bool, String)> = {
+            let active = inner.tabs.active_index();
+            inner.tabs.iter_mut().enumerate()
+                .filter_map(|(index, tab)| tab.take_busy_refusal().map(|id| (index == active, id)))
+                .collect()
+        };
+        for (shown, id) in refused {
+            if shown && matches!(inner.tabs.route_resume(&id), Route::Here | Route::Spawn) {
+                if let Err(error) = shared.open_tab(&mut inner, Some(Command::Resume(id))) {
+                    messages.push(format!("Could not open the session: {error}"));
+                }
+            }
+        }
         let mut notices = Vec::new();
         if let Some(w) = &inner.workspace { notices.push((w.root.clone(), active_notices)); }
-        for (root, tabs) in &mut inner.parked {
-            let (news, idle, alerts) = drain_project(app, tabs);
-            messages.extend(news.into_iter().map(|message| format!("{root}: {message}")));
-            closed.extend(idle);
-            if !alerts.is_empty() { notices.push((root.clone(), alerts)); }
+        {
+            let Inner { tabs, parked, workspace, previews, .. } = &mut *inner;
+            if let Some(w) = workspace { take_reads(tabs, &w.root, previews); }
+            for (root, tabs) in parked.iter_mut() {
+                let (news, idle, alerts) = drain_project(app, tabs);
+                for tab in tabs.iter_mut() {
+                    if tab.take_busy_refusal().is_some() {
+                        messages.push(format!("{root}: Could not open the session: Dial is still working; stop the turn first"));
+                    }
+                }
+                messages.extend(news.into_iter().map(|message| format!("{root}: {message}")));
+                closed.extend(idle);
+                if !alerts.is_empty() { notices.push((root.clone(), alerts)); }
+                take_reads(tabs, root, previews);
+            }
         }
         // Setup owns a separate RPC connection. Its prompts never enter a chat transcript.
         if let Some(setup) = shared.provider_setup.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
@@ -941,6 +1018,19 @@ async fn doctor_fix(webview: tauri::Webview, shared: State<'_, Shared>, id: Stri
         .map_err(|error| error.to_string())?
 }
 
+/// Download/install a local inference runtime on demand when the user selects it.
+#[tauri::command]
+async fn runtime_setup(
+    app: tauri::AppHandle,
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    runtime: String,
+) -> Result<bool, String> {
+    main_only(&webview, "set up a local inference runtime")?;
+    let (program, cwd) = (engine_program(&shared)?, cli_cwd(&shared));
+    crate::model_library::runtime_setup_with(app, program, cwd, runtime).await
+}
+
 /// The stored accounts of an OAuth provider; `action` is `select` or `remove` with `key`.
 /// Prefers the live engine's native `auth_accounts` RPC method and falls back to `dial auth accounts`.
 #[tauri::command]
@@ -1240,6 +1330,8 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("restore_checkpoint_files", 60),
     ("label_session", 20),
     ("restart_model", 60),
+    ("warm_local_model", 180),
+    ("wrap_up_thinking", 10),
     ("get_settings", 20),
     ("get_default_thinking", 20),
     ("set_default_thinking", 20),
@@ -1288,6 +1380,9 @@ const ENGINE_CALLS: &[(&str, u64)] = &[
     ("collaboration_invite", 30),
     ("collaboration_answer", 30),
     ("research_status", 30),
+    ("training_status", 30),
+    // Training exports (fuse, GGUF conversion/quantization, EXL3 quantization) can take minutes.
+    ("training_action", 1800),
     ("list_hooks", 20),
     ("ssh_hosts", 20),
     ("list_worktrees", 20),
@@ -1314,7 +1409,16 @@ async fn engine_call(
         .ok_or_else(|| format!("Dial Desktop does not call `{method}`"))?;
     let params = params.unwrap_or_else(|| serde_json::json!({}));
     let reply = workspace_rpc(&shared, &workspace_root, method, params)?;
-    rpc_reply(reply, Some(Duration::from_secs(secs))).await
+    let result = rpc_reply(reply, Some(Duration::from_secs(secs))).await?;
+    if matches!(method, "restart_model" | "warm_local_model") {
+        let inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) == Some(workspace_root.as_str())
+            && let Some(engine) = &inner.tabs.active().engine
+        {
+            engine.send(Command::State);
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1503,6 +1607,77 @@ fn send_background(
     Ok(())
 }
 
+/// Send a prompt to a brand-new independent session running in its own background engine,
+/// without interrupting or switching away from the conversation on screen.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn send_to_worker(
+    webview: tauri::Webview,
+    shared: State<'_, Shared>,
+    workspace_root: String,
+    text: String,
+    images: Vec<String>,
+    inline_images: Vec<String>,
+    documents: Option<Vec<attachments::documents::Document>>,
+) -> Result<(), String> {
+    if webview.label() != "main" {
+        return Err("Only the app UI can submit attachments".into());
+    }
+    let documents = documents.unwrap_or_default();
+    if images.len() + inline_images.len() + documents.len() > attachments::MAX_IMAGES {
+        return Err(format!(
+            "Attach at most {} files to one prompt",
+            attachments::MAX_IMAGES
+        ));
+    }
+    let text = text.trim().to_owned();
+    if text.is_empty() && images.is_empty() && inline_images.is_empty() && documents.is_empty() {
+        return Err("The prompt is empty".into());
+    }
+    {
+        let inner = shared.lock();
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed".into());
+        }
+    }
+    attachments::check(&images, &inline_images)?;
+    let mut images = images;
+    images.extend(save_pasted_images(&inline_images)?);
+    let (text, staged) = if documents.is_empty() {
+        (text, None)
+    } else {
+        let root = PathBuf::from(&workspace_root);
+        tauri::async_runtime::spawn_blocking(move || {
+            attachments::documents::stage(&root, text, documents)
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    {
+        let mut inner = shared.lock();
+        inner.tabs.allow_work()?;
+        if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(workspace_root.as_str()) {
+            return Err("The project changed".into());
+        }
+        let engine = shared
+            .spawn(Path::new(&workspace_root))
+            .ok_or(PREVIEW_NOTICE)?;
+        let mut tab = Tab::new(Model::starting(), Some(engine));
+        tab.enqueue(Command::Send {
+            text,
+            images,
+            inline_images: Vec::new(),
+            type_context: None,
+        })?;
+        inner.tabs.add_background(tab);
+    }
+    if let Some(folder) = staged {
+        let _ = folder.keep();
+    }
+    shared.poke();
+    Ok(())
+}
+
 #[tauri::command]
 async fn validate_attachment(webview: tauri::Webview, path: String) -> Result<(), String> {
     if webview.label() != "main" {
@@ -1648,16 +1823,17 @@ fn abort(app: AppHandle, shared: State<'_, Shared>) {
 
 /// A fresh session; while the one on screen works, in a new engine beside it.
 #[tauri::command]
-fn new_session(app: AppHandle, shared: State<'_, Shared>) -> Result<(), String> {
+fn new_session(shared: State<'_, Shared>, workspace_root: String, session_id: Option<String>) -> Result<(), String> {
     let mut inner = shared.lock();
+    inner.tabs.allow_work()?;
+    check_session(&inner, &workspace_root, session_id.as_deref())?;
+    if inner.tabs.active().opening_session() {
+        return Err("Wait for the conversation to open".into());
+    }
     match inner.tabs.route_new() {
         Route::Spawn => shared.open_tab(&mut inner, None)?,
         Route::Here | Route::Switch(_) | Route::Closing | Route::Elsewhere => {
-            dispatch(
-                &app,
-                inner.tabs.active().engine.as_ref(),
-                vec![Command::NewSession],
-            );
+            inner.tabs.active_mut().enqueue(Command::NewSession)?;
         }
     }
     drop(inner);
@@ -1702,8 +1878,23 @@ fn resume_once(
     {
         return Err("That search result belongs to a different project".into());
     }
+    if matches!(inner.tabs.route_resume(session_id), Route::Spawn | Route::Here)
+        && let Some(root) = inner.workspace.as_ref().map(|w| w.root.clone())
+    {
+        // Show the saved conversation at once: the kept copy now, the engine's read when it comes.
+        inner.previews.begin(&root, session_id);
+        let tab = inner.tabs.active();
+        if tab.model.session_messages_supported && matches!(tab.model.connection(), crate::model::Connection::Live { .. }) {
+            dispatch(app, tab.engine.as_ref(), vec![Command::SessionMessages(session_id.to_owned())]);
+        }
+    }
     match inner.tabs.route_resume(session_id) {
-        Route::Switch(index) => inner.tabs.switch(index),
+        Route::Switch(index) => {
+            if index != inner.tabs.active_index() {
+                inner.tabs.switch(index);
+                dispatch(app, inner.tabs.active().engine.as_ref(), vec![Command::ListSessions]);
+            }
+        }
         Route::Spawn => {
             shared.open_tab(&mut inner, Some(Command::Resume(session_id.to_owned())))?
         }
@@ -1764,6 +1955,7 @@ async fn delete_sessions(
     for reply in replies {
         rpc_reply(reply, None).await?;
     }
+    shared.lock().previews.forget(&workspace_root, &session_ids);
     Ok(())
 }
 
@@ -2293,7 +2485,7 @@ fn provider_setup_close(shared: State<'_, Shared>, id: u32) {
 
 /// Open a workspace PTY, streaming output only to the view that requested it.
 #[tauri::command]
-fn terminal_open(
+async fn terminal_open(
     shared: State<'_, Shared>,
     workspace_root: String,
     cols: u16,
@@ -2301,16 +2493,19 @@ fn terminal_open(
     task: Option<terminal::Task>,
     output: tauri::ipc::Channel<terminal::TerminalEvent>,
 ) -> Result<u32, String> {
+    let root = PathBuf::from(&workspace_root);
+    let child = if let Some(task) = task {
+        let program = engine_program(&shared)?;
+        tauri::async_runtime::spawn_blocking(move || {
+            if matches!(task, terminal::Task::Attach { .. }) { terminal::check_attach(&program)?; }
+            task.child(&program, &root)
+        }).await.map_err(|error| error.to_string())??
+    } else { terminal::login_shell(&root) };
     let inner = shared.lock();
     inner.tabs.allow_work()?;
     if inner.workspace.as_ref().map(|w| w.root.as_str()) != Some(&workspace_root) {
         return Err("The project changed before the terminal could open".into());
     }
-    let root = Path::new(&workspace_root);
-    let child = match task {
-        Some(task) => task.child(&engine_program(&shared)?, root)?,
-        None => terminal::login_shell(root),
-    };
     shared.terminals().open(child, cols, rows, move |event| {
         let _ = output.send(event);
     })
@@ -2539,6 +2734,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             app_release_restart,
             send_prompt,
             send_background,
+            send_to_worker,
             read_image,
             validate_attachment,
             read_clipboard_file_paths,
@@ -2583,6 +2779,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             crate::model_library::model_cache_remove_file,
             crate::model_library::model_hub_setup,
             crate::model_library::atomic_engine_setup,
+            runtime_setup,
             crate::model_library::model_hub_search,
             crate::model_library::model_hub_files,
             discover_models,
@@ -2633,6 +2830,7 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
             terminal_resize,
             terminal_close,
             browser::browser_show,
+            browser::browser_tab,
             browser::browser_bounds,
             browser::browser_hide,
             browser::browser_navigate,
@@ -2689,6 +2887,8 @@ pub fn run(source: Source, workspace: Option<PathBuf>, recents: Recents) -> taur
                     workspace: None,
                     recents,
                     entry_views: EntryViews::default(),
+                    previews: crate::session_preview::Previews::new(launcher::app_dir(home.as_deref().map(Path::new))),
+                    preview_views: EntryViews::default(),
                 }),
                 service_starts: Default::default(),
                 source,

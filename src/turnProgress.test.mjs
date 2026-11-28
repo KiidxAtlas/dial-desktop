@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { turnProgress } from './turnProgress.ts';
+import { cacheHitState, formatLastInference, turnProgress } from './turnProgress.ts';
 
 const active = { turnRunning: true, entries: [], approvals: [], question: null, stats: { running: 0 } };
 
@@ -38,4 +38,49 @@ test('user input, tool execution and turn settlement supersede request telemetry
   const live = { kind: 'tool', label: 'Edit', state: 'running' };
   assert.equal(turnProgress({ ...generating, stats: { running: 1 }, entries: [{ kind: 'tool', state: 'succeeded' }, live] }).tool, live);
   assert.equal(turnProgress({ ...generating, turnRunning: false, entries: [{ kind: 'error', message: 'Could not start server' }] }), null);
+});
+
+test('surfaces prefill progress fraction, cache hit rate, tok/s and ETA telemetry', () => {
+  const prefill = turnProgress({
+    ...active,
+    modelProgress: { phase: 'processing', processedTokens: 6000, promptTokens: 12000, cachedTokens: 9000, tokensPerSecond: 420, etaSecs: 14.2 },
+  });
+  assert.equal(prefill.fraction, 0.5);
+  assert.equal(prefill.meta, '75% cached · 420 tok/s · ~15s left');
+
+  const gen = turnProgress({
+    ...active,
+    modelProgress: { phase: 'generating', outputTokens: 84, tokensPerSecond: 34.7, cachedTokens: 8000, promptTokens: 10000 },
+  });
+  assert.equal(gen.meta, '35 tok/s · 80% cached');
+  assert.equal(formatLastInference({ phase: 'generating', tokensPerSecond: 8.4, cachedTokens: 5000, promptTokens: 10000 }), '8.4 tok/s · 50% cached');
+  assert.equal(formatLastInference(null), '');
+});
+
+test('classifies KV cache hit bands and marks active thinking steps for wrap-up steering', () => {
+  assert.equal(cacheHitState(9000, 10000), 'high');
+  assert.equal(cacheHitState(4500, 10000), 'mid');
+  assert.equal(cacheHitState(500, 10000), 'low');
+  assert.equal(cacheHitState(0, 4096), 'low');
+  assert.equal(cacheHitState(0, 512), undefined);
+
+  const cold = turnProgress({
+    ...active,
+    modelProgress: { phase: 'processing', processedTokens: 1024, promptTokens: 8192, cachedTokens: 0, tokensPerSecond: 300 },
+  });
+  assert.equal(cold.cacheState, 'low');
+  assert.equal(cold.meta, '0% cached · 300 tok/s');
+
+  const thinking = turnProgress({
+    ...active,
+    entries: [{ kind: 'assistant', streaming: true, text: '', reasoning: 'Evaluating options…' }],
+  });
+  assert.equal(thinking.label, 'Thinking…');
+  assert.equal(thinking.thinking, true);
+
+  const answering = turnProgress({
+    ...active,
+    entries: [{ kind: 'assistant', streaming: true, text: 'Here is the fix.', reasoning: 'Done.' }],
+  });
+  assert.equal(answering.thinking, false);
 });

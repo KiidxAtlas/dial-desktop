@@ -63,7 +63,7 @@ fn progress_belongs_only_to_the_active_prompt() {
     let (id, _) = requested(&mut model, prompt("hello", 0), 7);
     let progress = |session: &str, request: u64, phase: &str| event(json!({
         "event":"model_progress", "session_id":session, "request_id":request,
-        "progress":{"phase":phase,"prompt_tokens":20,"processed_tokens":5}
+        "progress":{"phase":phase,"prompt_tokens":20,"processed_tokens":5,"cached_tokens":12,"tokens_per_second":42.5,"eta_secs":1.2}
     }));
     model.apply(progress("s1", 7, "processing"));
     model.apply(progress("s2", 7, "generating"));
@@ -71,9 +71,65 @@ fn progress_belongs_only_to_the_active_prompt() {
     let view = serde_json::to_value(model.model_progress).unwrap();
     assert_eq!(view["phase"], "processing");
     assert_eq!(view["processedTokens"], 5);
+    assert_eq!(view["cachedTokens"], 12);
+    assert_eq!(view["tokensPerSecond"], 42.5);
+    assert_eq!(view["etaSecs"], 1.2);
     respond(&mut model, id, "send", json!({}));
     model.apply(progress("s1", 7, "generating"));
     assert!(model.model_progress.is_none());
+    let last = serde_json::to_value(model.last_inference).unwrap();
+    assert_eq!(last["cachedTokens"], 12);
+    assert_eq!(last["tokensPerSecond"], 42.5);
+}
+
+#[test]
+fn cloud_usage_and_cached_usage_populate_last_inference_for_cache_badge() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    let (id, _) = requested(&mut model, prompt("hello", 0), 9);
+    model.apply(event(json!({
+        "event":"usage", "session_id":"s1", "request_id":9,
+        "prompt_tokens":10000, "output_tokens":200, "seconds":4.0
+    })));
+    model.apply(event(json!({
+        "event":"cached_usage", "session_id":"s1", "request_id":9,
+        "read_tokens":8500, "write_tokens":0
+    })));
+    respond(&mut model, id, "send", json!({}));
+    let last = serde_json::to_value(model.last_inference).unwrap();
+    assert_eq!(last["promptTokens"], 10000);
+    assert_eq!(last["cachedTokens"], 8500);
+    assert_eq!(last["outputTokens"], 200);
+    assert_eq!(last["tokensPerSecond"], 50.0);
+}
+
+#[test]
+fn saved_session_reads_are_kept_for_previews_and_refreshed_after_turns() {
+    let mut model = Model::starting();
+    let mut supported = ready("s1");
+    supported.raw["methods"] = json!(["session_messages"]);
+    model.apply(Update::Connected(Box::new(supported)));
+    assert!(model.session_messages_supported);
+
+    let (id, _) = requested(&mut model, Command::SessionMessages("old".into()), 3);
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    respond(&mut model, id, "session_messages", json!({"session_id": "old", "messages": messages}));
+    assert_eq!(model.read_sessions, vec![("old".to_owned(), messages.as_array().unwrap().clone())]);
+
+    // A failed read is silent: opening the session reports its own problems.
+    let (id, _) = requested(&mut model, Command::SessionMessages("gone".into()), 4);
+    model.apply(Update::Message(Message::Response { id, method: "session_messages".into(), result: Err(dial_client::RpcError { code: Some("not_found".into()), message: "no".into() }) }));
+    assert!(model.toast.is_none());
+
+    let (id, _) = requested(&mut model, prompt("hello", 0), 5);
+    let follow = respond(&mut model, id, "send", json!({}));
+    assert!(follow.contains(&Command::SessionMessages("s1".into())), "{follow:?}");
+
+    // Older engines do not get the request.
+    let mut old = Model::starting();
+    old.apply(Update::Connected(Box::new(ready("s1"))));
+    let (id, _) = requested(&mut old, prompt("hello", 0), 5);
+    assert!(!respond(&mut old, id, "send", json!({})).iter().any(|c| matches!(c, Command::SessionMessages(_))));
 }
 
 #[test]
@@ -251,6 +307,19 @@ fn opening_a_session_does_not_reorder_the_list() {
         list(&mut model, 3, json!([row("new", 1), row("b", 3), row("c", 9), row("a", 4)])),
         ["new", "b", "a", "c"]
     );
+}
+
+#[test]
+fn sidebar_age_group_changes_on_new_messages_not_on_resume() {
+    let row = |updated, messages, title| SessionSummary::from_wire(&json!({
+        "session_id":"past", "updated":updated, "messages":messages, "title":title,
+    })).unwrap();
+    let yesterday = [row("100", 2, "Before")];
+    let opened = keep_session_order(&yesterday, vec![row("90000", 2, "Renamed")]);
+    assert_eq!(opened[0].updated, "100", "resuming must not move a row into Today");
+    assert_eq!(opened[0].title, "Renamed");
+    let worked = keep_session_order(&opened, vec![row("90001", 3, "Renamed")]);
+    assert_eq!(worked[0].updated, "90001");
 }
 
 #[test]
@@ -1050,4 +1119,149 @@ fn model_switch_only_requests_preparation_when_the_engine_offers_it() {
             assert!(model.toast.as_deref().unwrap().contains("llama-server exited"));
         }
     }
+}
+
+#[test]
+fn cannot_send_while_recover_or_apply_settings_is_in_flight() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+    assert!(model.can_send());
+
+    // Post-turn deferred `apply_settings` keeps `can_send` false until it settles.
+    let (turn, _) = requested(&mut model, prompt("go", 0), 1);
+    let save = Model::save_setting("ui.theme", json!("light"), "global").unwrap();
+    let (save_id, _) = requested(&mut model, save, 2);
+    assert_eq!(
+        respond(&mut model, save_id, "set_setting", json!({"saved": true})),
+        vec![Command::GetSettings]
+    );
+    let follow = respond(&mut model, turn, "send", json!({"outcome": "completed"}));
+    assert_eq!(follow, vec![Command::ListSessions, Command::ApplySettings]);
+    assert!(!model.conversation.turn_running());
+    assert!(!model.can_send(), "do not race a new prompt against post-turn apply_settings");
+    let (apply_id, _) = requested(&mut model, Command::ApplySettings, 3);
+    assert!(!model.can_send());
+    respond(&mut model, apply_id, "apply_settings", json!({"applied": "live"}));
+    assert!(model.can_send());
+
+    // In-flight `recovery_snapshot` also holds `can_send` false until settled or failed.
+    let (recover_id, _) = requested(&mut model, Command::Recover, 4);
+    assert!(!model.can_send());
+    respond(
+        &mut model,
+        recover_id,
+        "recovery_snapshot",
+        json!({"session_id": "s1", "seq": 4, "messages": [], "busy": false,
+               "pending_approvals": [], "question": null, "todo": []}),
+    );
+    assert!(model.can_send());
+
+    // Idle `saved_settings` holds `can_send` false until `apply_settings` settles or fails.
+    assert_eq!(
+        model.saved_settings(false),
+        vec![Command::GetSettings, Command::ApplySettings]
+    );
+    assert!(!model.can_send());
+    model.apply(Update::RequestFailed {
+        command: Command::ApplySettings,
+        error: "disconnected".into(),
+    });
+    assert!(model.can_send());
+}
+
+#[test]
+fn recover_compacted_snapshot_pages_full_archived_history() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+
+    let (recover_id, _) = requested(&mut model, Command::Recover, 10);
+    let compacted_snapshot = json!({
+        "session_id": "s1",
+        "seq": 5,
+        "messages": [
+            {"role": "user", "dial_compaction_summary": true, "content": "summary"},
+            {"role": "user", "content": "after compaction"},
+            {"role": "assistant", "content": "latest answer"}
+        ],
+        "busy": false,
+        "pending_approvals": [],
+        "question": null,
+        "todo": []
+    });
+    let follow = respond(&mut model, recover_id, "recovery_snapshot", compacted_snapshot);
+    assert_eq!(follow, vec![Command::MessagesPage { offset: 0, after: None }]);
+    assert!(model.read_sessions.is_empty(), "truncated snapshot must not overwrite preview cache");
+
+    let (page1_id, _) = requested(&mut model, Command::MessagesPage { offset: 0, after: None }, 11);
+    let follow = respond(&mut model, page1_id, "messages_page", json!({
+        "messages": [
+            {"role": "user", "content": "very first prompt"},
+            {"role": "assistant", "content": "very first answer"}
+        ],
+        "next_offset": 2
+    }));
+    assert_eq!(follow, vec![Command::MessagesPage { offset: 2, after: Some(page1_id) }]);
+
+    let (page2_id, _) = requested(&mut model, Command::MessagesPage { offset: 2, after: Some(page1_id) }, 12);
+    let follow = respond(&mut model, page2_id, "messages_page", json!({
+        "messages": [
+            {"role": "user", "content": "after compaction"},
+            {"role": "assistant", "content": "latest answer"}
+        ],
+        "next_offset": null
+    }));
+    assert!(follow.is_empty());
+    let texts: Vec<&str> = model.conversation.entries().iter().filter_map(|e| match e {
+        Entry::User(u) => Some(u.text.as_str()),
+        Entry::Assistant(a) => Some(a.text.as_str()),
+        Entry::Notice(n) => Some(n.message.as_str()),
+        _ => None,
+    }).collect();
+    assert_eq!(texts, vec!["very first prompt", "very first answer", "after compaction", "latest answer"]);
+    assert_eq!(model.read_sessions.len(), 1);
+    assert_eq!(model.read_sessions[0].1.len(), 4);
+}
+
+#[test]
+fn recover_refused_over_budget_falls_back_to_messages_page() {
+    let mut model = Model::starting();
+    model.apply(Update::Connected(Box::new(ready("s1"))));
+
+    let (recover_id, _) = requested(&mut model, Command::Recover, 20);
+    assert!(model.recovering);
+    let follow = model.apply(Update::Message(Message::Response {
+        id: recover_id,
+        method: "recovery_snapshot".into(),
+        result: Err(dial_client::RpcError {
+            code: Some("refused".into()),
+            message: "recovery snapshot exceeds the 65011712-byte response budget; use messages_page for history and state.live for interactions".into(),
+        }),
+    }));
+    assert_eq!(follow, vec![Command::MessagesPage { offset: 0, after: None }, Command::State]);
+    assert!(model.recovering, "stay recovering until fallback paging completes");
+    assert!(model.toast.is_none(), "budget fallback should not toast an error");
+
+    let (page_id, _) = requested(&mut model, Command::MessagesPage { offset: 0, after: None }, 21);
+    let (state_id, _) = requested(&mut model, Command::State, 22);
+    respond(&mut model, state_id, "state", json!({
+        "session_id": "s1",
+        "live": {
+            "session_id": "s1",
+            "seq": 9,
+            "busy": false,
+            "pending_approvals": [],
+            "question": null,
+            "todo": []
+        }
+    }));
+    respond(&mut model, page_id, "messages_page", json!({
+        "messages": [
+            {"role": "user", "content": "full history prompt"},
+            {"role": "assistant", "content": "full history reply"}
+        ],
+        "next_offset": null
+    }));
+    assert!(!model.recovering);
+    assert!(model.can_send());
+    assert_eq!(model.conversation.entries().len(), 2);
 }

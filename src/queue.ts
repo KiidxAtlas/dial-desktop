@@ -19,6 +19,10 @@ export interface SessionQueue {
   items: QueuedPrompt[];
   /** Set when a turn fails, is aborted, or a send is rejected so queued prompts do not fire blindly. */
   paused: boolean;
+  /** Paused only because the user navigated away; clears if they return while the turn still runs. */
+  pausedBySwitch: boolean;
+  /** The turn finished cleanly and this queue is waiting for `canSend` / local save to settle. */
+  pendingDispatch: boolean;
   sending: boolean;
   loading: boolean;
   saving: boolean;
@@ -85,6 +89,8 @@ async function changeItems(key: string, queue: SessionQueue, items: QueuedPrompt
     queue.items = items;
     if (!items.length) {
       queue.paused = false;
+      queue.pausedBySwitch = false;
+      queue.pendingDispatch = false;
       queue.recovered = false;
     }
     return true;
@@ -97,7 +103,16 @@ export function queueFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): S
   const key = keyOf(snap);
   let queue = queues.get(key);
   if (!queue) {
-    queue = reactive({ items: [], paused: false, sending: false, loading: !!snap.sessionId, saving: false, recovered: false });
+    queue = reactive({
+      items: [],
+      paused: false,
+      pausedBySwitch: false,
+      pendingDispatch: false,
+      sending: false,
+      loading: !!snap.sessionId,
+      saving: false,
+      recovered: false,
+    });
     queues.set(key, queue);
     if (snap.sessionId) void restore(key, queue);
   }
@@ -111,11 +126,54 @@ export async function enqueuePrompt(snap: OpenSnapshot, text: string, attachment
   if (!trimmed && !attachments.length) return false;
   const queue = queueFor(snap);
   if (queue.loading || queue.saving || queue.sending) return false;
-  const started = turnEpoch;
   const key = keyOf(snap);
+  if (observedKey === undefined) {
+    observedKey = key;
+    observedRunning = snap.turnRunning;
+  }
+  const started = turnEpoch;
   const saved = await changeItems(key, queue, [...queue.items, { id: ++nextId, text: trimmed, attachments: [...attachments] }]);
-  if (saved && (observedKey !== key || !observedRunning || started !== turnEpoch)) queue.paused = true;
-  return saved;
+  if (!saved) return false;
+  if (observedKey !== key) {
+    queue.paused = true;
+    queue.pausedBySwitch = true;
+    queue.pendingDispatch = false;
+    return true;
+  }
+  if (observedRunning && started === turnEpoch) {
+    if (!queue.recovered) {
+      queue.paused = false;
+      queue.pausedBySwitch = false;
+    }
+    return true;
+  }
+  // The turn finished while this queued prompt was saving: send it once the session is ready,
+  // unless the turn failed, was aborted, or has an unreviewed crash-recovered queue.
+  const current = snapshot.value;
+  const open: OpenSnapshot | null =
+    current && current.workspace ? { ...current, workspace: current.workspace } : null;
+  if (
+    !queue.paused &&
+    !queue.recovered &&
+    open &&
+    open.workspace.root === snap.workspace.root &&
+    open.sessionId === snap.sessionId &&
+    !canRetry(open)
+  ) {
+    if (readyForFollowUp(current, snap)) {
+      queue.pendingDispatch = false;
+      void sendQueuedNext(current);
+    } else if (open.connection.state === "live" && !open.turnRunning) {
+      queue.pendingDispatch = true;
+    } else {
+      queue.paused = true;
+      queue.pendingDispatch = false;
+    }
+  } else {
+    queue.paused = true;
+    queue.pendingDispatch = false;
+  }
+  return true;
 }
 
 export async function removeQueued(snap: Pick<OpenSnapshot, "workspace" | "sessionId">, id: number) {
@@ -158,11 +216,14 @@ export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
   if (!queue || queue.loading || queue.saving || queue.sending || !queue.items.length) return false;
   if (!snap.sessionId || !readyForFollowUp(snapshot.value, snap)) {
     queue.paused = true;
+    queue.pendingDispatch = false;
     return false;
   }
   const [item, ...remaining] = queue.items;
   queue.sending = true;
   queue.paused = false;
+  queue.pausedBySwitch = false;
+  queue.pendingDispatch = false;
   // Keep the restart warning on a rejected or unconfirmed send.
   try {
     const scope = { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId, typeId: typeIdFor(snap.sessionId) };
@@ -187,37 +248,71 @@ export async function sendQueuedNext(snap: OpenSnapshot): Promise<boolean> {
 /** Pause this session's queue when the user stops the running turn. */
 export function markTurnAborted(snap: Pick<OpenSnapshot, "workspace" | "sessionId">) {
   const queue = queues.get(keyOf(snap));
-  if (queue) queue.paused = true;
+  if (queue) {
+    queue.paused = true;
+    queue.pausedBySwitch = false;
+    queue.pendingDispatch = false;
+  }
 }
 
 /** Observe snapshots so a finished turn advances the queue (or pauses on error/abort). */
 export function syncQueue(snap: OpenSnapshot) {
   const key = keyOf(snap);
-  const switched = key !== observedKey;
+  const switched = observedKey !== undefined && key !== observedKey;
   const finished = !switched && observedRunning && !snap.turnRunning;
   if (switched || observedRunning !== snap.turnRunning) turnEpoch++;
   if (observedKey && switched) {
     const previous = queues.get(observedKey);
+    if (previous) previous.pendingDispatch = false;
     if (previous?.items.length && !previous.paused) {
       previous.paused = true;
+      previous.pausedBySwitch = true;
       showToast('Follow-ups stay with their conversation. Reopen it to resume the queue.');
     }
   }
   observedKey = key;
-  if (snap.turnRunning && (switched || !observedRunning) && !queueFor(snap).items.length) queueFor(snap).paused = false;
+  const currentQueue = queues.get(key);
+  if (snap.turnRunning) {
+    const q = currentQueue ?? queueFor(snap);
+    q.pendingDispatch = false;
+    if ((switched || !observedRunning) && !q.items.length) {
+      q.paused = false;
+      q.pausedBySwitch = false;
+    } else if (switched && q.pausedBySwitch && !q.recovered) {
+      q.paused = false;
+      q.pausedBySwitch = false;
+    }
+  }
   observedRunning = snap.turnRunning;
-  if (!finished) return;
+
   const queue = queues.get(key);
   if (!queue || !queue.items.length) return;
-  if (queue.saving || queue.sending) {
-    queue.paused = true;
+  if (!finished && !queue.pendingDispatch) return;
+  if (snap.turnRunning) {
+    queue.pendingDispatch = false;
     return;
   }
-
-  if (queue.paused || !readyForFollowUp(snapshot.value, snap) || canRetry(snap)) {
+  if (queue.paused) {
+    queue.pendingDispatch = false;
+    if (finished) showToast("Queued follow-up paused; send it when ready");
+    return;
+  }
+  if (canRetry(snap) || snap.connection.state !== "live") {
+    queue.pendingDispatch = false;
     queue.paused = true;
     showToast("Queued follow-up paused; send it when ready");
     return;
   }
+  if (queue.saving || queue.sending) {
+    queue.pendingDispatch = true;
+    return;
+  }
+  if (!readyForFollowUp(snapshot.value, snap)) {
+    // Wait for post-turn transitions (e.g. deferred model/settings apply or history reload)
+    // to clear before dispatching, rather than permanently pausing on the turn-end frame.
+    queue.pendingDispatch = true;
+    return;
+  }
+  queue.pendingDispatch = false;
   void sendQueuedNext(snap);
 }

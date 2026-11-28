@@ -12,6 +12,43 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// Legacy unmarked compaction frame prepended by older engines' model-visible `messages()`.
+const COMPACTION_FRAME: &str =
+    "<summary>\nSummary of the earlier conversation (older messages were compacted away):\n";
+
+/// Whether `messages` holds a compacted model view rather than the full active-branch archive.
+pub(crate) fn has_compaction_truncation(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message["dial_compaction_summary"] == true
+            || message["dial_compaction_notes"] == true
+            || message["dial_compaction_files"] == true
+            || message["dial_compaction_critical"] == true
+            || !message["dial_snapcompact"].is_null()
+            || message["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(COMPACTION_FRAME))
+    })
+}
+
+/// Replay `messages` into a scratch Conversation so harness user-role records stay aligned
+/// with the exact row indices produced by `load_snapshot` / `load_history`.
+fn replay_received_from(messages: &[Value]) -> HashMap<usize, (String, bool)> {
+    let mut replay = Conversation::default();
+    let mut senders = HashMap::new();
+    for message in messages {
+        let index = replay.entries().len();
+        let sender = journal_sender(message).map(str::to_owned);
+        replay.apply(&Message::Event(dial_client::Event {
+            kind: "replay_message".into(),
+            body: json!({ "message": message }),
+        }));
+        if let Some(from) = sender && replay.entries().len() == index + 1 {
+            senders.insert(index, (from, true));
+        }
+    }
+    senders
+}
+
 /// Mail is display data, not a prompt. Never classify a person's text by a bracketed prefix.
 fn journal_sender(message: &Value) -> Option<&str> {
     if message["role"] != "user" || message["dial_structured_text"] == true {
@@ -27,7 +64,6 @@ fn journal_sender(message: &Value) -> Option<&str> {
     let sender = text.strip_prefix("[Message from ")?.split_once("]\n")?.0;
     (!sender.trim().is_empty() && !sender.contains(['\r', '\n'])).then_some(sender)
 }
-
 #[cfg(test)]
 mod tests;
 
@@ -116,18 +152,25 @@ pub fn keep_session_order(
     previous: &[SessionSummary],
     fresh: Vec<SessionSummary>,
 ) -> Vec<SessionSummary> {
-    let before: HashMap<&str, (usize, u64)> = previous
+    let before: HashMap<&str, (usize, &SessionSummary)> = previous
         .iter()
         .enumerate()
-        .map(|(i, s)| (s.id.as_str(), (i, s.messages)))
+        .map(|(i, s)| (s.id.as_str(), (i, s)))
         .collect();
     let unchanged = |s: &SessionSummary| {
         before
             .get(s.id.as_str())
-            .is_some_and(|(_, messages)| *messages == s.messages)
+            .is_some_and(|(_, old)| old.messages == s.messages)
     };
     let mut kept: Vec<SessionSummary> = fresh.iter().filter(|s| unchanged(s)).cloned().collect();
     kept.sort_by_key(|s| before[s.id.as_str()].0);
+    // The sidebar also groups by age. A resume touches the journal but is not a new message.
+    for row in &mut kept {
+        let old = before[row.id.as_str()].1;
+        if !old.updated.is_empty() {
+            row.updated.clone_from(&old.updated);
+        }
+    }
     let mut kept = kept.into_iter();
     fresh
         .into_iter()
@@ -150,6 +193,18 @@ pub struct CurrentModel {
     pub model_id: String,
     /// The effective window from `state`, absent on older engines.
     pub context_window: Option<u64>,
+    /// Actual loaded window reported by a local server, when probed.
+    pub loaded_context_window: Option<u64>,
+    /// User/config requested window before hardware/server capping.
+    pub requested_context_window: Option<u64>,
+    /// True when the active model runs locally (Dial MLX/GGUF or localhost server).
+    pub local: bool,
+    /// True when Dial supervises this local server (so it can be unloaded/restarted).
+    pub managed_local: bool,
+    /// True while Dial's supervised local server currently holds the model in RAM.
+    pub resident: bool,
+    /// Machine physical RAM reported by the engine (bytes), when known.
+    pub system_memory_bytes: Option<u64>,
     /// The session's reasoning level; `None` runs the model's default.
     pub thinking: Option<String>,
     /// The model's default level, when the catalog knows it.
@@ -169,6 +224,12 @@ impl CurrentModel {
             provider: provider.to_owned(),
             model_id: model_id.to_owned(),
             context_window: value["context_window"].as_u64().filter(|&n| n > 0),
+            loaded_context_window: value["loaded_context_window"].as_u64().filter(|&n| n > 0),
+            requested_context_window: value["requested_context_window"].as_u64().filter(|&n| n > 0),
+            local: value["local"].as_bool().unwrap_or(provider == "mlx"),
+            managed_local: value["managed_local"].as_bool().unwrap_or(false),
+            resident: value["resident"].as_bool().unwrap_or(false),
+            system_memory_bytes: value["system_memory_bytes"].as_u64().filter(|&n| n > 0),
             thinking: thinking["level"].as_str().map(str::to_owned),
             default_thinking: thinking["default_level"].as_str().map(str::to_owned),
             levels: strings(&thinking["levels"]),
@@ -195,6 +256,20 @@ pub struct ModelOption {
     /// Only from the static bundled catalog (not configured, local, or live-listed).
     pub catalog_only: bool,
     pub local_engine: Option<EngineChoice>,
+    pub memory_fit: Option<MemoryFit>,
+}
+
+/// Memory-fit estimate reported by the engine for a downloaded local model.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all(serialize = "camelCase"))]
+pub struct MemoryFit {
+    pub fit: String,
+    pub weights_bytes: u64,
+    pub kv_bytes: u64,
+    pub resident_bytes: u64,
+    pub memory_bytes: Option<u64>,
+    pub context_tokens: u64,
+    pub max_context_tokens: u64,
 }
 
 /// Only present when the connected engine supports per-model runtime selection.
@@ -203,8 +278,11 @@ pub struct EngineChoice {
     pub selected: String,
     pub choices: Vec<String>,
     pub setting: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub installed: std::collections::BTreeMap<String, bool>,
 }
-
 impl ModelOption {
     /// Parse one `list_models` row; `None` without a provider and model id.
     pub fn from_wire(value: &Value) -> Option<Self> {
@@ -234,6 +312,7 @@ impl ModelOption {
             listed,
             catalog_only,
             local_engine: serde_json::from_value(value["local_engine"].clone()).ok(),
+            memory_fit: serde_json::from_value(value["memory_fit"].clone()).ok(),
         })
     }
 }
@@ -324,6 +403,12 @@ pub struct Model {
     /// User-visible guidance awaiting engine acknowledgement, without legacy Type framing.
     pending_notes: HashMap<RequestId, String>,
     pub(crate) recovering: bool,
+    /// In-flight `messages_page` fetch for full uncompacted archived history (or oversized recovery).
+    history_page: Option<(RequestId, u64)>,
+    history_pages: Vec<Value>,
+    history_page_session: Option<String>,
+    history_page_from_truncation: bool,
+    history_page_live: Option<Value>,
     /// The open question already acknowledged as presented; the engine refuses a second ack.
     presented: Option<String>,
     /// Sessions to delete once the engine has moved off them (it refuses the active one).
@@ -332,15 +417,24 @@ pub struct Model {
     rename_after_switch: Option<(String, String)>,
     /// Saved settings wait for the running turn to end before they are applied.
     apply_pending: bool,
+    /// `apply_settings` has been queued or sent to the engine and has not settled yet.
+    applying_settings: bool,
     /// The conversation's size in tokens as the engine last reported it (`context_usage`).
     pub context: Option<ContextUsage>,
     /// Latest telemetry for the active inference request, never conversation history.
     pub model_progress: Option<ModelProgress>,
+    /// Merged telemetry from the latest turn/step (decode tok/s, prompt cache hits), retained
+    /// briefly after `model_progress` clears so local users can see speed and cache efficiency.
+    pub last_inference: Option<ModelProgress>,
     /// Hands-free voice mode.
     pub voice: Voice,
+    /// Whether the engine reads saved sessions without opening them (`session_messages`).
+    pub session_messages_supported: bool,
+    /// Saved conversations read for previews: `(session id, messages)`; the app takes them.
+    pub read_sessions: Vec<(String, Vec<Value>)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, serde::Serialize)]
 #[serde(rename_all(serialize = "camelCase"))]
 pub struct ModelProgress {
     pub phase: InferencePhase,
@@ -348,9 +442,14 @@ pub struct ModelProgress {
     pub prompt_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     #[serde(default)]
+    pub tokens_per_second: Option<f64>,
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub eta_secs: Option<f64>,
+    #[serde(default)]
     pub estimated: bool,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InferencePhase { Loading, Processing, Generating }
@@ -398,7 +497,10 @@ impl Model {
 
     /// Whether a new prompt can be sent now.
     pub fn can_send(&self) -> bool {
-        matches!(self.connection(), Connection::Live { .. }) && !self.conversation.turn_running()
+        matches!(self.connection(), Connection::Live { .. })
+            && !self.conversation.turn_running()
+            && !self.recovering
+            && !self.applying_settings
     }
 
     /// Reserve one provider scan before it is dispatched (the worker acknowledges it later).
@@ -583,6 +685,15 @@ impl Model {
             .and_then(|m| m.context_window)
     }
 
+    /// Actual loaded window reported by a local server, when probed.
+    pub fn loaded_context_window(&self) -> Option<u64> {
+        self.current_model.as_ref()?.loaded_context_window
+    }
+
+    /// Configured/requested context window before hardware or server capping.
+    pub fn requested_context_window(&self) -> Option<u64> {
+        self.current_model.as_ref()?.requested_context_window
+    }
     /// Title of the session on screen.
     pub fn title(&self) -> String {
         let id = self.conversation.session_id();
@@ -719,6 +830,7 @@ impl Model {
                 let (purpose, _, _) = command.request();
                 if matches!(purpose, Purpose::Turn | Purpose::Recover) {
                     self.model_progress = None;
+                    self.last_inference = None;
                 }
                 match &command {
                     Command::Steer { text, .. } => { self.pending_notes.insert(id, text.clone()); }
@@ -732,6 +844,17 @@ impl Model {
                             .is_some_and(|(current, _)| current == *after) =>
                     {
                         self.session_page = Some((id, *offset));
+                    }
+                    Command::MessagesPage { offset, after: None } => {
+                        self.history_pages.clear();
+                        self.history_page = Some((id, *offset));
+                    }
+                    Command::MessagesPage { offset, after: Some(after) }
+                        if self
+                            .history_page
+                            .is_some_and(|(current, _)| current == *after) =>
+                    {
+                        self.history_page = Some((id, *offset));
                     }
                     _ => {}
                 }
@@ -751,6 +874,9 @@ impl Model {
                 if purpose == Purpose::Recover {
                     self.recovering = true;
                 }
+                if purpose == Purpose::ApplySettings {
+                    self.applying_settings = true;
+                }
                 self.voice.requested(&command, id);
                 self.pending.insert(id, purpose);
             }
@@ -763,6 +889,20 @@ impl Model {
                 }
                 if matches!(command, Command::Recover) {
                     self.recovering = false;
+                }
+                if matches!(command, Command::MessagesPage { .. }) {
+                    let from_truncation = self.history_page_from_truncation;
+                    self.reset_history_pages();
+                    self.recovering = false;
+                    if from_truncation {
+                        return follow;
+                    }
+                }
+                if matches!(command, Command::ApplySettings) {
+                    self.applying_settings = self
+                        .pending
+                        .values()
+                        .any(|purpose| *purpose == Purpose::ApplySettings);
                 }
                 if matches!(command, Command::Send { .. } | Command::Retry) && !self.conversation.turn_running() {
                     self.apply_after_turn(&mut follow);
@@ -808,8 +948,10 @@ impl Model {
         }
         // A frame may be published before the worker acknowledges the follow-up request.
         self.recovering |= follow.contains(&Command::Recover);
+        self.applying_settings |= follow.contains(&Command::ApplySettings);
         if self.conversation.needs_reload()
             && !self.recovering
+            && self.history_page.is_none()
             && !self.conversation.turn_running()
             && matches!(self.connection(), Connection::Live { .. })
         {
@@ -826,9 +968,14 @@ impl Model {
         self.pending.clear();
         self.pending_notes.clear();
         self.recovering = false;
+        self.reset_history_pages();
+        self.applying_settings = false;
         self.ready_image_input = ready.raw["image_input"].as_bool();
         self.type_context_supported = ready.raw["features"]["type_context"].as_bool() == Some(true);
         self.prepare_local_model_supported = crate::engine::supports_local_preparation(ready);
+        self.session_messages_supported = ready.raw["methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|m| m == "session_messages"));
         self.connection = Some(Connection::Live {
             model: ready.model.clone(),
             engine_version: ready.engine_version.clone(),
@@ -897,23 +1044,118 @@ impl Model {
                         if !self.conversation.load_snapshot(snapshot) {
                             self.toast = Some("The engine's recovery snapshot was incomplete; the view may be out of date".into());
                         } else {
-                            // Replay into a scratch Conversation so harness user-role records
-                            // (worker results, hidden reminders, compaction summaries) stay aligned
-                            // with the exact row indices produced by `load_snapshot`.
-                            let mut replay = Conversation::default();
-                            let mut senders = HashMap::new();
-                            for message in snapshot["messages"].as_array().into_iter().flatten() {
-                                let index = replay.entries().len();
-                                let sender = journal_sender(message).map(str::to_owned);
-                                replay.apply(&Message::Event(dial_client::Event {
-                                    kind: "replay_message".into(),
-                                    body: json!({ "message": message }),
-                                }));
-                                if let Some(from) = sender && replay.entries().len() == index + 1 {
-                                    senders.insert(index, (from, true));
+                            let messages = snapshot["messages"].as_array();
+                            self.received_from = messages
+                                .map(|rows| replay_received_from(rows))
+                                .unwrap_or_default();
+                            if let Some(messages) = messages {
+                                if has_compaction_truncation(messages) {
+                                    // Older engines returned the compacted model view from
+                                    // `recovery_snapshot` while `messages_page` already serves
+                                    // the full active-branch archive. Page full history now.
+                                    self.reset_history_pages();
+                                    self.history_page_session =
+                                        self.conversation.session_id().map(str::to_owned);
+                                    self.history_page_from_truncation = true;
+                                    follow.push(Command::MessagesPage {
+                                        offset: 0,
+                                        after: None,
+                                    });
+                                } else if let Some(id) = self.conversation.session_id().map(str::to_owned) {
+                                    self.reset_history_pages();
+                                    self.read_sessions.push((id, messages.clone()));
                                 }
                             }
-                            self.received_from = senders;
+                        }
+                    }
+                    (Purpose::Recover, Err(error))
+                        if error.code.as_deref() == Some("refused")
+                            && (error.message.contains("messages_page")
+                                || error.message.contains("budget")) =>
+                    {
+                        // Session exceeded the single-response recovery budget; load full
+                        // history via `messages_page` and live interaction state via `state`.
+                        self.reset_history_pages();
+                        self.history_page_session =
+                            self.conversation.session_id().map(str::to_owned);
+                        self.history_page_from_truncation = false;
+                        self.recovering = true;
+                        follow.extend([
+                            Command::MessagesPage {
+                                offset: 0,
+                                after: None,
+                            },
+                            Command::State,
+                        ]);
+                    }
+                    (Purpose::MessagesPage, result) => {
+                        let Some((current, offset)) = self.history_page else {
+                            return;
+                        };
+                        if current != *id {
+                            return;
+                        }
+                        match result {
+                            Ok(page) => {
+                                let items = page["messages"].as_array().into_iter().flatten();
+                                self.history_pages.extend(items.cloned());
+                                if let Some(next) =
+                                    page["next_offset"].as_u64().filter(|n| *n > offset)
+                                {
+                                    follow.push(Command::MessagesPage {
+                                        offset: next,
+                                        after: Some(*id),
+                                    });
+                                } else {
+                                    let messages = std::mem::take(&mut self.history_pages);
+                                    let from_truncation = self.history_page_from_truncation;
+                                    let target_session = self.history_page_session.take();
+                                    let live = self.history_page_live.take();
+                                    self.history_page = None;
+                                    self.history_page_from_truncation = false;
+                                    self.recovering = false;
+                                    let same_session = target_session.as_deref().is_none_or(|wanted| {
+                                        self.conversation.session_id().is_none_or(|cur| cur == wanted)
+                                    });
+                                    if same_session
+                                        && !self.conversation.turn_running()
+                                        && (!from_truncation || !has_compaction_truncation(&messages))
+                                    {
+                                        let mut loaded_snapshot = false;
+                                        if !from_truncation
+                                            && let Some(Value::Object(mut live_map)) = live
+                                        {
+                                            live_map.insert(
+                                                "messages".into(),
+                                                Value::Array(messages.clone()),
+                                            );
+                                            loaded_snapshot = self
+                                                .conversation
+                                                .load_snapshot(&Value::Object(live_map));
+                                        }
+                                        if !loaded_snapshot {
+                                            let sid = target_session
+                                                .or_else(|| self.conversation.session_id().map(str::to_owned));
+                                            self.conversation.load_history(sid.as_deref(), &messages);
+                                        }
+                                        self.received_from = replay_received_from(&messages);
+                                        if !has_compaction_truncation(&messages)
+                                            && let Some(id) = self.conversation.session_id()
+                                        {
+                                            self.read_sessions.push((id.to_owned(), messages));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let from_truncation = self.history_page_from_truncation;
+                                self.reset_history_pages();
+                                self.recovering = false;
+                                if !from_truncation {
+                                    self.toast =
+                                        Some(format!("Could not reload the session: {error}"));
+                                }
+                            }
                         }
                     }
                     (Purpose::LiveStart, result) => {
@@ -934,6 +1176,14 @@ impl Model {
                         }
                     }
                     (Purpose::LiveMute | Purpose::Speak, Ok(_)) => {}
+                    (Purpose::SessionMessages, Ok(read)) => {
+                        if let (Some(id), Some(messages)) = (read["session_id"].as_str(), read["messages"].as_array())
+                            && !has_compaction_truncation(messages)
+                        {
+                            self.read_sessions.push((id.to_owned(), messages.clone()));
+                        }
+                    }
+                    (Purpose::SessionMessages, Err(_)) => {}
                     // Ending voice mode after the engine's session is gone is not a problem.
                     (Purpose::LiveStop, _) => self.voice.stopped(),
                     (Purpose::State, Ok(state)) => {
@@ -945,6 +1195,12 @@ impl Model {
                         }
                         if let Some(mode) = state["approval"].as_str() {
                             self.approval = Some(mode.to_owned());
+                        }
+                        if self.history_page.is_some()
+                            && !self.history_page_from_truncation
+                            && state["live"].is_object()
+                        {
+                            self.history_page_live = Some(state["live"].clone());
                         }
                     }
                     (Purpose::Models, Ok(page)) => {
@@ -1083,9 +1339,19 @@ impl Model {
                         follow.extend(self.saved_settings(false));
                     }
                     // Applying can change the model and the approval mode.
-                    (Purpose::ApplySettings, Ok(_)) => follow.push(Command::State),
+                    (Purpose::ApplySettings, Ok(_)) => {
+                        self.applying_settings = self
+                            .pending
+                            .values()
+                            .any(|purpose| *purpose == Purpose::ApplySettings);
+                        follow.push(Command::State);
+                    }
                     (Purpose::Turn, Ok(_)) => {
                         follow.push(Command::ListSessions);
+                        // Keep the session's preview copy current.
+                        if self.session_messages_supported && let Some(id) = self.conversation.session_id() {
+                            follow.push(Command::SessionMessages(id.to_owned()));
+                        }
                         self.apply_after_turn(follow);
                     }
 
@@ -1102,6 +1368,10 @@ impl Model {
                         self.apply_after_turn(follow);
                     }
                     (Purpose::ApplySettings, Err(error)) if error.code.as_deref() == Some("busy") && self.conversation.turn_running() => {
+                        self.applying_settings = self
+                            .pending
+                            .values()
+                            .any(|purpose| *purpose == Purpose::ApplySettings);
                         self.apply_pending = true;
                     }
                     (purpose, Err(error)) => {
@@ -1111,6 +1381,12 @@ impl Model {
                         }
                         if purpose == Purpose::Recover {
                             self.recovering = false;
+                        }
+                        if purpose == Purpose::ApplySettings {
+                            self.applying_settings = self
+                                .pending
+                                .values()
+                                .any(|purpose| *purpose == Purpose::ApplySettings);
                         }
                         if purpose == Purpose::NewSession {
                             self.delete_after_switch.clear();
@@ -1131,6 +1407,8 @@ impl Model {
                 self.pending.clear();
                 self.pending_notes.clear();
                 self.recovering = false;
+                self.reset_history_pages();
+                self.applying_settings = false;
                 self.voice.reset();
                 self.connection = Some(Connection::Ended);
             }
@@ -1138,7 +1416,81 @@ impl Model {
                 "model_progress" if self.conversation.turn_running()
                     && event.body["session_id"].as_str().is_none_or(|s| Some(s) == self.conversation.session_id())
                     && event.request_id().is_some_and(|id| matches!(self.pending.get(&id), Some(Purpose::Turn | Purpose::Listen))) => {
-                    self.model_progress = serde_json::from_value(event.body["progress"].clone()).ok();
+                    let next: Option<ModelProgress> = serde_json::from_value(event.body["progress"].clone()).ok();
+                    if let Some(p) = next {
+                        let merged = match self.last_inference {
+                            Some(prev) => ModelProgress {
+                                phase: p.phase,
+                                processed_tokens: p.processed_tokens.or(prev.processed_tokens),
+                                prompt_tokens: p.prompt_tokens.or(prev.prompt_tokens),
+                                output_tokens: p.output_tokens.or(prev.output_tokens),
+                                tokens_per_second: p.tokens_per_second.or(prev.tokens_per_second),
+                                cached_tokens: p.cached_tokens.or(prev.cached_tokens),
+                                eta_secs: p.eta_secs,
+                                estimated: p.estimated,
+                            },
+                            None => p,
+                        };
+                        if merged.tokens_per_second.is_some()
+                            || merged.cached_tokens.is_some()
+                            || merged.output_tokens.is_some()
+                        {
+                            self.last_inference = Some(merged);
+                        }
+                    }
+                    self.model_progress = next;
+                }
+                "usage" if self.conversation.turn_running()
+                    && event.body["session_id"].as_str().is_none_or(|s| Some(s) == self.conversation.session_id())
+                    && event.request_id().is_some_and(|id| matches!(self.pending.get(&id), Some(Purpose::Turn | Purpose::Listen))) => {
+                    let prompt_tokens = event.body["prompt_tokens"].as_u64();
+                    let output_tokens = event.body["output_tokens"].as_u64();
+                    let seconds = event.body["seconds"].as_f64();
+                    let fallback_tps = match (output_tokens, seconds) {
+                        (Some(out), Some(secs)) if out >= 8 && secs > 0.05 => Some(out as f64 / secs),
+                        _ => None,
+                    };
+                    let prev = self.last_inference;
+                    let from_live_progress = self.model_progress.is_some();
+                    let next = ModelProgress {
+                        phase: prev.map_or(InferencePhase::Generating, |p| p.phase),
+                        processed_tokens: prev.and_then(|p| p.processed_tokens),
+                        prompt_tokens: prompt_tokens.or_else(|| prev.and_then(|p| p.prompt_tokens)),
+                        output_tokens: output_tokens.or_else(|| prev.and_then(|p| p.output_tokens)),
+                        tokens_per_second: if from_live_progress {
+                            prev.and_then(|p| p.tokens_per_second).or(fallback_tps)
+                        } else {
+                            fallback_tps
+                        },
+                        cached_tokens: if from_live_progress {
+                            prev.and_then(|p| p.cached_tokens)
+                        } else {
+                            None
+                        },
+                        eta_secs: None,
+                        estimated: false,
+                    };
+                    if next.prompt_tokens.is_some() || next.tokens_per_second.is_some() || next.output_tokens.is_some() {
+                        self.last_inference = Some(next);
+                    }
+                }
+                "cached_usage" if self.conversation.turn_running()
+                    && event.body["session_id"].as_str().is_none_or(|s| Some(s) == self.conversation.session_id())
+                    && event.request_id().is_some_and(|id| matches!(self.pending.get(&id), Some(Purpose::Turn | Purpose::Listen))) => {
+                    if let Some(read_tokens) = event.body["read_tokens"].as_u64() {
+                        let mut next = self.last_inference.unwrap_or(ModelProgress {
+                            phase: InferencePhase::Generating,
+                            processed_tokens: None,
+                            prompt_tokens: None,
+                            output_tokens: None,
+                            tokens_per_second: None,
+                            cached_tokens: None,
+                            eta_secs: None,
+                            estimated: false,
+                        });
+                        next.cached_tokens = Some(read_tokens);
+                        self.last_inference = Some(next);
+                    }
                 }
                 "state_node" if event.body["node"]["kind"] == "inference"
                     && event.body["node"]["parent"].is_null()
@@ -1151,7 +1503,7 @@ impl Model {
                     });
                 }
                 // Another session's size is unknown until the engine reports it.
-                "active_session" => { self.context = None; self.current_model = None; self.model_progress = None; }
+                "active_session" => { self.context = None; self.current_model = None; self.model_progress = None; self.last_inference = None; self.reset_history_pages(); }
                 "live_transcript" => {
                     let text = event.body["text"].as_str().unwrap_or_default();
                     if let Some((id, repeated)) = self.voice.transcript(text) {
@@ -1188,12 +1540,24 @@ impl Model {
             self.apply_pending = true;
             vec![Command::GetSettings]
         } else {
+            if matches!(self.connection(), Connection::Live { .. }) {
+                self.applying_settings = true;
+            }
             vec![Command::GetSettings, Command::ApplySettings]
         }
     }
 
+    fn reset_history_pages(&mut self) {
+        self.history_page = None;
+        self.history_pages.clear();
+        self.history_page_session = None;
+        self.history_page_from_truncation = false;
+        self.history_page_live = None;
+    }
+
     fn apply_after_turn(&mut self, follow: &mut Vec<Command>) {
         if std::mem::take(&mut self.apply_pending) {
+            self.applying_settings = true;
             follow.push(Command::ApplySettings);
         }
     }
@@ -1250,6 +1614,7 @@ fn describe(command: &Command) -> &'static str {
         Command::ListSessions | Command::ListSessionsPage { .. } => "load sessions",
         Command::NewSession => "start a session",
         Command::Resume(_) => "open the session",
+        Command::SessionMessages(_) => "read the session",
         Command::DeleteSession(_) => "delete the session",
         Command::SettingsSchema => "load the settings reference",
         Command::GetSettings => "load settings",
@@ -1257,6 +1622,7 @@ fn describe(command: &Command) -> &'static str {
         Command::ResetSetting { .. } => "reset the setting",
         Command::ApplySettings => "apply settings",
         Command::Recover => "reload the session",
+        Command::MessagesPage { .. } => "load conversation history",
         Command::State => "read the session settings",
         Command::DiscoverModels => "refresh models",
         Command::ListImageModels => "load image models",
@@ -1289,6 +1655,7 @@ fn purpose_label(purpose: Purpose) -> &'static str {
         Purpose::Sessions => "Could not load sessions",
         Purpose::NewSession => "Could not start a session",
         Purpose::Resume => "Could not open the session",
+        Purpose::SessionMessages => "Could not read the session",
         Purpose::DeleteSession => "Could not delete the session",
         Purpose::SettingsSchema => "Could not load the settings reference",
         Purpose::Settings => "Could not load settings",
@@ -1296,6 +1663,7 @@ fn purpose_label(purpose: Purpose) -> &'static str {
         Purpose::ResetSetting => "Could not reset the setting",
         Purpose::ApplySettings => "Could not apply settings",
         Purpose::Recover => "Could not reload the session",
+        Purpose::MessagesPage => "Could not load conversation history",
         Purpose::State => "Could not read the session settings",
         Purpose::Models => "Could not load models",
         Purpose::ImageModels => "Could not load image models",

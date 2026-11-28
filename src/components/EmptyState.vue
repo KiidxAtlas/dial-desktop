@@ -7,7 +7,7 @@ import { canUseTaskRecipes, insertTaskRecipe, taskRecipes } from "../taskRecipes
 import Logo from "./Logo.vue";
 import Icon from "./Icon.vue";
 import { ui } from "../ui";
-import { goToSession } from "../sessionActions";
+import { goToSession, recentSession } from "../sessionActions";
 
 const props = defineProps<{ snap: OpenSnapshot }>();
 
@@ -27,11 +27,11 @@ function providers() {
   ui.settingsOpen = true;
 }
 /** Where to pick up: the latest few sessions with something in them. */
-const recent = computed(() => props.snap.sessions.filter((s) => !s.selected && !s.empty).slice(0, 3));
+const recent = computed(() => props.snap.sessions.filter((s) => recentSession(s, props.snap)).slice(0, 3));
 /** The sidebar already lists recent sessions; the card stands in for it only while it's hidden. */
 const showRecent = computed(() => !ui.sidebarOpen && recent.value.length > 0);
 /** The newest session leads the starters as "Continue …", so the likeliest next step is one click. */
-const resume = computed(() => recent.value[0] ?? null);
+const resume = computed(() => recent.value.find((s) => !s.selected) ?? null);
 const recipes = computed(() => taskRecipes().slice(0, resume.value ? 2 : 3));
 </script>
 

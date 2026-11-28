@@ -10,7 +10,7 @@ use crate::engine::{Command, Engine, Update};
 use crate::model::Model;
 use dial_client::{Message, RequestId};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -34,19 +34,28 @@ pub struct Tab {
     alerted: bool,
     notified: HashSet<(NoticeKind, String)>,
     turn_ended: bool,
-    opening: Option<(String, Option<RequestId>)>,
+    pub(crate) opening: Option<(String, Option<RequestId>)>,
+    /// A fresh session has no destination id until the engine opens it.
+    creating: bool,
+    // A fresh engine has no journal id until Ready. Never bind its input to a later switch.
+    startup_key: String,
+    startup_session: Option<String>,
     restore_target: Option<String>,
     turn_queued: bool,
     /// Edits belong to this tab's journal, including while its turn runs in the background.
     edits: Vec<Command>,
     editing: Option<Command>,
     local_load_failure: Option<LocalLoadFailure>,
+    /// The engine refused to open this session because it was still busy (with work Desktop
+    /// did not see as a turn); the app opens it in a second engine instead of failing.
+    busy_refusal: Option<String>,
     // Stand-in lifetime for tabs without a worker (preview and routing tests).
     lifetime: Arc<AtomicBool>,
 }
 
 impl Tab {
     pub fn new(model: Model, engine: Option<Engine>) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             model,
             engine,
@@ -54,17 +63,32 @@ impl Tab {
             notified: HashSet::new(),
             turn_ended: false,
             opening: None,
+            creating: false,
+            startup_key: format!("startup:{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            startup_session: None,
             restore_target: None,
             turn_queued: false,
             edits: Vec::new(),
             editing: None,
             local_load_failure: None,
+            busy_refusal: None,
             lifetime: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn session(&self) -> Option<&str> {
         self.model.conversation.session_id()
+    }
+
+    pub fn startup_draft_key(&self) -> Option<&str> {
+        (!self.startup_key.is_empty() && (self.session().is_none() || self.opening.is_some()
+            || self.session() == self.startup_session.as_deref())).then_some(&self.startup_key)
+    }
+
+    pub fn inherit_unbound_draft(&mut self, previous: &Tab) {
+        if previous.session().is_none() && previous.startup_key.starts_with("startup:") {
+            self.startup_key.clone_from(&previous.startup_key);
+        }
     }
 
     pub fn reconnect_target(&self) -> Option<&str> {
@@ -87,15 +111,24 @@ impl Tab {
             _ => None,
         };
         let starts_turn = matches!(command, Command::Send { .. } | Command::Retry);
+        let creates = command == Command::NewSession;
         self.engine
             .as_ref()
             .ok_or("Dial is not connected")?
             .enqueue(command)?;
+        if creates || opening.is_some() {
+            self.startup_key.clear();
+            if let Some(id) = &opening && self.session().is_none() {
+                self.startup_key.clone_from(id);
+                self.startup_session = Some(id.clone());
+            }
+        }
         if let Some(id) = opening {
             self.opening = Some((id, None));
         }
         self.restore_target = None;
         self.turn_queued |= starts_turn;
+        self.creating |= creates;
         Ok(())
     }
 
@@ -174,6 +207,9 @@ impl Tab {
     }
 
     pub fn apply(&mut self, update: Update) -> Vec<Command> {
+        if let Update::Connected(ready) = &update && self.startup_session.is_none() {
+            self.startup_session = Some(ready.session_id.clone());
+        }
         match &update {
             Update::Message(Message::Response { method, result, .. }) => {
                 self.settle_edit(method, result.as_ref().err().map(|err| err.message.as_str()))
@@ -187,6 +223,11 @@ impl Tab {
             _ => {}
         }
         match &update {
+            Update::Requested { command: Command::NewSession, .. } => self.creating = true,
+            Update::RequestFailed { command: Command::NewSession, .. } => self.creating = false,
+            Update::Message(Message::Response { method, .. }) if method == "new_session" => {
+                self.creating = false;
+            }
             Update::Requested {
                 command: Command::Resume(target),
                 id,
@@ -203,9 +244,13 @@ impl Tab {
                     .as_ref()
                     .is_some_and(|(_, request)| *request == Some(*id)) =>
             {
-                self.opening = None;
-                if result.is_ok() {
-                    self.restore_target = None;
+                let (target, _) = self.opening.take().expect("checked above");
+                match result {
+                    Ok(_) => self.restore_target = None,
+                    Err(error) if error.code.as_deref() == Some("busy") => {
+                        self.busy_refusal = Some(target);
+                    }
+                    Err(_) => {}
                 }
             }
             Update::RequestFailed {
@@ -230,12 +275,17 @@ impl Tab {
             }
             Update::ConnectFailed(_) | Update::Message(Message::Disconnected { .. }) => {
                 self.opening = None;
+                self.creating = false;
                 self.turn_queued = false;
             }
             _ => {}
         }
         let was_running = self.model.conversation.turn_running();
         let mut follow = self.model.apply(update);
+        if self.busy_refusal.is_some() {
+            // The app retries in another engine; the refusal is not the user's error.
+            self.model.toast = None;
+        }
         follow.extend(self.next_edit());
         if self.local_load_failure.as_ref().is_some_and(|failure| self.session() != Some(failure.session_id.as_str())) {
             self.local_load_failure = None;
@@ -253,7 +303,17 @@ impl Tab {
     }
 
     pub fn opening_session(&self) -> bool {
-        self.opening.is_some()
+        self.creating || self.opening.is_some()
+    }
+
+    /// The session this engine refused to open while busy, once.
+    pub fn take_busy_refusal(&mut self) -> Option<String> {
+        self.busy_refusal.take()
+    }
+
+    /// The session this tab is opening, if any.
+    pub fn opening_id(&self) -> Option<&str> {
+        self.opening.as_ref().map(|(id, _)| id.as_str())
     }
 
     pub fn local_load_failure(&self) -> Option<&LocalLoadFailure> {
@@ -269,7 +329,7 @@ impl Tab {
     }
 
     pub fn transitioning(&self) -> bool {
-        self.opening.is_some()
+        self.opening_session()
             || self.turn_queued
             || self.editing.is_some()
             || !self.edits.is_empty()
@@ -503,6 +563,11 @@ impl Tabs {
     /// Show tab `index`.
     pub fn switch(&mut self, index: usize) {
         if index < self.tabs.len() {
+            if index != self.active {
+                // Switching engines isn't a history refresh. Keep the project list on screen
+                // until the newly visible engine returns a current list_sessions response.
+                self.tabs[index].model.sessions = self.active().model.sessions.clone();
+            }
             self.active = index;
             self.tabs[index].alerted = false;
             // The picker lists the models of the engine on screen.

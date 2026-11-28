@@ -28,11 +28,24 @@ export function openSession(snap: OpenSnapshot): Session | null {
   return snap.sessions.find((s) => s.selected) ?? null;
 }
 
-export function listedSession(s: Session, snap: OpenSnapshot): boolean {
+type SidebarSnapshot = Pick<OpenSnapshot, 'sessions' | 'workspace'>;
+
+export function listedSession(s: Session, snap: SidebarSnapshot): boolean {
   // Deleted with Undo still offered: gone from the list (and ⌘1–9) until Undo brings it back.
   if (hiddenSessions.has(s.id)) return false;
   if (isTypeSession(s.id) || (s.selected && typeState.pending)) return false;
   return !s.empty || s.running || s.waiting || s.pinned || s.selected || hasDraft(snap.workspace.root, s.id);
+}
+
+/** External sessions are attachable by explicit search, not suggestions to continue. */
+function omitFromRecents(s: Session): boolean {
+  // Older CLIs interpreted Desktop's literal attach invocation as the first prompt/title.
+  // Match only the whole command with a full journal id; these chats stay searchable.
+  return !!s.openElsewhere || /^attach (?:-- )?[0-9a-f]{16}$/i.test(s.title);
+}
+
+export function recentSession(s: Session, snap: SidebarSnapshot): boolean {
+  return !omitFromRecents(s) && !s.empty && listedSession(s, snap);
 }
 
 /** The age bucket of a session row, read from its "3h ago · 12 messages" line. */
@@ -49,14 +62,19 @@ function ageGroup(meta: string): string {
  * week, Older), keeping those whose title matches `filter`. A type's own conversations are not
  * listed: they open with their type. Recents that all fall in one age stay one "Recents" group.
  */
-export function sessionGroups(snap: OpenSnapshot, filter = ""): { name: string; sessions: Session[] }[] {
+export function sessionGroups(snap: SidebarSnapshot, filter = ""): { name: string; sessions: Session[] }[] {
   const f = filter.trim().toLowerCase();
   const matching = snap.sessions.filter((s) => listedSession(s, snap) && (!f || s.title.toLowerCase().includes(f)));
-  const recents = matching.filter((s) => !s.pinned && !s.running && !s.waiting);
+  const idle = matching.filter((s) => !s.pinned && !s.running && !s.waiting);
+  // Keep a fresh conversation reachable immediately without counting selection as history.
+  const blank = idle.find((s) => s.selected && s.empty && !hasDraft(snap.workspace.root, s.id));
+  const recents = idle.filter((s) => s !== blank && (f || !omitFromRecents(s)));
   const byAge = new Map<string, Session[]>();
   for (const s of recents) {
     const name = ageGroup(s.meta ?? "");
-    byAge.set(name, [...(byAge.get(name) ?? []), s]);
+    const group = byAge.get(name);
+    if (group) group.push(s);
+    else byAge.set(name, [s]);
   }
   const aged = f || byAge.size < 2
     ? [{ name: "Recents", sessions: recents }]
@@ -65,6 +83,7 @@ export function sessionGroups(snap: OpenSnapshot, filter = ""): { name: string; 
     { name: "Active", sessions: matching.filter((s) => s.running || s.waiting) },
     { name: "Pinned", sessions: matching.filter((s) => s.pinned && !s.running && !s.waiting) },
     ...aged,
+    { name: "New session", sessions: blank ? [blank] : [] },
   ].filter((g) => g.sessions.length);
 }
 

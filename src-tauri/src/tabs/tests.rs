@@ -100,6 +100,45 @@ fn failed_local_selection_can_retry_in_its_original_tab() {
 }
 
 #[test]
+fn session_creation_blocks_another_transition_until_settled() {
+    let mut tab = tab("old", false);
+    let id = request_id(2);
+    tab.apply(Update::Requested { command: Command::NewSession, id });
+    assert!(tab.opening_session());
+    assert!(tab.transitioning());
+    tab.apply(Update::Message(Message::Response {
+        id, method: "new_session".into(), result: Ok(json!({})),
+    }));
+    assert!(!tab.transitioning());
+    for end in [
+        Update::RequestFailed { command: Command::NewSession, error: "not sent".into() },
+        Update::Message(Message::Disconnected { outstanding: vec![] }),
+    ] {
+        tab.apply(Update::Requested { command: Command::NewSession, id });
+        tab.apply(end);
+        assert!(!tab.transitioning());
+    }
+}
+
+#[test]
+fn session_creation_shows_selected_row_before_history_list_arrives() {
+    let tabs = Tabs::new(tab("fresh", false));
+    let mut snap = crate::view::Snapshot::new(&tabs.active().model, None, 0);
+    snap.show_activity(&tabs.activity());
+    assert_eq!(snap.sessions.len(), 1);
+    assert_eq!(snap.sessions[0].id, "fresh");
+    assert!(snap.sessions[0].selected && snap.sessions[0].empty);
+    assert!(!snap.sessions[0].running);
+    // Re-publishing or receiving the actual history row must not create a second row.
+    snap.show_activity(&tabs.activity());
+    assert_eq!(snap.sessions.len(), 1);
+    snap.sessions.clear();
+    snap.history_loading = true;
+    snap.show_activity(&tabs.activity());
+    assert!(snap.sessions.is_empty(), "do not surface a boot session during resume");
+}
+
+#[test]
 fn an_idle_tab_opens_sessions_in_place() {
     let tabs = Tabs::new(tab("s1", false));
     assert_eq!(tabs.route_resume("s2"), Route::Here);
@@ -263,6 +302,22 @@ fn a_new_tab_starts_with_the_sidebar_on_screen() {
 }
 
 #[test]
+fn switching_sessions_does_not_restore_a_stale_recents_list() {
+    let row = |id, messages| crate::model::SessionSummary::from_wire(&json!({
+        "session_id": id, "messages": messages,
+    })).unwrap();
+    let mut tabs = Tabs::new(tab("one", true));
+    tabs.active_mut().model.sessions = vec![row("one", 2)];
+    tabs.open(tab("two", true));
+    let latest = vec![row("two", 4), row("one", 3)];
+    tabs.active_mut().model.sessions = latest.clone();
+    for index in [0, 1] {
+        tabs.switch(index);
+        assert_eq!(tabs.active().model.sessions, latest);
+    }
+}
+
+#[test]
 fn a_session_cannot_be_resumed_while_its_previous_engine_shuts_down() {
     let mut tabs = Tabs::new(tab("s1", true));
     tabs.open(tab("s2", false));
@@ -335,6 +390,24 @@ fn switching_away_from_a_queued_send_preserves_its_engine() {
 }
 
 #[test]
+fn startup_draft_belongs_to_one_launch_and_its_initial_journal() {
+    let mut tab = Tab::new(Model::starting(), None);
+    let key = tab.startup_draft_key().unwrap().to_owned();
+    let mut other = Tab::new(Model::starting(), None);
+    assert_ne!(other.startup_draft_key(), Some(key.as_str()));
+    tab.apply(Update::ConnectFailed("test".into()));
+    other.inherit_unbound_draft(&tab);
+    assert_eq!(other.startup_draft_key(), Some(key.as_str()));
+    other.apply(Update::Connected(Box::new(Ready {
+        session_id: "first".into(), engine_version: None, model: "m".into(),
+        supported_protocol_versions: vec![1], methods: vec![], capabilities: vec![], raw: json!({}),
+    })));
+    assert_eq!(other.startup_draft_key(), Some(key.as_str()));
+    other.model = model("different", false);
+    assert_eq!(other.startup_draft_key(), None);
+}
+
+#[test]
 fn reconnect_keeps_its_target_after_a_failed_engine_start() {
     let mut restoring = Tab::new(Model::starting(), None);
     restoring.opening = Some(("original".into(), None));
@@ -383,4 +456,36 @@ fn restart_reservation_rechecks_terminals_and_all_tabs_before_blocking_work() {
     assert!(tabs.allow_work().is_err());
     tabs.release_restart();
     assert!(tabs.allow_work().is_ok());
+}
+
+#[test]
+fn busy_refusal_to_open_a_session_is_handed_to_a_second_engine() {
+    // The engine can be busy with work Desktop does not show as a turn (for example a
+    // failed turn still settling); its refusal must not reach the user as an error.
+    let mut tab = tab("one", false);
+    tab.opening = Some(("two".into(), None));
+    tab.apply(Update::Requested { command: Command::Resume("two".into()), id: request_id(7) });
+    tab.apply(Update::Message(Message::Response {
+        id: request_id(7),
+        method: "resume".into(),
+        result: Err(dial_client::RpcError { code: Some("busy".into()), message: "agent busy".into() }),
+    }));
+    assert!(tab.model.toast.is_none());
+    assert!(!tab.opening_session());
+    assert_eq!(tab.take_busy_refusal().as_deref(), Some("two"));
+    assert_eq!(tab.take_busy_refusal(), None);
+}
+
+#[test]
+fn other_refusals_to_open_a_session_still_explain_themselves() {
+    let mut tab = tab("one", false);
+    tab.opening = Some(("two".into(), None));
+    tab.apply(Update::Requested { command: Command::Resume("two".into()), id: request_id(7) });
+    tab.apply(Update::Message(Message::Response {
+        id: request_id(7),
+        method: "resume".into(),
+        result: Err(dial_client::RpcError { code: Some("not_found".into()), message: "no such session".into() }),
+    }));
+    assert!(tab.model.toast.is_some());
+    assert_eq!(tab.take_busy_refusal(), None);
 }

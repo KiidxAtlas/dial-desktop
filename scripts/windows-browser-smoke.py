@@ -5,6 +5,7 @@ import functools
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -22,6 +23,7 @@ def smoke(exe, root):
         <input id="entry" onkeydown="if(event.key==='x') event.preventDefault()">
         <select id="choice"><option>First</option><option disabled>Skip</option><option>Last</option></select>
         <button>Smoke button</button></form>''')
+    (project / 'second.html').write_text('<!doctype html><title>Second fixture</title><h1>Second page</h1>')
     env = {**os.environ, 'APPDATA': str(root / 'roaming'), 'LOCALAPPDATA': str(root / 'local'),
            'WEBVIEW2_USER_DATA_FOLDER': str(root / 'webview')}
 
@@ -62,6 +64,20 @@ def smoke(exe, root):
             state = call('browser_eval', script='''return [document.querySelector('#entry').value,
                 document.querySelector('#choice').value, document.activeElement.id, window.submitted]''')
             assert json.loads(state) == ['a', 'Last', 'entry', True], state
+            def active_tab():
+                return int(re.search(r'^\* tab (\d+):', call('browser_tab', action='list'), re.M)[1])
+
+            first = active_tab()
+            call('browser_tab', action='new')
+            second = active_tab()
+            assert second != first
+            second_url = f'http://127.0.0.1:{server.server_port}/second.html'
+            assert 'Second page' in call('browser_open', url=second_url)
+            call('browser_tab', action='select', id=first)
+            assert json.loads(call('browser_eval', script="return document.querySelector('#entry').value")) == 'a'
+            call('browser_tab', action='close', id=second)
+            assert active_tab() == first
+            assert rpc('tools/call', name='browser_tab', arguments={'action': 'select', 'id': second})['isError']
             assert 'no native default' in call('browser_press', key='Escape')
             assert rpc('tools/call', name='browser_press', arguments={'key': 'Ctrl+L'})['isError']
             reply = rpc('tools/call', name='browser_screenshot', arguments={})

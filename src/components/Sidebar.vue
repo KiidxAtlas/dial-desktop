@@ -47,7 +47,10 @@ async function openHit(hit: TranscriptHit) {
   }
 }
 /** Each session belongs to one group (Shift-click ranges follow the displayed order). */
-const groups = computed(() => sessionGroups(props.snap, ui.sessionFilter));
+// Streaming replaces the snapshot, but unchanged rows and workspace keep their identity.
+const rows = computed(() => props.snap.sessions);
+const project = computed(() => props.snap.workspace);
+const groups = computed(() => sessionGroups({ sessions: rows.value, workspace: project.value }, ui.sessionFilter));
 const sessions = computed(() => groups.value.flatMap((g) => g.sessions));
 /** ⌘1–9 numbers for the first nine rows, shown while ⌘ is held. */
 const jumpNumber = computed(() => new Map(sessions.value.slice(0, 9).map((s, i) => [s.id, i + 1])));
