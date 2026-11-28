@@ -2,7 +2,7 @@
 # Verify that a built Dial .app carries the macOS host helper at its fixed resource path, signed with the
 # virtualization entitlement, and that no guest companion or guest OS media is inside the bundle.
 #
-# Usage: packaging/macos-guest/verify-bundle.sh path/to/Dial.app
+# Usage: packaging/macos-guest/verify-bundle.sh path/to/Dial.app [--with-engine]
 #
 # Read-only: it never runs the helper, a VM or any installer. Exits 0 when every check holds, 1 otherwise.
 set -eu
@@ -11,6 +11,11 @@ app=${1:?usage: verify-bundle.sh path/to/Dial.app}
 helper="$app/Contents/Resources/macos-guest/dial-mac-guest"
 macos_dir="$app/Contents/MacOS"
 fail() { echo "verify-bundle: FAIL: $*" >&2; exit 1; }
+case "${2:-}" in
+	'') expected_count=1 ;;
+	--with-engine) expected_count=2 ;;
+	*) fail "unknown option: $2" ;;
+esac
 
 [ -d "$app" ] || fail "not an app bundle: $app"
 
@@ -30,12 +35,20 @@ case "$helper_ent" in
 	*) fail "helper lacks com.apple.security.virtualization = true" ;;
 esac
 
-# 3. Contents/MacOS holds only the app's main executable, and it is not the helper or a companion
+# 3. Contents/MacOS holds the main executable and, for release builds, the engine sidecar.
 [ -d "$macos_dir" ] || fail "missing Contents/MacOS"
+if [ "$expected_count" = 2 ]; then
+	engine="$macos_dir/dial"
+	[ -f "$engine" ] && [ ! -L "$engine" ] && [ -x "$engine" ] || fail "missing executable engine sidecar at Contents/MacOS/dial"
+fi
 count=$(find "$macos_dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
-[ "$count" = "1" ] || fail "Contents/MacOS must hold only the main executable (found $count entries)"
-main=$(find "$macos_dir" -mindepth 1 -maxdepth 1)
-[ -x "$main" ] || fail "main entry in Contents/MacOS is not executable"
+[ "$count" = "$expected_count" ] || fail "expected $expected_count entries in Contents/MacOS, found $count"
+if [ "$expected_count" = 2 ]; then
+	main=$(find "$macos_dir" -mindepth 1 -maxdepth 1 ! -name dial)
+else
+	main=$(find "$macos_dir" -mindepth 1 -maxdepth 1)
+fi
+[ -f "$main" ] && [ ! -L "$main" ] && [ -x "$main" ] || fail "main entry in Contents/MacOS is not a regular executable"
 case "$(basename "$main")" in
 	*guest*|*Guest*) fail "guest helper or companion baked into Contents/MacOS as $(basename "$main")" ;;
 esac
