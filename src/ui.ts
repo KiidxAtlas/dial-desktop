@@ -48,6 +48,7 @@ export type SettingsTab =
   | "providers"
   | "roles"
   | "images"
+  | "training"
   | "appearance"
   | "usage"
   | "skills"

@@ -9,11 +9,20 @@ use tauri::State;
 use std::path::Path;
 mod setup;
 mod atomic;
+mod runtime;
 mod progress;
 mod snapshots;
 #[tauri::command]
 pub async fn atomic_engine_setup(app: tauri::AppHandle) -> Result<bool, String> {
     atomic::setup(app).await
+}
+pub(crate) async fn runtime_setup_with(
+    app: tauri::AppHandle,
+    program: std::path::PathBuf,
+    cwd: Option<std::path::PathBuf>,
+    runtime: String,
+) -> Result<bool, String> {
+    runtime::setup(app, program, cwd, runtime).await
 }
 #[tauri::command]
 pub async fn model_hub_setup(app: tauri::AppHandle) -> Result<bool, String> {

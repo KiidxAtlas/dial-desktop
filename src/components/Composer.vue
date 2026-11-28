@@ -2,17 +2,18 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Decision, OpenSnapshot } from "../types";
-import { engine, files, showToast, workspaceFiles } from "../bridge";
+import { engine, files, showToast, snapshot, workspaceFiles } from "../bridge";
 import * as attachments from "../attachments";
 import { clipboardAction, MAX_ATTACHMENTS, MAX_FILE_BYTES } from '../attachmentFormats';
 import { viewAttachment } from "../imageViewer";
 import { openMenu, ui } from "../ui";
 import { beginSend, draftFor } from "../drafts";
 import { draftReady, readingFiles, restoreInput } from '../draftInput';
+import { startupDestination } from '../startupPrompt';
 import { canCompact, promptHistory } from "../sessionActions";
 import { sendInType, typeIdFor, typeSessionOnScreen, types } from "../savedTypes";
 import { canUseTaskRecipes, taskRecipes } from "../taskRecipes";
-import { engineCommands, loadEngineCommands } from "../engineTools";
+import { engineCall, engineCommands, loadEngineCommands } from "../engineTools";
 import { matchSlash, slashCommands, type SlashCommand } from "../slashCommands";
 import { runTyped, typedCommand } from "../commandRunner";
 import CommandPanel from "./CommandPanel.vue";
@@ -81,6 +82,31 @@ const allCommands = computed<SlashCommand[]>(() => [
 ]);
 watch(() => [props.snap.workspace.root, props.snap.connection.state] as const, () => void loadEngineCommands(), { immediate: true });
 
+/** Silently pre-warm an idle Dial-managed local server as the user drafts their first prompt. */
+const prewarmedKey = ref("");
+watch(
+  () => [
+    draft.value.text.trim().length >= 3,
+    props.snap.workspace.root,
+    props.snap.sessionId,
+    props.snap.connection.state,
+    props.snap.turnRunning,
+    props.snap.entries.length,
+    props.snap.model?.managedLocal,
+    props.snap.model?.resident,
+    props.snap.model?.modelId,
+  ] as const,
+  ([typing, root, sessionId, conn, running, entries, managedLocal, resident, modelId], _, cleanup) => {
+    if (!typing || conn !== "live" || running || entries > 0 || !managedLocal || resident || !modelId) return;
+    const key = `${root}\0${sessionId ?? ""}\0${modelId}`;
+    if (prewarmedKey.value === key) return;
+    const timer = setTimeout(() => {
+      prewarmedKey.value = key;
+      void engineCall("warm_local_model", {}, root).catch(() => {});
+    }, 600);
+    cleanup(() => clearTimeout(timer));
+  },
+);
 const approval = computed(() => props.snap.approvals[0] ?? null);
 /** The built-in command a typed `/name args` will run (shown in the key hint), else `""`. */
 const typedName = computed(() => {
@@ -120,6 +146,22 @@ async function queueDraft() {
     finish(queued);
   }
 }
+const canSendToWorker = computed(() => props.snap.connection.state === "live" && ready.value && hasContent.value);
+async function sendToWorker() {
+  if (!canSendToWorker.value) return;
+  const target = draft.value;
+  const text = target.text;
+  const attached = [...target.attachments];
+  const finish = beginSend(target);
+  focus();
+  let sent = false;
+  try {
+    sent = await engine.sendToWorker(text, attached, { workspaceRoot: props.snap.workspace.root });
+    if (sent) showToast("Sent to an independent worker");
+  } finally {
+    finish(sent);
+  }
+}
 /** While a turn runs, typed text goes to it as guidance (files cannot). */
 const steering = computed(
   () => props.snap.turnRunning && props.snap.connection.state === "live" && !!draft.value.text.trim() && !draft.value.attachments.length,
@@ -135,8 +177,9 @@ const runningHint = computed(() => {
 const runningTitle = computed(() => draft.value.attachments.length
   ? "Enter queues this for the next turn: files can't go in a note"
   : `Enter adds a note to this turn; ${queueKey.value} queues it for the next turn instead`);
+const starting = computed(() => props.snap.connection.state === 'starting' && !!props.snap.startupDraftKey && !ui.typeOpen);
 const canSend = computed(() => ready.value && (slash.value.length > 0 || steering.value || (
-  props.snap.canSend && hasContent.value
+  (props.snap.canSend || starting.value) && hasContent.value
 )));
 /** Files are being dragged over the window. */
 const dropping = ref(false);
@@ -144,7 +187,7 @@ const dropping = ref(false);
  *  down, the banner above the conversation says so once, with Reconnect; this stays quiet. */
 const caption = computed(() => {
   const c = props.snap.connection;
-  if (c.state === "starting") return `Starting Dial in ${props.snap.workspace.display}…`;
+  if (c.state === 'starting') return draft.value.pending ? 'Queued · sends when Dial is ready' : `Starting Dial in ${props.snap.workspace.display}…`;
   if (c.state === "preview") return "Design preview · prompts are not sent";
   return "";
 });
@@ -202,6 +245,12 @@ async function send() {
   let accepted = false;
   try {
     const scope = { workspaceRoot: props.snap.workspace.root, sessionId: props.snap.sessionId, typeId: typeIdFor(props.snap.sessionId) };
+    if (starting.value) {
+      const sessionId = await startupDestination(props.snap, () => ui.typeOpen ? null : snapshot.value, lifetime.signal);
+      if (!sessionId) { showToast('Startup prompt was not sent. It is still in its draft.'); return; }
+      accepted = await engine.send(text, attached, { ...scope, sessionId, typeId: typeIdFor(sessionId) });
+      return;
+    }
     // In an open type, a prompt or steer goes to the type's own conversation.
     accepted = steer
       ? await engine.steer(text, scope)
@@ -258,6 +307,7 @@ function onPaste(event: ClipboardEvent) {
 
 // Files dropped anywhere on the window attach to the draft.
 let unlistenDrop: (() => void) | null = null;
+const lifetime = new AbortController();
 let unmounted = false;
 onMounted(async () => {
   document.addEventListener('paste', onPaste);
@@ -279,6 +329,7 @@ onMounted(async () => {
 onUnmounted(() => {
   document.removeEventListener('paste', onPaste);
   unmounted = true;
+  lifetime.abort();
   unlistenDrop?.();
 });
 
@@ -392,11 +443,12 @@ function scopeMenu(event: MouseEvent) {
     { label: `Always allow ${what} everywhere`, run: () => decide("always") },
   ], event.currentTarget as HTMLElement);
 }
-/** While a turn runs: the note goes now by default; queueing waits in this menu. */
+/** While a turn runs: the note goes now by default; queueing and independent workers wait in this menu. */
 function noteMenu(event: MouseEvent) {
   openMenu(event, [
     { label: "Send note now", hint: "Enter", disabled: !canSend.value, run: () => void send() },
     { label: "Queue for next turn", hint: queueKey.value, disabled: !canQueue.value, run: () => void queueDraft() },
+    { label: "Send to independent worker", disabled: !canSendToWorker.value, run: () => void sendToWorker() },
   ], event.currentTarget as HTMLElement);
 }
 const mac = computed(() => props.snap.platform === "macos");
@@ -591,6 +643,7 @@ onMounted(focus);
             :live="snap.connection.state === 'live'"
             :turn-running="snap.turnRunning"
             :can-compact="canCompact(snap)"
+            :local="snap.model?.local ?? false"
             @compact="engine.compact()"
           />
           <button
@@ -610,7 +663,7 @@ onMounted(focus);
             <button class="send labeled" :disabled="!canSend" title="Send note now (Enter)" @click.stop="send">Send note</button>
             <button
               class="send caret"
-              :disabled="!canQueue"
+              :disabled="!canQueue && !canSendToWorker"
               :title="`More ways to send (queue: ${queueKey})`"
               aria-label="More ways to send"
               aria-haspopup="menu"
@@ -619,15 +672,29 @@ onMounted(focus);
               <Icon name="chevronDown" :size="12" />
             </button>
           </span>
-          <button
+          <span
             v-else-if="hasContent && snap.turnRunning && snap.sessionId && snap.connection.state === 'live'"
-            class="send labeled"
-            :disabled="!canQueue"
-            title="Queue for the next turn (Enter): files can't go in a note"
-            @click.stop="queueDraft"
+            class="split"
           >
-            Queue for next turn
-          </button>
+            <button
+              class="send labeled"
+              :disabled="!canQueue"
+              title="Queue for the next turn (Enter): files can't go in a note"
+              @click.stop="queueDraft"
+            >
+              Queue for next turn
+            </button>
+            <button
+              class="send caret"
+              :disabled="!canQueue && !canSendToWorker"
+              title="More ways to send"
+              aria-label="More ways to send"
+              aria-haspopup="menu"
+              @click.stop="noteMenu"
+            >
+              <Icon name="chevronDown" :size="12" />
+            </button>
+          </span>
           <button
             v-else-if="!snap.turnRunning"
             class="send"
@@ -640,7 +707,7 @@ onMounted(focus);
           </button>
         </div>
       </div>
-      <div v-if="draft.sending && !snap.turnRunning" class="caption" role="status">Submitting prompt…</div>
+      <div v-if="draft.sending && !snap.turnRunning && snap.connection.state !== 'starting'" class="caption" role="status">Submitting prompt…</div>
       <div v-if="caption" class="caption" role="status">
         <span class="truncate">{{ caption }}</span>
       </div>

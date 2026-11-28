@@ -1,10 +1,20 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, computed, watch } from "vue";
+import type { CacheState } from "../turnProgress";
 
 // `waiting`: the turn is paused on the user (an approval or a question), so it reads as a prompt
 // to act rather than as work in progress, and Esc-to-stop is not offered as the next step.
-const props = defineProps<{ label: string; detail?: string; waiting?: boolean }>();
-
+const props = defineProps<{
+  label: string;
+  detail?: string;
+  meta?: string;
+  fraction?: number;
+  waiting?: boolean;
+  canWrapUp?: boolean;
+  wrappingUp?: boolean;
+  cacheState?: CacheState;
+}>();
+const emit = defineEmits<{ wrapUp: [] }>();
 const statusText = ref<HTMLElement>();
 let handoff: Animation | undefined;
 watch(() => props.label, () => {
@@ -43,7 +53,24 @@ const elapsedLabel = computed(() => {
   <div class="working" :class="{ waiting }">
     <span class="glyph" aria-hidden="true">{{ waiting ? "●" : GLYPHS[frame] }}</span>
     <span ref="statusText" class="label" role="status">{{ label }}</span>
+    <span v-if="fraction !== undefined && !waiting" class="prefill-bar" role="progressbar" :aria-valuenow="Math.round(fraction * 100)" aria-valuemin="0" aria-valuemax="100" :aria-label="label">
+      <span class="prefill-fill" :style="{ width: `${Math.max(fraction * 100, 3)}%` }" />
+    </span>
     <span v-if="detail" class="metric">{{ detail }}</span>
+    <span
+      v-if="meta"
+      class="meta"
+      :class="cacheState ? `cache-${cacheState}` : undefined"
+      :title="cacheState === 'low' ? 'Low KV cache hit — prompt prefix was rebuilt for this step' : cacheState === 'high' ? 'High KV cache reuse — prompt prefix stayed warm' : undefined"
+    >{{ meta }}</span>
+    <button
+      v-if="canWrapUp && !waiting"
+      type="button"
+      class="wrap-up"
+      :disabled="wrappingUp"
+      title="Stop deliberating and act immediately using what’s been reasoned so far"
+      @click="emit('wrapUp')"
+    >{{ wrappingUp ? "Wrapping up…" : "Wrap up & act" }}</button>
     <span class="hint">{{ elapsedLabel }}<template v-if="!waiting"> · Esc to stop</template><template v-else> · answer below</template></span>
   </div>
 </template>
@@ -85,6 +112,52 @@ const elapsedLabel = computed(() => {
   font-size: 13px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
+}
+.meta {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.meta.cache-low {
+  color: var(--warning);
+}
+.meta.cache-high {
+  color: var(--text-muted);
+}
+.wrap-up {
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.wrap-up:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.wrap-up:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.prefill-bar {
+  position: relative;
+  display: inline-block;
+  width: 72px;
+  height: 4px;
+  align-self: center;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border-strong);
+}
+.prefill-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 200ms var(--ease);
 }
 @media (prefers-reduced-motion: reduce) {
   .glyph { visibility: hidden; }

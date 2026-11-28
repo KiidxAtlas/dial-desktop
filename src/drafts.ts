@@ -44,7 +44,7 @@ async function attachPersistence(key: string, draft: Draft) {
   try {
     stored = await readLocal(DRAFTS, key) as typeof stored;
   } catch { storageError(); }
-  const edited = !!(draft.text || draft.attachments.length);
+  const edited = !!(draft.text || draft.attachments.length || draft.pending);
   if (typeof stored?.text === 'string' && Array.isArray(stored.attachments)) {
     restoreInput(draft, { text: stored.text, attachments: stored.attachments });
   }
@@ -56,14 +56,44 @@ async function attachPersistence(key: string, draft: Draft) {
   }, { immediate: edited });
 }
 
-export function draftFor(snap: Pick<OpenSnapshot, "workspace" | "sessionId">): Draft {
-  const key = JSON.stringify([snap.workspace.root, snap.sessionId]);
+type DraftScope = Pick<OpenSnapshot, 'workspace' | 'sessionId' | 'startupDraftKey'>;
+const starting = new Map<string, Draft>();
+
+export function draftFor(snap: DraftScope): Draft {
+  const startup = snap.startupDraftKey;
+  const unbound = startup?.startsWith('startup:');
+  const launch = JSON.stringify([snap.workspace.root, startup]);
+  // A resume already knows its journal id, even while the worker is briefly in its initial session.
+  const id = startup && !unbound ? startup : snap.sessionId;
+  if (unbound && !id) {
+    let draft = starting.get(launch);
+    if (!draft) {
+      draft = reactive<Draft>({ text: '', attachments: [], sending: false, loading: false, reading: 0 });
+      starting.set(launch, draft);
+    }
+    return draft;
+  }
+  const key = JSON.stringify([snap.workspace.root, id]);
   let draft = drafts.get(key);
   if (!draft) {
-    const created = reactive<Draft>({ text: '', attachments: [], sending: false, loading: true, reading: 0 });
+    // Keep the object itself: a picker, paste or unacknowledged send may still own it.
+    const created = (unbound && starting.get(launch)) || reactive<Draft>({ text: '', attachments: [], sending: false, loading: false, reading: 0 });
+    created.loading = true;
+    starting.delete(launch);
     drafts.set(key, created);
     void attachPersistence(key, created).catch(storageError).finally(() => { created.loading = false; });
     draft = created;
+  } else if (unbound) {
+    // A launch can reconnect to a journal whose draft is already cached.
+    const earlier = starting.get(launch);
+    if (earlier) {
+      starting.delete(launch);
+      const destination = draft;
+      const move = () => restoreInput(destination, earlier);
+      if (earlier.sending || earlier.reading) {
+        const stop = watch(() => !earlier.sending && !earlier.reading, ready => { if (ready) { stop(); move(); } });
+      } else move();
+    }
   }
   return draft;
 }

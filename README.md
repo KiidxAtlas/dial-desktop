@@ -7,6 +7,11 @@ Dial Desktop is a separate process: it starts `dial rpc` and talks to it through
 [`dial-client`](https://github.com/KiidxAtlas/dial/tree/main/crates/dial-client), Dial's Rust
 client for the versioned RPC protocol. It never links engine crates.
 
+What changed in each release: [CHANGELOG](CHANGELOG.md). More documentation:
+[sessions and the sidebar](docs/sessions.md), [browser panel and agent tools](docs/browser-agent.md),
+[App runtime packaging](docs/app-runtime-packaging.md) and
+[local inference on Windows](docs/windows-local-inference-smoke.md).
+
 ## Setup
 
 Needs Rust (see `edition` in `src-tauri/Cargo.toml`), Node 20+ and the
@@ -371,7 +376,7 @@ continues. Local builds without the release config do not contact Azure.
     **Revert** discards every uncommitted change to the file (yours too) after a confirmation:
     tracked files return to `HEAD`, new files are deleted. **Revert hunk** undoes just one hunk in
     the working tree after a confirmation; a hunk that no longer matches the file is refused.
-    Nested repositories report their own status and diffs, including when the project folder isn't a Git repository. Child-repository edits made outside the session appear separately. To stage, revert or commit there, open the child repository as the project.
+    Nested repositories report their own status and diffs, including when the project folder isn't a Git repository. Child-repository edits made outside the session appear separately. To stage, revert or commit there, open the child repository as the project: when the project is not a repository, **Changes** lists its nested repositories to open. In the terminal, `/git` uses the only nested repository, or lists them; choose one with `/git repo <folder>`.
     The Expand/Shrink choice is remembered per project. Each listed file from the project's own repository has a checkbox that
     stages or unstages it (a dash means partly staged), the header shows the current branch, and
     **Review staged files** (⌘/Ctrl+Enter in the commit message) lists every staged path, including files
@@ -400,12 +405,13 @@ continues. Local builds without the release config do not contact Azure.
     **Run in my shell**, which types it at the current shell's prompt without pressing Enter. Font size and
     scrollback are in Settings › Appearance › Terminal and apply to open terminals at once.
     With several shells, each tab has its own close button; <kbd>Delete</kbd> on a focused tab closes it too.
-  - **Browser**: a real web view in the panel with address bar, back, forward and reload. Bare
+  - **Browser**: a real web view in the panel with tabs, address bar, back, forward and reload.
+    Open, switch and close tabs from the tab bar; each keeps its page while another is shown. Bare
     hosts get `https://`, `localhost` gets `http://`, anything else is searched. The send button
     hands the page to Dial: ask it to check the page, or add the address, selected text, page text
     or console errors to the prompt. Pages get no access to the app's commands (the capability
     covers only the `main` web view) and cannot open windows. Local links in the conversation open
-    here; ⌘-click opens them in the system browser.
+    here; ⌘-click opens them in the system browser. See [browser-agent.md](docs/browser-agent.md).
   - **Live previews**: local server announcements such as `Local: http://localhost:5173/` offer a
     preview in the Browser panel without switching panels. To open new previews automatically,
     opt in from the Browser panel or command palette. Session history never opens previews.

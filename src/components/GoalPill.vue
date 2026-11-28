@@ -14,7 +14,10 @@ const live = computed(() => props.snap.connection.state === "live");
 // and can finish, pause or run out of budget during one).
 watch(
   () => [props.snap.sessionId, live.value, props.snap.turnRunning] as const,
-  ([, now]) => { if (now) void loadGoal(); else goal.value = null; },
+  ([, now, running]) => {
+    if (!now) goal.value = null;
+    else if (!running) void loadGoal();
+  },
   { immediate: true },
 );
 

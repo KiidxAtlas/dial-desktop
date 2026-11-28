@@ -366,13 +366,31 @@ export const engine = {
       return false;
     }
   },
+  /** Run a prompt in a new independent background session without disturbing the current turn. */
+  async sendToWorker(text: string, attachments: Attachment[], scope: { workspaceRoot: string }) {
+    try {
+      await invoke("send_to_worker", {
+        workspaceRoot: scope.workspaceRoot,
+        text,
+        ...attachmentPayload(attachments, snapshot.value?.model?.acceptsImages),
+      });
+      return true;
+    } catch (error) {
+      showToast(String(error));
+      return false;
+    }
+  },
   approve: (approvalId: string, decision: Decision) => call("approve", { approvalId, decision }),
   abort: () => call("abort"),
-  newSession: () => call("new_session"),
+  newSession: () => {
+    const snap = snapshot.value;
+    return snap?.workspace ? call("new_session", { workspaceRoot: snap.workspace.root, sessionId: snap.sessionId }) : Promise.resolve(false);
+  },
   resume: (sessionId: string, workspaceRoot?: string, waitForClose = false) => call("resume", { sessionId, workspaceRoot, waitForClose }),
   searchTranscripts: (workspaceRoot: string, query: string, limit: number) =>
     invoke<import("./types").TranscriptResults>("search_transcripts", { workspaceRoot, query, limit }),
   setupAtomic: () => invoke<boolean>('atomic_engine_setup'),
+  setupRuntime: (runtime: string) => invoke<boolean>('runtime_setup', { runtime }),
   localModelDetails: (workspaceRoot: string, model: string) =>
     invoke<import("./types").LocalModelRemoval>("local_model_removal", { workspaceRoot, model, dryRun: true }),
   async removeLocalModel(workspaceRoot: string, model: string, preview: import("./types").LocalModelRemoval) {
@@ -688,6 +706,7 @@ export const workspaceFiles = {
 export const browserApi = {
   /** Show it at `bounds`, creating it on first use; opens `url` when given. */
   show: (bounds: Bounds, url?: string) => invoke<BrowserState>("browser_show", { bounds, url: url ?? null }),
+  tab: (action: 'new' | 'select' | 'close', id?: number) => invoke<BrowserState>('browser_tab', { action, id }),
   bounds: (bounds: Bounds) => invoke<void>("browser_bounds", { bounds }),
   hide: () => invoke<void>("browser_hide"),
   /** Open an address or a search; resolves to the URL opened. */
@@ -733,7 +752,7 @@ export const providerApi = {
 };
 
 /** Shells for the Terminal panel, running in the project folder. Calls throw. */
-export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler"; once?: boolean } | { kind: "attach"; session: string };
+export type TerminalTask = { kind: "slash"; command: string } | { kind: "scheduler"; once?: boolean } | { kind: "attach"; session: string } | { kind: "prepareGguf"; source: string; output: string };
 /** Session and collaboration tools that run the engine's own commands (`src-tauri/src/engine_cli.rs`). Calls throw a readable message. */
 export const sessionToolsApi = {
   /** `dial share`: an encrypted link to the session's active branch, or a secret gist through `gh`. */

@@ -2,8 +2,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { conversationFindOpen } from "../commands";
 import { entryKey, focusComposer, toggle, ui } from "../ui";
-import { engine } from "../bridge";
-import { canRetry, canUndo, copyText, editFromHere, editLastPrompt, promptOccurrence, regenerateBlocker, regenerateLast, sentImagesFor } from '../sessionActions';
+import { engine, showToast } from "../bridge";
+import { engineCall } from "../engineTools";
+import { canCompact, canRetry, canUndo, copyText, editFromHere, editLastPrompt, promptOccurrence, regenerateBlocker, regenerateLast, sentImagesFor } from '../sessionActions';
 import { draftFor } from "../drafts";
 import { isLongPrompt, withQuote } from "../quote";
 import type { OpenSnapshot } from "../types";
@@ -18,7 +19,7 @@ import RecordedTurns from './RecordedTurns.vue';
 import CodeBlock from "./CodeBlock.vue";
 import { showPanel } from "../workspace";
 import { phaseOf, toolRuns, type ToolRun as Run } from "../toolFolds";
-import { turnProgress } from "../turnProgress";
+import { cacheHitState, formatLastInference, turnProgress } from "../turnProgress";
 import { findOccurrences, transcriptCandidates } from '../chatFind';
 import FindText from './FindText.vue';
 import { viewAttachment } from '../imageViewer';
@@ -421,7 +422,11 @@ const thoughtOverrides = ref(new Map<number, boolean>());
 watch([positionKey, () => props.snap.showThinking], () => thoughtOverrides.value.clear());
 function reasoningOpen(index: number) {
   if (current.value?.entry === index && current.value.field === 'reasoning') return true;
-  return thoughtOverrides.value.get(index) ?? (props.snap.showThinking !== false);
+  const override = thoughtOverrides.value.get(index);
+  if (override !== undefined) return override;
+  if (props.snap.showThinking === false) return false;
+  if (props.snap.model?.local) return false;
+  return true;
 }
 function toggleThought(index: number) {
   thoughtOverrides.value.set(index, !reasoningOpen(index));
@@ -432,7 +437,59 @@ function words(text: string) {
   const n = text.trim().split(/\s+/).filter(Boolean).length;
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k words` : n === 1 ? "1 word" : `${n} words`;
 }
-
+/** Short one-line snippet of reasoning when collapsed on a local model. */
+function thoughtPreview(text: string) {
+  const line = text.trim().split(/\n+/).map(s => s.trim()).filter(Boolean).at(-1) ?? "";
+  return line.length > 76 ? `${line.slice(0, 75)}…` : line;
+}
+const lastInferenceLabel = computed(() =>
+  !props.snap.turnRunning ? formatLastInference(props.snap.lastInference) : "",
+);
+const lastInferenceCacheState = computed(() =>
+  !props.snap.turnRunning
+    ? cacheHitState(props.snap.lastInference?.cachedTokens, props.snap.lastInference?.promptTokens)
+    : undefined,
+);
+const wrappingUp = ref(false);
+watch(() => [props.snap.turnRunning, props.snap.entries.length], () => {
+  wrappingUp.value = false;
+});
+async function wrapUpThinking() {
+  if (wrappingUp.value || !props.snap.turnRunning) return;
+  wrappingUp.value = true;
+  try {
+    const res = await engineCall<{ accepted?: boolean }>("wrap_up_thinking", {}, props.snap.workspace.root);
+    if (!res?.accepted) wrappingUp.value = false;
+  } catch (error) {
+    wrappingUp.value = false;
+    showToast(String(error));
+  }
+}
+/** Classify local-model error text so error cards offer concrete next steps. */
+function localErrorKind(message: string): "context" | "server" | null {
+  if (!props.snap.model?.local) return null;
+  const lower = message.toLowerCase();
+  if (/context|too large|token limit|n_ctx|exceed/.test(lower)) return "context";
+  if (/out of memory|oom|exited|refused|could not start|not running|broken pipe|connection reset|model server/.test(lower)) return "server";
+  return null;
+}
+const restartingModel = ref(false);
+async function restartLocalModel() {
+  if (restartingModel.value || props.snap.turnRunning) return;
+  restartingModel.value = true;
+  try {
+    await engineCall("restart_model", {}, props.snap.workspace.root);
+    showToast("Local model unloaded. It will reload cleanly on the next turn.");
+  } catch (error) {
+    showToast(String(error));
+  } finally {
+    restartingModel.value = false;
+  }
+}
+function openLocalContextSettings() {
+  ui.settingsTab = "";
+  ui.settingsOpen = true;
+}
 const runs = computed(() => toolRuns(grouping.value, props.snap.sessionId));
 /** Entries drawn by their run's line rather than as rows of their own. */
 const inRun = computed(() => {
@@ -546,6 +603,7 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
             <div v-if="entry.reasoning" class="reasoning">
               <button class="thinking" :aria-expanded="reasoningOpen(index)" @click="toggleThought(index)">
                 <span>{{ entry.streaming && !entry.text ? "Thinking…" : `Thought · ${words(entry.reasoning)}` }}</span>
+                <span v-if="!reasoningOpen(index) && snap.model?.local && snap.showThinking !== false" class="thought-preview">{{ thoughtPreview(entry.reasoning) }}</span>
                 <Icon
                   :name="reasoningOpen(index) ? 'chevronDown' : 'chevronRight'"
                   :size="12"
@@ -596,6 +654,12 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
               >
                 <Icon :name="readingEntry === index && snap.voice.reading ? 'volumeOff' : 'volume'" :size="14" />
               </button>
+              <span
+                v-if="index === lastAnswer && lastInferenceLabel"
+                class="inference-stat"
+                :class="lastInferenceCacheState ? `cache-${lastInferenceCacheState}` : undefined"
+                :title="lastInferenceCacheState === 'low' ? 'Low KV cache hit — prompt prefix was rebuilt on this turn' : 'Last turn speed and prompt cache reuse'"
+              >{{ lastInferenceLabel }}</span>
             </div>
           </template>
 
@@ -610,7 +674,15 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
           </div>
 
           <div v-else-if="entry.kind === 'error'" class="error">
-            <span><strong>Error:</strong> <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template></span>
+            <div class="error-body">
+              <span><strong>Error:</strong> <FindText v-if="current?.entry === index" :text="entry.message" :match="current" /><template v-else>{{ entry.message }}</template></span>
+              <div v-if="index === lastError && localErrorKind(entry.message)" class="error-actions">
+                <button v-if="localErrorKind(entry.message) === 'context' && canCompact(snap)" class="btn btn-secondary" @click="engine.compact()">Compact</button>
+                <button v-if="localErrorKind(entry.message) === 'context'" class="btn btn-secondary" @click="openLocalContextSettings">Context settings</button>
+                <button v-if="localErrorKind(entry.message) === 'server' && snap.model?.managedLocal" class="btn btn-secondary" :disabled="restartingModel || snap.turnRunning" @click="restartLocalModel">{{ restartingModel ? 'Unloading…' : 'Unload / restart model' }}</button>
+                <button class="btn btn-secondary" @click="ui.modelPickerOpen = true">Switch model</button>
+              </div>
+            </div>
             <button class="act copy-error" title="Copy error" aria-label="Copy error" @click="copyText(entry.message, 'Error copied')">
               <Icon name="copy" :size="14" />
             </button>
@@ -651,7 +723,7 @@ const regenerateNote = computed(() => regenerateBlocker(props.snap));
 
       <RecordedTurns ref="recorded" v-if="snap.connection.state === 'live' && snap.sessionId && !snap.turnRunning && !snap.historyLoading" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :root="snap.workspace.root" :session="snap.sessionId" />
       <!-- While Dial waits on you, the request card under the conversation says so; no second line here. -->
-      <WorkingIndicator v-if="progress && !progress.waiting && !stalled" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :label="progressLabel" :detail="progress.detail" :waiting="progress.waiting" />
+      <WorkingIndicator v-if="progress && !progress.waiting && !stalled" :key="JSON.stringify([snap.workspace.root, snap.sessionId])" :label="progressLabel" :detail="progress.detail" :meta="progress.meta" :fraction="progress.fraction" :waiting="progress.waiting" :can-wrap-up="progress.thinking && snap.connection.state === 'live'" :wrapping-up="wrappingUp" :cache-state="progress.cacheState" @wrap-up="wrapUpThinking" />
       <div v-if="!pinned && !matches.length" class="jump">
         <button :class="{ wide: unseen }" :title="unseen ? 'Jump to the new replies' : 'Jump to the latest message'" aria-label="Jump to the latest message" @click="jumpToEnd">
           <Icon name="arrowDown" :size="16" />
@@ -979,6 +1051,24 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
 .thinking:hover {
   color: var(--text-muted);
 }
+.thought-preview {
+  max-width: 44ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  opacity: 0.8;
+  font-weight: 400;
+}
+.inference-stat {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.inference-stat.cache-low {
+  color: var(--warning);
+}
 .thought {
   margin: 6px 0 4px;
   padding-left: 14px;
@@ -1028,8 +1118,18 @@ details[open] > summary > .review-chevron { transform: rotate(90deg); }
   user-select: text;
   -webkit-user-select: text;
 }
-.error span {
+.error-body {
   flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.error span {
   min-width: 0;
   overflow-wrap: anywhere;
   padding-top: 2px;

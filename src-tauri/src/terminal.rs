@@ -76,6 +76,7 @@ pub fn login_shell(cwd: &Path) -> CommandBuilder {
 pub enum Task {
     Slash { command: String },
     Attach { session: String },
+    PrepareGguf { source: PathBuf, output: PathBuf },
     Scheduler {
         /// Run the entries that are due now, then exit (`schedule run --once`).
         #[serde(default)]
@@ -83,10 +84,43 @@ pub enum Task {
     },
 }
 
+/// Old engines accept unknown positional words as a new prompt, even `attach <id>`.
+/// Probe help without the id and require the subcommand's usage, not just exit status 0.
+pub fn check_attach(program: &Path) -> Result<(), String> {
+    let output = crate::launcher::run_with_timeout(
+        std::process::Command::new(program).args(["attach", "--help"]), std::time::Duration::from_secs(5),
+    );
+    if output.is_some_and(|bytes| attach_usage(&String::from_utf8_lossy(&bytes))) { Ok(()) }
+    else { Err("This engine did not confirm support for dial attach. Update the Dial engine to open a running chat.".into()) }
+}
+
+fn attach_usage(help: &str) -> bool {
+    help.lines().filter_map(|line| line.trim().strip_prefix("Usage:"))
+        .any(|usage| usage.split_whitespace().nth(1) == Some("attach"))
+}
+
 impl Task {
     pub fn child(self, program: &Path, cwd: &Path) -> Result<CommandBuilder, String> {
         match self {
             Self::Slash { command } => slash_command(program, cwd, &command),
+            Self::PrepareGguf { source, output } => {
+                if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    return Err("Local LoRA training requires Apple Silicon.".into());
+                }
+                if !source.is_absolute() || !source.is_file() || !output.is_absolute() || output.exists() {
+                    return Err("Choose an installed GGUF file and a new output folder.".into());
+                }
+                let mut child = CommandBuilder::new("uv");
+                child.cwd(std::env::temp_dir());
+                child.args(["run", "--no-config", "--no-project", "--isolated", "--no-build", "--python", "3.12",
+                    "--with", "transformers==4.57.6", "--with", "gguf==0.19.0", "--with", "torch==2.8.0",
+                    "--with", "accelerate==1.12.0", "--with", "sentencepiece==0.2.2", "--with", "protobuf==7.36.2",
+                    "--with", "tiktoken==0.14.0", "python", "-I", "-u", "-c", include_str!("terminal/prepare_gguf.py")]);
+                child.arg(source);
+                child.arg(output);
+                child.env("HF_HUB_OFFLINE", "1");
+                Ok(child)
+            }
             Self::Attach { session } => {
                 if session.is_empty() || !session.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("Invalid session ID".into()); }
                 let mut child = CommandBuilder::new(program);

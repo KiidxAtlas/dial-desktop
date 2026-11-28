@@ -22,7 +22,14 @@ const EXTENSION: Record<string, string> = { png: "png", jpeg: "jpg", gif: "gif",
 
 /** The image as a PNG blob, for the clipboard, which takes PNG everywhere. */
 async function pngBlob(url: string): Promise<Blob> {
-  if (url.startsWith("data:image/png;")) return (await fetch(url)).blob();
+  const pngPrefix = "data:image/png;base64,";
+  if (url.startsWith(pngPrefix)) {
+    // The app permits data: images but not data: fetches under connect-src.
+    const binary = atob(url.slice(pngPrefix.length));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: "image/png" });
+  }
   const img = new Image();
   img.src = url;
   await img.decode();

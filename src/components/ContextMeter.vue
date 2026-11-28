@@ -6,13 +6,18 @@ import type { ContextView } from "../types";
 import { resetSettingRow, saveSettingRow, settings, settingsPage } from "../bridge";
 import SettingRow from "./SettingRow.vue";
 
-const props = defineProps<{ context: ContextView | null; live: boolean; turnRunning: boolean; canCompact?: boolean }>();
+const props = defineProps<{ context: ContextView | null; live: boolean; turnRunning: boolean; canCompact?: boolean; local?: boolean }>();
 const emit = defineEmits<{ compact: [] }>();
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const trigger = ref<HTMLButtonElement | null>(null);
-const rows = computed(() => settingsPage.value?.settings.filter(s => s.key === 'context_window' || s.key === 'local_context_window') ?? []);
-
+const rows = computed(() => {
+  const keys = props.local
+    ? ['local_context_window', 'local_runtime.kv_bits', 'context_window']
+    : ['context_window', 'local_context_window'];
+  const all = settingsPage.value?.settings ?? [];
+  return keys.map(k => all.find(s => s.key === k)).filter((s): s is NonNullable<typeof s> => !!s);
+});
 watch(open, (shown, _, cleanup) => {
   if (!shown) return;
   void settings.load();
@@ -47,14 +52,25 @@ function count(n: number) {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
+const windowMismatch = computed(() => {
+  const c = props.context;
+  if (!c?.loadedWindow || !c.requestedWindow || c.loadedWindow >= c.requestedWindow) return null;
+  return `Server loaded ${count(c.loadedWindow)} (requested ${count(c.requestedWindow)} — capped by RAM or server config)`;
+});
+
 const label = computed(() => {
   if (!props.context) return 'Context usage not reported yet';
-  const { tokens, window, estimated } = props.context;
+  const { tokens, window, loadedWindow, estimated } = props.context;
   const about = estimated ? "About " : "";
-  if (!window || share.value === null) return `${about}${count(tokens)} tokens of context in use`;
-  return `${about}${count(tokens)} of ${count(window)} tokens of context in use (${Math.round(share.value * 100)}%)`;
+  const effective = loadedWindow ?? window;
+  const suffix = loadedWindow ? " loaded" : "";
+  if (!effective || share.value === null) return `${about}${count(tokens)} tokens of context in use`;
+  return `${about}${count(tokens)} of ${count(effective)}${suffix} tokens in use (${Math.round(share.value * 100)}%)`;
 });
-const title = computed(() => props.live ? `${label.value}. Open context controls.` : label.value);
+const title = computed(() => {
+  const base = windowMismatch.value ? `${label.value} · ${windowMismatch.value}` : label.value;
+  return props.live ? `${base}. Open context controls.` : base;
+});
 </script>
 
 <template>
@@ -74,7 +90,12 @@ const title = computed(() => props.live ? `${label.value}. Open context controls
       <span v-if="share !== null && share >= 0.5" class="pct">{{ Math.round(share * 100) }}%</span>
     </button>
     <section v-if="open" class="context-panel" aria-label="Context window">
-      <header><strong>Context window</strong><span>{{ label }}</span></header>
+      <header>
+        <strong>Context window</strong>
+        <span>{{ label }}</span>
+        <span v-if="windowMismatch" class="mismatch">{{ windowMismatch }}</span>
+        <span v-else-if="local && context && !context.loadedWindow" class="faint-note">Configured limit — actual server window is confirmed after the first request.</span>
+      </header>
       <template v-if="rows.length">
         <p>Changes here apply to this project.</p>
         <SettingRow v-for="s in rows" :key="s.key" :setting="{ ...s, modified: s.modified && s.source !== 'global' }" page-scope="project"
@@ -105,6 +126,8 @@ const title = computed(() => props.live ? `${label.value}. Open context controls
 }
 .context-panel header { display: grid; gap: 4px; }
 .context-panel header span, .context-panel p { color: var(--text-muted); font-size: var(--text-sm); }
+.context-panel .mismatch { color: var(--warning); font-size: var(--text-xs); }
+.context-panel .faint-note { color: var(--text-faint); font-size: var(--text-xs); }
 .context-panel :deep(.s-row) { flex-direction: column; align-items: stretch; gap: 7px; padding: 10px 0; border-top: 1px solid var(--border); }
 .context-panel :deep(.s-control) { max-width: none; justify-content: flex-start; flex-wrap: wrap; }
 .context-panel .btn { margin-top: 6px; }

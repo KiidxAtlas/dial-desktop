@@ -26,7 +26,8 @@ fn desktop_plugins_are_granted_only_to_the_local_app_webview() {
         assert!(allowed("main", &Origin::Local), "missing {command}");
         assert!(!allowed("main", &remote), "remote grant: {command}");
         assert!(
-            !allowed(dial_desktop::browser::LABEL, &Origin::Local),
+            !allowed(dial_desktop::browser::LABEL, &Origin::Local)
+                && !allowed(&dial_desktop::browser::tab_label(1), &Origin::Local),
             "browser grant: {command}"
         );
     }

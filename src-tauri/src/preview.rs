@@ -27,6 +27,7 @@ pub fn model(kind: Preview, workspace: &str) -> Model {
         default_thinking: Some("medium".into()),
         levels: ["low", "medium", "high"].map(String::from).to_vec(),
         thinking_settable: true,
+        ..CurrentModel::default()
     });
     model.models = models();
     model.models_changed = true;
@@ -322,6 +323,7 @@ fn models() -> Vec<ModelOption> {
         listed: !configured && provider != "mlx",
         catalog_only: false,
         local_engine: None,
+        memory_fit: None,
     };
     vec![
         row(

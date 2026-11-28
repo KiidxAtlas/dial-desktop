@@ -5,7 +5,7 @@ import { openMenu, ui, type InspectorTab } from "../ui";
 import { addToPrompt, inspectorWidth, mention, MIN_WIDTH, projectPref, setInspectorWidth, setProjectPref, showPanel } from "../workspace";
 import { changeRows, gitLabel, inNestedRepo, otherNestedChanges, stagedCount, stageState, type GitFileStatus } from "../workspaceGit";
 import { workspaceGitApi, type CommitReview, type GitBranchInfo, type GitStashEntry } from "../workspaceGitApi";
-import { showToast, workspaceChange } from "../bridge";
+import { folders, showToast, workspaceChange } from "../bridge";
 import { aiReviewView, gitLogView, worktreesView } from "../commandRunner";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { needsGitIdentity, paneErrorText } from "../paneErrors";
@@ -93,6 +93,11 @@ function dismissReview() {
 }
 watch([() => props.snap.workspace.root, () => props.snap.sessionId, commitMessage, () => shown("changes")], dismissReview, { flush: "sync" });
 watch(() => props.snap.workspace.root, () => { commitMessage.value = ""; author.value = null; branchInfo.value = null; stashes.value = []; });
+/** Open a nested repository as the project: the explicit choice Git actions need. */
+function openNestedRepo(repo: string) {
+  const root = props.snap.workspace.root.replace(/[\\/]+$/, "");
+  void folders.open(`${root}/${repo}`);
+}
 let gitRequest = 0;
 async function loadGit() {
   const root = props.snap.workspace.root, id = ++gitRequest;
@@ -547,6 +552,17 @@ function resizeByKey(event: KeyboardEvent) {
             </button>
           </div>
         </template>
+        <div v-if="!gitRepo && nestedRepos.length" class="nested-repos" aria-label="Git repositories in this folder">
+          <span class="section-label">Nested repositories</span>
+          <p class="faint">This folder is not a repository itself. Open one as the project to use its Git actions; Dial never picks between several for you.</p>
+          <div v-for="repo in nestedRepos" :key="repo" class="file-row">
+            <button type="button" class="file" :title="repo" @click="openNestedRepo(repo)">
+              <Icon name="file" :size="14" />
+              <span class="file-text mono truncate">{{ repo }}</span>
+              <Icon name="chevronRight" :size="13" />
+            </button>
+          </div>
+        </div>
         <div v-if="gitRepo" class="git-bar" aria-label="Branch and remote actions">
           <div class="git-bar-row">
             <select

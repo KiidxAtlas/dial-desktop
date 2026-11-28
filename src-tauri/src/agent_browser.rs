@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Url};
 
 use crate::browser::{self, Browser};
 
@@ -116,7 +116,8 @@ when the user requests it or the task needs a capability the panel lacks, such a
 browser_open loads a page and lists its interactive elements with refs like [3]; \
 browser_click, browser_type and browser_select act on a ref; browser_read returns the page text \
 and console errors; browser_screenshot shows how it looks. Take a new snapshot after the page \
-changes. For a request to launch a graphical app, use app_desktop when the guest is configured; \
+changes. browser_tab lists, opens (new), switches (select) and closes tabs; the other browser tools act on the active tab. browser_open answers only once its page has loaded there. \
+For a request to launch a graphical app, use app_desktop when the guest is configured; \
 the user need not name the App panel. Check state first. When app_desktop state reports ssh for a \
 VM, run shell commands and read files in that VM with the ssh tool (host ssh.host) instead of \
 typing into its screen; keep frame and input for graphical apps. If setup or project files are \
@@ -247,6 +248,13 @@ pub fn tools() -> Value {
             false,
             "Go `back`, `forward`, or `reload` the page.",
             json!({"type": "object", "properties": {"action": {"type": "string", "enum": ["back", "forward", "reload"]}}, "required": ["action"]}),
+        ),
+        tool(
+            "browser_tab",
+            "Tabs",
+            false,
+            "List the Browser panel's tabs (`list`), open a blank one (`new`), show one (`select` with its id) or close one (`close` with its id). The panel shows the active tab, and the other browser tools act on it.",
+            json!({"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "new", "select", "close"]}, "id": {"type": "integer", "description": "The tab's id, from list (select and close)"}}, "required": ["action"]}),
         ),
         tool(
             "browser_wait",
@@ -774,6 +782,7 @@ pub fn describe_call(tool: &str, args: &Value) -> String {
         "browser_press" => format!("Pressing {}", arg("key")),
         "browser_scroll" => "Scrolling".into(),
         "browser_navigate" => format!("Going {}", arg("action")),
+        "browser_tab" => format!("Tabs: {}", arg("action")),
         "browser_wait" => "Waiting for the page".into(),
         "browser_eval" => "Running a script in the page".into(),
         "browser_screenshot" => "Taking a screenshot".into(),
@@ -968,7 +977,7 @@ fn run_script<R: Runtime>(app: &AppHandle<R>, body: &str) -> Result<Value, Strin
 }
 
 fn ensure_open<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    if app.get_webview(browser::LABEL).is_none() {
+    if browser::active_view(app).is_err() {
         return Err("The browser has no page yet; open one with browser_open".into());
     }
     Ok(())
@@ -979,7 +988,7 @@ fn wait_load<R: Runtime>(app: &AppHandle<R>, before: u64, timeout: Duration) -> 
     let browser = app.state::<Browser>();
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if app.get_webview(browser::LABEL).is_some()
+        if browser::active_view(app).is_ok()
             && browser.loads() > before
             && !browser.current().loading
         {
@@ -988,6 +997,40 @@ fn wait_load<R: Runtime>(app: &AppHandle<R>, before: u64, timeout: Duration) -> 
         thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+/// Wait until the active tab finishes a navigation to `target` that started after `since`.
+fn wait_opened<R: Runtime>(
+    app: &AppHandle<R>,
+    target: &Url,
+    since: u64,
+    timeout: Duration,
+) -> Option<browser::Nav> {
+    let browser = app.state::<Browser>();
+    let start = Instant::now();
+    loop {
+        if let Some(nav) = browser.opened(target, since) {
+            return Some(nav);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The tabs as the agent reads them, the active one marked with `*`.
+fn describe_tabs(state: &browser::BrowserState) -> String {
+    if state.tabs.is_empty() {
+        return "No browser tabs are open. browser_open loads a page in the panel.".into();
+    }
+    let mut out = String::new();
+    for tab in &state.tabs {
+        let mark = if tab.id == state.active_tab { "*" } else { " " };
+        let title = if tab.title.is_empty() { "(untitled)" } else { tab.title.as_str() };
+        out.push_str(&format!("{mark} tab {}: {} ({})\n", tab.id, clip(title, 120), clip(&tab.url, 2048)));
+    }
+    out.trim_end().to_owned()
 }
 
 /// After an action: wait for a page load it started, then say where the page is.
@@ -1026,14 +1069,18 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
     match tool {
         "browser_open" => {
             let url = browser::normalize_url(string_arg(args, "url")?)?;
+            let target = Url::parse(&url).map_err(|e| e.to_string())?;
+            let since = browser.navs();
             let _ = app.emit("agent-browser", json!({"kind": "open", "url": url}));
-            let loaded = wait_load(app, before, LOAD_TIMEOUT);
-            ensure_open(app).map_err(|_| {
-                "The Browser panel did not open; is the Dial Desktop window showing?".to_owned()
+            let nav = wait_opened(app, &target, since, LOAD_TIMEOUT).ok_or_else(|| {
+                format!(
+                    "The page did not open in the Browser panel: {url} did not finish loading there within {} s. The panel may be hidden or showing another page; try again.",
+                    LOAD_TIMEOUT.as_secs()
+                )
             })?;
-            let mut text = snapshot(app)?;
-            if !loaded {
-                text.insert_str(0, "(The page is still loading.)\n");
+            let text = snapshot(app)?;
+            if browser.nav() != Some(nav) {
+                return Err("The Browser changed while the page was read; call browser_open again".into());
             }
             Ok(Reply::text(text))
         }
@@ -1149,9 +1196,7 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
         }
         "browser_navigate" => {
             ensure_open(app)?;
-            let view = app
-                .get_webview(browser::LABEL)
-                .ok_or("The browser is not open")?;
+            let view = browser::active_view(app)?;
             let result = match string_arg(args, "action")? {
                 "back" => view.eval("history.back()"),
                 "forward" => view.eval("history.forward()"),
@@ -1226,6 +1271,16 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
             let text = serde_json::to_string_pretty(&value).unwrap_or_default();
             Ok(Reply::text(clip(&text, TEXT_LIMIT)))
         }
+        "browser_tab" => {
+            let action = string_arg(args, "action")?;
+            if action == "list" {
+                return Ok(Reply::text(describe_tabs(&browser.current())));
+            }
+            let id = args.get("id").and_then(Value::as_u64);
+            let _ = app.emit("agent-browser", json!({"kind": "show"}));
+            let state = browser::tab_action(app, action, id)?;
+            Ok(Reply::text(format!("Done.\n{}", describe_tabs(&state))))
+        }
         "browser_screenshot" => {
             ensure_open(app)?;
             let _ = app.emit("agent-browser", json!({"kind": "show"}));
@@ -1239,9 +1294,7 @@ pub fn call(app: &AppHandle, tool: &str, args: &Value) -> Result<Reply, String> 
 fn capture(app: &AppHandle) -> Result<Reply, String> {
     // Let the panel come up if the agent's call just showed it.
     thread::sleep(Duration::from_millis(250));
-    let view = app
-        .get_webview(browser::LABEL)
-        .ok_or("The browser is not open")?;
+    let view = browser::active_view(app)?;
     #[cfg(target_os = "macos")]
     let png = screenshot::capture(&view, None)?;
     #[cfg(windows)]

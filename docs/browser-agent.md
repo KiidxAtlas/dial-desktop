@@ -26,6 +26,7 @@ dial rpc (engine) ──stdio MCP──▶ dial-desktop --browser-mcp (bridge)
 - **The bridge** (`browser_mcp.rs`) is a stdio MCP server (one JSON-RPC message per line):
   `initialize`, `ping`, `tools/list`, `tools/call`. It holds no browser. Each call goes to the
   running app. With no app running it lists no tools, so Dial sessions in a terminal see nothing.
+- **Tabs** (the UI's `browser_tab` command and the agent's `browser_tab` tool): each tab is its own webview labelled `browser-<id>`. Only the active tab is shown; the others keep their pages loaded. A link that opens a new window becomes a new tab. Each tab keeps its own local-file server (**Open file…**), stopped when that tab leaves its page. The `browser` event carries `{url, title, loading, activeTab, tabs: [{id, url, title}]}`; top-level fields describe the active tab.
 - **The app side** (`agent_browser.rs`) listens on a random loopback port and writes
   `{port, token, pid}` to `browser-endpoints/<pid>.json` in the app's folder
   (`~/Library/Application Support/dev.dial.desktop/` on macOS), mode `0600`. Each request carries
@@ -48,7 +49,7 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 
 | Tool | Does |
 | --- | --- |
-| `browser_open(url)` | Show the panel, load a page (address, `localhost:3000`, bare host or search), wait for it, return a snapshot |
+| `browser_open(url)` | Load a page in the panel's active tab (address, `localhost:3000`, bare host or search), wait until that exact address has finished loading there, and return a snapshot. Fails instead of reading an older page when the panel does not navigate. |
 | `browser_snapshot()` | Headings and visible interactive elements with refs like `[3]` |
 | `browser_read()` | Address, title, selected text, visible text, console errors |
 | `browser_click(ref \| selector \| name)` | Click (pointer and mouse events, then `click`); waits for a load it starts |
@@ -57,6 +58,7 @@ The engine offers them as `mcp__dial_desktop__<name>`.
 | `browser_press(key)` | Page keyboard events, with in-page Tab/Shift+Tab, typing/deletion and left/right caret movement in plain text controls, up/down in single selects, and Enter/Space activation on applicable controls. Escape and keys without an implemented default send events only; native browser/OS shortcuts are not supported. |
 | `browser_scroll(direction \| target)` | Scroll up, down, top, bottom, or to an element |
 | `browser_navigate(action)` | Back, forward, reload |
+| `browser_tab(action, id?)` | `list` the tabs (active one marked), `new` a blank tab, `select` one by id, or `close` one by id. The other tools act on the active tab. Up to 16 tabs; closing the last leaves a blank one. |
 | `browser_wait(text?, timeout_ms?)` | Wait for text to show (up to 30 s) |
 | `browser_eval(script)` | Run a function body (async; `await` works) and return JSON |
 | `browser_screenshot()` | PNG of the panel, returned as an MCP image block |

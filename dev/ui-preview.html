@@ -77,6 +77,11 @@
   const listeners = {};
   const emit = (event, payload) => (listeners[event] || []).forEach((id) => callbacks.get(id)?.({ event, id: 0, payload }));
   const publish = () => emit('snapshot', { seq: ++seq, base: seq - 1, full: JSON.parse(JSON.stringify(snap)) });
+  // Model the native tab state, not page content, for the UI-only preview.
+  let lastTab = 1, activeTab = 1;
+  const blankTab = id => ({ id, title: '', url: 'about:blank' });
+  const tabs = [blankTab(1)];
+  const browserState = () => ({ ...tabs.find(t => t.id === activeTab), activeTab, tabs: tabs.map(t => ({ ...t })), loading: false });
   const recent = [
     { root: '/Users/demo/code/site', name: 'site', display: '~/code/site' },
     { root: `/Users/demo/code/${LONG}`, name: LONG, display: `~/code/${LONG}` },
@@ -92,6 +97,19 @@
       if (cmd === 'plugin:event|listen') { (listeners[args.event] ||= []).push(args.handler); return args.handler; }
       if (cmd === 'plugin:event|unlisten') return null;
       if (cmd === 'snapshot') return { seq, snapshot: JSON.parse(JSON.stringify(snap)) };
+      if (cmd === 'browser_state') return browserState();
+      if (cmd === 'browser_tab' || cmd === 'browser_show') {
+        if (args.action === 'new') tabs.push(blankTab(activeTab = ++lastTab));
+        else if (args.action === 'select') activeTab = args.id;
+        else if (args.action === 'close') {
+          const index = tabs.findIndex(t => t.id === args.id);
+          if (index >= 0) tabs.splice(index, 1);
+          if (!tabs.length) tabs.push(blankTab(++lastTab));
+          if (activeTab === args.id) activeTab = tabs[Math.min(index, tabs.length - 1)].id;
+        } else if (args.url) tabs.find(t => t.id === activeTab).url = args.url;
+        if (args.action || args.url) emit('browser', browserState());
+        return browserState();
+      }
       if (cmd === 'recent_workspaces') return recent;
       if (cmd === 'board_usb_devices') return [
         { product: 'Pixel', kind: 'Android device', usb_id: '18d1:4ee2', location: '1:2', functions: ['Android debugging (ADB)', 'Imaging / media transfer'], speed: '480 Mb/s', interfaces: ['#0: 06/01/01', '#1: ff/42/01'] },
@@ -161,7 +179,8 @@
           : 'Boot complete\nSensor retry\ntemp=21.4\ntemp=24.0\ntemp=25.7\ntemp=26.6';
         return { text, bytes: text.length, capped: false };
       }
-      if (cmd === 'models' || cmd.endsWith('_list')) return [];
+      if (cmd === 'models') return ['mlx', 'gguf'].map(format => ({ provider: 'mlx', modelId: `demo/${format}`, label: `Example chat · ${format.toUpperCase()}`, local: true }));
+      if (cmd.endsWith('_list')) return [];
       if (cmd === 'read_transcript_image') {
         const name = args.path.split('/').pop();
         const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#e8744f"/><stop offset="1" stop-color="#5b4bd6"/></linearGradient></defs><rect width="256" height="256" rx="48" fill="url(#g)"/><circle cx="128" cy="128" r="56" fill="none" stroke="#fff" stroke-width="14"/></svg>`;
@@ -175,6 +194,7 @@
       }
       if (cmd === 'engine_call') {
         const fixtures = {
+          training_status: { format: args.params?.model === 'demo/gguf' ? 'gguf' : 'mlx', gguf_file: args.params?.model === 'demo/gguf' ? '/models/example.gguf' : null, unavailable: args.params?.model === 'demo/gguf' ? 'GGUF weights cannot be trained in place. Prepare a separate checkpoint or choose the matching MLX source weights.' : null, enabled: true, compute_paused: false, paused: false, minimum: 24, validation_minimum: 1, verified_turns: 4, approved_snapshots: 12, job: null, version: null },
           stats: { report: { by_tool: [
             { tool: 'bash', calls: 20, avg_ms: 300, error_breakdown: { command_or_check: 3, execution_failure: 1, unclassified: 0 } },
             { tool: 'edit', calls: 12, avg_ms: 50, error_breakdown: { command_or_check: 0, execution_failure: 2, unclassified: 1 } },

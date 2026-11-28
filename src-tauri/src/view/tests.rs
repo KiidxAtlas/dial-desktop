@@ -619,6 +619,7 @@ fn the_model_view_prefers_state_and_labels_from_the_list() {
         listed: false,
         catalog_only: false,
         local_engine: None,
+        memory_fit: None,
     }];
     model.approval = Some("ask".into());
     let value = serde_json::to_value(Snapshot::new(&model, None, 0)).unwrap();

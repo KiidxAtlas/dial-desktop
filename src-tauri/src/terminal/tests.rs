@@ -82,6 +82,12 @@ fn slash_command_preserves_literal_argument_and_configured_program() {
 }
 
 #[test]
+fn attach_help_must_be_for_the_subcommand_not_the_legacy_prompt_cli() {
+    assert!(attach_usage("View a running session\n\nUsage: dial attach <SESSION>"));
+    assert!(!attach_usage("Usage: dial [OPTIONS] [PROMPT]... [COMMAND]\n  --image   Attach an image"));
+}
+
+#[test]
 fn attached_chat_targets_a_literal_session_in_the_selected_project() {
     let child = Task::Attach { session: "abcd1234".into() }.child(Path::new("dial"), Path::new("project")).unwrap();
     assert_eq!(child.get_argv(), &[OsStr::new("dial"), OsStr::new("attach"), OsStr::new("--"), OsStr::new("abcd1234")]);

@@ -139,6 +139,7 @@ pub struct SessionView {
     /// "3h ago · 12 messages".
     pub meta: String,
     pub empty: bool,
+    pub open_elsewhere: bool,
     pub pinned: bool,
     /// The session on screen.
     pub selected: bool,
@@ -506,6 +507,10 @@ pub struct ModelView {
     pub provider: String,
     pub model_id: String,
     pub label: String,
+    pub local: bool,
+    pub managed_local: bool,
+    pub resident: bool,
+    pub system_memory_bytes: Option<u64>,
     /// The session's level; `None` runs the model's default.
     pub thinking: Option<String>,
     pub default_thinking: Option<String>,
@@ -514,7 +519,6 @@ pub struct ModelView {
     /// Whether the model takes image attachments; `None` while unknown.
     pub accepts_images: Option<bool>,
 }
-
 impl ModelView {
     /// The model `model` reports, labelled from the model list when it is loaded.
     pub fn of(model: &Model) -> Option<Self> {
@@ -542,6 +546,10 @@ impl ModelView {
                 label: label(&current.provider, &current.model_id),
                 provider: current.provider.clone(),
                 model_id: current.model_id.clone(),
+                local: current.local,
+                managed_local: current.managed_local,
+                resident: current.resident,
+                system_memory_bytes: current.system_memory_bytes,
                 thinking: current.thinking.clone(),
                 default_thinking: current.default_thinking.clone(),
                 levels: current.levels.clone(),
@@ -554,6 +562,10 @@ impl ModelView {
                 provider: String::new(),
                 model_id: id.clone(),
                 label: id.clone(),
+                local: false,
+                managed_local: false,
+                resident: false,
+                system_memory_bytes: None,
                 thinking: None,
                 default_thinking: None,
                 levels: Vec::new(),
@@ -580,6 +592,7 @@ pub struct ModelOptionView {
     pub listed: bool,
     pub catalog_only: bool,
     pub local_engine: Option<crate::model::EngineChoice>,
+    pub memory_fit: Option<crate::model::MemoryFit>,
 }
 
 impl From<&ModelOption> for ModelOptionView {
@@ -596,15 +609,15 @@ impl From<&ModelOption> for ModelOptionView {
             listed: m.listed,
             catalog_only: m.catalog_only,
             local_engine: m.local_engine.clone(),
+            memory_fit: m.memory_fit.clone(),
         }
     }
 }
 
 /// Everything the UI shows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
-    /// `macos`, `windows` or `linux`; the UI leaves room for the macOS window buttons.
     pub platform: &'static str,
     pub apple_silicon: bool,
     /// `None` until the user picks a folder; the UI then shows the welcome screen.
@@ -615,11 +628,14 @@ pub struct Snapshot {
     /// Approval mode in force: `readonly`, `ask`, `write` or `auto`.
     pub approval: Option<String>,
     pub session_id: Option<String>,
+    /// Binds pre-handshake input to the conversation this engine actually opened.
+    pub startup_draft_key: Option<String>,
     pub history_loading: bool,
     /// Whether to expand reasoning by default, from this engine's effective UI settings.
     pub show_thinking: bool,
     pub turn_running: bool,
     pub model_progress: Option<crate::model::ModelProgress>,
+    pub last_inference: Option<crate::model::ModelProgress>,
     pub loading_local_model: Option<String>,
     pub local_load_failure: Option<crate::tabs::LocalLoadFailure>,
     pub can_send: bool,
@@ -660,9 +676,12 @@ pub struct ContextView {
     pub tokens: u64,
     /// Effective window, or catalog capacity on engines without that field.
     pub window: Option<u64>,
+    /// Actual loaded window reported by a local server, when known.
+    pub loaded_window: Option<u64>,
+    /// User/config requested window before capping, when known.
+    pub requested_window: Option<u64>,
     pub estimated: bool,
 }
-
 impl Snapshot {
     /// The view of `model` at time `now` (Unix seconds, for relative session times).
     pub fn new(model: &Model, workspace: Option<&Workspace>, now: i64) -> Self {
@@ -706,6 +725,7 @@ impl Snapshot {
                     title: s.title.clone(),
                     meta,
                     empty: s.messages == 0,
+                    open_elsewhere: s.open_elsewhere,
                     pinned: s.pinned,
                     selected: session_id.as_deref() == Some(s.id.as_str()),
                     running: false,
@@ -762,6 +782,7 @@ impl Snapshot {
             approval: model.approval.clone(),
             title: model.title(),
             session_id,
+            startup_draft_key: None,
             history_loading: model.recovering,
             show_thinking: model
                 .settings
@@ -771,6 +792,7 @@ impl Snapshot {
                 .unwrap_or(true),
             turn_running: conversation.turn_running(),
             model_progress: model.model_progress,
+            last_inference: model.last_inference,
             loading_local_model: None,
             local_load_failure: None,
             can_send: model.can_send(),
@@ -788,6 +810,8 @@ impl Snapshot {
             context: model.context.map(|usage| ContextView {
                 tokens: usage.tokens,
                 window: model.context_window(),
+                loaded_window: model.loaded_context_window(),
+                requested_window: model.requested_context_window(),
                 estimated: usage.estimated,
             }),
             voice: VoiceView {
@@ -802,11 +826,11 @@ impl Snapshot {
         }
     }
 
-    /// Mark sessions that run in some tab. A running session the list does not have yet (its
-    /// first turn is still going) is shown on top, so the user can always get back to it.
+    /// Keep the selected session and busy background sessions reachable before history arrives.
     pub fn show_activity(&mut self, activity: &HashMap<String, Activity>) {
         for session in &mut self.sessions {
             if let Some(a) = activity.get(&session.id) {
+                session.open_elsewhere = false; // Owned by a tab in this window.
                 session.running = a.running;
                 session.waiting = a.waiting;
             }
@@ -814,7 +838,8 @@ impl Snapshot {
         let mut missing: Vec<(&String, &Activity)> = activity
             .iter()
             .filter(|(id, a)| {
-                (a.running || a.waiting) && !self.sessions.iter().any(|s| &s.id == *id)
+                let selected = self.session_id.as_ref() == Some(*id) && !self.history_loading;
+                (selected || a.running || a.waiting) && !self.sessions.iter().any(|s| &s.id == *id)
             })
             .collect();
         missing.sort_by(|a, b| a.0.cmp(b.0));
@@ -826,12 +851,15 @@ impl Snapshot {
                     title: a.title.clone(),
                     meta: if a.waiting {
                         "Waiting for you"
-                    } else {
+                    } else if a.running {
                         "Running"
+                    } else {
+                        "Just now"
                     }
                     .into(),
                     pinned: false,
-                    empty: false,
+                    open_elsewhere: false,
+                    empty: !a.running && !a.waiting && self.entries.is_empty(),
                     selected: self.session_id.as_deref() == Some(id.as_str()),
                     running: a.running,
                     waiting: a.waiting,
@@ -1012,10 +1040,12 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
         model,
         approval,
         session_id,
+        startup_draft_key,
         history_loading,
         show_thinking,
         turn_running,
         model_progress,
+        last_inference,
         loading_local_model,
         local_load_failure,
         can_send,
@@ -1044,10 +1074,12 @@ pub fn patch(prev: &Snapshot, next: &Snapshot) -> serde_json::Map<String, Value>
     field!(model, "model");
     field!(approval, "approval");
     field!(session_id, "sessionId");
+    field!(startup_draft_key, "startupDraftKey");
     field!(history_loading, "historyLoading");
     field!(show_thinking, "showThinking");
     field!(turn_running, "turnRunning");
     field!(model_progress, "modelProgress");
+    field!(last_inference, "lastInference");
     field!(loading_local_model, "loadingLocalModel");
     field!(local_load_failure, "localLoadFailure");
     field!(can_send, "canSend");

@@ -37,9 +37,7 @@ const view = ref<HTMLElement | null>(null);
 const input = ref<HTMLInputElement | null>(null);
 const address = ref("");
 const editing = ref(false);
-const state = ref<BrowserState>({ url: "", title: "", loading: false });
-/** The webview exists (created on the first page opened). */
-const created = ref(false);
+const state = ref<BrowserState>({ url: '', title: '', loading: false, tabs: [], activeTab: 0 });
 const busy = ref(false);
 const search = ref<SearchChoice>(loadSearch());
 const viewport = ref<ViewportId>(loadViewport());
@@ -59,7 +57,7 @@ const blank = computed(() => !state.value.url || state.value.url === "about:blan
 const covered = computed(
   () => ui.settingsOpen || ui.paletteOpen || ui.shortcutsOpen || ui.modelPickerOpen || !!ui.menu || !!viewedImage.value,
 );
-const visible = computed(() => props.active && !covered.value && created.value && !blank.value);
+const visible = computed(() => props.active && !covered.value && !blank.value);
 
 function bounds(): Bounds | null {
   const el = view.value ?? stage.value;
@@ -76,14 +74,28 @@ async function open(url: string) {
   if (!box) return;
   busy.value = true;
   try {
-    if (created.value) {
-      await browserApi.navigate(url);
-      await place();
-    } else {
-      state.value = await browserApi.show(box, url);
-      created.value = true;
-    }
+    accept(await browserApi.show(box, url));
     editing.value = false;
+  } catch (error) {
+    showToast(paneErrorText(error));
+  } finally {
+    busy.value = false;
+  }
+}
+
+function accept(now: BrowserState) {
+  if (state.value.activeTab !== now.activeTab) editing.value = false;
+  state.value = now;
+}
+
+async function changeTab(action: 'new' | 'select' | 'close', id?: number) {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    accept(await browserApi.tab(action, id));
+    await nextTick();
+    await place();
+    if (blank.value) input.value?.focus();
   } catch (error) {
     showToast(paneErrorText(error));
   } finally {
@@ -95,8 +107,14 @@ async function open(url: string) {
 async function place() {
   try {
     const box = bounds();
-    if (visible.value && box) await browserApi.show(box);
-    else if (created.value) await browserApi.hide();
+    // Keep the request queued until the panel has a real stage (including during its transition).
+    if (props.active && !covered.value && box && workspace.pendingUrl) {
+      const url = workspace.pendingUrl;
+      workspace.pendingUrl = null;
+      address.value = url;
+      await open(url);
+    } else if (visible.value && box) await browserApi.show(box);
+    else await browserApi.hide();
   } catch (error) {
     console.warn("browser placement failed", error);
   }
@@ -281,7 +299,7 @@ watch(state, (now) => {
   if (!editing.value) address.value = now.url === "about:blank" ? "" : now.url;
   if (!now.loading) history.value = pushHistory(history.value, now.url, now.title);
 });
-watch(visible, placeSoon);
+watch([visible, () => state.value.activeTab], placeSoon);
 watch(() => appearance.zoom, placeSoon);
 
 // Opening an empty browser puts the cursor in the address bar.
@@ -303,19 +321,7 @@ function onKey(event: KeyboardEvent) {
   input.value?.focus();
 }
 
-// A preview Dial started (or a link) asks to open here.
-watch(
-  () => [workspace.pendingUrl, props.active] as const,
-  async ([url, active]) => {
-    if (!url || !active) return;
-    workspace.pendingUrl = null;
-    address.value = url;
-    await nextTick();
-    // The panel may still be sliding in; wait until it has a size.
-    soon(() => void open(url));
-  },
-  { immediate: true },
-);
+watch(() => [workspace.pendingUrl, props.active, covered.value], placeSoon, { flush: 'post' });
 
 let observer: ResizeObserver | null = null;
 let unlisten: (() => void) | null = null;
@@ -332,13 +338,10 @@ onMounted(async () => {
       .features()
       .then((features) => (devtools.value = features.devtools))
       .catch(() => {});
-    unlisten = await browserApi.onState((now) => (state.value = now));
+    unlisten = await browserApi.onState(accept);
     const now = await browserApi.state();
-    if (now.url) {
-      state.value = now;
-      created.value = true;
-      placeSoon();
-    }
+    if (now) accept(now);
+    placeSoon();
   } catch {
     // Outside Tauri there is no browser.
   }
@@ -350,13 +353,19 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   cancelPlace?.();
   unlisten?.();
-  if (created.value) void browserApi.hide().catch(() => {});
-  void browserOptionsApi.stopLocal().catch(() => {});
+  void browserApi.hide().catch(() => {});
 });
 </script>
 
 <template>
   <div class="browser">
+    <nav class="browser-tabs" aria-label="Browser tabs">
+      <div v-for="tab in state.tabs" :key="tab.id" class="browser-tab" :class="{ current: tab.id === state.activeTab }">
+        <button type="button" class="tab-name truncate" :aria-current="tab.id === state.activeTab ? 'page' : undefined" :title="tab.url || 'New tab'" :disabled="busy" @click="changeTab('select', tab.id)">{{ tab.title || tab.url.replace(/^about:blank$/, '') || 'New tab' }}</button>
+        <button type="button" class="icon-btn tab-close" :aria-label="`Close ${tab.title || tab.url || 'tab'}`" title="Close tab" :disabled="busy" @click="changeTab('close', tab.id)"><Icon name="cross" :size="12" /></button>
+      </div>
+      <button class="icon-btn" type="button" title="New tab" aria-label="New browser tab" :disabled="busy" @click="changeTab('new')"><Icon name="plus" :size="14" /></button>
+    </nav>
     <form class="bar" @submit.prevent="submit">
       <button type="button" class="icon-btn" title="Back" :disabled="blank" @click="go('back')">
         <Icon name="arrowLeft" :size="15" />
@@ -440,6 +449,11 @@ onBeforeUnmount(() => {
   height: 100%;
   min-height: 0;
 }
+.browser-tabs { display: flex; align-items: center; gap: 3px; flex: none; overflow-x: auto; padding: 0 0 5px; }
+.browser-tab { display: flex; align-items: center; min-width: 54px; max-width: 145px; border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--text-faint); }
+.browser-tab.current { background: var(--surface); border-color: var(--border); color: var(--text); }
+.tab-name { min-width: 0; flex: 1; padding: 4px 5px; font-size: 11px; text-align: left; }
+.tab-close { flex: none; }
 .bar {
   display: flex;
   align-items: center;
